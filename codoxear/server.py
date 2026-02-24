@@ -129,6 +129,7 @@ CHAT_INDEX_RESEED_THRESHOLD_BYTES = int(os.environ.get("CODEX_WEB_CHAT_INDEX_RES
 CHAT_INDEX_MAX_EVENTS = int(os.environ.get("CODEX_WEB_CHAT_INDEX_MAX_EVENTS", "12000"))
 METRICS_WINDOW = int(os.environ.get("CODEX_WEB_METRICS_WINDOW", "256"))
 FILE_READ_MAX_BYTES = int(os.environ.get("CODEX_WEB_FILE_READ_MAX_BYTES", str(2 * 1024 * 1024)))
+FILE_WRITE_MAX_BYTES = int(os.environ.get("CODEX_WEB_FILE_WRITE_MAX_BYTES", str(FILE_READ_MAX_BYTES)))
 FILE_HISTORY_MAX = int(os.environ.get("CODEX_WEB_FILE_HISTORY_MAX", "20"))
 HARNESS_PROMPT_PREFIX = """Unattended-mode instructions (optimize for 8+ hours, minimal turns, minimal repetition, maximal progress)
 
@@ -335,6 +336,9 @@ def _json_response(handler: http.server.BaseHTTPRequestHandler, status: int, obj
     handler.send_response(status)
     handler.send_header("Content-Type", "application/json; charset=utf-8")
     handler.send_header("Content-Length", str(len(body)))
+    handler.send_header("Cache-Control", "no-store")
+    handler.send_header("Pragma", "no-cache")
+    handler.send_header("Expires", "0")
     handler.end_headers()
     handler.wfile.write(body)
 
@@ -624,7 +628,7 @@ def _has_assistant_output_text(obj: dict[str, Any]) -> bool:
 
 def _analyze_log_chunk(
     objs: list[dict[str, Any]],
-) -> tuple[int, int, int, float | None, dict[str, Any] | None, list[dict[str, Any]]]:
+) -> tuple[int, int, int, float | None, float | None, dict[str, Any] | None, list[dict[str, Any]]]:
     return _rollout_log._analyze_log_chunk(objs)
 
 
@@ -648,6 +652,14 @@ def _last_chat_role_ts_from_tail(
     return _rollout_log._last_chat_role_ts_from_tail(path, max_scan_bytes=max_scan_bytes)
 
 
+def _last_assistant_ts_from_tail(
+    path: Path,
+    *,
+    max_scan_bytes: int,
+) -> float | None:
+    return _rollout_log._last_assistant_ts_from_tail(path, max_scan_bytes=max_scan_bytes)
+
+
 @dataclass
 class Session:
     session_id: str
@@ -664,6 +676,7 @@ class Session:
     token: dict[str, Any] | None = None
     last_turn_id: str | None = None
     last_chat_ts: float | None = None
+    last_assistant_ts: float | None = None
     meta_thinking: int = 0
     meta_tools: int = 0
     meta_system: int = 0
@@ -702,6 +715,7 @@ class SessionManager:
         s.meta_tools = 0
         s.meta_system = 0
         s.last_chat_ts = None
+        s.last_assistant_ts = None
         s.meta_log_off = int(meta_log_off)
         s.chat_index_events = []
         s.chat_index_scan_bytes = 0
@@ -1108,6 +1122,15 @@ class SessionManager:
                 meta_log_off = int(log_path.stat().st_size)
             else:
                 meta_log_off = 0
+            prev: Session | None
+            with self._lock:
+                prev = self._sessions.get(session_id)
+            last_assistant_ts: float | None = None
+            if log_path is not None and log_path.exists():
+                if prev and prev.log_path == log_path and prev.last_assistant_ts is not None:
+                    last_assistant_ts = prev.last_assistant_ts
+                else:
+                    last_assistant_ts = _last_assistant_ts_from_tail(log_path, max_scan_bytes=CHAT_INIT_MAX_SCAN_BYTES)
 
             s = Session(
                 session_id=session_id,
@@ -1122,6 +1145,7 @@ class SessionManager:
                 busy=bool(resp.get("busy")),
                 queue_len=int(resp.get("queue_len")),
                 token=(resp.get("token") if isinstance(resp.get("token"), (dict, type(None))) else None),
+                last_assistant_ts=last_assistant_ts,
                 meta_thinking=0,
                 meta_tools=0,
                 meta_system=0,
@@ -1146,6 +1170,8 @@ class SessionManager:
                     if prev.log_path != s.log_path:
                         prev.log_path = s.log_path
                         self._reset_log_caches(prev, meta_log_off=meta_log_off)
+                    if s.last_assistant_ts is not None:
+                        prev.last_assistant_ts = s.last_assistant_ts
         with self._lock:
             self._last_discover_ts = time.time()
 
@@ -1209,18 +1235,23 @@ class SessionManager:
             total_tools = 0
             total_sys = 0
             latest_chat_ts: float | None = None
+            latest_assistant_ts: float | None = None
             latest_token: dict[str, Any] | None = None
             loops = 0
             while off < sz and loops < 16:
                 objs, new_off = _read_jsonl_from_offset(lp, off, max_bytes=256 * 1024)
                 if new_off <= off:
                     break
-                d_th, d_tools, d_sys, chunk_chat_ts, token_update, _chat_events = _analyze_log_chunk(objs)
+                d_th, d_tools, d_sys, chunk_chat_ts, chunk_assistant_ts, token_update, _chat_events = _analyze_log_chunk(objs)
                 total_th += d_th
                 total_tools += d_tools
                 total_sys += d_sys
                 if chunk_chat_ts is not None:
                     latest_chat_ts = chunk_chat_ts if latest_chat_ts is None else max(latest_chat_ts, chunk_chat_ts)
+                if chunk_assistant_ts is not None:
+                    latest_assistant_ts = (
+                        chunk_assistant_ts if latest_assistant_ts is None else max(latest_assistant_ts, chunk_assistant_ts)
+                    )
                 if token_update is not None:
                     latest_token = token_update
                 off = new_off
@@ -1232,6 +1263,10 @@ class SessionManager:
                     continue
                 if latest_chat_ts is not None:
                     s2.last_chat_ts = latest_chat_ts if s2.last_chat_ts is None else max(s2.last_chat_ts, latest_chat_ts)
+                if latest_assistant_ts is not None:
+                    s2.last_assistant_ts = (
+                        latest_assistant_ts if s2.last_assistant_ts is None else max(s2.last_assistant_ts, latest_assistant_ts)
+                    )
                 if latest_token is not None:
                     s2.token = latest_token
                 if s2.busy:
@@ -1300,6 +1335,7 @@ class SessionManager:
                         "thinking": int(s.meta_thinking),
                         "tools": int(s.meta_tools),
                         "system": int(s.meta_system),
+                        "last_assistant_ts": (float(s.last_assistant_ts) if isinstance(s.last_assistant_ts, (int, float)) else None),
                         "harness_enabled": h_enabled,
                         "alias": alias,
                         "files": list(files),
@@ -1512,7 +1548,7 @@ class SessionManager:
                     objs, new_off = _read_jsonl_from_offset(lp3, cur, max_bytes=CHAT_INDEX_INCREMENT_BYTES)
                     if new_off <= cur:
                         break
-                    _th, _tools, _sys, _last_ts, token_update, new_events = _analyze_log_chunk(objs)
+                    _th, _tools, _sys, _last_ts, _last_assistant_ts, token_update, new_events = _analyze_log_chunk(objs)
                     if token_update is not None:
                         latest_token = token_update
                     if new_events:
@@ -1540,7 +1576,7 @@ class SessionManager:
         return page, log_off2, has_older, next_before, token2
 
     def mark_log_delta(self, session_id: str, *, objs: list[dict[str, Any]], new_off: int) -> None:
-        _th, _tools, _sys, _last_ts, token_update, new_events = _analyze_log_chunk(objs)
+        _th, _tools, _sys, _last_ts, _last_assistant_ts, token_update, new_events = _analyze_log_chunk(objs)
         self._append_chat_events(session_id, new_events, new_off=new_off, latest_token=token_update)
         with self._lock:
             s = self._sessions.get(session_id)
@@ -2166,6 +2202,60 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     except KeyError:
                         pass
                 _json_response(self, 200, {"ok": True, "path": str(path_obj), "size": int(size), "text": text})
+                return
+
+            if path == "/api/files/write":
+                if not _require_auth(self):
+                    self._unauthorized()
+                    return
+                body = _read_body(self)
+                body_text = body.decode("utf-8")
+                if not body_text.strip():
+                    raise ValueError("empty request body")
+                obj = json.loads(body_text)
+                if not isinstance(obj, dict):
+                    raise ValueError("invalid json body (expected object)")
+                path_raw = obj.get("path")
+                if not isinstance(path_raw, str) or not path_raw.strip():
+                    _json_response(self, 400, {"error": "path required"})
+                    return
+                text = obj.get("text")
+                if not isinstance(text, str):
+                    _json_response(self, 400, {"error": "text required"})
+                    return
+                session_id_raw = obj.get("session_id")
+                session_id = session_id_raw if isinstance(session_id_raw, str) and session_id_raw else ""
+                path_obj = Path(path_raw).expanduser()
+                if not path_obj.is_absolute():
+                    path_obj = (Path.cwd() / path_obj).resolve()
+                else:
+                    path_obj = path_obj.resolve()
+                if not path_obj.exists():
+                    _json_response(self, 404, {"error": "file not found"})
+                    return
+                if not path_obj.is_file():
+                    _json_response(self, 400, {"error": "path is not a file"})
+                    return
+                data = text.encode("utf-8")
+                if len(data) > FILE_WRITE_MAX_BYTES:
+                    _json_response(self, 400, {"error": f"file too large (max {FILE_WRITE_MAX_BYTES} bytes)"})
+                    return
+                tmp = path_obj.with_name(path_obj.name + ".tmp")
+                try:
+                    tmp.write_bytes(data)
+                    os.replace(tmp, path_obj)
+                except PermissionError:
+                    _json_response(self, 403, {"error": "permission denied"})
+                    return
+                except Exception as e:
+                    _json_response(self, 500, {"error": f"write failed: {e}"})
+                    return
+                if session_id:
+                    try:
+                        MANAGER.files_add(session_id, str(path_obj))
+                    except KeyError:
+                        pass
+                _json_response(self, 200, {"ok": True, "path": str(path_obj), "size": int(len(data))})
                 return
 
             if path.startswith("/api/sessions/") and path.endswith("/delete"):

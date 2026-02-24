@@ -116,6 +116,90 @@
         width: 100%;
         justify-content: center;
       }
+      .workspace {
+        border: 1px solid var(--border);
+        border-radius: 14px;
+        padding: 10px;
+        margin-bottom: 12px;
+        background: rgba(255, 255, 255, 0.96);
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+      }
+      .workspace.active {
+        border-color: rgba(37, 99, 235, 0.45);
+        background: rgba(29, 78, 216, 0.05);
+      }
+      .workspaceHeader {
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+        min-width: 0;
+      }
+      .workspaceTitleRow {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 10px;
+        min-width: 0;
+      }
+      .workspaceTitle {
+        font-weight: 650;
+        font-size: 13px;
+        overflow: hidden;
+        white-space: nowrap;
+        text-overflow: ellipsis;
+        flex: 1 1 auto;
+      }
+      .workspacePath {
+        font-size: 11px;
+        overflow: hidden;
+        white-space: nowrap;
+        text-overflow: ellipsis;
+      }
+      .workspaceMeta {
+        font-size: 11px;
+        flex: 0 0 auto;
+      }
+      .workspaceFiles {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+      }
+      .workspaceFilesLabel {
+        font-size: 11px;
+        color: var(--muted);
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+      }
+      .workspaceFile {
+        text-align: left;
+        padding: 6px 8px;
+        border-radius: 8px;
+        font-size: 12px;
+        line-height: 1.2;
+        border: 1px solid var(--border);
+        background: #ffffff;
+        color: var(--text);
+        overflow: hidden;
+        white-space: nowrap;
+        text-overflow: ellipsis;
+        touch-action: manipulation;
+      }
+      .workspaceFile:hover {
+        background: rgba(15, 23, 42, 0.04);
+      }
+      .workspaceFilesMore {
+        font-size: 11px;
+      }
+      .workspaceSessions {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+      }
+      .workspace .session {
+        margin-bottom: 0;
+      }
       .session {
         padding: 10px;
         border: 1px solid var(--border);
@@ -138,44 +222,19 @@
         display: flex;
         flex-direction: column;
       }
+      .sessionSummary {
+        margin-top: 4px;
+        font-size: 12px;
+        overflow: hidden;
+        white-space: nowrap;
+        text-overflow: ellipsis;
+      }
       .sessionAction {
         flex: 0 0 auto;
         display: flex;
         align-items: center;
         justify-content: center;
         gap: 6px;
-      }
-      .sessionFiles {
-        margin-top: 6px;
-        display: flex;
-        flex-direction: column;
-        gap: 6px;
-      }
-      .sessionFilesLabel {
-        font-size: 11px;
-        color: var(--muted);
-        text-transform: uppercase;
-        letter-spacing: 0.04em;
-      }
-      .sessionFile {
-        text-align: left;
-        padding: 6px 8px;
-        border-radius: 8px;
-        font-size: 12px;
-        line-height: 1.2;
-        border: 1px solid var(--border);
-        background: #ffffff;
-        color: var(--text);
-        overflow: hidden;
-        white-space: nowrap;
-        text-overflow: ellipsis;
-        touch-action: manipulation;
-      }
-      .sessionFile:hover {
-        background: rgba(15, 23, 42, 0.04);
-      }
-      .sessionFilesMore {
-        font-size: 11px;
       }
       .sessionAction > .icon-btn {
         width: 36px;
@@ -222,6 +281,32 @@
         border: 1px solid var(--border);
         color: var(--muted);
         background: #ffffff;
+      }
+      .sessionBadges {
+        display: inline-flex;
+        align-items: center;
+        justify-content: flex-end;
+        flex: 0 0 auto;
+        flex-wrap: wrap;
+      }
+      .sessionBadges > * {
+        flex: 0 0 auto;
+      }
+      .sessionBadges > * + * {
+        margin-left: 6px;
+      }
+      .unreadDot {
+        width: 8px;
+        height: 8px;
+        min-width: 8px;
+        min-height: 8px;
+        border-radius: 999px;
+        background: #dc2626;
+        box-shadow: 0 0 0 2px rgba(220, 38, 38, 0.12);
+        display: inline-block;
+        flex: 0 0 auto;
+        align-self: center;
+        margin-left: 0;
       }
 	      .badge.busy {
 	        color: var(--accent);
@@ -297,8 +382,25 @@
         flex-wrap: nowrap;
       }
       .toast {
+        margin-top: 0;
+        min-height: 0;
+      }
+      .toast:empty {
+        display: none;
+      }
+      .toast:not(:empty) {
         margin-top: 4px;
         min-height: 18px;
+      }
+      .lastLine {
+        font-size: 12px;
+        line-height: 1.2;
+        overflow: hidden;
+        white-space: nowrap;
+        text-overflow: ellipsis;
+      }
+      .lastLine:empty {
+        display: none;
       }
       .actions {
         display: flex;
@@ -586,6 +688,17 @@
         color: inherit;
         white-space: inherit;
       }
+      .md .mermaid {
+        margin: 10px 0 12px 0;
+        overflow-x: auto;
+        max-width: 100%;
+        white-space: pre;
+      }
+      .md .mermaid > svg {
+        display: block;
+        max-width: 100%;
+        height: auto;
+      }
       .md ul,
       .md ol {
         margin: 0 0 10px 20px;
@@ -807,6 +920,7 @@ input[type="text"] {
         transform: translate(-50%, -50%);
         z-index: 80;
         width: min(92vw, 980px);
+        height: min(78vh, calc(var(--appH, 100dvh) - 24px));
         max-height: calc(var(--appH, 100dvh) - 24px);
         background: var(--panel);
         border: 1px solid var(--border);
@@ -816,6 +930,64 @@ input[type="text"] {
         flex-direction: column;
         gap: 10px;
         box-sizing: border-box;
+      }
+      body.file-fullscreen {
+        overflow: hidden;
+      }
+      body.file-fullscreen .app {
+        display: none;
+      }
+      body.file-fullscreen .fileViewer {
+        position: fixed;
+        inset: 0;
+        transform: none;
+        width: 100vw;
+        height: var(--appH, 100dvh);
+        max-height: var(--appH, 100dvh);
+        border-radius: 0;
+        box-shadow: none;
+        border: none;
+        background: var(--bg);
+        padding: 0 0 env(safe-area-inset-bottom) 0;
+        gap: 0;
+      }
+      body.file-fullscreen .fileViewerHeader {
+        padding: calc(12px + env(safe-area-inset-top)) 16px 12px 16px;
+        background: var(--panel);
+        border-bottom: 1px solid var(--border);
+      }
+      body.file-fullscreen .fileViewerHeader .title {
+        font-weight: 650;
+        font-size: 14px;
+      }
+      body.file-fullscreen .filePathRow {
+        display: none;
+      }
+      body.file-fullscreen #fileStatus {
+        padding: 8px 16px 10px 16px;
+        background: var(--panel);
+        border-bottom: 1px solid var(--border);
+      }
+      body.file-fullscreen .fileContent,
+      body.file-fullscreen .filePreview {
+        margin: 12px 16px 16px;
+        border-radius: 12px;
+        border: 1px solid var(--border);
+        box-shadow: var(--shadow-sm);
+      }
+      body.file-fullscreen .fileEditor {
+        margin: 12px 16px 16px;
+        border-radius: 12px;
+        border: 1px solid var(--border);
+        box-shadow: var(--shadow-sm);
+      }
+      .fileViewer[data-mode="edit"],
+      .fileViewer[data-mode="preview"] {
+        width: min(92vw, 980px);
+      }
+      body.file-fullscreen .fileViewer[data-mode="edit"],
+      body.file-fullscreen .fileViewer[data-mode="preview"] {
+        width: 100vw;
       }
       .fileViewerHeader {
         display: flex;
@@ -827,6 +999,7 @@ input[type="text"] {
         display: flex;
         align-items: center;
         gap: 8px;
+        flex-wrap: wrap;
       }
       .filePathRow {
         display: flex;
@@ -852,7 +1025,53 @@ input[type="text"] {
         min-height: 120px;
         -webkit-overflow-scrolling: touch;
       }
+      .fileEditor {
+        display: none;
+        margin: 0;
+        padding: 12px;
+        border-radius: 12px;
+        border: 1px solid rgba(15, 23, 42, 0.18);
+        background: #0b1220;
+        color: #e5e7eb;
+        overflow: auto;
+        white-space: pre;
+        font-size: 12px;
+        line-height: 1.4;
+        flex: 1 1 auto;
+        min-height: 120px;
+        height: auto;
+        max-height: none;
+        resize: vertical;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+        -webkit-overflow-scrolling: touch;
+        tab-size: 2;
+        box-sizing: border-box;
+        width: 100%;
+      }
+      .fileEditor:focus {
+        outline: none;
+        border-color: rgba(37, 99, 235, 0.6);
+        box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.18);
+      }
+      .filePreview {
+        display: none;
+        margin: 0;
+        padding: 12px;
+        border-radius: 12px;
+        border: 1px solid rgba(15, 23, 42, 0.1);
+        background: #f8fafc;
+        color: var(--text);
+        overflow: auto;
+        flex: 1 1 auto;
+        min-height: 120px;
+        -webkit-overflow-scrolling: touch;
+      }
       .fileViewer.wrap .fileContent {
+        white-space: pre-wrap;
+        word-break: break-word;
+        overflow-wrap: anywhere;
+      }
+      .fileViewer.wrap .fileEditor {
         white-space: pre-wrap;
         word-break: break-word;
         overflow-wrap: anywhere;
@@ -1057,10 +1276,38 @@ input[type="text"] {
           left: 0;
           right: 0;
           top: var(--vvTop, 0px);
-          bottom: 0;
+          bottom: auto;
+          height: var(--appH, 100dvh);
           transform: none;
           border-radius: 0;
           padding: calc(10px + env(safe-area-inset-top)) 10px calc(10px + env(safe-area-inset-bottom)) 10px;
+        }
+        .fileViewerHeader {
+          position: relative;
+          align-items: stretch;
+          flex-direction: column;
+          gap: 8px;
+          padding-right: 44px;
+        }
+        .fileViewerHeader .actions {
+          width: 100%;
+          flex-wrap: nowrap;
+          overflow-x: auto;
+          -webkit-overflow-scrolling: touch;
+        }
+        .fileViewerHeader .actions .text-btn {
+          padding: 6px 8px;
+          font-size: 12px;
+        }
+        #fileCloseBtn {
+          position: absolute;
+          right: 6px;
+          top: 0;
+          z-index: 1;
+        }
+        .fileEditor {
+          min-height: 0;
+          font-size: 16px;
         }
         .queueViewer {
           width: 100vw;
@@ -1072,12 +1319,6 @@ input[type="text"] {
           transform: none;
           border-radius: 0;
           padding: calc(10px + env(safe-area-inset-top)) 10px calc(10px + env(safe-area-inset-bottom)) 10px;
-        }
-        .sessionFilesLabel {
-          font-size: 10px;
-        }
-        .sessionFile {
-          font-size: 11px;
         }
         .fileContent {
           font-size: 11px;
@@ -1098,6 +1339,9 @@ input[type="text"] {
         }
         textarea,
         input[type="password"] {
+          font-size: 16px;
+        }
+        .fileEditor {
           font-size: 16px;
         }
         .composer textarea {
