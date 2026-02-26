@@ -166,11 +166,33 @@
         flex-direction: column;
         gap: 6px;
       }
+      .workspaceFilesHeader {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+      }
       .workspaceFilesLabel {
         font-size: 11px;
         color: var(--muted);
         text-transform: uppercase;
         letter-spacing: 0.04em;
+      }
+      .workspaceFilesActions {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+      }
+      .workspaceFilesClear {
+        height: 24px;
+        padding: 0 8px;
+        font-size: 11px;
+        border-radius: 8px;
+      }
+      .workspaceFileRow {
+        display: flex;
+        align-items: stretch;
+        gap: 6px;
       }
       .workspaceFile {
         text-align: left;
@@ -185,9 +207,22 @@
         white-space: nowrap;
         text-overflow: ellipsis;
         touch-action: manipulation;
+        flex: 1 1 auto;
       }
       .workspaceFile:hover {
         background: rgba(15, 23, 42, 0.04);
+      }
+      .workspaceFileRemove {
+        width: 24px;
+        height: auto;
+        min-height: 0;
+        padding: 0;
+        border-radius: 8px;
+        align-self: stretch;
+      }
+      .workspaceFileRemove .icon {
+        width: 12px;
+        height: 12px;
       }
       .workspaceFilesMore {
         font-size: 11px;
@@ -312,15 +347,13 @@
 	        color: var(--accent);
 	        border-color: rgba(37, 99, 235, 0.5);
 	      }
-	      .badge.harness {
-	        color: var(--accent);
-	        border-color: rgba(37, 99, 235, 0.5);
-	        background: rgba(37, 99, 235, 0.08);
-	      }
-	      .badge.queue {
-	        color: #f59e0b;
-	        border-color: rgba(245, 158, 11, 0.5);
-	      }
+      .badge.queue {
+        color: #f59e0b;
+        border-color: rgba(245, 158, 11, 0.5);
+      }
+      .sessionSummary.draft {
+        color: #f59e0b;
+      }
 
       .main {
         display: flex;
@@ -380,6 +413,34 @@
         gap: 6px;
         flex: 0 0 auto;
         flex-wrap: nowrap;
+      }
+      .relayStatus {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        font-size: 12px;
+        color: var(--muted);
+        white-space: nowrap;
+      }
+      .relayStatus .dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 999px;
+        background: #94a3b8;
+        box-shadow: 0 0 0 2px rgba(148, 163, 184, 0.15);
+      }
+      .relayStatus.live .dot {
+        background: #22c55e;
+        box-shadow: 0 0 0 2px rgba(34, 197, 94, 0.2);
+        animation: fileSyncBreathe 1.6s ease-in-out infinite;
+      }
+      .relayStatus.warn .dot {
+        background: #f59e0b;
+        box-shadow: 0 0 0 2px rgba(245, 158, 11, 0.2);
+      }
+      .relayStatus.offline .dot {
+        background: #ef4444;
+        box-shadow: 0 0 0 2px rgba(239, 68, 68, 0.2);
       }
       .toast {
         margin-top: 0;
@@ -707,6 +768,26 @@
       .md li {
         margin: 4px 0;
       }
+      .md-table {
+        margin: 0 0 12px 0;
+        overflow-x: auto;
+        max-width: 100%;
+      }
+      .md-table table {
+        width: 100%;
+        border-collapse: collapse;
+      }
+      .md-table th,
+      .md-table td {
+        padding: 6px 8px;
+        border: 1px solid rgba(15, 23, 42, 0.12);
+        font-size: 12px;
+        vertical-align: top;
+      }
+      .md-table th {
+        background: rgba(15, 23, 42, 0.06);
+        font-weight: 600;
+      }
 
       .composer {
         --composerCtl: 38px;
@@ -863,48 +944,6 @@ input[type="text"] {
 	        font-size: 16px;
 	      }
 
-	      .harnessMenu {
-	        display: none;
-	        position: fixed;
-	        z-index: 60;
-	        width: min(92vw, 460px);
-	        background: var(--panel);
-	        border: 1px solid var(--border);
-	        border-radius: 16px;
-	        box-shadow: 0 24px 60px rgba(15, 23, 42, 0.22);
-	        padding: 12px;
-	      }
-	      .harnessMenu .row {
-	        display: flex;
-	        align-items: center;
-	        justify-content: space-between;
-	        gap: 10px;
-	        margin-bottom: 10px;
-	      }
-	      .harnessMenu .label {
-	        font-size: 13px;
-	        color: var(--muted);
-	        margin: 6px 0 8px 0;
-	      }
-	      .harnessMenu label {
-	        display: inline-flex;
-	        align-items: center;
-	        gap: 8px;
-	        font-size: 14px;
-	      }
-	      .harnessMenu input[type="checkbox"] {
-	        width: 16px;
-	        height: 16px;
-	      }
-      .harnessMenu textarea {
-        min-height: 160px;
-        height: 160px;
-        max-height: 320px;
-        overflow-y: auto;
-        border-radius: 14px;
-        resize: vertical;
-      }
-
       .modalBackdrop {
         display: none;
         position: fixed;
@@ -963,7 +1002,7 @@ input[type="text"] {
       body.file-fullscreen .filePathRow {
         display: none;
       }
-      body.file-fullscreen #fileStatus {
+      body.file-fullscreen .fileStatusRow {
         padding: 8px 16px 10px 16px;
         background: var(--panel);
         border-bottom: 1px solid var(--border);
@@ -980,6 +1019,7 @@ input[type="text"] {
         border-radius: 12px;
         border: 1px solid var(--border);
         box-shadow: var(--shadow-sm);
+        width: calc(100% - 32px);
       }
       .fileViewer[data-mode="edit"],
       .fileViewer[data-mode="preview"] {
@@ -1009,6 +1049,62 @@ input[type="text"] {
       .filePathRow input[type="text"] {
         flex: 1 1 auto;
         min-width: 0;
+      }
+      .fileStatusRow {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        justify-content: space-between;
+      }
+      #fileStatus {
+        flex: 1 1 auto;
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .fileSync {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        font-size: 12px;
+        color: var(--muted);
+        white-space: nowrap;
+        flex: 0 0 auto;
+      }
+      .fileSync .dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 999px;
+        background: #94a3b8;
+        box-shadow: 0 0 0 2px rgba(148, 163, 184, 0.15);
+      }
+      .fileSync.live .dot {
+        background: #22c55e;
+        box-shadow: 0 0 0 2px rgba(34, 197, 94, 0.2);
+        animation: fileSyncBreathe 1.6s ease-in-out infinite;
+      }
+      .fileSync.warn .dot {
+        background: #f59e0b;
+        box-shadow: 0 0 0 2px rgba(245, 158, 11, 0.2);
+      }
+      .fileSync.offline .dot {
+        background: #ef4444;
+        box-shadow: 0 0 0 2px rgba(239, 68, 68, 0.2);
+      }
+      @keyframes fileSyncBreathe {
+        0% {
+          transform: scale(0.9);
+          opacity: 0.6;
+        }
+        50% {
+          transform: scale(1.2);
+          opacity: 1;
+        }
+        100% {
+          transform: scale(0.9);
+          opacity: 0.6;
+        }
       }
       .fileContent {
         margin: 0;
@@ -1093,6 +1189,71 @@ input[type="text"] {
         flex-direction: column;
         gap: 10px;
         box-sizing: border-box;
+      }
+      .sessionTools {
+        display: none;
+        position: fixed;
+        left: 50%;
+        top: calc(50% + var(--vvTop, 0px));
+        transform: translate(-50%, -50%);
+        z-index: 80;
+        width: min(92vw, 760px);
+        max-height: calc(var(--appH, 100dvh) - 24px);
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 14px;
+        box-shadow: 0 24px 60px rgba(15, 23, 42, 0.28);
+        padding: 12px;
+        flex-direction: column;
+        gap: 12px;
+        box-sizing: border-box;
+      }
+      .sessionToolsHeader {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 10px;
+      }
+      .sessionToolRow {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+      }
+      .sessionToolLabel {
+        font-size: 12px;
+      }
+      .sessionToolCmdRow {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        flex-wrap: wrap;
+      }
+      .sessionToolCmd {
+        flex: 1 1 auto;
+        min-width: 0;
+        padding: 6px 8px;
+        border-radius: 8px;
+        border: 1px solid rgba(15, 23, 42, 0.2);
+        background: #0b1220;
+        color: #e5e7eb;
+        font-size: 12px;
+        line-height: 1.4;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+        overflow: auto;
+        white-space: pre;
+      }
+      .sessionTail {
+        margin: 0;
+        padding: 10px;
+        border-radius: 10px;
+        border: 1px solid rgba(15, 23, 42, 0.2);
+        background: #0b1220;
+        color: #e5e7eb;
+        font-size: 12px;
+        line-height: 1.4;
+        max-height: 240px;
+        overflow: auto;
+        white-space: pre;
       }
       .queueHeader {
         display: flex;

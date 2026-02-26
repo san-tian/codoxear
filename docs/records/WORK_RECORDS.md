@@ -1,0 +1,86 @@
+# Work Records
+
+This document summarizes the team's current work focus. Each session appears under its own heading, and the detailed record lives under `docs/records/sessions/`.
+
+## Current Focus by Session
+- `docs/records/sessions/2026-02-26-live-tail-line-breaks-rollback.md`: Roll back forced line breaks in live tail sanitization.
+- `docs/records/sessions/2026-02-26-web-tmux-input-fix.md`: Fix allow_input NameError so web sessions start.
+- `docs/records/sessions/2026-02-26-relay-indicator-sidebar.md`: Move the relay indicator into the sidebar header next to the logo.
+- `docs/records/sessions/2026-02-26-remove-topbar-lastline.md`: Remove the topbar last-line snippet to avoid duplication with the sidebar.
+- `docs/records/sessions/2026-02-26-session-tools-feature-doc.md`: Document Session Tools as a standalone feature.
+- `docs/records/sessions/2026-02-26-web-tmux-input.md`: Enable stdin passthrough when attaching to tmux-backed web sessions.
+- `docs/records/sessions/2026-02-26-web-tmux-sessions.md`: Launch web-owned sessions under tmux and surface attach commands.
+- `docs/records/sessions/2026-02-26-live-tail-line-breaks.md`: Add line breaks when ANSI cursor moves hide newlines in live tail output.
+- `docs/records/sessions/2026-02-26-live-tail-utf8-decoder.md`: Decode PTY output incrementally to reduce replacement characters in live tail.
+- `docs/records/sessions/2026-02-26-file-history-remove-all-fallback.md`: Add global file-history removal fallback when workspace removal fails.
+- `docs/records/sessions/2026-02-26-live-tail-sanitize.md`: Strip ANSI/control sequences from live tail output.
+- `docs/records/sessions/2026-02-26-file-history-remove-cwd.md`: Remove workspace file history entries by cwd to avoid reappearing.
+- `docs/records/sessions/2026-02-26-file-history-auto-refresh-record-history.md`: Keep auto-refresh from re-adding removed file history entries.
+- `docs/records/sessions/2026-02-26-session-draft-summary-indicator.md`: Show a yellow draft line in the session list where the summary normally appears.
+- `docs/records/sessions/2026-02-26-queue-badge-refresh.md`: Ensure queue badge/list refresh after queuing messages.
+- `docs/records/sessions/2026-02-26-session-draft-indicator.md`: Show a draft badge in the sidebar when a session has a saved draft.
+- `docs/records/sessions/2026-02-26-file-history-remove-across-sessions.md`: Remove workspace file history entries across all sessions so they do not reappear.
+- `docs/records/sessions/2026-02-26-file-history-auto-refresh.md`: Prevent background file refresh from re-adding removed history entries.
+- `docs/records/sessions/2026-02-26-file-history-x-close.md`: Ensure the file history remove button clears the row immediately.
+- `docs/records/sessions/2026-02-26-file-viewer-copy-buttons.md`: Add copy path/name actions to the file viewer header.
+- `docs/records/sessions/2026-02-26-queue-viewer-only.md`: Show queued messages only in the queue viewer, not in chat.
+- `docs/records/sessions/2026-02-26-queue-echo.md`: Show queued messages as local pending bubbles in the chat UI.
+- `docs/records/sessions/2026-02-26-workspace-file-remove-size.md`: Align the workspace file remove button height with the file row.
+- `docs/records/sessions/2026-02-26-file-history-remove-icon.md`: Replace the workspace file history remove icon with an “x”.
+- `docs/records/sessions/2026-02-26-workspace-file-history-actions.md`: Add remove/clear actions for workspace file history.
+- `docs/records/sessions/2026-02-26-session-tools-ui.md`: Add a session tools button for copying commands and live tail viewing.
+- `docs/records/sessions/2026-02-25-server-side-queue.md`: Move queued messages to a server-side queue and remove Harness UI.
+- `docs/records/sessions/2026-02-25-ssh-status-helper.md`: Add an SSH-friendly status helper for session busy/idle checks.
+- `docs/records/sessions/2026-02-25-production-local-service.md`: Define production environment as the local host service in deployment docs.
+- `docs/records/sessions/2026-02-25-relay-indicator-left.md`: Move relay health indicator to the left side of the topbar.
+- `docs/records/sessions/2026-02-25-agents-startup.md`: Add standard startup guidance to AGENTS.md.
+- `docs/records/sessions/2026-02-25-file-viewer-tab-title.md`: Set pop-out file tab title to the active filename.
+- `docs/records/sessions/2026-02-25-standardize-startup.md`: Standardize startup method in docs and confirm running server cwd.
+- `docs/records/sessions/2026-02-25-remove-provider-vendor.md`: Remove Gemini/Claude adapters and vendor-switching support.
+- `docs/records/sessions/2026-02-25-markdown-table-preview.md`: Fix markdown table rendering in preview.
+- `docs/records/sessions/2026-02-25-file-editor-overflow.md`: Fix full-screen file editor overflow past the right edge.
+- `docs/records/sessions/2026-02-24-relay-health-indicator.md`: Add a relay health breathing indicator in the topbar.
+- `docs/records/sessions/2026-02-24-file-viewer-sync-indicator.md`: Add a live sync status indicator for the file viewer.
+- `docs/records/sessions/2026-02-24-file-viewer-mobile-header-scroll.md`: Make mobile file viewer header actions scrollable to reduce crowding.
+- `docs/records/sessions/2026-02-24-file-viewer-mobile-close.md`: Keep the file viewer close button visible on mobile.
+- `docs/records/sessions/2026-02-24-file-editor-auto-refresh.md`: Auto-refresh full-screen file viewer when the file changes on disk.
+- `docs/records/sessions/2026-02-24-ios-file-viewer-tap.md`: Ensure file viewer opens on iOS taps.
+- `docs/records/sessions/2026-02-24-file-editor-fullscreen-layout.md`: Make full-screen file viewing/editing visually distinct from the floating modal.
+- `docs/records/sessions/2026-02-24-file-viewer-scroll-restore.md`: Preserve file viewer scroll position on reload.
+- `docs/records/sessions/2026-02-24-duplicate-message-dedupe.md`: Suppress duplicate user/assistant messages in the chat UI.
+- `docs/records/sessions/2026-02-24-ordered-list-preview.md`: Fix ordered list numbering in markdown preview.
+- `docs/records/sessions/2026-02-24-sidebar-user-summary.md`: Show last user message summary in the session list.
+- `docs/records/sessions/2026-02-24-safari-unread-dot.md`: Fix unread dot rendering on macOS Safari.
+- `docs/records/sessions/2026-02-24-duplicate-session-alias.md`: Auto-name duplicated sessions with a duplicate suffix.
+- `docs/records/sessions/2026-02-24-topbar-lastline.md`: Show last message snippet in the topbar per session.
+- `docs/records/sessions/2026-02-24-piloty-env-config.md`: Persist Gemini env in Codex MCP config for PiloTY.
+- `docs/records/sessions/2026-02-24-file-editor-popout-tab.md`: Add full-screen file editor in a dedicated browser tab.
+- `docs/records/sessions/2026-02-24-topbar-toast-alignment.md`: Prevent empty toast spacing from misaligning the topbar.
+- `docs/records/sessions/2026-02-24-session-unread-dot.md`: Add unread response indicator per session.
+- `docs/records/sessions/2026-02-24-mermaid-preview.md`: Render Mermaid diagrams in markdown preview.
+- `docs/records/sessions/2026-02-24-session-drafts.md`: Store composer drafts per session in localStorage.
+- `docs/records/sessions/2026-02-24-env-path-doc.md`: Document active `.env` path for this host.
+- `docs/records/sessions/2026-02-24-fixed-startup.md`: Fixed startup script and systemd unit for stable working directory.
+- `docs/records/sessions/2026-02-24-server-cwd-env.md`: Document server working directory and .env location.
+- `docs/records/sessions/2026-02-24-file-editor-height-consistent.md`: Fix editor collapse by setting a consistent modal height.
+- `docs/records/sessions/2026-02-24-file-editor-ios-height.md`: Fix file editor height on iOS visual viewport changes.
+- `docs/records/sessions/2026-02-24-file-editor-consistency.md`: Align edit/preview sizing with view.
+- `docs/records/sessions/2026-02-24-queue-interrupt-guard.md`: Add idle guardrails to prevent queue interruption.
+- `docs/records/sessions/2026-02-24-attachment-duplicate-message.md`: Filter upload-path placeholders to avoid duplicate messages.
+- `docs/records/sessions/2026-02-24-file-editor-ui.md`: File editor layout tweaks for mobile and flex sizing.
+- `docs/records/sessions/2026-02-24-remove-session-file-css.md`: Remove unused session file styles.
+- `docs/records/sessions/2026-02-24-workspace-files-only.md`: Show files only at workspace scope.
+- `docs/records/sessions/2026-02-24-workspace-session-sort.md`: Sort sessions by name within each workspace.
+- `docs/records/sessions/2026-02-24-workspaces.md`: Workspace grouping by cwd with shared file lists.
+- `docs/records/sessions/2026-02-24-queue-idle-history-sync.md`: Deferred queue idle fallback + session history sync.
+- `docs/records/sessions/2026-02-24-queue-ime-interruption.md`: Prevent queue editor re-renders from interrupting IME composition.
+- `docs/records/sessions/2026-02-24-paste-image-safari.md`: Paste-to-attach support for Safari.
+- `docs/records/sessions/2026-02-24-cache-version-bump.md`: Invalidate stale chat caches when switching sessions.
+- `docs/records/sessions/2026-02-24-file-viewer-edit-preview.md`: File viewer edit and markdown preview modes.
+- `docs/records/sessions/2026-02-22-refresh-toast.md`: Refresh action now shows a success toast.
+- `docs/records/sessions/2026-02-22-queue-release-task-complete.md`: Queue release now uses task completion, not token updates.
+- `docs/records/sessions/2026-02-22-refresh-clears-cache.md`: Refresh action now clears cache and re-fetches history.
+- `docs/records/sessions/2026-02-22-missing-user-echo.md`: UI fix for missing user messages after send.
+- `docs/records/sessions/2026-02-22-deferred-queue-race.md`: Deferred message gating to avoid sending before turn end.
+- `docs/records/sessions/2026-02-22-docs-public-deploy.md`: Documentation accuracy updates for public deployment and socket metadata.
+- `docs/records/sessions/2026-02-22-docs-bootstrap.md`: Initial documentation structure and AGENTS.md alignment with openclaw-hub.

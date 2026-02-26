@@ -1,4 +1,5 @@
       const $ = (q) => document.querySelector(q);
+      const APP_TITLE = document.title || "Codoxear";
       function updateAppHeightVar() {
         const vv = window.visualViewport;
         const h = vv ? vv.height : window.innerHeight;
@@ -121,6 +122,80 @@
 
       window.codoxearPerf = summarizePerf;
 
+      let relayStatusEl = null;
+      let relayStatusLabelEl = null;
+      let relayLastOkAt = 0;
+      let relayLastErrorAt = 0;
+      let relayLastNetErrorAt = 0;
+      let relayTicker = null;
+      const RELAY_OK_WINDOW_MS = 8000;
+      const RELAY_ERROR_WINDOW_MS = 8000;
+      const RELAY_NET_ERROR_WINDOW_MS = 8000;
+      const RELAY_IDLE_WINDOW_MS = 20000;
+      const RELAY_LABELS = {
+        live: "Live",
+        warn: "Degraded",
+        offline: "Offline",
+        off: "Manual",
+      };
+
+      function setRelayState(state, label) {
+        if (!relayStatusEl) return;
+        const next = state || "off";
+        relayStatusEl.classList.remove("live", "warn", "offline", "off");
+        relayStatusEl.classList.add(next);
+        if (relayStatusLabelEl) relayStatusLabelEl.textContent = "Relay";
+        const text = label || RELAY_LABELS[next] || "";
+        relayStatusEl.title = text ? `Relay: ${text}` : "Relay";
+      }
+
+      function updateRelayState() {
+        if (!relayStatusEl) return;
+        if (typeof navigator !== "undefined" && navigator && navigator.onLine === false) {
+          setRelayState("offline", "Offline");
+          return;
+        }
+        const now = Date.now();
+        if (relayLastOkAt && now - relayLastOkAt <= RELAY_OK_WINDOW_MS) {
+          setRelayState("live", "Live");
+          return;
+        }
+        if (relayLastNetErrorAt && now - relayLastNetErrorAt <= RELAY_NET_ERROR_WINDOW_MS) {
+          setRelayState("offline", "Offline");
+          return;
+        }
+        if (relayLastErrorAt && now - relayLastErrorAt <= RELAY_ERROR_WINDOW_MS) {
+          setRelayState("warn", "Degraded");
+          return;
+        }
+        if (!relayLastOkAt && !relayLastErrorAt && !relayLastNetErrorAt) {
+          setRelayState("off", "Manual");
+          return;
+        }
+        if (relayLastOkAt && now - relayLastOkAt <= RELAY_IDLE_WINDOW_MS) {
+          setRelayState("warn", "Stale");
+          return;
+        }
+        setRelayState("off", "Manual");
+      }
+
+      function markRelayOk() {
+        relayLastOkAt = Date.now();
+        updateRelayState();
+      }
+
+      function markRelayError({ network = false } = {}) {
+        const now = Date.now();
+        if (network) relayLastNetErrorAt = now;
+        else relayLastErrorAt = now;
+        updateRelayState();
+      }
+
+      function startRelayTicker() {
+        if (relayTicker) return;
+        relayTicker = setInterval(updateRelayState, 2000);
+      }
+
       const appBaseUrl = new URL(".", window.location.href);
       function resolveAppUrl(path) {
         const s = String(path ?? "");
@@ -163,13 +238,26 @@
           opts.body = JSON.stringify(body);
         }
         const url = resolveAppUrl(path);
-        const res = await fetch(url, opts);
-        const txt = await res.text();
+        let res;
+        try {
+          res = await fetch(url, opts);
+        } catch (e) {
+          markRelayError({ network: true });
+          throw e;
+        }
+        let txt;
+        try {
+          txt = await res.text();
+        } catch (e) {
+          markRelayError({ network: true });
+          throw e;
+        }
         let obj;
         try {
           obj = JSON.parse(txt);
         } catch (e) {
           console.error("api: invalid json response", { path, url, method, txt });
+          markRelayError({ network: false });
           throw e;
         }
         const dt = performance.now() - t0;
@@ -179,7 +267,11 @@
           if (rawPath.includes("init=1")) pushPerfSample("api_messages_init_ms", dt);
           else pushPerfSample("api_messages_poll_ms", dt);
         }
-        if (!res.ok) throw Object.assign(new Error(obj.error || "request failed"), { status: res.status, obj });
+        if (!res.ok) {
+          markRelayError({ network: false });
+          throw Object.assign(new Error(obj.error || "request failed"), { status: res.status, obj });
+        }
+        markRelayOk();
         return obj;
       }
 
@@ -519,6 +611,85 @@
           return out.join("");
         };
 
+        const splitTableRow = (line) => {
+          const raw = String(line ?? "");
+          if (!raw.includes("|")) return null;
+          let t = raw.trim();
+          if (t.startsWith("|")) t = t.slice(1);
+          if (t.endsWith("|")) t = t.slice(0, -1);
+          return t.split("|").map((p) => p.trim());
+        };
+
+        const isTableDivider = (cell) => {
+          const t = String(cell ?? "").trim();
+          return /^:?-{3,}:?$/.test(t);
+        };
+
+        const tableAlign = (cell) => {
+          const t = String(cell ?? "").trim();
+          const left = t.startsWith(":");
+          const right = t.endsWith(":");
+          if (left && right) return "center";
+          if (right) return "right";
+          return "left";
+        };
+
+        const parseTable = (lines, start) => {
+          if (start + 1 >= lines.length) return null;
+          const headCells = splitTableRow(lines[start]);
+          const divCells = splitTableRow(lines[start + 1]);
+          if (!headCells || !divCells) return null;
+          if (!headCells.length || !divCells.length) return null;
+          if (!divCells.every(isTableDivider)) return null;
+          const align = [];
+          for (let i = 0; i < headCells.length; i++) {
+            align.push(tableAlign(divCells[i] ?? ""));
+          }
+          const rows = [];
+          let i = start + 2;
+          while (i < lines.length) {
+            const line = lines[i];
+            if (!line || !line.trim()) break;
+            if (!line.includes("|")) break;
+            const row = splitTableRow(line);
+            if (!row) break;
+            rows.push(row);
+            i += 1;
+          }
+          return { node: { head: headCells, align, rows }, next: i };
+        };
+
+        const renderTable = (node) => {
+          const out = [];
+          out.push('<div class="md-table"><table>');
+          out.push("<thead><tr>");
+          for (let i = 0; i < node.head.length; i++) {
+            const align = node.align[i] || "left";
+            out.push(`<th style="text-align: ${align}">`);
+            out.push(renderInlineMd(node.head[i] || ""));
+            out.push("</th>");
+          }
+          out.push("</tr></thead>");
+          if (node.rows.length) {
+            out.push("<tbody>");
+            for (const row of node.rows) {
+              out.push("<tr>");
+              const maxCols = Math.max(node.head.length, row.length);
+              for (let i = 0; i < maxCols; i++) {
+                const align = node.align[i] || "left";
+                const cell = row[i] ?? "";
+                out.push(`<td style="text-align: ${align}">`);
+                out.push(renderInlineMd(cell));
+                out.push("</td>");
+              }
+              out.push("</tr>");
+            }
+            out.push("</tbody>");
+          }
+          out.push("</table></div>");
+          return out.join("");
+        };
+
         const chunks = splitByFences(s);
 
         const out = [];
@@ -560,6 +731,13 @@
               const t = l.trim();
               if (!t) {
                 flushPara();
+                continue;
+              }
+              const table = parseTable(lines, i);
+              if (table) {
+                flushPara();
+                out.push(renderTable(table.node));
+                i = table.next - 1;
                 continue;
               }
               const info = listItemInfo(l);
@@ -642,6 +820,8 @@
           return `<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>`;
         if (name === "file")
           return `<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8Z"/><path d="M14 2v6h6"/></svg>`;
+        if (name === "terminal")
+          return `<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 6l6 6-6 6"/><path d="M12 18h8"/></svg>`;
         if (name === "x")
           return `<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6 6 18"/><path d="M6 6l12 12"/></svg>`;
         if (name === "queue")
@@ -723,8 +903,6 @@
         const OLDER_PAGE_LIMIT = 60;
         const CACHE_LIMIT = 40;
         const CHAT_DOM_WINDOW = 260;
-        const DEFER_IDLE_RELEASE_MS = 2000;
-        const DEFER_GATE_MIN_MS = 8000;
         let activeLogPath = null;
         let activeThreadId = null;
         let olderBefore = 0;
@@ -740,25 +918,21 @@
 	        let turnOpen = false;
 	        let sessionsTimer = null;
 	        let currentRunning = false;
-        let deferInFlight = false;
-        const deferredBySession = new Map();
-        const deferredLoaded = new Set();
-        const deferGateBySession = new Map();
-        const deferGateSinceBySession = new Map();
-        const deferIdleSinceBySession = new Map();
-        const lastActivityBySession = new Map();
         let queueSaveTimer = null;
+        const queueCacheBySession = new Map();
+        const queueLoaded = new Set();
+        const queueFetchInFlight = new Set();
+        let currentQueueLen = 0;
         const draftBySession = new Map();
         const draftSaveTimers = new Map();
         const seenAssistantBySession = new Map();
-        const lastLineBySession = new Map();
-        const lastLineSaveTimers = new Map();
         const userSummaryBySession = new Map();
         const userSummarySaveTimers = new Map();
         const cacheBySession = new Map();
         const cacheLoaded = new Set();
         const cacheSaveTimers = new Map();
-	        let sessionIndex = new Map(); // session_id -> session info
+        let sessionIndex = new Map(); // session_id -> session info
+        let sessionCardIndex = new Map(); // session_id -> session card element
         function normalizeSessionName(name) {
           return String(name || "")
             .trim()
@@ -791,7 +965,7 @@
 	        const pendingUser = [];
 	        let attachedImages = 0;
 		        let autoScroll = true;
-			        let backfillToken = 0;
+	        let backfillToken = 0;
         let backfillState = null;
 			    let lastScrollTop = 0;
 				    let lastToken = null;
@@ -807,9 +981,6 @@
         const RECENT_EVENT_SIG_WINDOW_MS = 1600;
                 let clickLoadT0 = 0;
                 let clickMetricPending = false;
-					        let harnessMenuOpen = false;
-					        let harnessCfg = { enabled: false, request: "" };
-					        let harnessSaveTimer = null;
 
 				        const titleLabel = el("div", { id: "threadTitle", text: "No session selected" });
 				        const statusChip = el("span", { class: "status-chip", id: "statusChip", text: "Idle" });
@@ -825,23 +996,13 @@
         });
         interruptBtn.style.display = "none";
         const toast = el("div", { class: "muted toast", id: "toast" });
-			        const toggleSidebarBtn = el("button", {
+	        const toggleSidebarBtn = el("button", {
 	          id: "toggleSidebarBtn",
 	          class: "icon-btn",
 	          title: "Toggle sidebar",
 	          "aria-label": "Toggle sidebar",
 	          html: iconSvg("menu"),
 	        });
-        const harnessBtn = el("button", {
-          id: "harnessBtn",
-          class: "icon-btn",
-          title: "Harness mode",
-          "aria-label": "Harness mode",
-            type: "button",
-            html: iconSvg("harness"),
-          });
-          harnessBtn.disabled = true;
-          harnessBtn.classList.toggle("active", false);
         const renameBtn = el("button", {
           id: "renameBtn",
           class: "icon-btn",
@@ -868,29 +1029,43 @@
           type: "button",
           html: iconSvg("file"),
         });
-        const harnessMenu = el("div", { id: "harnessMenu", class: "harnessMenu", role: "dialog", "aria-label": "Harness mode settings" }, [
-          el("div", { class: "row" }, [
-            el("label", {}, [
-              el("input", { type: "checkbox", id: "harnessEnabled" }),
-              el("span", { text: "Harness mode" }),
-			            ]),
-			          ]),
-			          el("div", { class: "label", text: "Additional request to append (optional; per session)" }),
-			          el("textarea", { id: "harnessRequest", "aria-label": "Additional request for harness prompt" }),
-			        ]);
-
+        const sessionToolsBtn = el("button", {
+          id: "sessionToolsBtn",
+          class: "icon-btn",
+          title: "Session tools",
+          "aria-label": "Session tools",
+          type: "button",
+          html: iconSvg("terminal"),
+        });
+        sessionToolsBtn.disabled = true;
+        const relayDot = el("span", { class: "dot", "aria-hidden": "true" });
+        const relayLabel = el("span", { class: "label", text: "Relay" });
+        const relayStatus = el("div", { class: "relayStatus off", id: "relayStatus", title: "Relay: Manual" }, [
+          relayDot,
+          relayLabel,
+        ]);
+        relayStatusEl = relayStatus;
+        relayStatusLabelEl = relayLabel;
+        setRelayState("off", "Manual");
+        startRelayTicker();
+        if (!window.__codexwebRelayHandlers) {
+          const onOnline = () => updateRelayState();
+          const onOffline = () => updateRelayState();
+          window.addEventListener("online", onOnline);
+          window.addEventListener("offline", onOffline);
+          window.__codexwebRelayHandlers = { onOnline, onOffline };
+        }
         const topMeta = el("div", { class: "topMeta" }, [statusChip, ctxChip]);
         const titleRow = el("div", { class: "titleRow" }, [titleLabel, topMeta]);
-        const lastLine = el("div", { class: "lastLine muted", id: "lastLine", text: "" });
-        const titleWrap = el("div", { class: "titleWrap" }, [titleRow, lastLine, toast]);
+        const titleWrap = el("div", { class: "titleWrap" }, [titleRow, toast]);
         const topbar = el("div", { class: "topbar" }, [
           el("div", { class: "pill" }, [toggleSidebarBtn, titleWrap]),
           el("div", { class: "actions topActions" }, [
             duplicateBtn,
             renameBtn,
             fileBtn,
+            sessionToolsBtn,
             interruptBtn,
-            harnessBtn,
           ]),
         ]);
 
@@ -915,7 +1090,11 @@
 
         sidebar.appendChild(
           el("header", {}, [
-            el("div", { class: "title", html: `<img class="sidebarLogo" src="/static/codoxear-icon.png" alt="" />Codoxear` }),
+            el("div", { class: "title" }, [
+              el("img", { class: "sidebarLogo", src: "/static/codoxear-icon.png", alt: "" }),
+              el("span", { text: "Codoxear" }),
+              relayStatus,
+            ]),
             el("div", { class: "actions" }, [
               el("button", { id: "newBtn", class: "icon-btn", title: "New session", "aria-label": "New session", html: iconSvg("plus") }),
               el("button", { id: "refreshBtn", class: "icon-btn", title: "Refresh", "aria-label": "Refresh", html: iconSvg("refresh") }),
@@ -931,8 +1110,6 @@
         app.appendChild(main);
         app.appendChild(backdrop);
         root.appendChild(app);
-        root.appendChild(harnessMenu);
-
         const fileBackdrop = el("div", { class: "modalBackdrop", id: "fileBackdrop" });
         const fileCloseBtn = el("button", {
           id: "fileCloseBtn",
@@ -998,9 +1175,31 @@
           type: "button",
           text: "Pop out",
         });
+        const fileCopyPathBtn = el("button", {
+          id: "fileCopyPathBtn",
+          class: "icon-btn text-btn",
+          title: "Copy full path",
+          "aria-label": "Copy full path",
+          type: "button",
+          text: "Copy path",
+        });
+        const fileCopyNameBtn = el("button", {
+          id: "fileCopyNameBtn",
+          class: "icon-btn text-btn",
+          title: "Copy file name",
+          "aria-label": "Copy file name",
+          type: "button",
+          text: "Copy name",
+        });
         const filePathInput = el("input", { id: "filePathInput", type: "text", placeholder: "/path/to/file" });
         const fileOpenBtn = el("button", { id: "fileOpenBtn", class: "primary", type: "button", text: "Open" });
         const fileStatus = el("div", { class: "muted", id: "fileStatus", text: "" });
+        const fileSyncLabel = el("span", { class: "label", text: "Manual" });
+        const fileSync = el("div", { class: "fileSync off", id: "fileSync", title: "Manual refresh" }, [
+          el("span", { class: "dot", "aria-hidden": "true" }),
+          fileSyncLabel,
+        ]);
+        const fileStatusRow = el("div", { class: "fileStatusRow" }, [fileStatus, fileSync]);
         const fileContent = el("pre", { class: "fileContent", id: "fileContent" });
         const fileEditor = el("textarea", { class: "fileEditor", id: "fileEditor", spellcheck: "false" });
         const filePreview = el("div", { class: "filePreview md", id: "filePreview" });
@@ -1015,13 +1214,15 @@
               filePreviewBtn,
               fileSaveBtn,
               filePopoutBtn,
+              fileCopyPathBtn,
+              fileCopyNameBtn,
               fileOpenInlineBtn,
               fileWrapBtn,
               fileCloseBtn,
             ]),
           ]),
           filePathRow,
-          fileStatus,
+          fileStatusRow,
           fileContent,
           fileEditor,
           filePreview,
@@ -1070,6 +1271,72 @@
         root.appendChild(queueBackdrop);
         root.appendChild(queueViewer);
 
+        const sessionToolsBackdrop = el("div", { class: "modalBackdrop", id: "sessionToolsBackdrop" });
+        const sessionToolsCloseBtn = el("button", {
+          id: "sessionToolsCloseBtn",
+          class: "icon-btn",
+          title: "Close",
+          "aria-label": "Close",
+          type: "button",
+          html: iconSvg("x"),
+        });
+        const sessionToolsMeta = el("div", { class: "muted", id: "sessionToolsMeta", text: "No session selected." });
+        const sessionStatusCmd = el("code", { class: "sessionToolCmd", id: "sessionStatusCmd", text: "" });
+        const sessionResumeCmd = el("code", { class: "sessionToolCmd", id: "sessionResumeCmd", text: "" });
+        const sessionTmuxCmd = el("code", { class: "sessionToolCmd", id: "sessionTmuxCmd", text: "" });
+        const statusCopyBtn = el("button", {
+          class: "icon-btn text-btn",
+          title: "Copy status command",
+          "aria-label": "Copy status command",
+          type: "button",
+          text: "Copy",
+        });
+        const resumeCopyBtn = el("button", {
+          class: "icon-btn text-btn",
+          title: "Copy resume command",
+          "aria-label": "Copy resume command",
+          type: "button",
+          text: "Copy",
+        });
+        const tmuxCopyBtn = el("button", {
+          class: "icon-btn text-btn",
+          title: "Copy tmux attach command",
+          "aria-label": "Copy tmux attach command",
+          type: "button",
+          text: "Copy",
+        });
+        statusCopyBtn.disabled = true;
+        resumeCopyBtn.disabled = true;
+        tmuxCopyBtn.disabled = true;
+        const sessionTailStatus = el("div", { class: "muted", id: "sessionTailStatus", text: "" });
+        const sessionTail = el("pre", { class: "sessionTail", id: "sessionTail", text: "" });
+        const sessionTools = el("div", { class: "sessionTools", id: "sessionTools", role: "dialog", "aria-label": "Session tools" }, [
+          el("div", { class: "sessionToolsHeader" }, [
+            el("div", { class: "title", text: "Session tools" }),
+            el("div", { class: "actions" }, [sessionToolsCloseBtn]),
+          ]),
+          sessionToolsMeta,
+          el("div", { class: "sessionToolRow" }, [
+            el("div", { class: "sessionToolLabel muted", text: "Status (SSH)" }),
+            el("div", { class: "sessionToolCmdRow" }, [sessionStatusCmd, statusCopyBtn]),
+          ]),
+          el("div", { class: "sessionToolRow" }, [
+            el("div", { class: "sessionToolLabel muted", text: "Resume in TUI" }),
+            el("div", { class: "sessionToolCmdRow" }, [sessionResumeCmd, resumeCopyBtn]),
+          ]),
+          el("div", { class: "sessionToolRow" }, [
+            el("div", { class: "sessionToolLabel muted", text: "TMUX attach" }),
+            el("div", { class: "sessionToolCmdRow" }, [sessionTmuxCmd, tmuxCopyBtn]),
+          ]),
+          el("div", { class: "sessionToolRow" }, [
+            el("div", { class: "sessionToolLabel muted", text: "Live tail" }),
+            sessionTailStatus,
+            sessionTail,
+          ]),
+        ]);
+        root.appendChild(sessionToolsBackdrop);
+        root.appendChild(sessionTools);
+
         function setToast(text) {
           toast.textContent = text || "";
           if (!text) return;
@@ -1078,17 +1345,121 @@
           }, 2200);
         }
 
+        let sessionToolsOpen = false;
+        let sessionTailTimer = null;
+        let sessionTailInFlight = false;
+        function copyToClipboard(raw) {
+          const text = String(raw || "");
+          if (!text) return Promise.resolve(false);
+          if (navigator && navigator.clipboard && navigator.clipboard.writeText) {
+            return navigator.clipboard
+              .writeText(text)
+              .then(() => true)
+              .catch(() => false);
+          }
+          try {
+            const ta = el("textarea", {
+              value: text,
+              style: "position:fixed;left:-9999px;top:-9999px;opacity:0;",
+            });
+            document.body.appendChild(ta);
+            ta.value = text;
+            ta.focus();
+            ta.select();
+            const ok = document.execCommand("copy");
+            document.body.removeChild(ta);
+            return Promise.resolve(ok);
+          } catch {
+            return Promise.resolve(false);
+          }
+        }
+        function updateSessionToolsContent() {
+          const sid = selected;
+          if (!sid) {
+            sessionToolsMeta.textContent = "No session selected.";
+            sessionStatusCmd.textContent = "";
+            sessionResumeCmd.textContent = "";
+            sessionTmuxCmd.textContent = "";
+            statusCopyBtn.disabled = true;
+            resumeCopyBtn.disabled = true;
+            tmuxCopyBtn.disabled = true;
+            sessionTailStatus.textContent = "";
+            sessionTail.textContent = "";
+            return;
+          }
+          const s = sessionIndex.get(sid);
+          const name = s ? sessionTitleWithId(s) : sid;
+          sessionToolsMeta.textContent = `${name} (${sid})`;
+          sessionStatusCmd.textContent = `scripts/codoxear-status --id ${sid}`;
+          sessionResumeCmd.textContent = `codex resume ${sid}`;
+          statusCopyBtn.disabled = false;
+          resumeCopyBtn.disabled = false;
+          const tmuxName = s && typeof s.tmux_name === "string" ? s.tmux_name.trim() : "";
+          if (tmuxName) {
+            sessionTmuxCmd.textContent = `tmux attach -t ${tmuxName}`;
+            tmuxCopyBtn.disabled = false;
+          } else {
+            sessionTmuxCmd.textContent = "Not available";
+            tmuxCopyBtn.disabled = true;
+          }
+        }
+        async function refreshSessionTail() {
+          if (!sessionToolsOpen || sessionTailInFlight) return;
+          const sid = selected;
+          if (!sid) {
+            sessionTailStatus.textContent = "No session selected.";
+            sessionTail.textContent = "";
+            return;
+          }
+          sessionTailInFlight = true;
+          try {
+            const res = await api(`/api/sessions/${sid}/tail`);
+            const tail = res && typeof res.tail === "string" ? res.tail : "";
+            sessionTail.textContent = tail;
+            sessionTail.scrollTop = sessionTail.scrollHeight;
+            sessionTailStatus.textContent = `Updated ${fmtTs(Date.now() / 1000)}`;
+          } catch (e) {
+            sessionTailStatus.textContent = `Tail error: ${e && e.message ? e.message : "unknown error"}`;
+          } finally {
+            sessionTailInFlight = false;
+          }
+        }
+        function startSessionTail() {
+          if (sessionTailTimer) return;
+          void refreshSessionTail();
+          sessionTailTimer = setInterval(() => {
+            void refreshSessionTail();
+          }, 1500);
+        }
+        function stopSessionTail() {
+          if (!sessionTailTimer) return;
+          clearInterval(sessionTailTimer);
+          sessionTailTimer = null;
+        }
+        function showSessionTools() {
+          if (!selected) {
+            setToast("select a session first");
+            return;
+          }
+          sessionToolsOpen = true;
+          updateSessionToolsContent();
+          sessionTailStatus.textContent = "Loading...";
+          sessionToolsBackdrop.style.display = "block";
+          sessionTools.style.display = "flex";
+          startSessionTail();
+        }
+        function hideSessionTools() {
+          sessionToolsOpen = false;
+          stopSessionTail();
+          sessionToolsBackdrop.style.display = "none";
+          sessionTools.style.display = "none";
+        }
+
         function setStatus({ running, queueLen }) {
           const q = Number(queueLen || 0);
           const mobile = isMobile();
-          const wasRunning = currentRunning;
           currentRunning = Boolean(running);
-          if (selected && currentRunning) {
-            const dq = getDeferredQueue(selected);
-            if (dq.length) {
-              markDeferGate(selected);
-            }
-          }
+          if (selected) setSelectedQueueLen(q);
           if (running) {
             statusChip.style.display = "none";
             statusChip.classList.remove("running");
@@ -1099,12 +1470,7 @@
           }
           interruptBtn.style.display = running && selected ? "inline-flex" : "none";
           interruptBtn.disabled = !(running && selected);
-          if (wasRunning && !currentRunning) {
-            deferInFlight = false;
-          }
-          if (!currentRunning) {
-            maybeSendDeferred();
-          }
+          updateQueueBadge();
         }
 
 	        function setContext(tok) {
@@ -1176,59 +1542,99 @@
           return OLDER_PAGE_LIMIT;
         }
 
-        function deferredStorageKey(sid) {
-          return `codexweb.deferred.${sid}`;
+        function normalizeQueueList(raw) {
+          if (!Array.isArray(raw)) return [];
+          const out = [];
+          for (const item of raw) {
+            if (typeof item !== "string") continue;
+            if (!item.trim()) continue;
+            out.push(item);
+          }
+          return out;
         }
 
-        function loadDeferredFromStorage(sid) {
-          if (!sid || deferredLoaded.has(sid)) return;
-          deferredLoaded.add(sid);
-          try {
-            const raw = localStorage.getItem(deferredStorageKey(sid));
-            if (!raw) return;
-            const arr = JSON.parse(raw);
-            if (!Array.isArray(arr)) return;
-            const out = [];
-            for (const v of arr) {
-              if (typeof v !== "string") continue;
-              const t = v.trim();
-              if (!t) continue;
-              out.push(t);
-            }
-            if (out.length) deferredBySession.set(sid, out);
-          } catch {
-            // ignore corrupted storage
+        function getQueueCache(sid) {
+          if (!sid) return [];
+          const q = queueCacheBySession.get(sid);
+          return Array.isArray(q) ? q : [];
+        }
+
+        function setSelectedQueueLen(n) {
+          const val = Number(n);
+          currentQueueLen = Number.isFinite(val) ? Math.max(0, val) : 0;
+          if (selected) {
+            const s = sessionIndex.get(selected);
+            if (s) s.queue_len = currentQueueLen;
           }
         }
 
-        function saveDeferredToStorage(sid) {
-          if (!sid) return;
-          const q = deferredBySession.get(sid) || [];
+        function getSelectedQueueLen() {
+          if (selected) {
+            const s = sessionIndex.get(selected);
+            if (s && Number.isFinite(Number(s.queue_len))) return Number(s.queue_len) || 0;
+          }
+          return Number.isFinite(currentQueueLen) ? currentQueueLen : 0;
+        }
+
+        function applyQueueResponse(sid, res) {
+          if (!sid || !res || typeof res !== "object") return [];
+          let list = null;
+          if (Array.isArray(res.queue)) {
+            list = normalizeQueueList(res.queue);
+            queueCacheBySession.set(sid, list);
+            queueLoaded.add(sid);
+          }
+          const lenRaw = res.queue_len;
+          const len = Number.isFinite(Number(lenRaw)) ? Number(lenRaw) : list ? list.length : null;
+          if (len !== null) {
+            if (sid === selected) setSelectedQueueLen(len);
+            else {
+              const s = sessionIndex.get(sid);
+              if (s) s.queue_len = len;
+            }
+          }
+          return list || getQueueCache(sid);
+        }
+
+        async function fetchQueue(sid) {
+          if (!sid) return [];
+          if (queueFetchInFlight.has(sid)) return getQueueCache(sid);
+          queueFetchInFlight.add(sid);
           try {
-            localStorage.setItem(deferredStorageKey(sid), JSON.stringify(q));
-          } catch {
-            // ignore quota or serialization issues
+            const data = await api(`/api/sessions/${sid}/queue`);
+            return applyQueueResponse(sid, data);
+          } finally {
+            queueFetchInFlight.delete(sid);
+          }
+        }
+
+        async function saveQueueToServer(sid) {
+          if (!sid) return;
+          const q = normalizeQueueList(getQueueCache(sid));
+          queueCacheBySession.set(sid, q);
+          try {
+            const res = await api(`/api/sessions/${sid}/queue`, { method: "POST", body: { queue: q } });
+            applyQueueResponse(sid, res);
+          } catch (e) {
+            setToast(`queue save error: ${e && e.message ? e.message : "unknown error"}`);
           }
         }
 
         function scheduleQueueSave() {
           if (!selected) return;
+          const sid = selected;
           if (queueSaveTimer) clearTimeout(queueSaveTimer);
           queueSaveTimer = setTimeout(() => {
-            if (!selected) return;
-            saveDeferredToStorage(selected);
+            if (selected !== sid) return;
+            void saveQueueToServer(sid);
           }, 350);
         }
 
-        function getDeferredQueue(sid) {
-          if (!sid) return [];
-          loadDeferredFromStorage(sid);
-          let q = deferredBySession.get(sid);
-          if (!q) {
-            q = [];
-            deferredBySession.set(sid, q);
-          }
-          return q;
+        function clearQueueForSession(sid) {
+          if (!sid) return;
+          queueCacheBySession.delete(sid);
+          queueLoaded.delete(sid);
+          queueFetchInFlight.delete(sid);
         }
 
         function draftStorageKey(sid) {
@@ -1252,6 +1658,7 @@
           if (!sid) return;
           const val = String(text || "");
           draftBySession.set(sid, val);
+          updateSessionSummaryForSession(sid, val);
           try {
             if (val) localStorage.setItem(draftStorageKey(sid), val);
             else localStorage.removeItem(draftStorageKey(sid));
@@ -1262,11 +1669,14 @@
 
         function scheduleDraftSave(sid, text) {
           if (!sid) return;
+          const val = String(text || "");
+          draftBySession.set(sid, val);
+          updateSessionSummaryForSession(sid, val);
           const prev = draftSaveTimers.get(sid);
           if (prev) clearTimeout(prev);
           const t = setTimeout(() => {
             draftSaveTimers.delete(sid);
-            saveDraftToStorage(sid, text);
+            saveDraftToStorage(sid, val);
           }, 250);
           draftSaveTimers.set(sid, t);
         }
@@ -1282,6 +1692,46 @@
           } catch {
             // ignore
           }
+          updateSessionSummaryForSession(sid, "");
+        }
+
+        function sessionHasDraft(sid, textOverride) {
+          if (!sid) return false;
+          const raw = typeof textOverride === "string" ? textOverride : loadDraftFromStorage(sid);
+          return Boolean(raw && raw.trim());
+        }
+
+        function applySessionSummaryEl(summaryEl, sid, textOverride) {
+          if (!summaryEl || !sid) return;
+          const hasDraft = sessionHasDraft(sid, textOverride);
+          if (hasDraft) {
+            summaryEl.textContent = "draft";
+            summaryEl.title = "Draft saved";
+            summaryEl.classList.add("draft");
+            summaryEl.style.display = "block";
+            return;
+          }
+          const summary = loadUserSummaryFromStorage(sid);
+          if (summary) {
+            summaryEl.textContent = summary;
+            summaryEl.title = summary;
+            summaryEl.classList.remove("draft");
+            summaryEl.style.display = "block";
+            return;
+          }
+          summaryEl.textContent = "";
+          summaryEl.title = "";
+          summaryEl.classList.remove("draft");
+          summaryEl.style.display = "none";
+        }
+
+        function updateSessionSummaryForSession(sid, textOverride) {
+          if (!sid) return;
+          const card = sessionCardIndex.get(String(sid));
+          if (!card) return;
+          const summaryEl = card.querySelector(".sessionSummary");
+          if (!summaryEl) return;
+          applySessionSummaryEl(summaryEl, sid, textOverride);
         }
 
         function seenAssistantStorageKey(sid) {
@@ -1333,59 +1783,6 @@
           }
         }
 
-        function lastLineStorageKey(sid) {
-          return `codexweb.lastline.${sid}`;
-        }
-
-        function loadLastLineFromStorage(sid) {
-          if (!sid) return "";
-          if (lastLineBySession.has(sid)) return lastLineBySession.get(sid) || "";
-          let raw = "";
-          try {
-            raw = localStorage.getItem(lastLineStorageKey(sid)) || "";
-          } catch {
-            raw = "";
-          }
-          lastLineBySession.set(sid, raw);
-          return raw;
-        }
-
-        function saveLastLineToStorage(sid, text) {
-          if (!sid) return;
-          const val = String(text || "");
-          lastLineBySession.set(sid, val);
-          try {
-            if (val) localStorage.setItem(lastLineStorageKey(sid), val);
-            else localStorage.removeItem(lastLineStorageKey(sid));
-          } catch {
-            // ignore storage issues
-          }
-        }
-
-        function scheduleLastLineSave(sid, text) {
-          if (!sid) return;
-          const prev = lastLineSaveTimers.get(sid);
-          if (prev) clearTimeout(prev);
-          const t = setTimeout(() => {
-            lastLineSaveTimers.delete(sid);
-            saveLastLineToStorage(sid, text);
-          }, 200);
-          lastLineSaveTimers.set(sid, t);
-        }
-
-        function clearLastLineForSession(sid) {
-          if (!sid) return;
-          const prev = lastLineSaveTimers.get(sid);
-          if (prev) clearTimeout(prev);
-          lastLineSaveTimers.delete(sid);
-          lastLineBySession.delete(sid);
-          try {
-            localStorage.removeItem(lastLineStorageKey(sid));
-          } catch {
-            // ignore
-          }
-        }
-
         function userSummaryStorageKey(sid) {
           return `codexweb.summary.user.${sid}`;
         }
@@ -1407,6 +1804,7 @@
           if (!sid) return;
           const val = String(text || "");
           userSummaryBySession.set(sid, val);
+          updateSessionSummaryForSession(sid);
           try {
             if (val) localStorage.setItem(userSummaryStorageKey(sid), val);
             else localStorage.removeItem(userSummaryStorageKey(sid));
@@ -1437,6 +1835,7 @@
           } catch {
             // ignore
           }
+          updateSessionSummaryForSession(sid);
         }
 
         function formatUserSummaryText(text, sid) {
@@ -1486,59 +1885,6 @@
           const line = formatUserSummaryText(best.text, sid);
           if (!line) return;
           saveUserSummaryToStorage(sid, line);
-        }
-
-        function formatLastLine(ev, sid) {
-          if (!ev || typeof ev.text !== "string") return "";
-          let text = ev.text;
-          if (ev.role === "user") {
-            const res = sanitizeUserText(text, sid);
-            if (res.dropped) return "";
-            text = res.text;
-          }
-          text = text.replace(/\s+/g, " ").trim();
-          if (!text) return "";
-          const prefix = ev.role === "user" ? "You: " : "Assistant: ";
-          const maxLen = 280;
-          if (text.length > maxLen) {
-            text = text.slice(0, Math.max(0, maxLen - 3)) + "...";
-          }
-          return prefix + text;
-        }
-
-        function updateLastLineForEvent(ev, sid) {
-          if (!sid || !ev || ev.pending) return;
-          if (ev.role !== "user" && ev.role !== "assistant") return;
-          const line = formatLastLine(ev, sid);
-          if (!line) return;
-          scheduleLastLineSave(sid, line);
-          if (sid === selected) setLastLine(line);
-        }
-
-        function updateLastLineFromEvents(events, sid) {
-          if (!sid || !Array.isArray(events) || !events.length) return;
-          let best = null;
-          let bestTs = -1;
-          for (const ev of events) {
-            if (!ev || ev.role !== "user" && ev.role !== "assistant") continue;
-            if (ev.pending) continue;
-            const ts = typeof ev.ts === "number" && Number.isFinite(ev.ts) ? ev.ts : null;
-            if (ts !== null) {
-              if (ts > bestTs) {
-                bestTs = ts;
-                best = ev;
-              }
-            } else if (best === null) {
-              best = ev;
-            } else {
-              best = ev;
-            }
-          }
-          if (!best) return;
-          const line = formatLastLine(best, sid);
-          if (!line) return;
-          saveLastLineToStorage(sid, line);
-          if (sid === selected) setLastLine(line);
         }
 
         function cacheStorageKey(sid) {
@@ -1676,6 +2022,21 @@
           return Boolean(active && active.classList && active.classList.contains("queueText"));
         }
 
+        function maybeRefreshQueueList() {
+          if (!selected) return;
+          if (queueViewer.style.display !== "flex") return;
+          if (queueEditorActive()) return;
+          const cached = getQueueCache(selected);
+          const expected = getSelectedQueueLen();
+          if (!queueLoaded.has(selected) || cached.length !== expected) {
+            void fetchQueue(selected).then(() => {
+              if (queueViewer.style.display === "flex" && !queueEditorActive()) renderQueueList();
+            });
+            return;
+          }
+          renderQueueList();
+        }
+
         function updateQueueBadge() {
           if (!queueBadgeEl) return;
           if (!selected) {
@@ -1683,8 +2044,7 @@
             queueBadgeEl.style.display = "none";
             return;
           }
-          const q = getDeferredQueue(selected);
-          const n = q.length;
+          const n = getSelectedQueueLen();
           if (n > 0) {
             queueBadgeEl.textContent = String(n);
             queueBadgeEl.style.display = "inline-flex";
@@ -1693,91 +2053,30 @@
             queueBadgeEl.style.display = "none";
           }
           // Avoid tearing down the queue editor while the user is typing (IME-safe).
-          if (queueViewer.style.display === "flex" && !queueEditorActive()) {
-            renderQueueList();
-          }
+          maybeRefreshQueueList();
         }
 
-        function queueLocalMessage(raw, { front = false } = {}) {
-          if (!selected) return;
-          markDeferGate(selected);
-          const q = getDeferredQueue(selected);
-          if (front) q.unshift(raw);
-          else q.push(raw);
-          saveDeferredToStorage(selected);
-          updateQueueBadge();
-          setToast(`queued locally (${q.length})`);
-        }
-
-        function maybeSendDeferred({ force = false } = {}) {
-          if (!selected) return;
-          if (sending || deferInFlight) return;
-          if (!force && currentRunning) return;
-          if (deferGateBySession.get(selected)) return;
-          const q = getDeferredQueue(selected);
-          if (!q.length) {
-            updateQueueBadge();
+        async function queueServerMessage(raw, { front = false } = {}) {
+          const sid = selected;
+          if (!sid) {
+            setToast("select a session first");
             return;
           }
-          const raw = q.shift();
-          saveDeferredToStorage(selected);
-          deferInFlight = true;
-          updateQueueBadge();
-          void sendText(raw, { deferred: true });
-        }
-
-        function trackDeferredIdle(sid, { idle }) {
-          if (!sid) return;
-          if (!deferGateBySession.get(sid)) {
-            deferIdleSinceBySession.delete(sid);
-            return;
-          }
-          const gateSince = deferGateSinceBySession.get(sid);
-          if (typeof gateSince === "number" && Number.isFinite(gateSince)) {
-            if (performance.now() - gateSince < DEFER_GATE_MIN_MS) {
-              deferIdleSinceBySession.delete(sid);
-              return;
+          if (!raw || !raw.trim()) return;
+          try {
+            setToast("queueing...");
+            const res = await api(`/api/sessions/${sid}/queue`, { method: "POST", body: { text: raw, front: Boolean(front) } });
+            const list = applyQueueResponse(sid, res);
+            const count = Array.isArray(list) ? list.length : getSelectedQueueLen();
+            if (sid === selected) {
+              if (Number.isFinite(Number(count))) setSelectedQueueLen(count);
+              updateQueueBadge();
+              if (queueViewer.style.display === "flex" && !queueEditorActive()) renderQueueList();
             }
+            setToast(count ? `queued (queue ${count})` : "queued");
+          } catch (e) {
+            setToast(`queue error: ${e && e.message ? e.message : "unknown error"}`);
           }
-          if (!idle) {
-            deferIdleSinceBySession.delete(sid);
-            return;
-          }
-          const lastAt = lastActivityBySession.get(sid);
-          if (typeof lastAt === "number" && Number.isFinite(lastAt)) {
-            if (performance.now() - lastAt < DEFER_IDLE_RELEASE_MS) {
-              deferIdleSinceBySession.delete(sid);
-              return;
-            }
-          }
-          const now = performance.now();
-          const t0 = deferIdleSinceBySession.get(sid);
-          if (t0 == null) {
-            deferIdleSinceBySession.set(sid, now);
-            return;
-          }
-          if (now - t0 < DEFER_IDLE_RELEASE_MS) return;
-          deferIdleSinceBySession.delete(sid);
-          clearDeferGate(sid);
-          if (sid === selected) {
-            maybeSendDeferred({ force: true });
-          }
-        }
-
-        function markDeferGate(sid) {
-          if (!sid) return;
-          deferGateBySession.set(sid, true);
-          if (!deferGateSinceBySession.has(sid)) {
-            deferGateSinceBySession.set(sid, performance.now());
-          }
-          deferIdleSinceBySession.delete(sid);
-        }
-
-        function clearDeferGate(sid) {
-          if (!sid) return;
-          deferGateBySession.delete(sid);
-          deferIdleSinceBySession.delete(sid);
-          deferGateSinceBySession.delete(sid);
         }
 
           function markClickFirstPaint() {
@@ -2089,26 +2388,133 @@
           return first ? first.session_id : null;
         }
 
+        function workspaceSessionIds(ws) {
+          const out = [];
+          const seen = new Set();
+          const sessions = ws && Array.isArray(ws.sessions) ? ws.sessions : [];
+          for (const s of sessions) {
+            const sid = s && s.session_id ? String(s.session_id) : "";
+            if (!sid || seen.has(sid)) continue;
+            seen.add(sid);
+            out.push(sid);
+          }
+          return out;
+        }
+
         function collectWorkspaceFiles(ws) {
           const out = [];
           const seen = new Set();
+          const owners = new Map();
           for (const s of ws.sessions) {
             const files = listFromFilesField(s && s.files);
             for (const p of files) {
+              const sid = s && s.session_id ? String(s.session_id) : "";
+              if (sid) {
+                const list = owners.get(p);
+                if (list) {
+                  if (!list.includes(sid)) list.push(sid);
+                } else {
+                  owners.set(p, [sid]);
+                }
+              }
               if (seen.has(p)) continue;
               seen.add(p);
               out.push(p);
             }
           }
-          return out;
+          return { files: out, owners };
         }
 
-        function buildWorkspaceFiles(ws, files) {
+        async function removeWorkspaceFile(ws, path, sessionIds = []) {
+          const cwd = ws && ws.cwd ? String(ws.cwd).trim() : "";
+          const targetPath = String(path || "");
+          if (cwd) {
+            try {
+              const res = await api("/api/files/remove", { method: "POST", body: { path: targetPath, cwd } });
+              if (res && Array.isArray(res.files) && res.files.includes(targetPath)) {
+                await api("/api/files/remove", { method: "POST", body: { path: targetPath, scope: "all" } });
+              }
+              await refreshSessions();
+              setToast("removed");
+              return;
+            } catch (e) {
+              console.warn("removeWorkspaceFile: cwd remove failed", e);
+            }
+          }
+          const fallback = workspacePreferredSessionId(ws);
+          const sids = [];
+          const seen = new Set();
+          const addSid = (sid) => {
+            const clean = typeof sid === "string" ? sid : sid != null ? String(sid) : "";
+            if (!clean || seen.has(clean)) return;
+            seen.add(clean);
+            sids.push(clean);
+          };
+          if (Array.isArray(sessionIds)) sessionIds.forEach(addSid);
+          else if (sessionIds) addSid(sessionIds);
+          if (!sids.length && fallback) addSid(fallback);
+          if (!sids.length) {
+            setToast("session unavailable");
+            return;
+          }
+          try {
+            const requests = sids.map((sid) => api("/api/files/remove", { method: "POST", body: { session_id: sid, path: targetPath } }));
+            const results = await Promise.allSettled(requests);
+            await refreshSessions();
+            const errors = results.filter((r) => r.status === "rejected");
+            if (errors.length) throw errors[0].reason;
+            setToast("removed");
+          } catch (e) {
+            setToast(`remove error: ${e && e.message ? e.message : "unknown error"}`);
+          }
+        }
+
+        async function clearWorkspaceFiles(ws) {
+          const cwd = ws && ws.cwd ? String(ws.cwd).trim() : "";
+          if (cwd) {
+            if (!confirm("Clear file history for this workspace?")) return;
+            try {
+              await api("/api/files/clear", { method: "POST", body: { cwd } });
+              await refreshSessions();
+              setToast("cleared");
+              return;
+            } catch (e) {
+              console.warn("clearWorkspaceFiles: cwd clear failed", e);
+            }
+          }
+          const sids = workspaceSessionIds(ws);
+          if (!sids.length) {
+            setToast("session unavailable");
+            return;
+          }
+          if (!confirm("Clear file history for this workspace?")) return;
+          try {
+            const requests = sids.map((sid) => api("/api/files/clear", { method: "POST", body: { session_id: sid } }));
+            const results = await Promise.allSettled(requests);
+            await refreshSessions();
+            const errors = results.filter((r) => r.status === "rejected");
+            if (errors.length) throw errors[0].reason;
+            setToast("cleared");
+          } catch (e) {
+            setToast(`clear error: ${e && e.message ? e.message : "unknown error"}`);
+          }
+        }
+
+        function buildWorkspaceFiles(ws, files, owners) {
           if (!files.length) return null;
+          const canClear = workspaceSessionIds(ws).length > 0;
           const maxShow = 5;
           const show = files.slice(0, maxShow);
           const fileRows = show.map((p) => {
+            const row = el("div", { class: "workspaceFileRow" });
             const btn = el("button", { class: "workspaceFile", title: p, "aria-label": `Open ${p}`, text: baseName(p) || p });
+            const removeBtn = el("button", {
+              class: "icon-btn danger workspaceFileRemove",
+              title: "Remove from history",
+              "aria-label": `Remove ${p}`,
+              type: "button",
+              html: iconSvg("x"),
+            });
             bindTap(btn, () => {
               const sid = workspacePreferredSessionId(ws);
               if (sid && sid !== selected) void selectSession(sid);
@@ -2116,11 +2522,32 @@
               filePathInput.value = p;
               openFilePath();
             });
-            return btn;
+            bindTap(removeBtn, () => {
+              row.remove();
+              const ownerIds = owners && owners.get ? owners.get(p) : [];
+              void removeWorkspaceFile(ws, p, ownerIds);
+            });
+            row.appendChild(btn);
+            row.appendChild(removeBtn);
+            return row;
           });
           const more = files.length > maxShow ? el("div", { class: "workspaceFilesMore muted", text: `+${files.length - maxShow} more` }) : null;
+          const clearBtn = el("button", {
+            class: "workspaceFilesClear",
+            type: "button",
+            text: "Clear",
+            title: "Clear file history",
+            "aria-label": "Clear file history",
+          });
+          clearBtn.disabled = !canClear;
+          bindTap(clearBtn, () => {
+            void clearWorkspaceFiles(ws);
+          });
           return el("div", { class: "workspaceFiles" }, [
-            el("div", { class: "workspaceFilesLabel", text: "Files" }),
+            el("div", { class: "workspaceFilesHeader" }, [
+              el("div", { class: "workspaceFilesLabel", text: "Files" }),
+              el("div", { class: "workspaceFilesActions" }, [clearBtn]),
+            ]),
             ...fileRows,
             ...(more ? [more] : []),
           ]);
@@ -2130,10 +2557,14 @@
           const badge = el("span", { class: "badge" + (s.busy ? " busy" : ""), text: s.busy ? "busy" : "idle" });
           const q = s.queue_len ? el("span", { class: "badge queue", text: `queue ${s.queue_len}` }) : null;
           const card = el("div", { class: "session" + (selected === s.session_id ? " active" : "") });
+          if (s && s.session_id) {
+            const sid = String(s.session_id);
+            card.dataset.sessionId = sid;
+            sessionCardIndex.set(sid, card);
+          }
 
           const title = sessionDisplayName(s);
           const badges = [];
-          if (s.harness_enabled) badges.push(el("span", { class: "badge harness", text: "harness", title: "Harness mode enabled" }));
           badges.push(badge);
           if (q) badges.push(q);
           if (isSessionUnread(s)) badges.push(el("span", { class: "unreadDot", title: "Unread response" }));
@@ -2165,9 +2596,9 @@
               try {
                 await api(`/api/sessions/${s.session_id}/delete`, { method: "POST", body: {} });
                 clearCache(s.session_id);
+                clearQueueForSession(s.session_id);
                 clearDraftForSession(s.session_id);
                 clearSeenAssistantForSession(s.session_id);
-                clearLastLineForSession(s.session_id);
                 clearUserSummaryForSession(s.session_id);
                 if (selected === s.session_id) {
                   selected = null;
@@ -2183,8 +2614,7 @@
                   setAttachCount(0);
                   resetChatRenderState();
                   updateQueueBadge();
-                  if (harnessMenuOpen) hideHarnessMenu();
-                  updateHarnessBtnState();
+                  updateActionBtnState();
                 }
                 await refreshSessions();
               } catch (err) {
@@ -2198,11 +2628,9 @@
           ]);
           const updatedTs = typeof s.updated_ts === "number" && Number.isFinite(s.updated_ts) ? s.updated_ts : s.start_ts;
           const meta = el("div", { class: "muted subLine", text: updatedTs ? `last ${fmtTs(updatedTs)}` : "" });
-          const summary = loadUserSummaryFromStorage(s.session_id);
-          const summaryEl = summary
-            ? el("div", { class: "sessionSummary muted", text: summary, title: summary })
-            : null;
-          const mainCol = el("div", { class: "sessionMain" }, [top, meta, ...(summaryEl ? [summaryEl] : [])]);
+          const summaryEl = el("div", { class: "sessionSummary muted", text: "" });
+          applySessionSummaryEl(summaryEl, s.session_id);
+          const mainCol = el("div", { class: "sessionMain" }, [top, meta, summaryEl]);
           // Session file lists are shown at the workspace level instead.
           card.appendChild(mainCol);
           const actionButtons = [renameCardBtn];
@@ -2239,6 +2667,7 @@
 	          const data = await api("/api/sessions");
 	          sessionsWrap.innerHTML = "";
 	          sessionIndex = new Map();
+	          sessionCardIndex = new Map();
 	          const sessions = (data.sessions || [])
               .slice()
               .sort((a, b) => (b.updated_ts || b.start_ts || 0) - (a.updated_ts || a.start_ts || 0));
@@ -2256,8 +2685,8 @@
                 ]),
                 title.subtitle ? el("div", { class: "workspacePath muted", text: title.subtitle, title: title.subtitle }) : null,
               ].filter(Boolean));
-              const files = collectWorkspaceFiles(ws);
-              const filesWrap = buildWorkspaceFiles(ws, files);
+              const { files, owners } = collectWorkspaceFiles(ws);
+              const filesWrap = buildWorkspaceFiles(ws, files, owners);
               const sessionWrap = el("div", { class: "workspaceSessions" });
               for (const s of ws.sessions) {
                 sessionWrap.appendChild(buildSessionCard(s));
@@ -2269,6 +2698,7 @@
               sessionsWrap.appendChild(wsEl);
             }
           if (selected && !sessionIndex.has(selected)) {
+            clearQueueForSession(selected);
             selected = null;
             offset = 0;
             activeLogPath = null;
@@ -2283,15 +2713,14 @@
             setTyping(false);
             resetChatRenderState();
             turnOpen = false;
-            setLastLine("");
-            if (harnessMenuOpen) hideHarnessMenu();
-            updateHarnessBtnState();
             updateQueueBadge();
+            updateActionBtnState();
           } else if (selected) {
             const s = sessionIndex.get(selected);
             if (s) titleLabel.textContent = sessionTitleWithId(s);
+            if (s && Number.isFinite(Number(s.queue_len))) setSelectedQueueLen(s.queue_len);
           }
-          updateHarnessBtnState();
+          updateActionBtnState();
           updateQueueBadge();
           return sessions;
         }
@@ -2303,9 +2732,6 @@
           if (consumePendingUserIfMatches(ev)) return;
           if (!ev.pending && isDuplicateEvent(ev)) return;
 
-          if (!ev.pending && selected) {
-            lastActivityBySession.set(selected, performance.now());
-          }
           const stick = autoScroll || isNearBottom();
           const ts = typeof ev.ts === "number" && Number.isFinite(ev.ts) ? ev.ts : ev.pending ? Date.now() / 1000 : null;
 	          const { row } = makeRow(ev, { ts, pending: Boolean(ev.pending) });
@@ -2321,7 +2747,6 @@
           if (!ev.pending && selected && ev.role === "assistant" && typeof ev.ts === "number" && Number.isFinite(ev.ts)) {
             markAssistantSeen(selected, ev.ts);
           }
-          if (selected) updateLastLineForEvent(ev, selected);
           if (selected) updateUserSummaryFromEvent(ev, selected);
 
           if (stick) {
@@ -2389,7 +2814,6 @@
         function startInitialRender(allEvents) {
           backfillToken += 1;
           const myToken = backfillToken;
-          if (selected) lastActivityBySession.delete(selected);
 
           const msgs = [];
           let latestAssistantTs = null;
@@ -2415,10 +2839,7 @@
           if (selected && latestAssistantTs !== null) {
             markAssistantSeen(selected, latestAssistantTs);
           }
-          if (selected) {
-            updateLastLineFromEvents(msgs, selected);
-            updateUserSummaryFromEvents(msgs, selected);
-          }
+          if (selected) updateUserSummaryFromEvents(msgs, selected);
 	          const frag = document.createDocumentFragment();
           for (const ev of msgs) {
             const ts = typeof ev.ts === "number" && Number.isFinite(ev.ts) ? ev.ts : null;
@@ -2465,7 +2886,6 @@
               setStatus({ running: Boolean(nowBusy), queueLen: data.queue_len });
               setContext(data.token);
               setTyping(Boolean(nowBusy));
-              trackDeferredIdle(sid, { idle: !nowBusy });
               return;
             }
 	            if (activeLogPath && lp && lp !== activeLogPath) {
@@ -2502,13 +2922,6 @@
                 setStatus({ running: Boolean(turnOpen || nowBusy2), queueLen: d2.queue_len });
                 setContext(d2.token);
                 setTyping(Boolean(turnOpen || nowBusy2));
-                if ((turnEnd2 || turnAborted2) && selected) {
-                  clearDeferGate(selected);
-                  if (getDeferredQueue(selected).length) {
-                    maybeSendDeferred({ force: true });
-                  }
-                }
-                trackDeferredIdle(sid, { idle: !(turnOpen || nowBusy2) });
                 } catch (e2) {
                   console.error("poll init reload failed", e2);
                   throw e2;
@@ -2545,13 +2958,6 @@
 				            setStatus({ running: Boolean(turnOpen || nowBusy), queueLen: data.queue_len });
 				            setContext(data.token);
 				            setTyping(Boolean(turnOpen || nowBusy));
-            if ((turnEnd || turnAborted) && selected) {
-              clearDeferGate(selected);
-              if (getDeferredQueue(selected).length) {
-                maybeSendDeferred({ force: true });
-              }
-            }
-            trackDeferredIdle(sid, { idle: !(turnOpen || nowBusy) });
             const s = sessionIndex.get(sid);
             if (s) titleLabel.textContent = sessionTitleWithId(s);
 		          } catch (e) {
@@ -2651,12 +3057,12 @@
             turnOpen = false;
 		          {
 		            const s = sessionIndex.get(sid);
-            if (s) titleLabel.textContent = sessionTitleWithId(s);
-            else titleLabel.textContent = sid ? String(sid) : "No session selected";
+                if (s) titleLabel.textContent = sessionTitleWithId(s);
+                else titleLabel.textContent = sid ? String(sid) : "No session selected";
+                if (s && Number.isFinite(Number(s.queue_len))) setSelectedQueueLen(s.queue_len);
+                updateQueueBadge();
                 const lastSeenTs = getLastAssistantTs(s);
                 if (lastSeenTs) saveSeenAssistantTs(sid, lastSeenTs);
-                const storedLine = loadLastLineFromStorage(sid);
-                setLastLine(storedLine);
 		          }
                 const draft = loadDraftFromStorage(sid);
                 const ta = $("#msg");
@@ -2729,10 +3135,10 @@
                   if (pollGen !== myGen || selected !== sid) return;
                 }
 		          }
-            refreshSessions().catch((e) => console.error("refreshSessions failed", e));
+           refreshSessions().catch((e) => console.error("refreshSessions failed", e));
            kickPoll(900);
            if (isMobile()) setSidebarOpen(false);
-           updateHarnessBtnState();
+           updateActionBtnState();
          }
 
 			        $("#refreshBtn").onclick = async () => {
@@ -2756,110 +3162,14 @@
                 }
                 setToast("refreshed");
               };
-        function updateHarnessBtnState() {
-          const s = selected ? sessionIndex.get(selected) : null;
-          const on = Boolean(s && s.harness_enabled);
-          harnessBtn.disabled = !selected;
-          harnessBtn.classList.toggle("active", Boolean(selected && on));
+        function updateActionBtnState() {
           renameBtn.disabled = !selected;
           duplicateBtn.disabled = !selected;
+          sessionToolsBtn.disabled = !selected;
+          if (!selected && sessionToolsOpen) hideSessionTools();
+          updateSessionToolsContent();
         }
-           async function loadHarnessCfgForSelected() {
-             if (!selected) return;
-             const sid = selected;
-              const d = await api(`/api/sessions/${sid}/harness`);
-              if (selected !== sid) return;
-              if (!d || typeof d !== "object") throw new Error("invalid harness response");
-              if (typeof d.enabled !== "boolean") throw new Error("invalid harness.enabled");
-              if (typeof d.request !== "string") throw new Error("invalid harness.request");
-              harnessCfg = { enabled: d.enabled, request: d.request };
-             const enabledEl = $("#harnessEnabled");
-             const requestEl = $("#harnessRequest");
-             if (enabledEl) enabledEl.checked = harnessCfg.enabled;
-             if (requestEl) requestEl.value = harnessCfg.request;
-           }
-			        function scheduleHarnessSave() {
-			          if (!selected) return;
-			          const sid = selected;
-			          if (harnessSaveTimer) clearTimeout(harnessSaveTimer);
-			          harnessSaveTimer = setTimeout(async () => {
-			            if (selected !== sid) return;
-               try {
-                 await api(`/api/sessions/${sid}/harness`, { method: "POST", body: { enabled: harnessCfg.enabled, request: harnessCfg.request } });
-                 await refreshSessions();
-               } catch (e) {
-                 console.error("save harness failed", e);
-                 setToast(`harness save error: ${e && e.message ? e.message : "unknown error"}`);
-               }
-               updateHarnessBtnState();
-             }, 450);
-           }
-			        function hideHarnessMenu() {
-			          harnessMenuOpen = false;
-			          harnessMenu.style.display = "none";
-			        }
-			        async function showHarnessMenu() {
-			          if (!selected) return;
-			          harnessMenuOpen = true;
-			          harnessMenu.style.display = "block";
-			          const rect = harnessBtn.getBoundingClientRect();
-			          const top = Math.min(window.innerHeight - 12, rect.bottom + 8);
-			          harnessMenu.style.top = `${top}px`;
-			          harnessMenu.style.left = "12px";
-			          harnessMenu.style.right = "auto";
-             const w = harnessMenu.offsetWidth || 320;
-             const left = Math.max(12, Math.min(window.innerWidth - 12 - w, rect.right - w));
-             harnessMenu.style.left = `${left}px`;
-             try {
-               await loadHarnessCfgForSelected();
-             } catch (e) {
-               console.error("load harness failed", e);
-               setToast(`harness load error: ${e && e.message ? e.message : "unknown error"}`);
-               hideHarnessMenu();
-             }
-           }
-			        function toggleHarnessMenu() {
-			          if (harnessMenuOpen) hideHarnessMenu();
-			          else showHarnessMenu();
-			        }
 
-			        harnessBtn.onclick = (e) => {
-			          e.preventDefault();
-			          e.stopPropagation();
-		          toggleHarnessMenu();
-		        };
-		        harnessMenu.onclick = (e) => e.stopPropagation();
-		        if (window.__codexwebHarnessGlobalHandlers) {
-		          const h = window.__codexwebHarnessGlobalHandlers;
-		          if (h.docClick) document.removeEventListener("click", h.docClick);
-		          if (h.resize) window.removeEventListener("resize", h.resize);
-		        }
-		        const onDocClick = () => {
-		          if (harnessMenuOpen) hideHarnessMenu();
-		        };
-		        const onResize = () => {
-		          if (harnessMenuOpen) hideHarnessMenu();
-		        };
-			        window.__codexwebHarnessGlobalHandlers = { docClick: onDocClick, resize: onResize };
-			        document.addEventListener("click", onDocClick);
-			        window.addEventListener("resize", onResize);
-			        const harnessEnabledEl = $("#harnessEnabled");
-			        const harnessRequestEl = $("#harnessRequest");
-			        if (harnessEnabledEl)
-			          harnessEnabledEl.onchange = (e) => {
-			            if (!selected) return;
-			            harnessCfg.enabled = Boolean(e.target.checked);
-			            const s = sessionIndex.get(selected);
-			            if (s) s.harness_enabled = harnessCfg.enabled;
-			            updateHarnessBtnState();
-			            scheduleHarnessSave();
-			          };
-        if (harnessRequestEl)
-          harnessRequestEl.oninput = (e) => {
-            if (!selected) return;
-            harnessCfg.request = String(e.target.value ?? "");
-            scheduleHarnessSave();
-          };
         async function renameSessionId(sid) {
           if (!sid) return;
           const s = sessionIndex.get(sid);
@@ -2896,6 +3206,39 @@
         let fileDirty = false;
         let fileStatusBase = "";
         let fileLoadedText = "";
+        let fileLoadedPath = "";
+        let fileSyncState = "off";
+        const FILE_SYNC_LABELS = {
+          live: "Live",
+          warn: "Reconnecting",
+          offline: "Offline",
+          paused: "Paused",
+          off: "Manual",
+        };
+        function setFileSyncState(state, label) {
+          const next = state || "off";
+          fileSyncState = next;
+          fileSync.classList.remove("live", "warn", "offline", "paused", "off");
+          fileSync.classList.add(next);
+          const text = label || FILE_SYNC_LABELS[next] || "";
+          fileSyncLabel.textContent = text;
+          fileSync.title = text ? `File sync: ${text}` : "File sync";
+        }
+        function syncFileStateForMode() {
+          if (!fileFullscreenMode) {
+            setFileSyncState("off");
+            return;
+          }
+          if (typeof navigator !== "undefined" && navigator && navigator.onLine === false) {
+            setFileSyncState("offline");
+            return;
+          }
+          if (fileDirty) {
+            setFileSyncState("paused");
+            return;
+          }
+          setFileSyncState("live");
+        }
         let fileAutoRefreshTimer = null;
         let fileAutoRefreshInFlight = false;
         function applyFileWrap() {
@@ -2907,10 +3250,12 @@
         function updateFileStatus() {
           const suffix = fileDirty ? " (modified)" : "";
           fileStatus.textContent = `${fileStatusBase}${suffix}`;
+          fileStatus.title = `${fileStatusBase}${suffix}`.trim();
         }
         function setFileDirty(next) {
           fileDirty = Boolean(next);
           updateFileStatus();
+          syncFileStateForMode();
           fileSaveBtn.disabled = !(fileMode === "edit" && fileDirty);
         }
         function currentFileSessionId() {
@@ -2983,8 +3328,11 @@
           fileLoadedText = res.text;
           const size = typeof res.size === "number" ? res.size : res.text.length;
           const label = res.path ? String(res.path) : String(filePathInput.value || "").trim();
+          setFileTabTitle(label);
+          fileLoadedPath = label;
           fileStatusBase = `${label} (${fmtBytes(size)})`;
           setFileDirty(false);
+          syncFileStateForMode();
           setFileMode(fileMode);
           requestAnimationFrame(() => restoreFileScroll(scrollState));
         }
@@ -3014,6 +3362,41 @@
           else if (fileMode === "preview") fileTitle.textContent = "Preview file";
           else fileTitle.textContent = "Read file";
         }
+        function fileTabTitleFromPath(path) {
+          const trimmed = String(path || "").trim();
+          if (!trimmed) return "";
+          const base = baseName(trimmed);
+          return base || trimmed;
+        }
+        function setFileTabTitle(path) {
+          if (!fileFullscreenMode) return;
+          const next = fileTabTitleFromPath(path);
+          document.title = next || APP_TITLE;
+        }
+        function getFileCopyPath() {
+          const loaded = String(fileLoadedPath || "").trim();
+          if (loaded) return loaded;
+          return String(filePathInput.value || "").trim();
+        }
+        async function copyFilePath() {
+          const path = getFileCopyPath();
+          if (!path) {
+            setToast("no file loaded");
+            return;
+          }
+          const ok = await copyToClipboard(path);
+          setToast(ok ? "path copied" : "copy failed");
+        }
+        async function copyFileName() {
+          const path = getFileCopyPath();
+          if (!path) {
+            setToast("no file loaded");
+            return;
+          }
+          const name = baseName(path) || path;
+          const ok = await copyToClipboard(name);
+          setToast(ok ? "name copied" : "copy failed");
+        }
         applyFileWrap();
         setFileMode(fileMode);
         if (fileFullscreenMode) filePopoutBtn.style.display = "none";
@@ -3036,6 +3419,7 @@
           fileViewer.style.display = "flex";
           applyFileWrap();
           startFileAutoRefresh();
+          syncFileStateForMode();
           const s = selected ? sessionIndex.get(selected) : null;
           const last = localStorage.getItem("codexweb.filePath") || "";
           const def = last || (s && s.cwd ? String(s.cwd) : "");
@@ -3053,6 +3437,7 @@
             return;
           }
           stopFileAutoRefresh();
+          setFileSyncState("off");
           fileBackdrop.style.display = "none";
           fileViewer.style.display = "none";
         }
@@ -3074,6 +3459,7 @@
             const size = typeof res.size === "number" ? res.size : fileLoadedText.length;
             const label = res.path ? String(res.path) : path;
             fileStatusBase = `${label} (${fmtBytes(size)})`;
+            fileLoadedPath = label;
             setFileDirty(false);
             setToast("saved");
             if (fileMode === "preview") updateFilePreview();
@@ -3088,12 +3474,14 @@
             fileStatus.textContent = "Enter a file path.";
             return;
           }
+          setFileTabTitle(path);
           const scrollState = captureFileScrollState();
           fileStatus.textContent = "Loading...";
           fileContent.textContent = "";
           fileEditor.value = "";
           filePreview.innerHTML = "";
           fileStatusBase = "";
+          fileLoadedPath = "";
           try {
             const body = { path };
             const sid = currentFileSessionId();
@@ -3110,20 +3498,30 @@
           if (!fileFullscreenMode) return;
           if (document.hidden) return;
           if (fileAutoRefreshInFlight) return;
-          if (fileDirty) return;
+          if (typeof navigator !== "undefined" && navigator && navigator.onLine === false) {
+            setFileSyncState("offline");
+            return;
+          }
+          if (fileDirty) {
+            setFileSyncState("paused");
+            return;
+          }
           const path = String(filePathInput.value || "").trim();
           if (!path) return;
           const scrollState = captureFileScrollState();
           fileAutoRefreshInFlight = true;
           try {
-            const body = { path };
+            const body = { path, record_history: false };
             const sid = currentFileSessionId();
             if (sid) body.session_id = sid;
             const res = await api("/api/files/read", { method: "POST", body });
             if (!res || typeof res.text !== "string") throw new Error("invalid response");
+            setFileSyncState("live");
             if (res.text === fileLoadedText) return;
             applyFileReadResult(res, scrollState);
           } catch (e) {
+            const offline = typeof navigator !== "undefined" && navigator && navigator.onLine === false;
+            setFileSyncState(offline ? "offline" : "warn");
             console.error("file auto-refresh failed", e);
           } finally {
             fileAutoRefreshInFlight = false;
@@ -3180,6 +3578,16 @@
           e.stopPropagation();
           openFileEditorTab();
         };
+        fileCopyPathBtn.onclick = async (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          await copyFilePath();
+        };
+        fileCopyNameBtn.onclick = async (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          await copyFileName();
+        };
         fileOpenInlineBtn.onclick = (e) => {
           e.preventDefault();
           e.stopPropagation();
@@ -3206,6 +3614,8 @@
           setFileDirty(fileEditor.value !== fileLoadedText);
           if (fileMode === "preview") updateFilePreview();
         });
+        window.addEventListener("online", () => syncFileStateForMode());
+        window.addEventListener("offline", () => syncFileStateForMode());
         document.addEventListener("visibilitychange", () => {
           if (!fileFullscreenMode) return;
           if (document.visibilityState !== "visible") return;
@@ -3216,6 +3626,7 @@
           if (fileViewer.style.display === "flex") hideFileViewer();
           if (sendChoice.style.display === "flex") hideSendChoice();
           if (queueViewer.style.display === "flex") hideQueueViewer();
+          if (sessionTools.style.display === "flex") hideSessionTools();
         });
 
         let sendChoicePending = null;
@@ -3246,7 +3657,7 @@
             hideSendChoice();
             if (!raw) return;
             clearComposer();
-            queueLocalMessage(raw);
+            void queueServerMessage(raw);
           };
         if (sendChoiceCancelBtn)
           sendChoiceCancelBtn.onclick = () => {
@@ -3261,7 +3672,7 @@
             queueEmpty.style.display = "block";
             return;
           }
-          const q = getDeferredQueue(sid);
+          const q = getQueueCache(sid);
           queueEmpty.style.display = q.length ? "none" : "block";
           if (!q.length) return;
           q.forEach((text, idx) => {
@@ -3269,19 +3680,22 @@
             const ta = el("textarea", { class: "queueText", "aria-label": `Queued message ${idx + 1}` });
             ta.value = text;
             ta.oninput = () => {
-              const q2 = getDeferredQueue(sid);
+              const q2 = getQueueCache(sid);
               if (idx >= q2.length) return;
               q2[idx] = String(ta.value || "");
+              queueCacheBySession.set(sid, q2);
               scheduleQueueSave();
+              updateQueueBadge();
             };
             const del = el("button", { class: "icon-btn danger", title: "Delete", "aria-label": "Delete", type: "button", html: iconSvg("trash") });
             del.onclick = (e) => {
               e.preventDefault();
               e.stopPropagation();
-              const q2 = getDeferredQueue(sid);
+              const q2 = getQueueCache(sid);
               if (idx >= q2.length) return;
               q2.splice(idx, 1);
-              saveDeferredToStorage(sid);
+              queueCacheBySession.set(sid, q2);
+              scheduleQueueSave();
               updateQueueBadge();
               renderQueueList();
             };
@@ -3291,9 +3705,17 @@
           });
         }
 
-        function showQueueViewer() {
+        async function showQueueViewer() {
           queueBackdrop.style.display = "block";
           queueViewer.style.display = "flex";
+          queueEmpty.textContent = "Loading...";
+          try {
+            if (selected) await fetchQueue(selected);
+          } catch (e) {
+            setToast(`queue load error: ${e && e.message ? e.message : "unknown error"}`);
+          }
+          queueEmpty.textContent = "No queued messages.";
+          updateQueueBadge();
           renderQueueList();
         }
 
@@ -3310,6 +3732,35 @@
             showQueueViewer();
           };
         }
+        sessionToolsBtn.onclick = (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          showSessionTools();
+        };
+        sessionToolsCloseBtn.onclick = (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          hideSessionTools();
+        };
+        sessionToolsBackdrop.onclick = () => hideSessionTools();
+        statusCopyBtn.onclick = async (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          const ok = await copyToClipboard(sessionStatusCmd.textContent || "");
+          setToast(ok ? "status command copied" : "copy failed");
+        };
+        resumeCopyBtn.onclick = async (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          const ok = await copyToClipboard(sessionResumeCmd.textContent || "");
+          setToast(ok ? "resume command copied" : "copy failed");
+        };
+        tmuxCopyBtn.onclick = async (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          const ok = await copyToClipboard(sessionTmuxCmd.textContent || "");
+          setToast(ok ? "tmux command copied" : "copy failed");
+        };
         queueCloseBtn.onclick = (e) => {
           e.preventDefault();
           e.stopPropagation();
@@ -3328,6 +3779,22 @@
           }
         }
 
+        async function waitForSessionByBrokerPid(brokerPid, { alias } = {}) {
+          if (!brokerPid) return null;
+          for (let i = 0; i < 60; i++) {
+            const sessions = await refreshSessions();
+            const found = (sessions || []).find((x) => Number(x.broker_pid || 0) === brokerPid);
+            if (found) {
+              if (alias) await applySessionAlias(found.session_id, alias);
+              selectSession(found.session_id);
+              return brokerPid;
+            }
+            await new Promise((r) => setTimeout(r, 250));
+          }
+          setToast("session will appear once Codex creates a rollout log");
+          return brokerPid;
+        }
+
         async function spawnSessionWithCwd(cwd, { alias } = {}) {
           if (!cwd || !String(cwd).trim()) {
             setToast("cwd unavailable");
@@ -3342,18 +3809,7 @@
               return null;
             }
             setToast(`started (broker ${brokerPid})`);
-            for (let i = 0; i < 60; i++) {
-              const sessions = await refreshSessions();
-              const found = (sessions || []).find((x) => Number(x.broker_pid || 0) === brokerPid);
-              if (found) {
-                if (alias) await applySessionAlias(found.session_id, alias);
-                selectSession(found.session_id);
-                return brokerPid;
-              }
-              await new Promise((r) => setTimeout(r, 250));
-            }
-            setToast("session will appear once Codex creates a rollout log");
-            return brokerPid;
+            return await waitForSessionByBrokerPid(brokerPid, { alias });
           } catch (e) {
             setToast(`start error: ${e.message}`);
             return null;
@@ -3485,13 +3941,6 @@
         setAttachCount(0);
         updateQueueBadge();
 
-        function setLastLine(text) {
-          const t = String(text || "").trim();
-          const elLine = $("#lastLine");
-          if (!elLine) return;
-          elLine.textContent = t;
-          elLine.style.display = t ? "block" : "none";
-        }
 	        function autoGrow() {
 	          const basePx = parseFloat(getComputedStyle(textarea).minHeight || "0") || 32;
 	          const maxPx = 180;
@@ -3701,16 +4150,13 @@
           if (selected) saveDraftToStorage(selected, "");
         }
 
-        async function sendText(raw, { deferred = false } = {}) {
+        async function sendText(raw) {
           if (!selected) return;
           if (!raw || !raw.trim()) return;
           if (sending) return;
           sending = true;
           $("#sendBtn").disabled = true;
           setToast("sending...");
-          if (deferred && selected) {
-            markDeferGate(selected);
-          }
 
           const localId = ++localEchoSeq;
           const t0 = Date.now() / 1000;
@@ -3721,8 +4167,17 @@
           updateUserSummaryFromText(selected, raw);
           try {
             const res = await api(`/api/sessions/${selected}/send`, { method: "POST", body: { text: raw } });
-            if (res.queued) setToast(`queued (queue ${res.queue_len})`);
-            else setToast("sent");
+            if (res.queued) {
+              setToast(`queued (queue ${res.queue_len})`);
+              if (Array.isArray(res.queue)) {
+                applyQueueResponse(selected, res);
+                updateQueueBadge();
+              } else {
+                void fetchQueue(selected).then(() => updateQueueBadge());
+              }
+            } else {
+              setToast("sent");
+            }
             setAttachCount(0);
             pollFastUntilMs = Date.now() + 5000;
             kickPoll(0);
@@ -3735,13 +4190,9 @@
               pendingEl.style.borderColor = "rgba(185, 28, 28, 0.7)";
               pendingEl.style.boxShadow = "0 0 0 2px rgba(185, 28, 28, 0.12)";
             }
-            if (deferred && selected) {
-              queueLocalMessage(raw, { front: true });
-            }
           } finally {
             sending = false;
             $("#sendBtn").disabled = false;
-            if (deferred) deferInFlight = false;
           }
         }
 

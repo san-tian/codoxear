@@ -1,59 +1,54 @@
-# Codoxear architecture notes
+# AGENTS.md
 
-This repo is a Linux-first companion UI for continuing Codex CLI TUI sessions on a phone/laptop browser.
+## Purpose
+Codoxear is a Linux-first companion UI for continuing Codex CLI TUI sessions on a phone or laptop browser. The web UI is a view/controller while all files, tools, and credentials stay on the host machine.
 
-## Components
+## Standard startup (this host)
+- Start the server with `scripts/codoxear-server-dev` to pin the working directory to the repo root.
+- The server loads `.env` from `/root/code/codoxear/.env` when started from the repo root.
 
-### `codoxear.server`
+## Structure at a glance
+- `codoxear/server.py`  HTTP server, JSON API, auth cookie, session discovery, Harness scheduler
+- `codoxear/broker.py`  PTY wrapper for Codex CLI, socket control channel, log discovery, busy/idle heuristics
+- `codoxear/sessiond.py`  Headless session launcher that mimics broker metadata output
+- `codoxear/rollout_log.py`  Rollout JSONL parsing, chat event extraction, idle detection, token stats
+- `codoxear/util.py`  Shared helpers for app dir, log scanning, JSONL reads
+- `codoxear/static/`  Browser UI (`index.html`, `app.js`, `app.css`)
+- `tests/`  Pytest coverage for log parsing, idle heuristics, and server behavior
+- `README.md`  User-facing overview and quick start
 
-- HTTP server (single process) that serves the UI and a small JSON API under `/api/*`.
-- Auth: password gate using `CODEX_WEB_PASSWORD` (required). Cookie-based session (`codoxear_auth`).
-- Session discovery: scans `~/.local/share/codoxear/socks/*.sock` for broker control sockets and reads the adjacent `*.json` metadata.
-- Web-owned sessions: `/api/sessions` (POST) spawns a new broker process with `CODEX_WEB_OWNER=web`. These sessions show a delete button in the UI and can be killed by the server.
-- Terminal-owned sessions: created by running `codoxear-broker` (usually via a shell wrapper for `codex`). The server can attach but should not kill them.
-- Runtime state directory: `~/.local/share/codoxear` (legacy `~/.local/share/codex-web` is no longer used).
+## Documentation taxonomy
+Docs are split into Feature, Flow, and Work Records. Feature docs describe purpose, implementation, key files, and call stacks. Flow docs describe repeatable dev/deploy/test workflows. Work records summarize requests and actions by session.
 
-### `codoxear.broker`
+## Documentation index
+`docs/features/server-and-api.md`: Server architecture, auth, discovery, and API behavior.
+`docs/features/broker.md`: Broker PTY lifecycle, socket protocol, and busy/idle state.
+`docs/features/sessiond.md`: Headless session runner and metadata behavior.
+`docs/features/ui.md`: Browser UI polling, local echo, queueing, and user actions.
+`docs/features/rollout-log-parsing.md`: Rollout JSONL parsing and idle heuristics.
+`docs/features/ROUTES.md`: API routes and auth overview.
+`docs/flows/DEVELOPMENT.md`: Dev environment, run commands, and doc sync rules.
+`docs/flows/DEPLOYMENT.md`: Deployment considerations and runtime paths.
+`docs/flows/TESTING.md`: Tests and verification steps.
+`docs/records/WORK_RECORDS.md`: Work records summary of current focus with per-session headings and links.
+`docs/records/sessions/2026-02-22-docs-bootstrap.md`: Work record for initial documentation and AGENTS structure.
 
-- Foreground PTY wrapper intended to be run from a real terminal.
-- Starts Codex CLI, preserves terminal UX, and creates a Unix socket control channel under `~/.local/share/codoxear/socks/`.
-- Writes a `*.json` sidecar with: session_id, pid(s), cwd, log_path, sock_path, owner tag.
-- Detects the active rollout log and keeps `log_path` updated by scanning `/proc` for writable `rollout-*.jsonl` file descriptors in the Codex process tree.
-- Ignores sub-agent rollout logs (`session_meta.payload.source.subagent`) so the UI stays bound to the main session.
-- Linux-only (relies on `/proc`, `pty`, `termios`).
+## Development or debug workflow
+Every dev task must follow these four steps in order and report results.
 
-### `codoxear.sessiond`
+1. Read new files
+Read related files and relevant feature or flow docs. `docs/records/WORK_RECORDS.md` is mandatory to read for every task, plus the related session record. If anything is unclear, consult docs first. When using Codex CLI to validate doc reading, use read-only prompts and require file path references.
+2. Code
+Only modify files relevant to the request.
+3. Test
+All code changes must be tested. Run existing tests. If there are no tests, explain why and provide required manual verification steps. If existing tests cannot validate the new functionality, add new tests and write the new test commands into the relevant feature doc(s) and the testing doc.
+4. Add detailed notes
+Add clear comments or documentation, and update relevant feature and flow docs to keep them concise and consistent with the code. Update the work records summary and session records as needed so the collaboration context is complete.
 
-- Headless session helper that can launch a Codex session without an interactive terminal.
-- Writes the same `socks/*.sock` + `socks/*.json` metadata the server expects.
-- Linux-only (PTY/termios assumptions).
+At the end of each conversation, if this round is debug or development, provide a short four-step summary: step 1 lists files read; steps 2/3/4 each list files changed.
 
-### UI (`codoxear/static/index.html`)
-
-- UI shell served at `/` and `/static/index.html`, with assets under `codoxear/static/` (`app.css`, `app.js`).
-- Polls `/api/sessions` and `/api/sessions/<id>/messages`.
-- Supports creating web-owned sessions via the "New session" button.
-
-## Data flow (high level)
-
-1. Terminal: `codoxear-broker` runs Codex and registers a control socket + metadata file.
-2. Server: lists available sockets, reads metadata, and serves session content via `/api/*`.
-3. Browser: selects a session, sends prompts via `/api/sessions/<id>/send`, renders messages from the rollout log.
-
-## Development reminders
-
-- Do not commit secrets: `.env`, `env`, keys, tokens, logs.
-- Do not commit runtime artifacts: `codex-homes/`, `socks/`, `root-repo/`, `server.log`, `hmac_secret`, `__pycache__/`.
-- Keep shared helpers in `codoxear/util.py` (avoid duplicating log-scan and app-dir logic across modules).
-- Local dev:
-  - Install: `python3 -m pip install -e .`
-  - Run server: `codoxear-server` or `python3 -m codoxear.server`
-  - Broker: `codoxear-broker -- <codex args>`
-
-## Ops notes
-
-- Restarting `codoxear.server` does **not** lose session content. Sessions live in Codex rollout logs on disk; the server only reads them.
-- To avoid losing live sessions, **only** stop the server process. Do **not** kill `codoxear-broker` or the Codex process.
-- Safe restart example (server only):
-  - `pgrep -f "python3 -m codoxear.server" | xargs -r kill`
-  - `CODEX_WEB_PASSWORD=... CODEX_WEB_PORT=13780 CODEX_WEB_HOST=0.0.0.0 nohup python3 -m codoxear.server >/tmp/codoxear-13780.log 2>&1 &`
+## Definition of Done
+- Requested change implemented and verifiable
+- Self-review and risks noted
+- Tests run or an explicit reason for skipping
+- Relevant comments or docs updated

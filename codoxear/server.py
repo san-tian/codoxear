@@ -16,10 +16,12 @@ import socketserver
 import subprocess
 import struct
 import sys
+import shutil
 import threading
 import time
 import traceback
 import urllib.parse
+import uuid
 import zlib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -173,9 +175,78 @@ def _render_harness_prompt(request: str | None) -> str:
         return base + "\n"
     return base + "\n\n---\n\nAdditional request from user: " + r + "\n"
 
+
+def _normalize_queue_list(raw: list[Any]) -> list[str]:
+    out: list[str] = []
+    for item in raw:
+        if not isinstance(item, str):
+            continue
+        if not item.strip():
+            continue
+        out.append(item)
+    return out
+
 _SESSION_ID_RE = re.compile(r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})", re.I)
+_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
 _METRICS_LOCK = threading.Lock()
 _METRICS: dict[str, list[float]] = {}
+
+def _strip_ansi_sequences(text: str) -> str:
+    out: list[str] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch != "\x1b":
+            out.append(ch)
+            i += 1
+            continue
+        i += 1
+        if i >= n:
+            break
+        nxt = text[i]
+        if nxt == "[":
+            i += 1
+            while i < n:
+                c = text[i]
+                if 0x40 <= ord(c) <= 0x7E:
+                    i += 1
+                    break
+                i += 1
+            continue
+        if nxt == "]":
+            i += 1
+            while i < n:
+                c = text[i]
+                if c == "\x07":
+                    i += 1
+                    break
+                if c == "\x1b" and (i + 1) < n and text[i + 1] == "\\":
+                    i += 2
+                    break
+                i += 1
+            continue
+        if nxt in ("P", "^", "_"):
+            i += 1
+            while i < n:
+                if text[i] == "\x1b" and (i + 1) < n and text[i + 1] == "\\":
+                    i += 2
+                    break
+                i += 1
+            continue
+        if nxt in ("(", ")", "*", "+", "-", ".", "/"):
+            i += 1
+            if i < n:
+                i += 1
+            continue
+        i += 1
+    return "".join(out)
+
+
+def _sanitize_tail_text(text: str) -> str:
+    cleaned = _strip_ansi_sequences(text)
+    cleaned = cleaned.replace("\r\n", "\n").replace("\r", "\n")
+    return _CONTROL_RE.sub("", cleaned)
 
 
 def _record_metric(name: str, value_ms: float) -> None:
@@ -244,6 +315,34 @@ def _drain_stream(f: Any) -> None:
         if not b:
             break
     f.close()
+
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return bool(default)
+    return raw.strip().lower() not in ("0", "false", "no", "off")
+
+def _tmux_pane_pid(tmux_bin: str, session_name: str, env: dict[str, str]) -> int | None:
+    try:
+        res = subprocess.run(
+            [tmux_bin, "list-panes", "-t", session_name, "-F", "#{pane_pid}"],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=1.5,
+        )
+    except Exception:
+        return None
+    if res.returncode != 0:
+        return None
+    for line in (res.stdout or "").splitlines():
+        try:
+            pid = int(line.strip())
+        except Exception:
+            continue
+        if pid > 0:
+            return pid
+    return None
 
 
 def _pid_alive(pid: int) -> bool:
@@ -671,6 +770,7 @@ class Session:
     cwd: str
     log_path: Path | None
     sock_path: Path
+    tmux_name: str | None = None
     busy: bool = False
     queue_len: int = 0
     token: dict[str, Any] | None = None
@@ -859,6 +959,20 @@ class SessionManager:
         tmp.write_text(json.dumps(obj, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
         os.replace(tmp, FILE_HISTORY_PATH)
 
+    def _cwd_key_from_value(self, cwd_raw: str) -> str | None:
+        if not isinstance(cwd_raw, str):
+            return None
+        cwd = cwd_raw.strip()
+        if not cwd or cwd == "?":
+            return None
+        try:
+            cwd_norm = str(Path(cwd).expanduser().resolve())
+        except Exception:
+            cwd_norm = cwd
+        if not cwd_norm:
+            return None
+        return f"cwd:{cwd_norm}"
+
     def _files_key_for_session(self, session_id: str) -> tuple[str, list[str], "Session"]:
         s = self._sessions.get(session_id)
         if not s:
@@ -924,6 +1038,145 @@ class SessionManager:
             self._files[key] = cur
         self._save_files()
         return list(cur)
+
+    def files_remove(self, session_id: str, path: str) -> list[str]:
+        p = str(path).strip()
+        if not p:
+            return self.files_get(session_id)
+        dirty = False
+        with self._lock:
+            key, legacy_keys, _s = self._files_key_for_session(session_id)
+            cur = list(self._files.get(key, []))
+            if not cur:
+                for lk in legacy_keys:
+                    legacy = self._files.get(lk)
+                    if isinstance(legacy, list) and legacy:
+                        cur = list(legacy)
+                        if lk != key:
+                            self._files.pop(lk, None)
+                            dirty = True
+                        break
+            if not cur:
+                return []
+            next_list = [x for x in cur if x != p]
+            if next_list:
+                self._files[key] = next_list
+            else:
+                if key in self._files:
+                    self._files.pop(key, None)
+            for lk in legacy_keys:
+                if lk == key:
+                    continue
+                legacy = self._files.get(lk)
+                if isinstance(legacy, list):
+                    legacy_next = [x for x in legacy if x != p]
+                    if legacy_next:
+                        self._files[lk] = legacy_next
+                    else:
+                        self._files.pop(lk, None)
+            dirty = True
+        if dirty:
+            self._save_files()
+        return list(next_list)
+
+    def files_remove_cwd(self, cwd_raw: str, path: str) -> list[str]:
+        p = str(path).strip()
+        if not p:
+            return []
+        cwd_key = self._cwd_key_from_value(cwd_raw)
+        if not cwd_key:
+            return []
+        dirty = False
+        out: list[str] = []
+        with self._lock:
+            keys = {cwd_key}
+            for s in self._sessions.values():
+                try:
+                    key, legacy_keys, _sref = self._files_key_for_session(s.session_id)
+                except KeyError:
+                    continue
+                if key != cwd_key:
+                    continue
+                for lk in legacy_keys:
+                    keys.add(lk)
+            for key in keys:
+                cur = self._files.get(key)
+                if not isinstance(cur, list) or not cur:
+                    continue
+                next_list = [x for x in cur if x != p]
+                if next_list == cur:
+                    continue
+                dirty = True
+                if next_list:
+                    self._files[key] = next_list
+                else:
+                    self._files.pop(key, None)
+            cur = self._files.get(cwd_key)
+            if isinstance(cur, list) and cur:
+                out = list(cur)
+        if dirty:
+            self._save_files()
+        return list(out)
+
+    def files_remove_all(self, path: str) -> int:
+        p = str(path).strip()
+        if not p:
+            return 0
+        dirty = False
+        removed = 0
+        with self._lock:
+            for key, cur in list(self._files.items()):
+                if not isinstance(cur, list) or not cur:
+                    continue
+                next_list = [x for x in cur if x != p]
+                if next_list == cur:
+                    continue
+                removed += len(cur) - len(next_list)
+                dirty = True
+                if next_list:
+                    self._files[key] = next_list
+                else:
+                    self._files.pop(key, None)
+        if dirty:
+            self._save_files()
+        return removed
+
+    def files_clear_scope(self, session_id: str) -> None:
+        dirty = False
+        with self._lock:
+            key, legacy_keys, _s = self._files_key_for_session(session_id)
+            for lk in legacy_keys:
+                if lk in self._files:
+                    self._files.pop(lk, None)
+                    dirty = True
+            if key in self._files:
+                self._files.pop(key, None)
+                dirty = True
+        if dirty:
+            self._save_files()
+
+    def files_clear_cwd(self, cwd_raw: str) -> None:
+        cwd_key = self._cwd_key_from_value(cwd_raw)
+        if not cwd_key:
+            return
+        dirty = False
+        with self._lock:
+            keys = {cwd_key}
+            for s in self._sessions.values():
+                try:
+                    key, legacy_keys, _sref = self._files_key_for_session(s.session_id)
+                except KeyError:
+                    continue
+                if key != cwd_key:
+                    continue
+                for lk in legacy_keys:
+                    keys.add(lk)
+            for key in keys:
+                if key in self._files:
+                    self._files.pop(key, None)
+                    dirty = True
+        if dirty:
+            self._save_files()
 
     def files_clear(self, session_id: str) -> None:
         dirty = False
@@ -1073,6 +1326,8 @@ class SessionManager:
             codex_pid = int(codex_pid_raw)
             broker_pid = int(broker_pid_raw)
             owned = (meta.get("owner") == "web") if isinstance(meta.get("owner"), str) else False
+            tmux_raw = meta.get("tmux_name")
+            tmux_name = tmux_raw.strip() if isinstance(tmux_raw, str) and tmux_raw.strip() else None
 
             log_path: Path | None = None
             if "log_path" not in meta:
@@ -1142,6 +1397,7 @@ class SessionManager:
                 cwd=str(cwd),
                 log_path=log_path,
                 sock_path=sock,
+                tmux_name=tmux_name,
                 busy=bool(resp.get("busy")),
                 queue_len=int(resp.get("queue_len")),
                 token=(resp.get("token") if isinstance(resp.get("token"), (dict, type(None))) else None),
@@ -1167,6 +1423,7 @@ class SessionManager:
                     prev.busy = s.busy
                     prev.queue_len = s.queue_len
                     prev.token = s.token
+                    prev.tmux_name = s.tmux_name
                     if prev.log_path != s.log_path:
                         prev.log_path = s.log_path
                         self._reset_log_caches(prev, meta_log_off=meta_log_off)
@@ -1339,6 +1596,7 @@ class SessionManager:
                         "harness_enabled": h_enabled,
                         "alias": alias,
                         "files": list(files),
+                        "tmux_name": s.tmux_name if isinstance(getattr(s, "tmux_name", None), str) else None,
                     }
                 )
 
@@ -1633,7 +1891,12 @@ class SessionManager:
         self._sock_call(s.sock_path, {"cmd": "shutdown"}, timeout_s=1.0)
         return True
 
-    def spawn_web_session(self, *, cwd: str, args: list[str] | None = None) -> dict[str, Any]:
+    def spawn_web_session(
+        self,
+        *,
+        cwd: str,
+        args: list[str] | None = None,
+    ) -> dict[str, Any]:
         argv = [sys.executable, "-m", "codoxear.broker", "--cwd", cwd, "--"]
         if args:
             argv.extend(args)
@@ -1644,6 +1907,36 @@ class SessionManager:
                 env.setdefault(k, v)
         env["CODEX_WEB_OWNER"] = "web"
         env.setdefault("CODEX_HOME", str(CODEX_HOME))
+
+        use_tmux = _env_flag("CODEX_WEB_TMUX", True)
+        tmux_bin = shutil.which("tmux") if use_tmux else None
+        if use_tmux and tmux_bin:
+            tmux_name = f"codoxear-web-{uuid.uuid4().hex[:8]}"
+            env.setdefault("CODEX_WEB_TMUX_INTERACTIVE", "1")
+            env["CODEX_WEB_TMUX_NAME"] = tmux_name
+            env_args = [f"{k}={v}" for k, v in env.items() if isinstance(k, str) and v is not None]
+            tmux_cmd = [tmux_bin, "new-session", "-d", "-s", tmux_name, "--", "env", *env_args, *argv]
+            try:
+                proc = subprocess.run(
+                    tmux_cmd,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    env=env,
+                    check=False,
+                    text=True,
+                )
+            except Exception as e:
+                raise RuntimeError(f"tmux spawn failed: {e}") from e
+            if proc.returncode != 0:
+                msg = (proc.stderr or "").strip()
+                msg = msg[-4000:] if msg else ""
+                raise RuntimeError(f"tmux spawn failed (rc={proc.returncode}): {msg}")
+            broker_pid = _tmux_pane_pid(tmux_bin, tmux_name, env) or 0
+            return {"broker_pid": int(broker_pid), "tmux_name": tmux_name}
+        if use_tmux and not tmux_bin:
+            sys.stderr.write("warning: CODEX_WEB_TMUX enabled but tmux not found; falling back to direct broker spawn.\n")
+            sys.stderr.flush()
 
         try:
             proc = subprocess.Popen(
@@ -1678,6 +1971,7 @@ class SessionManager:
             self.files_clear(session_id)
         return ok
 
+
     def send(self, session_id: str, text: str) -> dict[str, Any]:
         with self._lock:
             s = self._sessions.get(session_id)
@@ -1703,6 +1997,43 @@ class SessionManager:
                     raise ValueError("invalid broker send response")
                 s2.queue_len = int(resp.get("queue_len"))
         return resp
+
+    def _queue_call(self, session_id: str, req: dict[str, Any]) -> dict[str, Any]:
+        with self._lock:
+            s = self._sessions.get(session_id)
+            if not s:
+                raise KeyError("unknown session")
+            sock = s.sock_path
+        try:
+            resp = self._sock_call(sock, req, timeout_s=2.5)
+        except Exception:
+            if not _pid_alive(s.broker_pid) and not _pid_alive(s.codex_pid):
+                with self._lock:
+                    self._sessions.pop(session_id, None)
+                _unlink_quiet(sock)
+                _unlink_quiet(sock.with_suffix(".json"))
+                raise KeyError("unknown session")
+            raise
+        q_raw = resp.get("queue")
+        if not isinstance(q_raw, list):
+            raise ValueError("invalid broker queue response")
+        q = _normalize_queue_list(q_raw)
+        qlen = len(q)
+        with self._lock:
+            s2 = self._sessions.get(session_id)
+            if s2:
+                s2.queue_len = int(qlen)
+        return {"queue": q, "queue_len": int(qlen)}
+
+    def queue_get(self, session_id: str) -> dict[str, Any]:
+        return self._queue_call(session_id, {"cmd": "queue", "op": "get"})
+
+    def queue_set(self, session_id: str, queue: list[str]) -> dict[str, Any]:
+        cleaned = _normalize_queue_list(queue)
+        return self._queue_call(session_id, {"cmd": "queue", "op": "set", "queue": cleaned})
+
+    def queue_push(self, session_id: str, text: str, *, front: bool = False) -> dict[str, Any]:
+        return self._queue_call(session_id, {"cmd": "queue", "op": "push", "text": text, "front": bool(front)})
 
     def get_state(self, session_id: str) -> dict[str, Any]:
         with self._lock:
@@ -1754,7 +2085,7 @@ class SessionManager:
         tail = resp.get("tail")
         if not isinstance(tail, str):
             raise ValueError("invalid broker tail response")
-        return tail
+        return _sanitize_tail_text(tail)
 
     def inject_keys(self, session_id: str, seq: str) -> dict[str, Any]:
         with self._lock:
@@ -2045,6 +2376,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 _record_metric("api_messages_init_ms" if init else "api_messages_poll_ms", dt_total_ms)
                 return
 
+            if path.startswith("/api/sessions/") and path.endswith("/queue"):
+                if not _require_auth(self):
+                    self._unauthorized()
+                    return
+                parts = path.split("/")
+                session_id = parts[3] if len(parts) >= 4 else ""
+                try:
+                    resp = MANAGER.queue_get(session_id)
+                except KeyError:
+                    _json_response(self, 404, {"error": "unknown session"})
+                    return
+                _json_response(self, 200, resp)
+                return
+
             if path.startswith("/api/sessions/") and path.endswith("/tail"):
                 if not _require_auth(self):
                     self._unauthorized()
@@ -2177,6 +2522,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     return
                 session_id_raw = obj.get("session_id")
                 session_id = session_id_raw if isinstance(session_id_raw, str) and session_id_raw else ""
+                record_history = obj.get("record_history")
+                record_history = True if record_history is None else bool(record_history)
                 path_obj = Path(path_raw).expanduser()
                 if not path_obj.is_absolute():
                     path_obj = (Path.cwd() / path_obj).resolve()
@@ -2196,7 +2543,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 except ValueError as e:
                     _json_response(self, 400, {"error": str(e)})
                     return
-                if session_id:
+                if session_id and record_history:
                     try:
                         MANAGER.files_add(session_id, str(path_obj))
                     except KeyError:
@@ -2258,6 +2605,79 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 _json_response(self, 200, {"ok": True, "path": str(path_obj), "size": int(len(data))})
                 return
 
+            if path == "/api/files/remove":
+                if not _require_auth(self):
+                    self._unauthorized()
+                    return
+                body = _read_body(self)
+                body_text = body.decode("utf-8")
+                if not body_text.strip():
+                    raise ValueError("empty request body")
+                obj = json.loads(body_text)
+                if not isinstance(obj, dict):
+                    raise ValueError("invalid json body (expected object)")
+                path_raw = obj.get("path")
+                if not isinstance(path_raw, str) or not path_raw.strip():
+                    _json_response(self, 400, {"error": "path required"})
+                    return
+                cwd_raw = obj.get("cwd")
+                cwd = cwd_raw if isinstance(cwd_raw, str) and cwd_raw.strip() else ""
+                scope_raw = obj.get("scope")
+                scope = scope_raw if isinstance(scope_raw, str) else ""
+                session_id_raw = obj.get("session_id")
+                session_id = session_id_raw if isinstance(session_id_raw, str) and session_id_raw else ""
+                if scope and scope not in ("cwd", "session", "all"):
+                    _json_response(self, 400, {"error": "invalid scope"})
+                    return
+                if scope == "all":
+                    removed = MANAGER.files_remove_all(path_raw)
+                    _json_response(self, 200, {"ok": True, "removed": int(removed), "files": []})
+                    return
+                if cwd:
+                    files = MANAGER.files_remove_cwd(cwd, path_raw)
+                    _json_response(self, 200, {"ok": True, "files": list(files)})
+                    return
+                if not session_id:
+                    _json_response(self, 400, {"error": "session_id required"})
+                    return
+                try:
+                    files = MANAGER.files_remove(session_id, path_raw)
+                except KeyError:
+                    _json_response(self, 404, {"error": "unknown session"})
+                    return
+                _json_response(self, 200, {"ok": True, "files": list(files)})
+                return
+
+            if path == "/api/files/clear":
+                if not _require_auth(self):
+                    self._unauthorized()
+                    return
+                body = _read_body(self)
+                body_text = body.decode("utf-8")
+                if not body_text.strip():
+                    raise ValueError("empty request body")
+                obj = json.loads(body_text)
+                if not isinstance(obj, dict):
+                    raise ValueError("invalid json body (expected object)")
+                cwd_raw = obj.get("cwd")
+                cwd = cwd_raw if isinstance(cwd_raw, str) and cwd_raw.strip() else ""
+                session_id_raw = obj.get("session_id")
+                session_id = session_id_raw if isinstance(session_id_raw, str) and session_id_raw else ""
+                if cwd:
+                    MANAGER.files_clear_cwd(cwd)
+                    _json_response(self, 200, {"ok": True, "files": []})
+                    return
+                if not session_id:
+                    _json_response(self, 400, {"error": "session_id required"})
+                    return
+                try:
+                    MANAGER.files_clear_scope(session_id)
+                except KeyError:
+                    _json_response(self, 404, {"error": "unknown session"})
+                    return
+                _json_response(self, 200, {"ok": True, "files": []})
+                return
+
             if path.startswith("/api/sessions/") and path.endswith("/delete"):
                 if not _require_auth(self):
                     self._unauthorized()
@@ -2302,6 +2722,47 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     _json_response(self, 404, {"error": "unknown session"})
                     return
                 _json_response(self, 200, {"ok": True, "alias": alias})
+                return
+
+            if path.startswith("/api/sessions/") and path.endswith("/queue"):
+                if not _require_auth(self):
+                    self._unauthorized()
+                    return
+                parts = path.split("/")
+                session_id = parts[3] if len(parts) >= 4 else ""
+                body = _read_body(self)
+                body_text = body.decode("utf-8")
+                if not body_text.strip():
+                    raise ValueError("empty request body")
+                obj = json.loads(body_text)
+                if not isinstance(obj, dict):
+                    raise ValueError("invalid json body (expected object)")
+                if "queue" in obj and "text" in obj:
+                    _json_response(self, 400, {"error": "use queue or text, not both"})
+                    return
+                if "queue" in obj:
+                    q_raw = obj.get("queue")
+                    if not isinstance(q_raw, list):
+                        _json_response(self, 400, {"error": "queue must be a list"})
+                        return
+                    try:
+                        resp = MANAGER.queue_set(session_id, _normalize_queue_list(q_raw))
+                    except KeyError:
+                        _json_response(self, 404, {"error": "unknown session"})
+                        return
+                    _json_response(self, 200, resp)
+                    return
+                text = obj.get("text")
+                if not isinstance(text, str) or not text.strip():
+                    _json_response(self, 400, {"error": "text required"})
+                    return
+                front = bool(obj.get("front"))
+                try:
+                    resp = MANAGER.queue_push(session_id, text, front=front)
+                except KeyError:
+                    _json_response(self, 404, {"error": "unknown session"})
+                    return
+                _json_response(self, 200, resp)
                 return
 
             if path.startswith("/api/sessions/") and path.endswith("/send"):

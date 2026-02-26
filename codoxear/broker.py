@@ -38,6 +38,7 @@ PROC_ROOT = Path("/proc")
 
 CODEX_BIN = os.environ.get("CODEX_BIN", "codex")
 OWNER_TAG = os.environ.get("CODEX_WEB_OWNER", "")
+TMUX_NAME = os.environ.get("CODEX_WEB_TMUX_NAME", "")
 _CODEX_HOME_ENV = os.environ.get("CODEX_HOME")
 if _CODEX_HOME_ENV is None or (not _CODEX_HOME_ENV.strip()):
     DEFAULT_CODEX_HOME = Path.home() / ".codex"
@@ -66,6 +67,13 @@ def _dprint(msg: str) -> None:
         return
     sys.stderr.write(msg.rstrip("\n") + "\n")
     sys.stderr.flush()
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return bool(default)
+    return raw.strip().lower() not in ("0", "false", "no", "off")
 
 
 def _now() -> float:
@@ -315,10 +323,10 @@ def _response_call_finished(payload: dict[str, Any]) -> str | None:
     return call_id if isinstance(call_id, str) and call_id else None
 
 
-def _should_clear_busy_state(st: "State", now_ts: float) -> bool:
+def _should_clear_busy_state(st: "State", now_ts: float, *, ignore_queue: bool = False) -> bool:
     if not st.busy:
         return False
-    if st.queue or st.key_queue:
+    if (not ignore_queue) and (st.queue or st.key_queue):
         return False
     if st.pending_calls:
         return False
@@ -502,9 +510,45 @@ class Broker:
         self._emulate_terminal = (os.environ.get("CODEX_WEB_EMULATE_TERMINAL", "0") == "1") or (not sys.stdin.isatty())
         self._term_query_buf = b""
         self._stdin_termios: list[Any] | None = None
+        self._pty_decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
 
         self.codex_home = DEFAULT_CODEX_HOME
         self.sessions_dir = self.codex_home / "sessions"
+
+    def _drain_queue_once(self) -> None:
+        fd: int | None = None
+        msg: str | None = None
+        kq: list[bytes] = []
+        now_ts = _now()
+        with self._lock:
+            st = self.state
+            if not st:
+                return
+            if st.key_queue:
+                kq = st.key_queue[:]
+                st.key_queue.clear()
+            if st.queue:
+                msg = st.queue.pop(0)
+                st.pending_calls.clear()
+                st.busy = True
+                st.turn_open = True
+                st.turn_has_completion_candidate = False
+                st.last_interrupt_hint_ts = 0.0
+                if now_ts > st.last_turn_activity_ts:
+                    st.last_turn_activity_ts = now_ts
+            fd = st.pty_master_fd
+        if fd is None:
+            return
+        for b in kq:
+            try:
+                os.write(fd, b)
+            except Exception:
+                break
+        if msg is not None:
+            try:
+                _inject(fd, text=msg, suffix=_encode_enter())
+            except Exception:
+                pass
 
     def _discover_log_watcher(self) -> None:
         try:
@@ -567,6 +611,7 @@ class Broker:
             off = 0
 
         headless = (OWNER_TAG == "web")
+        allow_input = (not headless) or _env_flag("CODEX_WEB_TMUX_INTERACTIVE", False)
         sock_path = SOCK_DIR / f"{sid}-{os.getpid()}.sock"
         with self._lock:
             st = self.state
@@ -645,7 +690,7 @@ class Broker:
                     break
                 os.write(out_fd, b)
                 self._maybe_reply_to_terminal_queries(fd=fd, b=b)
-                s = b.decode("utf-8", errors="replace")
+                s = self._pty_decoder.decode(b)
                 if s:
                     with self._lock:
                         st2 = self.state
@@ -701,50 +746,20 @@ class Broker:
                 continue
 
             objs, new_off = _read_jsonl_from_offset(log_path, off, max_bytes=256 * 1024)
-            def drain_queues(*, clear_busy: bool) -> None:
-                q: list[str] = []
-                kq: list[bytes] = []
-                fd: int | None = None
-                with self._lock:
-                    st3 = self.state
-                    if not st3:
-                        return
-                    if clear_busy:
-                        st3.busy = False
-                    if not st3.queue and not st3.key_queue:
-                        return
-                    kq = st3.key_queue[:]
-                    st3.key_queue.clear()
-                    q = st3.queue[:]
-                    st3.queue.clear()
-                    fd = st3.pty_master_fd
-                if fd is None:
-                    return
-                for b in kq:
-                    try:
-                        os.write(fd, b)
-                    except Exception:
-                        break
-                for msg in q:
-                    try:
-                        _inject(fd, text=msg, suffix=_encode_enter())
-                    except Exception:
-                        break
-
             def maybe_mark_idle() -> None:
                 now_ts = _now()
-                should_clear = False
+                should_drain = False
                 with self._lock:
                     st3 = self.state
-                    if st3 and _should_clear_busy_state(st3, now_ts):
+                    if st3 and _should_clear_busy_state(st3, now_ts, ignore_queue=bool(st3.queue or st3.key_queue)):
                         st3.busy = False
                         st3.turn_open = False
                         st3.turn_has_completion_candidate = False
                         st3.last_turn_activity_ts = 0.0
                         st3.last_interrupt_hint_ts = 0.0
-                        should_clear = bool(st3.queue or st3.key_queue)
-                if should_clear:
-                    drain_queues(clear_busy=False)
+                        should_drain = bool(st3.queue or st3.key_queue)
+                if should_drain:
+                    self._drain_queue_once()
 
             if new_off == off:
                 maybe_mark_idle()
@@ -756,16 +771,16 @@ class Broker:
                 if st2:
                     st2.log_off = new_off
 
+            should_drain = False
             for obj in objs:
                 now_ts = _now()
-                aborted_or_rolled_back = False
                 if obj.get("type") == "event_msg":
                     p = obj.get("payload")
                     if not isinstance(p, dict):
                         raise ValueError("invalid rollout event_msg payload")
                     pt = p.get("type")
-                    if pt in ("turn_aborted", "thread_rolled_back"):
-                        aborted_or_rolled_back = True
+                    if pt in ("turn_aborted", "thread_rolled_back", "task_complete"):
+                        should_drain = True
                     if pt == "token_count":
                         info = p.get("info")
                         if isinstance(info, dict) and isinstance(info.get("total_token_usage"), dict):
@@ -789,8 +804,8 @@ class Broker:
                     st3 = self.state
                     if st3:
                         _apply_rollout_obj_to_state(st3, obj, now_ts=now_ts)
-                if aborted_or_rolled_back:
-                    drain_queues(clear_busy=False)
+            if should_drain:
+                self._drain_queue_once()
 
             maybe_mark_idle()
 
@@ -808,6 +823,7 @@ class Broker:
             "start_ts": st.start_ts,
             "log_path": str(st.log_path) if st.log_path else None,
             "sock_path": str(st.sock_path),
+            "tmux_name": TMUX_NAME if TMUX_NAME else None,
         }
         meta_path = st.sock_path.with_suffix(".json")
         SOCK_DIR.mkdir(parents=True, exist_ok=True)
@@ -893,6 +909,70 @@ class Broker:
                 f.write((json.dumps(resp) + "\n").encode("utf-8"))
                 f.flush()
                 return
+
+            if cmd == "queue":
+                op = req.get("op")
+                if op is None:
+                    op = "get"
+                if op == "get":
+                    with self._lock:
+                        st = self.state
+                        if not st:
+                            resp = {"error": "no state"}
+                        else:
+                            resp = {"queue": list(st.queue), "queue_len": len(st.queue)}
+                    f.write((json.dumps(resp) + "\n").encode("utf-8"))
+                    f.flush()
+                    return
+                if op == "set":
+                    raw = req.get("queue")
+                    if not isinstance(raw, list):
+                        resp = {"error": "queue must be a list"}
+                    else:
+                        cleaned = []
+                        for item in raw:
+                            if not isinstance(item, str):
+                                continue
+                            if not item.strip():
+                                continue
+                            cleaned.append(item)
+                        should_drain = False
+                        with self._lock:
+                            st = self.state
+                            if not st:
+                                resp = {"error": "no state"}
+                            else:
+                                st.queue = list(cleaned)
+                                resp = {"queue": list(st.queue), "queue_len": len(st.queue)}
+                                should_drain = bool(st.queue) and (not st.busy)
+                        if should_drain:
+                            self._drain_queue_once()
+                    f.write((json.dumps(resp) + "\n").encode("utf-8"))
+                    f.flush()
+                    return
+                if op == "push":
+                    text = req.get("text")
+                    if not isinstance(text, str) or not text.strip():
+                        resp = {"error": "text required"}
+                    else:
+                        front = bool(req.get("front"))
+                        should_drain = False
+                        with self._lock:
+                            st = self.state
+                            if not st:
+                                resp = {"error": "no state"}
+                            else:
+                                if front:
+                                    st.queue.insert(0, text)
+                                else:
+                                    st.queue.append(text)
+                                resp = {"queue": list(st.queue), "queue_len": len(st.queue)}
+                                should_drain = bool(st.queue) and (not st.busy)
+                        if should_drain:
+                            self._drain_queue_once()
+                    f.write((json.dumps(resp) + "\n").encode("utf-8"))
+                    f.flush()
+                    return
 
             if cmd == "keys":
                 seq_raw = req.get("seq")
@@ -1027,6 +1107,7 @@ class Broker:
         self.sessions_dir.mkdir(parents=True, exist_ok=True)
         start_ts = _now()
         headless = (OWNER_TAG == "web")
+        allow_input = (not headless) or _env_flag("CODEX_WEB_TMUX_INTERACTIVE", False)
 
         pid, master_fd = pty.fork()
         if pid == 0:
@@ -1057,7 +1138,7 @@ class Broker:
                 traceback.print_exc()
                 os._exit(127)
 
-        if (not headless) and (not self._emulate_terminal) and sys.stdin.isatty():
+        if allow_input and (not self._emulate_terminal) and sys.stdin.isatty():
             try:
                 fd = sys.stdin.fileno()
                 self._stdin_termios = termios.tcgetattr(fd)
@@ -1095,7 +1176,7 @@ class Broker:
         self._write_meta()
         threading.Thread(target=self._sock_server, daemon=True).start()
         threading.Thread(target=self._pty_to_stdout, daemon=True).start()
-        if not headless:
+        if allow_input and sys.stdin.isatty():
             threading.Thread(target=self._stdin_to_pty, daemon=True).start()
         threading.Thread(target=self._log_watcher, daemon=True).start()
         threading.Thread(target=self._discover_log_watcher, daemon=True).start()

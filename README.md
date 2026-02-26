@@ -59,11 +59,20 @@ Install Codoxear (installs `codoxear-server` and `codoxear-broker`):
 
 5. On your phone, open `http://<your-computer>:8743`, enter the password, and select the session.
 
-6. (Optional) Enable Harness mode for a session:
+6. Queue follow-up messages (server-side):
 
-   - Click the Harness icon in the top bar, toggle it on, and edit the injected text.
-   - Harness runs in the server process (not the browser tab), so it continues even if you close the web page.
-   - Settings are per session; enabled sessions show a `harness` badge in the sidebar.
+   - When a response is running, choose "Send after current" to queue the next message.
+   - Queued messages live on the server (broker) and continue even if you close the web page.
+   - Use the queue button to review or edit queued messages.
+
+## Quick status checks (SSH-friendly)
+
+If you want to see whether a web-owned session is still running without opening the UI:
+
+- `scripts/codoxear-status --web --last`
+- `scripts/codoxear-status --web --list`
+
+The status helper reads the broker socket sidecars and reports `running/idle`, queue length, and last log update time.
 
 ## User stories
 
