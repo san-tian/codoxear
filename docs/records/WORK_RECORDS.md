@@ -3,6 +3,24 @@
 This document summarizes the team's current work focus. Each session appears under its own heading, and the detailed record lives under `docs/records/sessions/`.
 
 ## Current Focus by Session
+- `docs/records/sessions/2026-03-02-markdown-preview-image-support.md`: Add image rendering support to markdown preview with proper relative path resolution.
+- `docs/records/sessions/2026-03-02-sidebar-collapse-toggle-button.md`: Add a topbar menu button to collapse/expand the left navigation on desktop and open/close the sidebar drawer on mobile.
+- `docs/records/sessions/2026-03-02-tmux-attach-button-relocation.md`: Move tmux attach button from Session Tools modal to topbar actions for better accessibility.
+- `docs/records/sessions/2026-03-02-claude-thinking-idle-false-positive.md`: Fix Claude sessions incorrectly showing idle during long thinking phases after initial text output by requiring explicit turn closure.
+- `docs/records/sessions/2026-03-02-claude-send-now-message-order.md`: Fix Claude chat ordering when `Send now` injects a user prompt mid-reply by rendering chat rows in stable timestamp order and re-positioning acknowledged pending user rows.
+- `docs/records/sessions/2026-03-02-tmux-locale-env-doc.md`: Document that tmux-backed launches must set UTF-8 locale environment (`LANG=en_US.UTF-8`, `LC_ALL=en_US.UTF-8`) in service/runtime configuration.
+- `docs/records/sessions/2026-03-02-claude-leading-bang-send-escape.md`: Prevent Claude prompts that start with markdown image syntax (`![...]`) from being interpreted as local shell `!` commands by escaping them on send/queue paths.
+- `docs/records/sessions/2026-03-02-claude-ended-session-busy-false-positive.md`: Prevent finished Claude sessions from staying busy due stale log-only busy fallback when broker state is already idle.
+- `docs/records/sessions/2026-03-02-claude-user-input-disappearing.md`: Keep Claude user turns visible by increasing Claude history seed windows and preserving recent user rows during DOM trimming.
+- `docs/records/sessions/2026-03-02-claude-message-recognition-and-live-tail-fix.md`: Filter Claude placeholder assistant rows (dot/blank) from chat events and reduce Claude live-tail spinner noise in Session Tools.
+- `docs/records/sessions/2026-03-02-claude-new-session-log-bind-conflict.md`: Prevent new Claude sessions from binding to logs already claimed by existing live Claude sessions in the same workspace.
+- `docs/records/sessions/2026-03-02-cli-choice-modal.md`: Add CLI selection modal for creating/duplicating sessions to replace multi-click CLI switching workflow.
+- `docs/records/sessions/2026-03-02-remove-sidebar-cli-toggle.md`: Remove the always-visible sidebar CLI toggle button (Codex/Claude/Gemini) from the top-left nav while keeping CLI choice in create/duplicate modals.
+- `docs/records/sessions/2026-03-02-topbar-elegance-improvements.md`: Refined the topbar navigation UI with an airy layout, softer backdrop blur, and modernized typography and buttons.
+- `docs/records/sessions/2026-03-02-chat-file-link-open-file-page.md`: Make local file markdown links open the dedicated fullscreen file-view page (pop-out style) instead of broken route navigation.
+- `docs/records/sessions/2026-03-02-portmap-ipv6-listener-fix.md`: Fix public `13780` access failures on IPv6 by adding a supervised IPv6 `13780 -> 8743` forwarder.
+- `docs/records/sessions/2026-03-02-ui-elegance-improvements.md`: Optimize Codoxear UI with softer colors, dynamic hover effects, layered shadows, and a refined chat/composer aesthetic.
+- `docs/records/sessions/2026-03-02-supervisord-autostart-and-portmap-restore.md`: Restore missing supervisord `codoxear` autostart, standardize service bind to 8743, and add a supervised `13780 -> 8743` port map.
 - `docs/records/sessions/2026-03-02-systemd-user-killmode-session-persistence.md`: Add a verified `systemd --user` restart checklist (`KillMode`/cgroup diagnostics + override fix) to prevent sidebar sessions from disappearing after service restart.
 - `docs/records/sessions/2026-03-02-deployment-session-persistence.md`: Add deployment tutorial guidance to keep sessions across updates/restarts and fix stale runtime-path notes after worktree consolidation.
 - `docs/records/sessions/2026-03-02-session-cli-logo-color-fix.md`: Fix Codex sidebar logo color by replacing monochrome `currentColor` asset with a colored transparent variant.
@@ -23,7 +41,7 @@ This document summarizes the team's current work focus. Each session appears und
 - `docs/records/sessions/2026-02-27-claude-log-bind-and-pending-fix.md`: Fix Claude web-session reply path (auth/env + log binding) and keep pending user echoes when switching sessions.
 - `docs/records/sessions/2026-02-27-queue-turn-end-gating.md`: Gate queue release on turn-end markers and harden idle fallback against commentary-phase false idles.
 - `docs/records/sessions/2026-02-27-claude-code-support.md`: Add first-class Claude Code CLI support alongside Codex (broker/server/ui/log parsing/resume helper).
-- `docs/records/sessions/2026-02-27-supervisord-daemon.md`: Confirm Codoxear daemon management via supervisord on port 13780 and document operations.
+- `docs/records/sessions/2026-02-27-supervisord-daemon.md`: Confirm Codoxear daemon management via supervisord and document operations.
 - `docs/records/sessions/2026-02-26-upstream-merge.md`: Merge upstream/main into dev and resolve conflicts.
 - `docs/records/sessions/2026-02-26-live-tail-line-breaks-rollback.md`: Roll back forced line breaks in live tail sanitization.
 - `docs/records/sessions/2026-02-26-web-tmux-input-fix.md`: Fix allow_input NameError so web sessions start.

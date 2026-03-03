@@ -10,6 +10,7 @@ from unittest.mock import patch
 from codoxear.cli_support import cli_bin
 from codoxear.cli_support import cli_home
 from codoxear.cli_support import cli_logs_dir
+from codoxear.cli_support import claude_assistant_text
 from codoxear.cli_support import infer_cli_from_log_path
 from codoxear.cli_support import is_gemini_chat_log_path
 from codoxear.cli_support import normalize_cli_name
@@ -106,6 +107,35 @@ class TestCliSupport(unittest.TestCase):
                 self.assertEqual(len(objs), 2)
                 self.assertEqual(objs[1].get("type"), "assistant")
                 self.assertFalse(bool(objs[1].get("_gemini_turn_end")))
+
+    def test_claude_assistant_text_filters_dot_placeholder_and_blank(self) -> None:
+        dot_obj = {
+            "type": "assistant",
+            "message": {
+                "stop_reason": None,
+                "usage": {"output_tokens": 1},
+                "content": [{"type": "text", "text": "."}],
+            },
+        }
+        self.assertIsNone(claude_assistant_text(dot_obj))
+
+        blank_obj = {
+            "type": "assistant",
+            "message": {
+                "content": [{"type": "text", "text": "\n\n"}],
+            },
+        }
+        self.assertIsNone(claude_assistant_text(blank_obj))
+
+        ok_obj = {
+            "type": "assistant",
+            "message": {
+                "stop_reason": "end_turn",
+                "usage": {"output_tokens": 2},
+                "content": [{"type": "text", "text": "OK"}],
+            },
+        }
+        self.assertEqual(claude_assistant_text(ok_obj), "OK")
 
 
 if __name__ == "__main__":

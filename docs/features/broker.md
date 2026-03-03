@@ -30,6 +30,7 @@ Notes:
 - Linux-only due to `/proc`, `pty`, and `termios`.
 - `CODEX_WEB_EMULATE_TERMINAL=1` forces terminal query emulation when no TTY is attached.
 - `CODEX_WEB_TMUX_INTERACTIVE=1` allows stdin passthrough for web-launched sessions running inside tmux.
+- When launching tmux-backed web sessions, set `LANG=en_US.UTF-8` and `LC_ALL=en_US.UTF-8` in the parent service environment so child CLIs run with a UTF-8 locale.
 - When `CODEX_WEB_UNSET_ANTHROPIC_AUTH_TOKEN=1`, headless login-shell launches unset `ANTHROPIC_AUTH_TOKEN` right before exec so shell rc exports do not reintroduce auth-token mode.
 
 ## Socket protocol
@@ -92,6 +93,7 @@ Call stack:
 
 Notes:
 - When a new `/new` thread hint is detected, the broker clears the current log binding and re-discovers.
+- Claude/Gemini fallback discovery skips log files already claimed by other live broker sidecars, so creating a new session in the same `cwd` does not attach to an existing session's log.
 - `CODEX_WEB_BUSY_QUIET_SECONDS` and `CODEX_WEB_BUSY_INTERRUPT_GRACE_SECONDS` tune busy clearing heuristics.
 - `CODEX_WEB_IDLE_TURN_END_QUIET_SECONDS` controls the quiet window for idle turn-end fallback used by queue release.
 - Assistant phase `commentary` does not count as a completion candidate; `final_answer` (or messages without phase) does.

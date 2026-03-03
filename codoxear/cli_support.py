@@ -402,16 +402,37 @@ def claude_assistant_content_parts(obj: dict[str, Any]) -> list[dict[str, Any]]:
     return [part for part in content if isinstance(part, dict)]
 
 
+def _claude_is_progress_placeholder_text(obj: dict[str, Any], text: str) -> bool:
+    marker = text.strip()
+    if marker not in (".", "..", "...", "…"):
+        return False
+    msg = obj.get("message")
+    if not isinstance(msg, dict):
+        return False
+    # Claude can emit "." placeholders while tools are running.
+    if msg.get("stop_reason") is not None:
+        return False
+    usage = msg.get("usage")
+    if isinstance(usage, dict):
+        out_tok = usage.get("output_tokens")
+        if isinstance(out_tok, (int, float)) and float(out_tok) <= 1.0:
+            return True
+    return True
+
+
 def claude_assistant_text(obj: dict[str, Any]) -> str | None:
     out: list[str] = []
     for part in claude_assistant_content_parts(obj):
         if part.get("type") != "text":
             continue
         text = part.get("text")
-        if isinstance(text, str) and text:
+        if isinstance(text, str) and text.strip():
             out.append(text)
     if out:
-        return "".join(out)
+        joined = "".join(out)
+        if _claude_is_progress_placeholder_text(obj, joined):
+            return None
+        return joined
     return None
 
 

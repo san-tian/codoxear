@@ -22,8 +22,9 @@ Key flow:
 Notes:
 - The list shows busy/idle badges and queue length from broker state.
 - Web-owned sessions display a delete button.
-- New session creation prompts only for `cwd`; CLI comes from the sidebar CLI toggle button (`Codex`/`Claude`/`Gemini`), and duplicate-session keeps the source session CLI.
-- The selected spawn CLI is cached in `localStorage` (`codexweb.spawnCli`) as the next default.
+- New/duplicate session flows prompt for `cwd` and then open a CLI choice modal (`Codex`/`Claude`/`Gemini`) before launch.
+- The last selected CLI is cached in `localStorage` (`codexweb.spawnCli`) for internal default tracking, but there is no always-visible sidebar CLI toggle button.
+- The topbar has a sidebar toggle button (menu icon): on desktop it collapses/expands the left navigation, and on mobile it opens/closes the sidebar drawer.
 - Sessions are grouped by workspace (cwd) and sorted by display name within each workspace.
 - Each session card shows a compact colored CLI logo chip (Codex/Claude/Gemini) before the title, rendered on a transparent background.
 - Files are displayed once per workspace, not within each session row.
@@ -64,6 +65,7 @@ Notes:
 - Queued messages are shown in the queue viewer (not as chat bubbles) until they are drained and logged.
 - Queued messages are stored server-side via `/api/sessions/<id>/queue`, so they continue even if the browser closes. The broker releases one queued message after each turn end (or idle fallback) to avoid interrupting active replies.
 - In the send-choice dialog, `Send after current` clears the composer only after queue push succeeds; if queue push fails, the text stays in the composer.
+- For Claude sessions, outgoing prompts that start with markdown image syntax (`![...](...)`) are auto-escaped to `\![...](...)` before send/queue so Claude does not treat leading `!` as a local shell command.
 - The queued-message editor skips list re-renders while a queue textarea is focused to prevent IME interruptions; the list refreshes once focus leaves.
 - Composer drafts are stored per session in `localStorage` and restored when switching sessions.
 
@@ -84,6 +86,9 @@ Key flow:
 
 Notes:
 - The UI uses an `init=1` fetch to seed recent history on selection, plus an older-messages pager.
+- Claude sessions use larger `init`/older page sizes to reduce cases where the latest user turn falls out of the seeded history window after long assistant streams.
+- DOM row trimming preserves recent user rows where possible, so long assistant bursts are less likely to push user messages out of view.
+- Chat rows are rendered with stable timestamp ordering (user-before-assistant when timestamps tie), so Claude `send now` mid-reply no longer leaves the new user turn behind later assistant chunks.
 - The UI suppresses near-duplicate user/assistant events (same role + text within a short window) to guard against occasional double renders.
 
 ## Attachments and interrupts
@@ -121,6 +126,7 @@ Notes:
 - On desktop the file viewer uses a consistent height across view/edit/preview so the editor does not collapse.
 - Markdown preview renders Mermaid code fences (language `mermaid`) as diagrams when Mermaid is available.
 - The file viewer can pop out into a dedicated full-screen tab via the "Pop out" action, or by using `?file=...&session_id=...&mode=edit&fullscreen=1` in the URL.
+- Chat/file markdown links that target local absolute paths (for example `[/root/code/codoxear/codoxear/static/app.js]`) open directly into the dedicated full-screen file page (`?file=...&fullscreen=1`) instead of navigating to a broken app route.
 - The file viewer header includes "Copy path" and "Copy name" actions for the current file.
 - Full-screen pop-out tabs set the browser tab title to the current filename.
 - Full-screen mode uses distinct header/status bars, hides the inline open-row, and keeps view/edit/preview content wrapped in a card so it no longer looks like the floating modal. Use the header "Open" action to enter a new path.

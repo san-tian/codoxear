@@ -12,7 +12,8 @@ In this project, "production" refers to the service running on this host (the sa
    - `CODEX_WEB_CLI=codex codoxear-broker -- <codex args>`
    - `CODEX_WEB_CLI=claude codoxear-broker -- <claude args>`
    - `CODEX_WEB_CLI=gemini codoxear-broker -- <gemini args>`
-4. Expose the configured port (this host currently uses `13780`) to the internet (or proxy it) and visit `http://<public-host>:<port>/` (or your HTTPS proxy URL).
+4. Expose the configured service port (`8743` on this host) to the internet, or expose a public port that forwards/proxies to `8743`.
+5. Visit `http://<public-host>:<public-port>/` (or your HTTPS proxy URL).
 
 ## Network security
 - The server does not provide TLS or strong authentication beyond a password.
@@ -21,7 +22,8 @@ In this project, "production" refers to the service running on this host (the sa
 - Treat the password as the only gate; assume anyone who can reach the port can observe or modify traffic.
 
 ## Public access options
-- Direct port forward: expose your configured port (`13780` on this host) on your router or cloud firewall, and restrict source IPs if possible.
+- Direct port forward: expose your configured service port (`8743`) on your router or cloud firewall, and restrict source IPs if possible.
+- Public/internal port mapping: expose public `13780` and forward/proxy to local `8743`.
 - Reverse proxy: terminate TLS and optionally mount under a subpath via `CODEX_WEB_URL_PREFIX`.
 
 ## URL prefix
@@ -41,6 +43,10 @@ To avoid losing active sessions on updates:
 1. Run web-owned sessions under tmux:
    - Set `CODEX_WEB_TMUX=1` in the service environment.
    - Keep `tmux` installed on the host.
+   - Set UTF-8 locale env in the same service environment before tmux spawn:
+     - `LANG=en_US.UTF-8`
+     - `LC_ALL=en_US.UTF-8`
+   - For this host's `supervisord`, put both vars in the `codoxear` program `environment=` line.
 2. Restart only the Codoxear server service during deploy:
    - Avoid blanket process-kill commands such as `pkill -f codoxear` that can kill broker children too.
 3. Keep service user and `HOME` stable:
@@ -88,15 +94,34 @@ Recommended deploy sequence (supervisord):
 ## Daemon operations (this host)
 This host runs Codoxear under `supervisord` instead of `systemd`.
 
-- Program name: `codoxear`
+- Program names: `codoxear`, `codoxear-portmap`, `codoxear-portmap-v6`
 - Supervisor config: `/mlplatform/supervisord/supervisord.conf`
-- Current runtime env in supervisor config: `CODEX_WEB_PORT=13780`, `CODEX_WEB_HOST=0.0.0.0`
+- Current web bind: `CODEX_WEB_PORT=8743` (from `/root/code/codoxear/.env`)
 
 Common commands:
 - `supervisorctl status codoxear`
+- `supervisorctl status codoxear-portmap`
+- `supervisorctl status codoxear-portmap-v6`
 - `supervisorctl restart codoxear`
+- `supervisorctl restart codoxear-portmap`
+- `supervisorctl restart codoxear-portmap-v6`
 - `supervisorctl start codoxear`
 - `supervisorctl stop codoxear`
+
+## Public `13780` to local `8743` mapping (this host)
+This host keeps Codoxear itself on `8743` and uses a small supervised TCP forwarder for compatibility with existing public `13780` access.
+
+- Forwarder programs: `codoxear-portmap`, `codoxear-portmap-v6`
+- IPv4 mapping: `0.0.0.0:13780 -> 127.0.0.1:8743`
+- IPv6 mapping: `[::]:13780 -> [::1]:8743`
+- Forwarder command path: `/usr/local/bin/tcp-port-forward`
+
+Verification:
+- `supervisorctl status codoxear codoxear-portmap codoxear-portmap-v6`
+- `curl -4 http://127.0.0.1:8743/`
+- `curl -6 http://[::1]:8743/`
+- `curl -4 http://127.0.0.1:13780/`
+- `curl -6 http://[::1]:13780/`
 
 ## Gemini all-approve mode (this host)
 To run web-owned Gemini sessions in "all approve" mode without changing app code:

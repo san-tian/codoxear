@@ -58,9 +58,11 @@ Call stack:
 Notes:
 - Web-owned sessions are spawned with `CODEX_WEB_OWNER=web`; `POST /api/sessions` accepts optional `cli` (`codex`, `claude`, or `gemini`).
 - Spawned brokers receive `CODEX_WEB_CLI=<cli>` and matching home/bin env (`CODEX_HOME/CODEX_BIN`, `CLAUDE_HOME/CLAUDE_BIN`, or `GEMINI_HOME/GEMINI_BIN`).
+- Web-owned Claude spawns inject a generated `--session-id <uuid>` unless explicit session-control args are provided (`--resume`, `--continue`, `--session-id`, `--from-pr`), so "new session" does not reuse an existing Claude thread.
 - Claude web sessions default to API-key auth mode when both `ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN` are visible (including tmux global env), and explicitly unset `ANTHROPIC_AUTH_TOKEN` for the child unless `CODEX_WEB_CLAUDE_PREFER_API_KEY=0`.
 - Web-owned sessions can be started under tmux when `CODEX_WEB_TMUX=1`; session listings include `tmux_name` when available.
 - When tmux is enabled, `CODEX_WEB_TMUX_INTERACTIVE=1` allows attaching to the tmux session and sending input.
+- Tmux-backed spawns should run with UTF-8 locale env (`LANG=en_US.UTF-8`, `LC_ALL=en_US.UTF-8`) in the Codoxear service environment to avoid locale/encoding issues in child CLI processes.
 - Terminal-owned sessions are attach-only; the UI hides delete for them.
 - Session listings include `cli` and `last_assistant_ts` to help the UI render resume commands and unread response indicators.
 
@@ -123,6 +125,9 @@ Notes:
 - `/messages` supports `init=1` for chat index seeding and `before` for older history paging.
 - `/tail`, `/interrupt`, and `/inject_image` are UI helpers for debug, interruption, and image attach.
 - `/tail` strips ANSI/control sequences so the live tail stays readable and decodes PTY output incrementally to avoid splitting multibyte characters.
+- Claude `/tail` responses apply extra noise filtering for spinner/counter redraw artifacts to keep Session Tools output readable.
+- For Claude sessions, `/send` escapes prompts that start with `![` to `\![` so markdown image syntax is sent as literal text instead of being interpreted as Claude local-shell `!` command mode.
+- Busy synthesis now treats broker state as primary and applies log-derived busy only within a short recency window (`CODEX_WEB_LOG_BUSY_FROM_LOG_STALE_SECONDS`, default `45s`) to prevent stale Claude sessions from remaining busy indefinitely.
 
 ## Server-side queue
 How users use it:
@@ -155,7 +160,8 @@ Call stack:
 Notes:
 - Queue length is surfaced in `/api/sessions` and `/api/sessions/<id>/messages`.
 - The queue list is fetched on demand via `/api/sessions/<id>/queue`.
- - Tests: `python3 -m unittest tests.test_server_queue`.
+- Claude queue writes (`push`/`set`) apply the same leading-`![` escape as `/send` to keep queued markdown image prompts from being executed as shell commands.
+- Tests: `python3 -m unittest tests.test_server_queue`.
 
 ## File API
 How users use it:

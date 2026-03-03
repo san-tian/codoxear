@@ -79,6 +79,27 @@ class TestServerChatFlags(unittest.TestCase):
         self.assertTrue(flags["turn_aborted"])
         self.assertIn("Read", diag["tool_names"])
 
+    def test_claude_dot_placeholder_does_not_render_chat_event(self) -> None:
+        events, _meta, _flags, _diag = _extract_chat_events(
+            [
+                {"type": "user", "message": {"content": [{"type": "text", "text": "hello"}]}},
+                {
+                    "type": "assistant",
+                    "message": {
+                        "stop_reason": None,
+                        "usage": {"output_tokens": 1},
+                        "content": [{"type": "text", "text": "."}],
+                    },
+                },
+                {
+                    "type": "assistant",
+                    "message": {"content": [{"type": "text", "text": "done"}]},
+                },
+            ]
+        )
+        self.assertEqual([e["role"] for e in events], ["user", "assistant"])
+        self.assertEqual(events[-1]["text"], "done")
+
     def test_gemini_assistant_marks_turn_end(self) -> None:
         _events, _meta, flags, _diag = _extract_chat_events(
             [

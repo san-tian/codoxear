@@ -17,7 +17,7 @@ Key flow:
 1. Read JSONL tail chunks.
 2. Extract chat events from both formats:
    - Codex: `event_msg` user + `response_item` assistant text
-   - Claude: top-level `user`/`assistant` messages with text parts
+   - Claude: top-level `user`/`assistant` messages with text parts (filters whitespace-only rows and progress placeholder dots like `"."`)
    - Gemini: `messages[]` records mapped to synthesized `user`/`assistant` events
 3. Track tool usage and turn boundaries for UI indicators:
    - Codex: `task_complete` / `turn_aborted`
@@ -47,12 +47,14 @@ Key flow:
    - Codex: `task_complete`, `turn_aborted`, `thread_rolled_back`
    - Claude: `system.subtype=turn_duration|api_error`
    - Gemini: synthesized assistant turn-end markers from completion rows in session-file updates
-4. Return idle when the turn is closed and the last terminal event is assistant/aborted, or when an open turn has an assistant completion candidate.
+4. Return idle based on format-specific logic:
+   - **Claude**: Requires explicit turn closure (`turn_duration`/`api_error`). Open turns stay busy even with text output, preventing false idle during long thinking phases.
+   - **Codex/Gemini**: Returns idle when turn is closed with assistant/aborted terminal event, or when an open turn has an assistant completion candidate.
 
 Notes:
 - The server combines broker `busy` state with log-derived idle state.
 - Large logs cap their scan size with `CODEX_WEB_CHAT_INIT_MAX_SCAN_BYTES` and related settings.
-- Gemini thinking/tool-only rows do not close turns; they keep the turn open so long-running reasoning is not misclassified as idle.
+- Claude and Gemini thinking/tool-only phases do not close turns; they keep the turn open so long-running reasoning is not misclassified as idle.
 
 ## Token statistics
 How users use it:

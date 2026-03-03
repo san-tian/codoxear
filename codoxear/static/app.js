@@ -517,9 +517,68 @@
         return null;
       }
 
-      function renderInlineMd(s) {
+      function stripFileRefSuffix(path) {
+        let p = String(path || "").trim();
+        if (!p) return "";
+        p = p.replace(/#L\d+(?:C\d+)?(?:-L?\d+(?:C\d+)?)?$/i, "");
+        const m = p.match(/^(\/.+):(\d+)(?::(\d+))?$/);
+        if (m) return m[1];
+        return p;
+      }
+
+      function parseLocalFilePathRef(rawRef) {
+        let raw = String(rawRef || "").trim();
+        if (!raw) return "";
+        if (raw.startsWith("<") && raw.endsWith(">")) raw = raw.slice(1, -1).trim();
+        const isRawAbsPath = raw.startsWith("/");
+        const isRawFileUrl = raw.toLowerCase().startsWith("file://");
+        const isRawAbsUrl = /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(raw);
+        if (!isRawAbsPath && !isRawFileUrl && !isRawAbsUrl) return "";
+
+        let candidate = raw;
+        if (isRawFileUrl) {
+          try {
+            candidate = new URL(raw).pathname || "";
+          } catch {
+            return "";
+          }
+        } else if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(raw) && !raw.startsWith("/")) {
+          return "";
+        } else {
+          try {
+            const asUrl = new URL(raw, location.origin);
+            if (asUrl.origin !== location.origin) return "";
+            candidate = asUrl.pathname || "";
+          } catch {
+            // Ignore and fall through to raw candidate.
+          }
+        }
+
+        try {
+          candidate = decodeURIComponent(candidate);
+        } catch {
+          // Keep undecoded path when invalid URI encoding is present.
+        }
+        candidate = stripFileRefSuffix(candidate);
+        if (!candidate.startsWith("/")) return "";
+        if (candidate === "/" || candidate.startsWith("/api/") || candidate.startsWith("/static/")) return "";
+        return candidate;
+      }
+
+      function buildFileLaunchHref(path) {
+        const clean = String(path || "").trim();
+        if (!clean) return "";
+        const url = new URL(resolveAppUrl("/"));
+        url.searchParams.set("file", clean);
+        url.searchParams.set("mode", "view");
+        url.searchParams.set("fullscreen", "1");
+        return url.toString();
+      }
+
+      function renderInlineMd(s, basePath) {
         const raw = String(s ?? "");
-        const re = /`([^`]+)`|\[([^\]]+)\]\(([^)]+)\)|\*\*([^*]+)\*\*/g;
+        // Updated regex to handle images: ![alt](url) and links: [text](url)
+        const re = /`([^`]+)`|!\[([^\]]*)\]\(([^)]+)\)|\[([^\]]+)\]\(([^)]+)\)|\*\*([^*]+)\*\*/g;
         let out = "";
         let last = 0;
         for (;;) {
@@ -527,13 +586,49 @@
           if (!m) break;
           out += escapeHtml(raw.slice(last, m.index));
           if (m[1] !== undefined) {
+            // Inline code: `code`
             out += `<code>${escapeHtml(m[1])}</code>`;
           } else if (m[2] !== undefined) {
-            const href = safeUrl(m[3]);
-            if (!href) out += `${escapeHtml(m[2])} (${escapeHtml(m[3])})`;
-            else out += `<a href="${escapeHtml(href)}" target="_blank" rel="noreferrer noopener">${escapeHtml(m[2])}</a>`;
+            // Image: ![alt](url)
+            const alt = m[2];
+            const url = m[3];
+
+            // Resolve relative paths
+            let resolvedUrl = url;
+            if (basePath && !url.startsWith('/') && !url.match(/^https?:\/\//)) {
+              // Relative path - resolve relative to basePath directory
+              const baseDir = basePath.substring(0, basePath.lastIndexOf('/'));
+              resolvedUrl = baseDir ? `${baseDir}/${url}` : url;
+            }
+
+            const filePath = parseLocalFilePathRef(resolvedUrl);
+            if (filePath) {
+              // Local file path
+              out += `<img src="${escapeHtml(filePath)}" alt="${escapeHtml(alt)}" loading="lazy" />`;
+            } else {
+              const href = safeUrl(resolvedUrl);
+              if (!href) out += `![${escapeHtml(alt)}](${escapeHtml(url)})`;
+              else out += `<img src="${escapeHtml(href)}" alt="${escapeHtml(alt)}" loading="lazy" />`;
+            }
           } else if (m[4] !== undefined) {
-            out += `<strong>${escapeHtml(m[4])}</strong>`;
+            // Link: [text](url)
+            const filePath = parseLocalFilePathRef(m[5]);
+            if (filePath) {
+              const href = buildFileLaunchHref(filePath);
+              if (!href) out += `${escapeHtml(m[4])} (${escapeHtml(m[5])})`;
+              else {
+                out += `<a href="${escapeHtml(href)}" target="_blank" rel="noreferrer noopener" data-file-path="${escapeHtml(filePath)}">${escapeHtml(
+                  m[4]
+                )}</a>`;
+              }
+            } else {
+              const href = safeUrl(m[5]);
+              if (!href) out += `${escapeHtml(m[4])} (${escapeHtml(m[5])})`;
+              else out += `<a href="${escapeHtml(href)}" target="_blank" rel="noreferrer noopener">${escapeHtml(m[4])}</a>`;
+            }
+          } else if (m[6] !== undefined) {
+            // Bold: **text**
+            out += `<strong>${escapeHtml(m[6])}</strong>`;
           } else {
             out += escapeHtml(m[0]);
           }
@@ -543,7 +638,7 @@
         return out;
       }
 
-      function mdToHtml(src) {
+      function mdToHtml(src, basePath) {
         const s = String(src ?? "").replaceAll("\r\n", "\n");
         const splitByFences = (input) => {
           const chunks = [];
@@ -648,7 +743,7 @@
           }
           for (const it of node.items) {
             out.push("<li>");
-            out.push(renderInlineMd(it.text || ""));
+            out.push(renderInlineMd(it.text || "", basePath));
             if (it.child) out.push(renderList(it.child));
             out.push("</li>");
           }
@@ -711,7 +806,7 @@
           for (let i = 0; i < node.head.length; i++) {
             const align = node.align[i] || "left";
             out.push(`<th style="text-align: ${align}">`);
-            out.push(renderInlineMd(node.head[i] || ""));
+            out.push(renderInlineMd(node.head[i] || "", basePath));
             out.push("</th>");
           }
           out.push("</tr></thead>");
@@ -724,7 +819,7 @@
                 const align = node.align[i] || "left";
                 const cell = row[i] ?? "";
                 out.push(`<td style="text-align: ${align}">`);
-                out.push(renderInlineMd(cell));
+                out.push(renderInlineMd(cell, basePath));
                 out.push("</td>");
               }
               out.push("</tr>");
@@ -759,7 +854,7 @@
             let startIdx = 0;
             if (mHeading) {
               const level = mHeading[1].length;
-              out.push(`<h${level}>${renderInlineMd(mHeading[2])}</h${level}>`);
+              out.push(`<h${level}>${renderInlineMd(mHeading[2], basePath)}</h${level}>`);
               startIdx = 1;
             }
 
@@ -768,7 +863,7 @@
               const para = paraLines.join("\n").trim();
               paraLines = [];
               if (!para) return;
-              out.push(`<p>${renderInlineMd(para).replaceAll("\n", "<br />")}</p>`);
+              out.push(`<p>${renderInlineMd(para, basePath).replaceAll("\n", "<br />")}</p>`);
             };
 
             for (let i = startIdx; i < lines.length; i++) {
@@ -802,11 +897,11 @@
       }
 
       const mdCache = new Map();
-      function mdToHtmlCached(src) {
-        const key = String(src ?? "");
+      function mdToHtmlCached(src, basePath) {
+        const key = String(src ?? "") + "|" + String(basePath ?? "");
         const hit = mdCache.get(key);
         if (hit !== undefined) return hit;
-        const html = mdToHtml(key);
+        const html = mdToHtml(src, basePath);
         mdCache.set(key, html);
         if (mdCache.size > 1200) {
           // Prevent unbounded growth; chat history is expected to be small.
@@ -873,6 +968,10 @@
           return `<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 7h16"/><path d="M4 12h16"/><path d="M4 17h10"/></svg>`;
         if (name === "duplicate")
           return `<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="8" y="8" width="11" height="11" rx="2"/><rect x="5" y="5" width="11" height="11" rx="2"/></svg>`;
+        if (name === "settings")
+          return `<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 1v6m0 6v6m5.2-14.2l-4.2 4.2m0 6l4.2 4.2M23 12h-6m-6 0H1m14.2 5.2l-4.2-4.2m0-6l-4.2-4.2"/></svg>`;
+        if (name === "more")
+          return `<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="1" fill="currentColor"/><circle cx="12" cy="5" r="1" fill="currentColor"/><circle cx="12" cy="19" r="1" fill="currentColor"/></svg>`;
         return "";
       }
 
@@ -946,8 +1045,13 @@
         const INIT_PAGE_LIMIT_DESKTOP = 60;
         const INIT_PAGE_LIMIT_MOBILE = 24;
         const OLDER_PAGE_LIMIT = 60;
+        const INIT_PAGE_LIMIT_CLAUDE_DESKTOP = 200;
+        const INIT_PAGE_LIMIT_CLAUDE_MOBILE = 80;
+        const OLDER_PAGE_LIMIT_CLAUDE = 120;
         const CACHE_LIMIT = 40;
         const CHAT_DOM_WINDOW = 260;
+        const CHAT_DOM_WINDOW_CLAUDE = 520;
+        const CHAT_DOM_MIN_USER_ROWS = 24;
         let activeLogPath = null;
         let activeThreadId = null;
         let olderBefore = 0;
@@ -984,6 +1088,16 @@
         let updateNotifiedCommit = String(localStorage.getItem("codexweb.updateNotifiedCommit") || "");
         let sessionIndex = new Map(); // session_id -> session info
         let sessionCardIndex = new Map(); // session_id -> session card element
+
+        function normalizeOutgoingTextForCli(raw, sid = selected) {
+          const text = typeof raw === "string" ? raw : "";
+          if (!text || !sid) return text;
+          const sess = sessionIndex.get(sid);
+          if (sessionCliName(sess) !== "claude") return text;
+          // Claude CLI treats leading "!" as local shell command; escape markdown image prefix.
+          return text.replace(/^(\s*)!\[/, "$1\\![");
+        }
+
         function normalizeSessionName(name) {
           return String(name || "")
             .trim()
@@ -1048,13 +1162,14 @@
         });
         interruptBtn.style.display = "none";
         const toast = el("div", { class: "muted toast", id: "toast" });
-	        const toggleSidebarBtn = el("button", {
-	          id: "toggleSidebarBtn",
-	          class: "icon-btn",
-	          title: "Toggle sidebar",
-	          "aria-label": "Toggle sidebar",
-	          html: iconSvg("menu"),
-	        });
+        const sidebarToggleBtn = el("button", {
+          id: "sidebarToggleBtn",
+          class: "icon-btn",
+          title: "Toggle sidebar",
+          "aria-label": "Toggle sidebar",
+          type: "button",
+          html: iconSvg("menu"),
+        });
         const renameBtn = el("button", {
           id: "renameBtn",
           class: "icon-btn",
@@ -1081,25 +1196,27 @@
           type: "button",
           html: iconSvg("file"),
         });
+        const tmuxAttachBtn = el("button", {
+          id: "tmuxAttachBtn",
+          class: "icon-btn",
+          title: "Copy tmux attach command",
+          "aria-label": "Copy tmux attach command",
+          type: "button",
+          html: iconSvg("terminal"),
+        });
+        tmuxAttachBtn.disabled = true;
         const sessionToolsBtn = el("button", {
           id: "sessionToolsBtn",
           class: "icon-btn",
           title: "Session tools",
           "aria-label": "Session tools",
           type: "button",
-          html: iconSvg("terminal"),
+          html: iconSvg("more"),
         });
         sessionToolsBtn.disabled = true;
-        const spawnCliBtn = el("button", {
-          id: "spawnCliBtn",
-          class: "icon-btn text-btn",
-          title: "New session CLI",
-          "aria-label": "New session CLI",
-          type: "button",
-          text: cliDisplayName(preferredSpawnCli),
-        });
-        const newBtn = el("button", { id: "newBtn", class: "icon-btn", title: "New session", "aria-label": "New session", html: iconSvg("plus") });
+        const newBtn = el("button", { id: "newBtn", class: "icon-btn primary-action", title: "New session", "aria-label": "New session", html: iconSvg("plus") });
         const refreshBtn = el("button", { id: "refreshBtn", class: "icon-btn", title: "Refresh", "aria-label": "Refresh", html: iconSvg("refresh") });
+        const configBtn = el("button", { id: "configBtn", class: "icon-btn", title: "Configuration", "aria-label": "Configuration", html: iconSvg("settings") });
         const updateBtn = el("button", {
           id: "updateBtn",
           class: "icon-btn text-btn",
@@ -1109,6 +1226,28 @@
           text: "Update",
         });
         updateBtn.style.display = "none";
+
+        // More menu button
+        const moreBtn = el("button", {
+          id: "moreBtn",
+          class: "icon-btn more-btn",
+          title: "More options",
+          "aria-label": "More options",
+          "aria-expanded": "false",
+          html: iconSvg("more")
+        });
+
+        // Dropdown menu
+        const moreMenu = el("div", { class: "more-menu", id: "moreMenu" }, [
+          el("button", { class: "menu-item", id: "menuRefresh", type: "button" }, [
+            el("span", { class: "menu-icon", html: iconSvg("refresh") }),
+            el("span", { class: "menu-label", text: "Refresh" }),
+          ]),
+          el("button", { class: "menu-item", id: "menuConfig", type: "button" }, [
+            el("span", { class: "menu-icon", html: iconSvg("settings") }),
+            el("span", { class: "menu-label", text: "Configuration" }),
+          ]),
+        ]);
         const relayDot = el("span", { class: "dot", "aria-hidden": "true" });
         const relayLabel = el("span", { class: "label", text: "Relay" });
         const relayStatus = el("div", { class: "relayStatus off", id: "relayStatus", title: "Relay: Manual" }, [
@@ -1130,11 +1269,12 @@
         const titleRow = el("div", { class: "titleRow" }, [titleLabel, topMeta]);
         const titleWrap = el("div", { class: "titleWrap" }, [titleRow, toast]);
         const topbar = el("div", { class: "topbar" }, [
-          el("div", { class: "pill" }, [toggleSidebarBtn, titleWrap]),
+          el("div", { class: "pill" }, [sidebarToggleBtn, titleWrap]),
           el("div", { class: "actions topActions" }, [
             duplicateBtn,
             renameBtn,
             fileBtn,
+            tmuxAttachBtn,
             sessionToolsBtn,
             interruptBtn,
           ]),
@@ -1167,9 +1307,11 @@
               relayStatus,
             ]),
             el("div", { class: "actions" }, [
-              spawnCliBtn,
               newBtn,
-              refreshBtn,
+              el("div", { class: "more-container" }, [
+                moreBtn,
+                moreMenu,
+              ]),
               updateBtn,
             ]),
           ])
@@ -1357,7 +1499,6 @@
         const sessionToolsNotice = el("div", { class: "muted sessionToolsNotice", id: "sessionToolsNotice", text: "" });
         const sessionStatusCmd = el("code", { class: "sessionToolCmd", id: "sessionStatusCmd", text: "" });
         const sessionResumeCmd = el("code", { class: "sessionToolCmd", id: "sessionResumeCmd", text: "" });
-        const sessionTmuxCmd = el("code", { class: "sessionToolCmd", id: "sessionTmuxCmd", text: "" });
         const statusCopyBtn = el("button", {
           class: "icon-btn text-btn",
           title: "Copy status command",
@@ -1372,16 +1513,8 @@
           type: "button",
           text: "Copy",
         });
-        const tmuxCopyBtn = el("button", {
-          class: "icon-btn text-btn",
-          title: "Copy tmux attach command",
-          "aria-label": "Copy tmux attach command",
-          type: "button",
-          text: "Copy",
-        });
         statusCopyBtn.disabled = true;
         resumeCopyBtn.disabled = true;
-        tmuxCopyBtn.disabled = true;
         const sessionTailStatus = el("div", { class: "muted", id: "sessionTailStatus", text: "" });
         const sessionTail = el("pre", { class: "sessionTail", id: "sessionTail", text: "" });
         const sessionTools = el("div", { class: "sessionTools", id: "sessionTools", role: "dialog", "aria-label": "Session tools" }, [
@@ -1400,10 +1533,6 @@
             el("div", { class: "sessionToolCmdRow" }, [sessionResumeCmd, resumeCopyBtn]),
           ]),
           el("div", { class: "sessionToolRow" }, [
-            el("div", { class: "sessionToolLabel muted", text: "TMUX attach" }),
-            el("div", { class: "sessionToolCmdRow" }, [sessionTmuxCmd, tmuxCopyBtn]),
-          ]),
-          el("div", { class: "sessionToolRow" }, [
             el("div", { class: "sessionToolLabel muted", text: "Live tail" }),
             sessionTailStatus,
             sessionTail,
@@ -1411,6 +1540,254 @@
         ]);
         root.appendChild(sessionToolsBackdrop);
         root.appendChild(sessionTools);
+
+        const cliChoiceBackdrop = el("div", { class: "modalBackdrop", id: "cliChoiceBackdrop" });
+        const cliChoiceTitle = el("div", { class: "title", id: "cliChoiceTitle", text: "Choose CLI" });
+        const cliChoiceCwd = el("div", { class: "muted", id: "cliChoiceCwd", text: "" });
+        const cliChoiceButtons = el("div", { class: "cliChoiceButtons" }, [
+          el("button", { class: "cliChoiceBtn", id: "cliChoiceCodex", type: "button", "data-cli": "codex" }, [
+            el("div", { class: "cliChoiceLogo" }, [
+              el("img", { src: "static/logos/codex.svg", alt: "Codex", width: "32", height: "32" }),
+            ]),
+            el("div", { class: "cliChoiceLabel", text: "Codex" }),
+          ]),
+          el("button", { class: "cliChoiceBtn", id: "cliChoiceClaude", type: "button", "data-cli": "claude" }, [
+            el("div", { class: "cliChoiceLogo" }, [
+              el("img", { src: "static/logos/claude.svg", alt: "Claude", width: "32", height: "32" }),
+            ]),
+            el("div", { class: "cliChoiceLabel", text: "Claude" }),
+          ]),
+          el("button", { class: "cliChoiceBtn", id: "cliChoiceGemini", type: "button", "data-cli": "gemini" }, [
+            el("div", { class: "cliChoiceLogo" }, [
+              el("img", { src: "static/logos/gemini.svg", alt: "Gemini", width: "32", height: "32" }),
+            ]),
+            el("div", { class: "cliChoiceLabel", text: "Gemini" }),
+          ]),
+        ]);
+        const cliChoiceCancel = el("button", { class: "cliChoiceCancel", id: "cliChoiceCancel", type: "button", text: "Cancel" });
+        const cliChoice = el("div", { class: "cliChoice", id: "cliChoice", role: "dialog", "aria-label": "Choose CLI" }, [
+          cliChoiceTitle,
+          cliChoiceCwd,
+          cliChoiceButtons,
+          cliChoiceCancel,
+        ]);
+        root.appendChild(cliChoiceBackdrop);
+        root.appendChild(cliChoice);
+
+        // Config modal
+        const configBackdrop = el("div", { class: "modalBackdrop", id: "configBackdrop" });
+        const configTitle = el("div", { class: "title", id: "configTitle", text: "CLI Configuration" });
+        const configContent = el("div", { class: "configContent", id: "configContent" });
+        const configActions = el("div", { class: "configActions" }, [
+          el("button", { class: "configCancel", id: "configCancel", type: "button", text: "Cancel" }),
+          el("button", { class: "configSave", id: "configSave", type: "button", text: "Save" }),
+        ]);
+        const configModal = el("div", { class: "configModal", id: "configModal", role: "dialog", "aria-label": "Configuration" }, [
+          configTitle,
+          configContent,
+          configActions,
+        ]);
+        root.appendChild(configBackdrop);
+        root.appendChild(configModal);
+
+        let currentConfig = null;
+        async function showConfig() {
+          try {
+            const data = await api("/api/config");
+            if (!data || !data.ok) {
+              setToast("failed to load config");
+              return;
+            }
+            currentConfig = data.config;
+            renderConfigForm(currentConfig);
+            configBackdrop.style.display = "block";
+            configModal.style.display = "flex";
+          } catch (e) {
+            setToast(`config error: ${e.message}`);
+          }
+        }
+        function hideConfig() {
+          configBackdrop.style.display = "none";
+          configModal.style.display = "none";
+          currentConfig = null;
+        }
+        function renderConfigForm(config) {
+          configContent.innerHTML = "";
+
+          // Codex section
+          const codexSection = el("div", { class: "configSection" }, [
+            el("div", { class: "configSectionTitle", text: "Codex (OpenAI)" }),
+            el("div", { class: "configField" }, [
+              el("label", { text: "API Key", for: "codexApiKey" }),
+              el("input", {
+                type: "password",
+                id: "codexApiKey",
+                class: "configInput",
+                value: config.codex?.api_key || config.env?.OPENAI_API_KEY || "",
+                placeholder: "sk-..."
+              }),
+            ]),
+            el("div", { class: "configField" }, [
+              el("label", { text: "Base URL", for: "codexBaseUrl" }),
+              el("input", {
+                type: "text",
+                id: "codexBaseUrl",
+                class: "configInput",
+                value: config.codex?.base_url || config.env?.OPENAI_BASE_URL || "",
+                placeholder: "https://api.openai.com/v1"
+              }),
+            ]),
+            el("div", { class: "configField" }, [
+              el("label", { text: "Model", for: "codexModel" }),
+              el("input", {
+                type: "text",
+                id: "codexModel",
+                class: "configInput",
+                value: config.codex?.model || "",
+                placeholder: "gpt-4"
+              }),
+            ]),
+          ]);
+
+          // Claude section
+          const claudeSection = el("div", { class: "configSection" }, [
+            el("div", { class: "configSectionTitle", text: "Claude (Anthropic)" }),
+            el("div", { class: "configField" }, [
+              el("label", { text: "API Key / Auth Token", for: "claudeApiKey" }),
+              el("input", {
+                type: "password",
+                id: "claudeApiKey",
+                class: "configInput",
+                value: config.env?.ANTHROPIC_API_KEY || config.env?.ANTHROPIC_AUTH_TOKEN || "",
+                placeholder: "sk-ant-..."
+              }),
+            ]),
+            el("div", { class: "configField" }, [
+              el("label", { text: "Base URL", for: "claudeBaseUrl" }),
+              el("input", {
+                type: "text",
+                id: "claudeBaseUrl",
+                class: "configInput",
+                value: config.env?.ANTHROPIC_BASE_URL || "",
+                placeholder: "https://api.anthropic.com"
+              }),
+            ]),
+            el("div", { class: "configField" }, [
+              el("label", { text: "Model", for: "claudeModel" }),
+              el("input", {
+                type: "text",
+                id: "claudeModel",
+                class: "configInput",
+                value: config.claude?.model || "",
+                placeholder: "opus"
+              }),
+            ]),
+          ]);
+
+          // Gemini section
+          const geminiSection = el("div", { class: "configSection" }, [
+            el("div", { class: "configSectionTitle", text: "Gemini (Google)" }),
+            el("div", { class: "configField" }, [
+              el("label", { text: "API Key", for: "geminiApiKey" }),
+              el("input", {
+                type: "password",
+                id: "geminiApiKey",
+                class: "configInput",
+                value: config.env?.GEMINI_API_KEY || "",
+                placeholder: "AIza..."
+              }),
+            ]),
+            el("div", { class: "configField" }, [
+              el("label", { text: "Base URL", for: "geminiBaseUrl" }),
+              el("input", {
+                type: "text",
+                id: "geminiBaseUrl",
+                class: "configInput",
+                value: config.env?.GOOGLE_GEMINI_BASE_URL || "",
+                placeholder: "https://generativelanguage.googleapis.com"
+              }),
+            ]),
+            el("div", { class: "configField" }, [
+              el("label", { text: "Model", for: "geminiModel" }),
+              el("input", {
+                type: "text",
+                id: "geminiModel",
+                class: "configInput",
+                value: config.env?.GEMINI_MODEL || "",
+                placeholder: "gemini-pro"
+              }),
+            ]),
+          ]);
+
+          configContent.appendChild(codexSection);
+          configContent.appendChild(claudeSection);
+          configContent.appendChild(geminiSection);
+        }
+        async function saveConfig() {
+          const updates = {
+            codex: {
+              api_key: $("#codexApiKey").value.trim(),
+              base_url: $("#codexBaseUrl").value.trim(),
+              model: $("#codexModel").value.trim(),
+            },
+            claude: {
+              api_key: $("#claudeApiKey").value.trim(),
+              base_url: $("#claudeBaseUrl").value.trim(),
+              model: $("#claudeModel").value.trim(),
+            },
+            gemini: {
+              api_key: $("#geminiApiKey").value.trim(),
+              base_url: $("#geminiBaseUrl").value.trim(),
+              model: $("#geminiModel").value.trim(),
+            },
+          };
+          try {
+            setToast("saving...");
+            const result = await api("/api/config", { method: "POST", body: { updates } });
+            if (result.ok) {
+              setToast("config saved");
+              hideConfig();
+            } else {
+              setToast("save failed");
+            }
+          } catch (e) {
+            setToast(`save error: ${e.message}`);
+          }
+        }
+        configBackdrop.onclick = hideConfig;
+        $("#configCancel").onclick = hideConfig;
+        $("#configSave").onclick = saveConfig;
+
+        let cliChoiceResolve = null;
+        function showCliChoice({ title, cwd } = {}) {
+          return new Promise((resolve) => {
+            cliChoiceResolve = resolve;
+            cliChoiceTitle.textContent = title || "Choose CLI";
+            cliChoiceCwd.textContent = cwd || "";
+            cliChoiceBackdrop.style.display = "block";
+            cliChoice.style.display = "flex";
+          });
+        }
+        function hideCliChoice() {
+          cliChoiceBackdrop.style.display = "none";
+          cliChoice.style.display = "none";
+          if (cliChoiceResolve) {
+            cliChoiceResolve(null);
+            cliChoiceResolve = null;
+          }
+        }
+        cliChoiceBackdrop.onclick = hideCliChoice;
+        cliChoiceCancel.onclick = hideCliChoice;
+        for (const btn of [$("#cliChoiceCodex"), $("#cliChoiceClaude"), $("#cliChoiceGemini")]) {
+          btn.onclick = () => {
+            const cli = btn.getAttribute("data-cli");
+            if (cliChoiceResolve) {
+              cliChoiceResolve(cli);
+              cliChoiceResolve = null;
+            }
+            hideCliChoice();
+          };
+        }
 
         function setToast(text) {
           toast.textContent = text || "";
@@ -1483,10 +1860,6 @@
         function setPreferredSpawnCli(cli, { persist = true } = {}) {
           preferredSpawnCli = normalizeCliName(cli, "codex");
           if (persist) localStorage.setItem("codexweb.spawnCli", preferredSpawnCli);
-          const label = cliDisplayName(preferredSpawnCli);
-          spawnCliBtn.textContent = label;
-          spawnCliBtn.title = `New session CLI: ${label} (click to switch)`;
-          spawnCliBtn.setAttribute("aria-label", `New session CLI: ${label}`);
         }
         setPreferredSpawnCli(preferredSpawnCli, { persist: false });
 
@@ -1542,10 +1915,8 @@
             setSessionToolsNotice("");
             sessionStatusCmd.textContent = "";
             sessionResumeCmd.textContent = "";
-            sessionTmuxCmd.textContent = "";
             statusCopyBtn.disabled = true;
             resumeCopyBtn.disabled = true;
-            tmuxCopyBtn.disabled = true;
             sessionTailStatus.textContent = "";
             sessionTail.textContent = "";
             return;
@@ -1558,14 +1929,6 @@
           sessionResumeCmd.textContent = resumeCommandForSession(sid, s);
           statusCopyBtn.disabled = false;
           resumeCopyBtn.disabled = false;
-          const tmuxName = s && typeof s.tmux_name === "string" ? s.tmux_name.trim() : "";
-          if (tmuxName) {
-            sessionTmuxCmd.textContent = `tmux attach -t ${tmuxName}`;
-            tmuxCopyBtn.disabled = false;
-          } else {
-            sessionTmuxCmd.textContent = "Not available";
-            tmuxCopyBtn.disabled = true;
-          }
         }
         async function refreshSessionTail() {
           if (!sessionToolsOpen || sessionTailInFlight) return;
@@ -1700,10 +2063,18 @@
         }
 
         function initPageLimit() {
+          const s = selected ? sessionIndex.get(selected) : null;
+          const cli = sessionCliName(s);
+          if (cli === "claude") {
+            return isMobile() ? INIT_PAGE_LIMIT_CLAUDE_MOBILE : INIT_PAGE_LIMIT_CLAUDE_DESKTOP;
+          }
           return isMobile() ? INIT_PAGE_LIMIT_MOBILE : INIT_PAGE_LIMIT_DESKTOP;
         }
 
         function olderPageLimit() {
+          const s = selected ? sessionIndex.get(selected) : null;
+          const cli = sessionCliName(s);
+          if (cli === "claude") return OLDER_PAGE_LIMIT_CLAUDE;
           return OLDER_PAGE_LIMIT;
         }
 
@@ -1775,7 +2146,7 @@
 
         async function saveQueueToServer(sid) {
           if (!sid) return;
-          const q = normalizeQueueList(getQueueCache(sid));
+          const q = normalizeQueueList(getQueueCache(sid)).map((x) => normalizeOutgoingTextForCli(x, sid));
           queueCacheBySession.set(sid, q);
           try {
             const res = await api(`/api/sessions/${sid}/queue`, { method: "POST", body: { queue: q } });
@@ -2152,8 +2523,9 @@
             const norm = normalizeCacheEvent(ev);
             if (norm) out.push(norm);
           }
-          if (out.length > CACHE_LIMIT) out.splice(0, out.length - CACHE_LIMIT);
-          cache.events = out;
+          const ordered = sortChatEventsByTs(out);
+          if (ordered.length > CACHE_LIMIT) ordered.splice(0, ordered.length - CACHE_LIMIT);
+          cache.events = ordered;
           cacheBySession.set(sid, cache);
           scheduleCacheSave(sid);
         }
@@ -2167,8 +2539,9 @@
             const norm = normalizeCacheEvent(ev);
             if (norm) list.push(norm);
           }
-          if (list.length > CACHE_LIMIT) list.splice(0, list.length - CACHE_LIMIT);
-          cache.events = list;
+          const ordered = sortChatEventsByTs(list);
+          if (ordered.length > CACHE_LIMIT) ordered.splice(0, ordered.length - CACHE_LIMIT);
+          cache.events = ordered;
           cacheBySession.set(sid, cache);
           scheduleCacheSave(sid);
         }
@@ -2267,10 +2640,11 @@
             setToast("select a session first");
             return false;
           }
-          if (!raw || !raw.trim()) return false;
+          const outgoing = normalizeOutgoingTextForCli(raw, sid);
+          if (!outgoing || !outgoing.trim()) return false;
           try {
             setToast("queueing...");
-            const res = await api(`/api/sessions/${sid}/queue`, { method: "POST", body: { text: raw, front: Boolean(front) } });
+            const res = await api(`/api/sessions/${sid}/queue`, { method: "POST", body: { text: outgoing, front: Boolean(front) } });
             const list = applyQueueResponse(sid, res);
             const count = Array.isArray(list) ? list.length : getSelectedQueueLen();
             if (sid === selected) {
@@ -2400,10 +2774,27 @@
 
         function trimRenderedRows({ fromTop }) {
           const rows = Array.from(chatInner.querySelectorAll(".msg-row")).filter((x) => !x.classList.contains("typing-row"));
-          if (rows.length <= CHAT_DOM_WINDOW) return;
-          const extra = rows.length - CHAT_DOM_WINDOW;
+          const s = selected ? sessionIndex.get(selected) : null;
+          const cli = sessionCliName(s);
+          const windowLimit = cli === "claude" ? CHAT_DOM_WINDOW_CLAUDE : CHAT_DOM_WINDOW;
+          if (rows.length <= windowLimit) return;
+          const extra = rows.length - windowLimit;
           if (fromTop) {
-            for (const row of rows.slice(0, extra)) row.remove();
+            let removed = 0;
+            const userRows = rows.filter((row) => row.classList.contains("user"));
+            const protectedUsers = new Set(
+              userRows.slice(Math.max(0, userRows.length - CHAT_DOM_MIN_USER_ROWS)),
+            );
+            for (const row of rows) {
+              if (removed >= extra) break;
+              if (protectedUsers.has(row)) continue;
+              row.remove();
+              removed += 1;
+            }
+            if (removed < extra) {
+              const remain = Array.from(chatInner.querySelectorAll(".msg-row")).filter((x) => !x.classList.contains("typing-row"));
+              for (const row of remain.slice(0, extra - removed)) row.remove();
+            }
           } else {
             for (const row of rows.slice(rows.length - extra)) row.remove();
           }
@@ -2452,6 +2843,51 @@
 
         function eventTs(ev) {
           return typeof ev.ts === "number" && Number.isFinite(ev.ts) ? ev.ts : null;
+        }
+
+        function compareChatEventsByTs(a, b) {
+          const ta = eventTs(a);
+          const tb = eventTs(b);
+          if (ta !== null && tb !== null) {
+            if (ta !== tb) return ta - tb;
+            const ar = a && a.role === "user" ? "user" : "assistant";
+            const br = b && b.role === "user" ? "user" : "assistant";
+            if (ar !== br) return ar === "user" ? -1 : 1;
+          }
+          return 0;
+        }
+
+        function sortChatEventsByTs(events) {
+          if (!Array.isArray(events) || !events.length) return [];
+          const withIdx = events.map((ev, idx) => ({ ev, idx }));
+          withIdx.sort((a, b) => {
+            const c = compareChatEventsByTs(a.ev, b.ev);
+            return c || (a.idx - b.idx);
+          });
+          return withIdx.map((x) => x.ev);
+        }
+
+        function insertRowChronologically(row, { ts, role } = {}) {
+          const anchor = typingRow && typingRow.isConnected ? typingRow : bottomSentinel;
+          const tsNum = typeof ts === "number" && Number.isFinite(ts) ? ts : null;
+          const rowRole = role === "user" ? "user" : "assistant";
+          if (tsNum === null) {
+            chatInner.insertBefore(row, anchor);
+            return;
+          }
+          const rows = Array.from(chatInner.querySelectorAll(".msg-row")).filter(
+            (x) => !x.classList.contains("typing-row") && x !== row,
+          );
+          for (const cur of rows) {
+            const curTsRaw = Number(cur.dataset.ts || "");
+            if (!Number.isFinite(curTsRaw)) continue;
+            const curRole = cur.dataset.role === "user" ? "user" : "assistant";
+            if (curTsRaw > tsNum || (curTsRaw === tsNum && rowRole === "user" && curRole === "assistant")) {
+              chatInner.insertBefore(row, cur);
+              return;
+            }
+          }
+          chatInner.insertBefore(row, anchor);
         }
 
         function markEventSeen(ev) {
@@ -2530,7 +2966,7 @@
           pending.splice(idx, 1);
           if (!pending.length) clearPendingForSession(sid);
           const pendingEl = chatInner.querySelector(`.msg.user[data-local-id="${id}"]`);
-          if (!pendingEl) return true;
+          if (!pendingEl) return false;
 
           pendingEl.style.opacity = "1";
           pendingEl.removeAttribute("data-local-id");
@@ -2543,7 +2979,10 @@
           }
 
           const row = pendingEl.closest(".msg-row");
-          if (row && typeof ev.ts === "number" && Number.isFinite(ev.ts)) row.dataset.ts = String(ev.ts);
+          if (row && typeof ev.ts === "number" && Number.isFinite(ev.ts)) {
+            row.dataset.ts = String(ev.ts);
+            insertRowChronologically(row, { ts: ev.ts, role: "user" });
+          }
           const tsEl = pendingEl.querySelector(".ts");
           if (tsEl && typeof ev.ts === "number" && Number.isFinite(ev.ts)) tsEl.textContent = time24(new Date(ev.ts * 1000));
           rebuildDecorations({ preserveScroll: true });
@@ -2965,7 +3404,9 @@
             }
             const base = sessionDisplayName(s) || baseName(cwd) || "Session";
             const alias = buildDuplicateAlias(base);
-            await spawnSessionWithCwd(cwd, { alias, cli: sessionCliName(s) });
+            const cli = await showCliChoice({ title: "Choose CLI for duplicate session", cwd });
+            if (!cli) return;
+            await spawnSessionWithCwd(cwd, { alias, cli });
           };
           actionButtons.unshift(dupBtn);
           if (delBtn) actionButtons.push(delBtn);
@@ -3064,8 +3505,7 @@
           const stick = autoScroll || isNearBottom();
           const ts = typeof ev.ts === "number" && Number.isFinite(ev.ts) ? ev.ts : ev.pending ? Date.now() / 1000 : null;
 	          const { row } = makeRow(ev, { ts, pending: Boolean(ev.pending) });
-	          const anchor = typingRow && typingRow.isConnected ? typingRow : bottomSentinel;
-	          chatInner.insertBefore(row, anchor);
+	          insertRowChronologically(row, { ts, role: ev.role });
             trimRenderedRows({ fromTop: true });
           rebuildDecorations({ preserveScroll: false });
             if (!ev.pending) markClickFirstPaint();
@@ -3094,11 +3534,12 @@
             if (!clean) continue;
             msgs.push(clean);
           }
-          if (!msgs.length) return;
+          const orderedMsgs = sortChatEventsByTs(msgs);
+          if (!orderedMsgs.length) return;
           const oldTop = chat.scrollTop;
           const oldH = chat.scrollHeight;
           const frag = document.createDocumentFragment();
-          for (const ev of msgs) {
+          for (const ev of orderedMsgs) {
             const ts = typeof ev.ts === "number" && Number.isFinite(ev.ts) ? ev.ts : null;
             frag.appendChild(makeRow(ev, { ts, pending: false }).row);
           }
@@ -3163,14 +3604,15 @@
                     latestAssistantTs === null ? clean.ts : Math.max(latestAssistantTs, clean.ts);
                 }
           }
-          if (!msgs.length) return;
-          if (selected) replaceCacheEvents(selected, msgs);
+          const orderedMsgs = sortChatEventsByTs(msgs);
+          if (!orderedMsgs.length) return;
+          if (selected) replaceCacheEvents(selected, orderedMsgs);
           if (selected && latestAssistantTs !== null) {
             markAssistantSeen(selected, latestAssistantTs);
           }
-          if (selected) updateUserSummaryFromEvents(msgs, selected);
+          if (selected) updateUserSummaryFromEvents(orderedMsgs, selected);
 	          const frag = document.createDocumentFragment();
-          for (const ev of msgs) {
+          for (const ev of orderedMsgs) {
             const ts = typeof ev.ts === "number" && Number.isFinite(ev.ts) ? ev.ts : null;
             frag.appendChild(makeRow(ev, { ts, pending: false }).row);
 	          }
@@ -3475,7 +3917,7 @@
            updateActionBtnState();
          }
 
-			        $("#refreshBtn").onclick = async () => {
+			        refreshBtn.onclick = async () => {
                 const sid = selected;
                 if (!sid) {
                   await refreshSessions();
@@ -3500,6 +3942,17 @@
           renameBtn.disabled = !selected;
           duplicateBtn.disabled = !selected;
           sessionToolsBtn.disabled = !selected;
+
+          // Update tmux attach button state
+          const s = selected ? sessionIndex.get(selected) : null;
+          const tmuxName = s && typeof s.tmux_name === "string" ? s.tmux_name.trim() : "";
+          tmuxAttachBtn.disabled = !tmuxName;
+          if (tmuxName) {
+            tmuxAttachBtn.title = `Copy tmux attach command: tmux attach -t ${tmuxName}`;
+          } else {
+            tmuxAttachBtn.title = "Tmux attach not available";
+          }
+
           if (!selected && sessionToolsOpen) hideSessionTools();
           updateSessionToolsContent();
         }
@@ -3618,7 +4071,8 @@
         }
         function updateFilePreview() {
           const text = fileEditor.value || fileContent.textContent || "";
-          filePreview.innerHTML = mdToHtmlCached(text);
+          const currentPath = String(filePathInput.value || "").trim();
+          filePreview.innerHTML = mdToHtmlCached(text, currentPath);
           renderMermaidIn(filePreview);
         }
         function buildFileEditorUrl({ path, sessionId, mode, fullscreen, wrap }) {
@@ -3644,16 +4098,29 @@
             setToast("enter a file path first");
             return;
           }
-          const sid = currentFileSessionId();
           const mode = fileMode === "preview" ? "preview" : "edit";
+          openLinkedFilePath(path, { mode });
+        }
+        function openLinkedFilePath(path, { mode = "view" } = {}) {
+          const cleanPath = String(path || "").trim();
+          if (!cleanPath) return false;
+          const sid = currentFileSessionId();
+          const nextMode = normalizeFileModeValue(mode) || "view";
           const url = buildFileEditorUrl({
-            path,
+            path: cleanPath,
             sessionId: sid,
-            mode,
+            mode: nextMode,
             fullscreen: true,
             wrap: fileWrap,
           });
-          window.open(url, "_blank", "noopener");
+          const win = window.open(url, "_blank", "noopener");
+          if (win) return true;
+          showFileViewer();
+          filePathInput.value = cleanPath;
+          setFileMode(nextMode === "preview" ? "preview" : "view");
+          void openFilePath();
+          setToast("popup blocked, opened inline");
+          return false;
         }
         function applyFileReadResult(res, scrollState) {
           if (!res || typeof res.text !== "string") throw new Error("invalid response");
@@ -3765,6 +4232,18 @@
             fileEditor.focus();
           }
         }
+        root.addEventListener("click", (e) => {
+          if (!e || e.defaultPrevented) return;
+          if (e.metaKey || e.ctrlKey || e.altKey || e.shiftKey) return;
+          const node = e.target && typeof e.target.closest === "function" ? e.target.closest("a[data-file-path]") : null;
+          if (!node) return;
+          const rawPath = node.getAttribute("data-file-path") || "";
+          const filePath = parseLocalFilePathRef(rawPath);
+          if (!filePath) return;
+          e.preventDefault();
+          e.stopPropagation();
+          openLinkedFilePath(filePath, { mode: "view" });
+        });
         function hideFileViewer() {
           if (fileFullscreenMode) {
             exitFileFullscreen();
@@ -4094,22 +4573,18 @@
           setToast(msg);
           setSessionToolsNotice(msg, { kind: ok ? "success" : "error" });
         };
-        tmuxCopyBtn.onclick = async (e) => {
+        tmuxAttachBtn.onclick = async (e) => {
           e.preventDefault();
           e.stopPropagation();
-          const ok = await copyToClipboard(sessionTmuxCmd.textContent || "");
-          const msg = ok ? "tmux command copied" : "copy failed";
-          setToast(msg);
-          setSessionToolsNotice(msg, { kind: ok ? "success" : "error" });
-        };
-        spawnCliBtn.onclick = (e) => {
-          e.preventDefault();
-          e.stopPropagation();
-          const options = ["codex", "claude", "gemini"];
-          const curIdx = Math.max(0, options.indexOf(preferredSpawnCli));
-          const next = options[(curIdx + 1) % options.length];
-          setPreferredSpawnCli(next);
-          setToast(`new session CLI: ${cliDisplayName(next)}`);
+          const s = selected ? sessionIndex.get(selected) : null;
+          const tmuxName = s && typeof s.tmux_name === "string" ? s.tmux_name.trim() : "";
+          if (!tmuxName) {
+            setToast("tmux attach not available");
+            return;
+          }
+          const cmd = `tmux attach -t ${tmuxName}`;
+          const ok = await copyToClipboard(cmd);
+          setToast(ok ? "tmux command copied" : "copy failed");
         };
         queueCloseBtn.onclick = (e) => {
           e.preventDefault();
@@ -4176,8 +4651,52 @@
           const def = cur && cur.cwd && cur.cwd !== "?" ? cur.cwd : "";
           const cwd = prompt("New session cwd:", def);
           if (!cwd) return;
-          await spawnSessionWithCwd(cwd, { cli: preferredSpawnCli });
+          const cli = await showCliChoice({ title: "Choose CLI for new session", cwd });
+          if (!cli) return;
+          await spawnSessionWithCwd(cwd, { cli });
         };
+
+        // More menu toggle
+        let moreMenuOpen = false;
+        function toggleMoreMenu() {
+          moreMenuOpen = !moreMenuOpen;
+          const menu = $("#moreMenu");
+          const btn = $("#moreBtn");
+          if (moreMenuOpen) {
+            menu.classList.add("open");
+            btn.setAttribute("aria-expanded", "true");
+          } else {
+            menu.classList.remove("open");
+            btn.setAttribute("aria-expanded", "false");
+          }
+        }
+        function closeMoreMenu() {
+          if (moreMenuOpen) {
+            moreMenuOpen = false;
+            $("#moreMenu").classList.remove("open");
+            $("#moreBtn").setAttribute("aria-expanded", "false");
+          }
+        }
+        moreBtn.onclick = (e) => {
+          e.stopPropagation();
+          toggleMoreMenu();
+        };
+        document.addEventListener("click", (e) => {
+          if (moreMenuOpen && !e.target.closest(".more-container")) {
+            closeMoreMenu();
+          }
+        });
+
+        // Menu item handlers
+        $("#menuRefresh").onclick = () => {
+          closeMoreMenu();
+          refreshBtn.click();
+        };
+        $("#menuConfig").onclick = () => {
+          closeMoreMenu();
+          configBtn.click();
+        };
+
 	        interruptBtn.onclick = async () => {
 	          if (!selected) return;
 	          try {
@@ -4209,6 +4728,18 @@
           setToast("already up to date");
         };
 
+        configBtn.onclick = () => {
+          showConfig();
+        };
+
+        sidebarToggleBtn.onclick = () => {
+          if (isMobile()) {
+            setSidebarOpen(!document.body.classList.contains("sidebar-open"));
+            return;
+          }
+          setSidebarCollapsed(!document.body.classList.contains("sidebar-collapsed"));
+        };
+
         duplicateBtn.onclick = async () => {
           if (!selected) return;
           const s = sessionIndex.get(selected);
@@ -4219,16 +4750,11 @@
           }
           const base = sessionDisplayName(s) || baseName(cwd) || "Session";
           const alias = buildDuplicateAlias(base);
-          await spawnSessionWithCwd(cwd, { alias, cli: sessionCliName(s) });
+          const cli = await showCliChoice({ title: "Choose CLI for duplicate session", cwd });
+          if (!cli) return;
+          await spawnSessionWithCwd(cwd, { alias, cli });
         };
 
-        toggleSidebarBtn.onclick = () => {
-          if (isMobile()) {
-            setSidebarOpen(!document.body.classList.contains("sidebar-open"));
-            return;
-          }
-          setSidebarCollapsed(!document.body.classList.contains("sidebar-collapsed"));
-        };
 	        backdrop.onclick = () => setSidebarOpen(false);
 
 	        chat.addEventListener("scroll", () => {
@@ -4524,7 +5050,8 @@
         async function sendText(raw) {
           if (!selected) return;
           const sid = selected;
-          if (!raw || !raw.trim()) return;
+          const outgoing = normalizeOutgoingTextForCli(raw, sid);
+          if (!outgoing || !outgoing.trim()) return;
           if (sending) return;
           sending = true;
           $("#sendBtn").disabled = true;
@@ -4534,17 +5061,16 @@
           const t0 = Date.now() / 1000;
           pendingForSession(sid, { create: true }).push({
             id: localId,
-            key: pendingMatchKey(raw),
-            loose: normalizeTextForPendingMatch(raw),
+            key: pendingMatchKey(outgoing),
+            loose: normalizeTextForPendingMatch(outgoing),
             t0,
-            text: raw,
+            text: outgoing,
           });
-          appendEvent({ role: "user", text: raw, pending: true, localId, ts: t0 });
+          appendEvent({ role: "user", text: outgoing, pending: true, localId, ts: t0 });
           turnOpen = true;
-          currentRunning = true;
-          updateUserSummaryFromText(sid, raw);
+          updateUserSummaryFromText(sid, outgoing);
           try {
-            const res = await api(`/api/sessions/${sid}/send`, { method: "POST", body: { text: raw } });
+            const res = await api(`/api/sessions/${sid}/send`, { method: "POST", body: { text: outgoing } });
             if (res.queued) {
               setToast(`queued (queue ${res.queue_len})`);
               if (Array.isArray(res.queue)) {

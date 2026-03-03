@@ -240,7 +240,22 @@ def _paths_match(a: Path, b: Path) -> bool:
             return str(a) == str(b)
 
 
-def _find_recent_claude_project_log(*, sessions_dir: Path, cwd: str, after_ts: float) -> Path | None:
+def _path_is_excluded(path: Path, excluded_paths: set[Path] | None) -> bool:
+    if not excluded_paths:
+        return False
+    for p in excluded_paths:
+        if _paths_match(path, p):
+            return True
+    return False
+
+
+def _find_recent_claude_project_log(
+    *,
+    sessions_dir: Path,
+    cwd: str,
+    after_ts: float,
+    exclude_paths: set[Path] | None = None,
+) -> Path | None:
     if not isinstance(cwd, str) or (not cwd):
         return None
     if not sessions_dir.exists():
@@ -262,13 +277,21 @@ def _find_recent_claude_project_log(*, sessions_dir: Path, cwd: str, after_ts: f
         return None
     cands.sort(key=lambda t: t[0], reverse=True)
     for _mt, p in cands:
+        if _path_is_excluded(p, exclude_paths):
+            continue
         pcwd = _read_claude_log_cwd(p)
         if isinstance(pcwd, str) and pcwd == cwd:
             return p
     return None
 
 
-def _find_recent_gemini_chat_log(*, sessions_dir: Path, cwd: str, after_ts: float) -> Path | None:
+def _find_recent_gemini_chat_log(
+    *,
+    sessions_dir: Path,
+    cwd: str,
+    after_ts: float,
+    exclude_paths: set[Path] | None = None,
+) -> Path | None:
     if not isinstance(cwd, str) or (not cwd):
         return None
     if not sessions_dir.exists():
@@ -290,10 +313,41 @@ def _find_recent_gemini_chat_log(*, sessions_dir: Path, cwd: str, after_ts: floa
         return None
     cands.sort(key=lambda t: t[0], reverse=True)
     for _mt, p in cands:
+        if _path_is_excluded(p, exclude_paths):
+            continue
         pcwd = _read_gemini_log_cwd(p)
         if isinstance(pcwd, str) and pcwd == cwd:
             return p
     return None
+
+
+def _claimed_rollout_paths_from_sock_meta(*, sock_dir: Path, exclude_sock: Path | None = None) -> set[Path]:
+    out: set[Path] = set()
+    if not sock_dir.exists():
+        return out
+    for meta_path in sock_dir.glob("*.json"):
+        sock_path = meta_path.with_suffix(".sock")
+        if exclude_sock is not None and _paths_match(sock_path, exclude_sock):
+            continue
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if not isinstance(meta, dict):
+            continue
+        log_path_raw = meta.get("log_path")
+        if not isinstance(log_path_raw, str) or (not log_path_raw.strip()):
+            continue
+        broker_pid = int(meta.get("broker_pid")) if isinstance(meta.get("broker_pid"), int) else 0
+        codex_pid = int(meta.get("codex_pid")) if isinstance(meta.get("codex_pid"), int) else 0
+        if (broker_pid > 0 or codex_pid > 0) and (not _pid_alive(broker_pid)) and (not _pid_alive(codex_pid)):
+            continue
+        p = Path(log_path_raw)
+        try:
+            out.add(p.resolve())
+        except Exception:
+            out.add(p)
+    return out
 
 
 def _maybe_detach_on_new_session_hint(*, st: "State", tail: str, cleaned: str) -> bool:
@@ -767,6 +821,7 @@ class Broker:
                     need = (st.log_path is None) or (not st.log_path.exists())
                     root_pid = int(st.codex_pid)
                     start_ts = float(st.start_ts)
+                    sock_path = st.sock_path
                 if not need:
                     time.sleep(0.25)
                     continue
@@ -777,20 +832,30 @@ class Broker:
                         time.sleep(0.25)
                         continue
                     if CLI_KIND == "claude":
+                        claimed_paths = _claimed_rollout_paths_from_sock_meta(
+                            sock_dir=SOCK_DIR,
+                            exclude_sock=sock_path,
+                        )
                         fallback = _find_recent_claude_project_log(
                             sessions_dir=self.sessions_dir,
                             cwd=self.cwd,
                             after_ts=start_ts,
+                            exclude_paths=claimed_paths,
                         )
                         if fallback and fallback.exists():
                             self._maybe_register_or_switch_rollout(log_path=fallback)
                             time.sleep(0.25)
                             continue
                     if CLI_KIND == "gemini":
+                        claimed_paths = _claimed_rollout_paths_from_sock_meta(
+                            sock_dir=SOCK_DIR,
+                            exclude_sock=sock_path,
+                        )
                         fallback = _find_recent_gemini_chat_log(
                             sessions_dir=self.sessions_dir,
                             cwd=self.cwd,
                             after_ts=start_ts,
+                            exclude_paths=claimed_paths,
                         )
                         if fallback and fallback.exists():
                             self._maybe_register_or_switch_rollout(log_path=fallback)

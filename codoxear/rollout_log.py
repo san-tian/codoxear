@@ -547,12 +547,14 @@ def _compute_idle_from_log(path: Path, max_scan_bytes: int = 8 * 1024 * 1024) ->
     turn_open = False
     turn_has_completion_candidate = False
     last_terminal_event: str | None = None
+    is_claude_format = False  # Track if we see Claude-specific message types
 
     while True:
         objs = _read_jsonl_tail(path, scan)
         for obj in objs:
             typ = obj.get("type")
             if typ == "user":
+                is_claude_format = True  # Claude uses top-level "user" type
                 if _claude_user_text(obj):
                     saw_user = True
                     turn_open = True
@@ -560,20 +562,40 @@ def _compute_idle_from_log(path: Path, max_scan_bytes: int = 8 * 1024 * 1024) ->
                     last_terminal_event = "user"
                 continue
             if typ == "assistant":
-                if _has_assistant_output_text(obj):
-                    if turn_open:
-                        turn_has_completion_candidate = True
-                    last_terminal_event = "assistant"
-                if turn_open and (
-                    _claude_assistant_thinking_count(obj) > 0 or _claude_assistant_tool_use_count(obj) > 0
-                ):
+                is_claude_format = True  # Claude uses top-level "assistant" type
+                has_text = _has_assistant_output_text(obj)
+                has_thinking = _claude_assistant_thinking_count(obj) > 0
+                has_tools = _claude_assistant_tool_use_count(obj) > 0
+
+                # Check for turn completion via stop_reason
+                msg = obj.get("message", {})
+                stop_reason = msg.get("stop_reason") if isinstance(msg, dict) else None
+
+                # Turn ends when stop_reason is present and not "tool_use"
+                if stop_reason and stop_reason != "tool_use":
+                    turn_open = False
                     turn_has_completion_candidate = False
+                    last_terminal_event = "assistant"
+                    continue
+
+                if has_text:
+                    last_terminal_event = "assistant"
+                    # For Claude: only mark completion candidate if text exists WITHOUT thinking/tools
+                    # This prevents false idle during long thinking phases after initial text output
+                    if turn_open and not has_thinking and not has_tools:
+                        turn_has_completion_candidate = True
+
+                # Any thinking or tool use keeps the turn busy
+                if turn_open and (has_thinking or has_tools):
+                    turn_has_completion_candidate = False
+
                 if bool(obj.get("_gemini_turn_end")):
                     turn_open = False
                     turn_has_completion_candidate = False
                     last_terminal_event = "assistant"
                 continue
             if typ == "system":
+                is_claude_format = True  # Claude uses "system" type
                 sub = obj.get("subtype")
                 if sub == "turn_duration":
                     turn_open = False
@@ -649,6 +671,11 @@ def _compute_idle_from_log(path: Path, max_scan_bytes: int = 8 * 1024 * 1024) ->
         return True if sz <= 128 * 1024 else False
 
     if turn_open:
+        # For Claude format: require explicit turn closure (turn_duration/api_error)
+        # Don't trust completion_candidate alone, as model may still be thinking
+        if is_claude_format:
+            return False  # Stay busy until turn explicitly closes
+        # For Codex/Gemini: use completion candidate heuristic
         return bool(turn_has_completion_candidate)
 
     if last_terminal_event in ("assistant", "aborted"):

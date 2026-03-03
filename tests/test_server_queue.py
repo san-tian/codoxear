@@ -13,14 +13,14 @@ def _make_manager() -> SessionManager:
     return mgr
 
 
-def _make_session(*, sid: str) -> Session:
+def _make_session(*, sid: str, cli: str = "codex") -> Session:
     p = Path("/tmp") / f"{sid}.jsonl"
     return Session(
         session_id=sid,
         thread_id="thread-1",
         broker_pid=1,
         codex_pid=1,
-        cli="codex",
+        cli=cli,
         owned=False,
         start_ts=0.0,
         cwd="/tmp",
@@ -88,6 +88,73 @@ class TestServerQueue(unittest.TestCase):
         self.assertEqual(resp["queue_len"], 1)
         self.assertEqual(seen["req"]["op"], "push")
         self.assertTrue(seen["req"]["front"])
+
+    def test_send_claude_escapes_markdown_image_prefix(self) -> None:
+        mgr = _make_manager()
+        sess = _make_session(sid="sid", cli="claude")
+        mgr._sessions["sid"] = sess
+
+        seen = {}
+
+        def sock_call(sock, req, timeout_s=0.0):
+            seen["req"] = req
+            return {"queued": False, "queue_len": 0}
+
+        mgr._sock_call = sock_call  # type: ignore[assignment]
+
+        mgr.send("sid", "![plot](figures/a.svg)")
+        self.assertEqual(seen["req"]["cmd"], "send")
+        self.assertEqual(seen["req"]["text"], "\\![plot](figures/a.svg)")
+
+    def test_send_claude_keeps_shell_prefix_when_not_markdown_image(self) -> None:
+        mgr = _make_manager()
+        sess = _make_session(sid="sid", cli="claude")
+        mgr._sessions["sid"] = sess
+
+        seen = {}
+
+        def sock_call(sock, req, timeout_s=0.0):
+            seen["req"] = req
+            return {"queued": False, "queue_len": 0}
+
+        mgr._sock_call = sock_call  # type: ignore[assignment]
+
+        mgr.send("sid", "!ls -la")
+        self.assertEqual(seen["req"]["text"], "!ls -la")
+
+    def test_queue_push_claude_escapes_markdown_image_prefix(self) -> None:
+        mgr = _make_manager()
+        sess = _make_session(sid="sid", cli="claude")
+        mgr._sessions["sid"] = sess
+
+        seen = {}
+
+        def sock_call(sock, req, timeout_s=0.0):
+            seen["req"] = req
+            return {"queue": [str(req.get("text") or "")]}
+
+        mgr._sock_call = sock_call  # type: ignore[assignment]
+
+        resp = mgr.queue_push("sid", "![plot](figures/a.svg)")
+        self.assertEqual(seen["req"]["text"], "\\![plot](figures/a.svg)")
+        self.assertEqual(resp["queue"], ["\\![plot](figures/a.svg)"])
+
+    def test_queue_set_claude_escapes_markdown_image_prefix(self) -> None:
+        mgr = _make_manager()
+        sess = _make_session(sid="sid", cli="claude")
+        mgr._sessions["sid"] = sess
+
+        seen = {}
+
+        def sock_call(sock, req, timeout_s=0.0):
+            seen["req"] = req
+            return {"queue": list(req.get("queue") or [])}
+
+        mgr._sock_call = sock_call  # type: ignore[assignment]
+
+        resp = mgr.queue_set("sid", ["![plot](figures/a.svg)", "next"])
+        self.assertEqual(seen["req"]["queue"], ["\\![plot](figures/a.svg)", "next"])
+        self.assertEqual(resp["queue"], ["\\![plot](figures/a.svg)", "next"])
 
 
 if __name__ == "__main__":

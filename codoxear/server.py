@@ -130,6 +130,7 @@ HARNESS_IDLE_SECONDS = int(os.environ.get("CODEX_WEB_HARNESS_IDLE_SECONDS", "300
 HARNESS_SWEEP_SECONDS = float(os.environ.get("CODEX_WEB_HARNESS_SWEEP_SECONDS", "2.5"))
 HARNESS_MAX_SCAN_BYTES = int(os.environ.get("CODEX_WEB_HARNESS_MAX_SCAN_BYTES", str(8 * 1024 * 1024)))
 DISCOVER_MIN_INTERVAL_SECONDS = float(os.environ.get("CODEX_WEB_DISCOVER_MIN_INTERVAL_SECONDS", "1.0"))
+LOG_BUSY_FROM_LOG_STALE_SECONDS = float(os.environ.get("CODEX_WEB_LOG_BUSY_FROM_LOG_STALE_SECONDS", "45.0"))
 CHAT_INIT_SEED_SCAN_BYTES = int(os.environ.get("CODEX_WEB_CHAT_INIT_SEED_SCAN_BYTES", str(512 * 1024)))
 CHAT_INIT_MAX_SCAN_BYTES = int(os.environ.get("CODEX_WEB_CHAT_INIT_MAX_SCAN_BYTES", str(128 * 1024 * 1024)))
 CHAT_INDEX_INCREMENT_BYTES = int(os.environ.get("CODEX_WEB_CHAT_INDEX_INCREMENT_BYTES", str(2 * 1024 * 1024)))
@@ -196,9 +197,19 @@ def _normalize_queue_list(raw: list[Any]) -> list[str]:
         out.append(item)
     return out
 
+
+def _normalize_outgoing_text_for_cli(text: str, cli: str) -> str:
+    raw = text if isinstance(text, str) else ""
+    if _normalize_cli_name(cli, default="codex") != "claude":
+        return raw
+    # Claude CLI treats a leading "!" as local shell command. Escape markdown
+    # image prefix so `![...]` stays literal text in chat prompts.
+    return re.sub(r"^(\s*)!\[", r"\1\\![", raw, count=1)
+
 _SESSION_ID_RE = re.compile(r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})", re.I)
 _CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
 _GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$", re.I)
+_TAIL_SHORT_SHARD_RE = re.compile(r"^[A-Za-z0-9·✢✶✻✽*\.]+$")
 _METRICS_LOCK = threading.Lock()
 _METRICS: dict[str, list[float]] = {}
 _UPDATE_CHECK_LOCK = threading.Lock()
@@ -260,6 +271,79 @@ def _sanitize_tail_text(text: str) -> str:
     cleaned = _strip_ansi_sequences(text)
     cleaned = cleaned.replace("\r\n", "\n").replace("\r", "\n")
     return _CONTROL_RE.sub("", cleaned)
+
+
+def _has_cjk(text: str) -> bool:
+    for ch in text:
+        code = ord(ch)
+        if (0x4E00 <= code <= 0x9FFF) or (0x3400 <= code <= 0x4DBF):
+            return True
+    return False
+
+
+def _sanitize_claude_tail_text(text: str) -> str:
+    lines = text.split("\n")
+    out: list[str] = []
+    blank = False
+    box_chars = "│─╭╮╰╯▐▛▜▝▘"
+    for raw in lines:
+        line = raw.rstrip()
+        stripped = line.strip()
+        if not stripped:
+            if not blank:
+                out.append("")
+            blank = True
+            continue
+        blank = False
+        flat = "".join(stripped.split()).lower()
+        if flat in ("esctointerrupt", "?forshortcuts"):
+            continue
+        if ("flowing…" in flat) or ("flowing..." in flat) or ("brewedfor" in flat):
+            continue
+        if len(stripped) >= 8:
+            box_count = sum(1 for ch in stripped if ch in box_chars)
+            if (box_count / float(len(stripped))) > 0.35:
+                continue
+        if stripped and all(not ch.isalnum() for ch in stripped):
+            if stripped not in ("❯", "↯", "───"):
+                continue
+        if _has_cjk(stripped):
+            out.append(line)
+            continue
+        if (" " not in stripped) and len(stripped) <= 6:
+            up = stripped.upper()
+            if up not in ("OK", "DONE", "YES", "NO") and not stripped.startswith(("❯", "●", "⎿", "↯")):
+                continue
+        if (
+            len(stripped) <= 8
+            and bool(_TAIL_SHORT_SHARD_RE.fullmatch(stripped))
+            and any(ch.isdigit() for ch in stripped)
+        ):
+            continue
+        if (
+            re.search(r"[A-Za-z]{3,}", stripped)
+            or ("/" in stripped)
+            or ("\\" in stripped)
+            or stripped.startswith(("●", "⎿", "❯", "↯", "───"))
+        ):
+            out.append(line)
+            continue
+        if len(stripped) >= 10:
+            out.append(line)
+            continue
+    compact: list[str] = []
+    prev_blank = False
+    for line in out:
+        is_blank = not line.strip()
+        if is_blank and prev_blank:
+            continue
+        compact.append(line)
+        prev_blank = is_blank
+    while compact and (not compact[0].strip()):
+        compact.pop(0)
+    while compact and (not compact[-1].strip()):
+        compact.pop()
+    return "\n".join(compact)
 
 
 def _record_metric(name: str, value_ms: float) -> None:
@@ -523,6 +607,19 @@ def _env_flag(name: str, default: bool) -> bool:
     if raw is None:
         return bool(default)
     return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
+def _claude_args_override_session(args: list[str]) -> bool:
+    if not args:
+        return False
+    for a in args:
+        if not isinstance(a, str):
+            continue
+        if a in ("-c", "--continue", "-r", "--resume", "--session-id", "--from-pr"):
+            return True
+        if a.startswith("--resume=") or a.startswith("--session-id=") or a.startswith("--from-pr="):
+            return True
+    return False
 
 def _tmux_pane_pid(tmux_bin: str, session_name: str, env: dict[str, str]) -> int | None:
     try:
@@ -989,6 +1086,204 @@ def _last_assistant_ts_from_tail(
     max_scan_bytes: int,
 ) -> float | None:
     return _rollout_log._last_assistant_ts_from_tail(path, max_scan_bytes=max_scan_bytes)
+
+
+def _busy_from_state_and_log_idle(*, state_busy: bool, idle_from_log: bool, log_path: Path | None) -> bool:
+    # Broker runtime state is primary. Log-based busy is only used as a short
+    # fallback window to avoid stale "busy" when no new events arrive.
+    if state_busy:
+        return True
+    if idle_from_log:
+        return False
+    if log_path is None:
+        return False
+    try:
+        age = max(0.0, time.time() - float(log_path.stat().st_mtime))
+    except Exception:
+        return True
+    return age <= max(float(LOG_BUSY_FROM_LOG_STALE_SECONDS), 0.0)
+
+
+def _read_cli_config() -> dict[str, Any]:
+    """Read configuration for all three CLIs from files and environment."""
+    config: dict[str, Any] = {
+        "codex": {},
+        "claude": {},
+        "gemini": {},
+        "env": {},
+    }
+
+    # Read Codex config
+    try:
+        codex_config_path = Path.home() / ".codex" / "config.toml"
+        if codex_config_path.exists():
+            try:
+                import tomllib
+            except ImportError:
+                try:
+                    import tomli as tomllib  # type: ignore
+                except ImportError:
+                    config["codex"]["error"] = "toml library not available"
+                    tomllib = None
+
+            if tomllib:
+                with open(codex_config_path, "rb") as f:
+                    codex_data = tomllib.load(f)
+                    config["codex"]["config_toml"] = codex_data
+                    # Extract commonly used fields
+                    if "model_providers" in codex_data:
+                        for provider_name, provider_data in codex_data["model_providers"].items():
+                            if isinstance(provider_data, dict) and "base_url" in provider_data:
+                                config["codex"]["base_url"] = provider_data["base_url"]
+                                break
+                    if "model" in codex_data:
+                        config["codex"]["model"] = codex_data["model"]
+    except Exception as e:
+        config["codex"]["error"] = str(e)
+
+    try:
+        codex_auth_path = Path.home() / ".codex" / "auth.json"
+        if codex_auth_path.exists():
+            with open(codex_auth_path, "r") as f:
+                auth_data = json.load(f)
+                config["codex"]["auth_json"] = auth_data
+                if "OPENAI_API_KEY" in auth_data:
+                    config["codex"]["api_key"] = auth_data["OPENAI_API_KEY"]
+    except Exception as e:
+        config["codex"]["auth_error"] = str(e)
+
+    # Read Claude config
+    try:
+        claude_settings_path = Path.home() / ".claude" / "settings.json"
+        if claude_settings_path.exists():
+            with open(claude_settings_path, "r") as f:
+                claude_data = json.load(f)
+                config["claude"]["settings_json"] = claude_data
+                if "model" in claude_data:
+                    config["claude"]["model"] = claude_data["model"]
+    except Exception as e:
+        config["claude"]["error"] = str(e)
+
+    # Read Gemini config
+    try:
+        gemini_settings_path = Path.home() / ".gemini" / "settings.json"
+        if gemini_settings_path.exists():
+            with open(gemini_settings_path, "r") as f:
+                gemini_data = json.load(f)
+                config["gemini"]["settings_json"] = gemini_data
+    except Exception as e:
+        config["gemini"]["error"] = str(e)
+
+    # Read environment variables
+    env_vars = [
+        "OPENAI_API_KEY", "OPENAI_BASE_URL",
+        "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL",
+        "GEMINI_API_KEY", "GOOGLE_GEMINI_BASE_URL", "GEMINI_MODEL",
+    ]
+    for var in env_vars:
+        val = os.environ.get(var)
+        if val:
+            config["env"][var] = val
+
+    return config
+
+
+def _save_cli_config(updates: dict[str, Any]) -> dict[str, Any]:
+    """Save configuration updates for CLIs."""
+    result = {"ok": True, "updated": [], "note": "Configuration saved. Restart CLI sessions for changes to take effect."}
+
+    # Update Codex config
+    if "codex" in updates:
+        codex_updates = updates["codex"]
+
+        # Update config.toml using simple text replacement
+        if "base_url" in codex_updates or "model" in codex_updates:
+            try:
+                codex_config_path = Path.home() / ".codex" / "config.toml"
+                if codex_config_path.exists():
+                    content = codex_config_path.read_text()
+
+                    # Update base_url
+                    if "base_url" in codex_updates and codex_updates["base_url"]:
+                        import re
+                        content = re.sub(
+                            r'(base_url\s*=\s*")[^"]*(")',
+                            r'\1' + codex_updates["base_url"] + r'\2',
+                            content
+                        )
+
+                    # Update model
+                    if "model" in codex_updates and codex_updates["model"]:
+                        import re
+                        content = re.sub(
+                            r'^(model\s*=\s*")[^"]*(")',
+                            r'\1' + codex_updates["model"] + r'\2',
+                            content,
+                            flags=re.MULTILINE
+                        )
+
+                    codex_config_path.write_text(content)
+                    result["updated"].append("codex_config")
+            except Exception as e:
+                result["codex_config_error"] = str(e)
+
+        # Update auth.json
+        if "api_key" in codex_updates and codex_updates["api_key"]:
+            try:
+                codex_auth_path = Path.home() / ".codex" / "auth.json"
+                auth_data = {}
+                if codex_auth_path.exists():
+                    with open(codex_auth_path, "r") as f:
+                        auth_data = json.load(f)
+
+                auth_data["OPENAI_API_KEY"] = codex_updates["api_key"]
+                if "auth_mode" not in auth_data:
+                    auth_data["auth_mode"] = "apikey"
+
+                with open(codex_auth_path, "w") as f:
+                    json.dump(auth_data, f, indent=2)
+
+                result["updated"].append("codex_auth")
+            except Exception as e:
+                result["codex_auth_error"] = str(e)
+
+    # Update Claude config
+    if "claude" in updates:
+        claude_updates = updates["claude"]
+
+        # Update settings.json
+        if "model" in claude_updates and claude_updates["model"]:
+            try:
+                claude_settings_path = Path.home() / ".claude" / "settings.json"
+                claude_data = {}
+                if claude_settings_path.exists():
+                    with open(claude_settings_path, "r") as f:
+                        claude_data = json.load(f)
+
+                claude_data["model"] = claude_updates["model"]
+
+                with open(claude_settings_path, "w") as f:
+                    json.dump(claude_data, f, indent=2)
+
+                result["updated"].append("claude_settings")
+            except Exception as e:
+                result["claude_error"] = str(e)
+
+        # Note: Claude API key and base URL are typically set via environment variables
+        # We'll add a note about this
+        if "api_key" in claude_updates or "base_url" in claude_updates:
+            result["claude_env_note"] = "Claude API key and base URL should be set via ANTHROPIC_API_KEY and ANTHROPIC_BASE_URL environment variables"
+
+    # Update Gemini config
+    if "gemini" in updates:
+        gemini_updates = updates["gemini"]
+
+        # Gemini settings.json doesn't typically store API keys or base URLs
+        # These are usually in environment variables
+        if "api_key" in gemini_updates or "base_url" in gemini_updates or "model" in gemini_updates:
+            result["gemini_env_note"] = "Gemini API key, base URL, and model should be set via GEMINI_API_KEY, GOOGLE_GEMINI_BASE_URL, and GEMINI_MODEL environment variables"
+
+    return result
 
 
 @dataclass
@@ -1851,9 +2146,14 @@ class SessionManager:
             if not log_exists:
                 busy_out = False
             else:
-                # When a log exists, unify semantics with /messages:
-                # busy if broker says busy OR log-derived idle is false.
-                busy_out = state_busy or (not bool(self.idle_from_log(sid)))
+                log_path_raw = it.get("log_path")
+                lp = Path(log_path_raw) if isinstance(log_path_raw, str) and log_path_raw else None
+                idle_val = bool(self.idle_from_log(sid))
+                busy_out = _busy_from_state_and_log_idle(
+                    state_busy=state_busy,
+                    idle_from_log=idle_val,
+                    log_path=lp,
+                )
             it2 = dict(it)
             it2.pop("log_exists", None)
             it2.pop("state_busy", None)
@@ -2150,9 +2450,14 @@ class SessionManager:
         cli: str | None = None,
     ) -> dict[str, Any]:
         cli_name = _parse_cli_name(cli, default=DEFAULT_SPAWN_CLI)
+        cli_args = list(args) if isinstance(args, list) else []
+        if cli_name == "claude" and (not _claude_args_override_session(cli_args)):
+            # Keep "new web session" semantics stable even when another Claude
+            # session already exists in the same workspace.
+            cli_args.extend(["--session-id", str(uuid.uuid4())])
         argv = [sys.executable, "-m", "codoxear.broker", "--cwd", cwd, "--"]
-        if args:
-            argv.extend(args)
+        if cli_args:
+            argv.extend(cli_args)
 
         env = dict(os.environ)
         if _DOTENV.exists():
@@ -2268,8 +2573,10 @@ class SessionManager:
             if not s:
                 raise KeyError("unknown session")
             sock = s.sock_path
+            cli = _normalize_cli_name(s.cli, default="codex")
+        text_out = _normalize_outgoing_text_for_cli(text, cli)
         try:
-            resp = self._sock_call(sock, {"cmd": "send", "text": text}, timeout_s=3.0)
+            resp = self._sock_call(sock, {"cmd": "send", "text": text_out}, timeout_s=3.0)
         except Exception:
             if not _pid_alive(s.broker_pid) and not _pid_alive(s.codex_pid):
                 with self._lock:
@@ -2320,10 +2627,22 @@ class SessionManager:
 
     def queue_set(self, session_id: str, queue: list[str]) -> dict[str, Any]:
         cleaned = _normalize_queue_list(queue)
+        with self._lock:
+            s = self._sessions.get(session_id)
+            if not s:
+                raise KeyError("unknown session")
+            cli = _normalize_cli_name(s.cli, default="codex")
+        cleaned = [_normalize_outgoing_text_for_cli(item, cli) for item in cleaned]
         return self._queue_call(session_id, {"cmd": "queue", "op": "set", "queue": cleaned})
 
     def queue_push(self, session_id: str, text: str, *, front: bool = False) -> dict[str, Any]:
-        return self._queue_call(session_id, {"cmd": "queue", "op": "push", "text": text, "front": bool(front)})
+        with self._lock:
+            s = self._sessions.get(session_id)
+            if not s:
+                raise KeyError("unknown session")
+            cli = _normalize_cli_name(s.cli, default="codex")
+        text_out = _normalize_outgoing_text_for_cli(text, cli)
+        return self._queue_call(session_id, {"cmd": "queue", "op": "push", "text": text_out, "front": bool(front)})
 
     def get_state(self, session_id: str) -> dict[str, Any]:
         with self._lock:
@@ -2360,6 +2679,7 @@ class SessionManager:
             if not s:
                 raise KeyError("unknown session")
             sock = s.sock_path
+            cli = _normalize_cli_name(getattr(s, "cli", ""), default="codex")
         try:
             resp = self._sock_call(sock, {"cmd": "tail"}, timeout_s=1.5)
         except Exception:
@@ -2375,7 +2695,10 @@ class SessionManager:
         tail = resp.get("tail")
         if not isinstance(tail, str):
             raise ValueError("invalid broker tail response")
-        return _sanitize_tail_text(tail)
+        cleaned = _sanitize_tail_text(tail)
+        if cli == "claude":
+            return _sanitize_claude_tail_text(cleaned)
+        return cleaned
 
     def inject_keys(self, session_id: str, seq: str) -> dict[str, Any]:
         with self._lock:
@@ -2639,7 +2962,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 dt_idle_ms = (time.perf_counter() - t0_idle) * 1000.0
                 diag["idle_from_log_ms"] = round(dt_idle_ms, 3)
 
-                busy_val = bool(state_busy) or (not bool(idle_val))
+                busy_val = _busy_from_state_and_log_idle(
+                    state_busy=bool(state_busy),
+                    idle_from_log=bool(idle_val),
+                    log_path=s.log_path,
+                )
                 queue_val = state_queue
 
                 token_val: dict[str, Any] | None = None
@@ -2719,6 +3046,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     _json_response(self, 404, {"error": "unknown session"})
                     return
                 _json_response(self, 200, {"ok": True, **cfg})
+                return
+
+            if path == "/api/config":
+                if not _require_auth(self):
+                    self._unauthorized()
+                    return
+                config = _read_cli_config()
+                _json_response(self, 200, {"ok": True, "config": config})
                 return
 
             self.send_error(404)
@@ -3222,6 +3557,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 # Optional integration point. Current design does not rely on this.
                 _read_body(self)
                 _json_response(self, 200, {"ignored": True})
+                return
+
+            if path == "/api/config":
+                if not _require_auth(self):
+                    self._unauthorized()
+                    return
+                body = _read_body(self)
+                body_text = body.decode("utf-8")
+                if not body_text.strip():
+                    raise ValueError("empty request body")
+                obj = json.loads(body_text)
+                if not isinstance(obj, dict):
+                    raise ValueError("invalid json body (expected object)")
+                updates = obj.get("updates")
+                if not isinstance(updates, dict):
+                    _json_response(self, 400, {"error": "updates must be an object"})
+                    return
+                result = _save_cli_config(updates)
+                _json_response(self, 200, result)
                 return
 
             self.send_error(404)

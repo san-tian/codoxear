@@ -14,6 +14,8 @@ Start server (fixed working directory, standard):
 Daemonized server control (this host runtime):
 `supervisorctl status codoxear`
 `supervisorctl restart codoxear`
+`supervisorctl status codoxear-portmap`
+`supervisorctl status codoxear-portmap-v6`
 
 Start broker from a terminal:
 `CODEX_WEB_CLI=codex codoxear-broker -- <codex args>`
@@ -29,10 +31,13 @@ Default bind:
 `CODEX_WEB_HOST=::`
 
 Default port:
-`CODEX_WEB_PORT=8743` (the daemon on this host is currently configured to `13780`)
+`CODEX_WEB_PORT=8743` (the daemon on this host is configured to `8743`)
 
 Required env:
 `CODEX_WEB_PASSWORD` must be set (via `.env` or environment).
+If enabling tmux-backed web sessions (`CODEX_WEB_TMUX=1`), also set:
+`LANG=en_US.UTF-8`
+`LC_ALL=en_US.UTF-8`
 
 Env file location (this host):
 `/root/code/codoxear/.env`

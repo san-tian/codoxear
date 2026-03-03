@@ -194,6 +194,28 @@ class TestBrokerProcRolloutDiscovery(unittest.TestCase):
             found = _find_recent_claude_project_log(sessions_dir=root / "projects", cwd="/want", after_ts=2000.0)
             self.assertIsNone(found)
 
+    def test_broker_fallback_skips_excluded_claude_logs(self) -> None:
+        with TemporaryDirectory() as td:
+            root = Path(td)
+            projects = root / "projects" / "workspace"
+            projects.mkdir(parents=True, exist_ok=True)
+
+            claimed = projects / "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa.jsonl"
+            want = projects / "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb.jsonl"
+            _write_jsonl(claimed, [{"type": "system", "cwd": "/want", "subtype": "init"}])
+            _write_jsonl(want, [{"type": "system", "cwd": "/want", "subtype": "init"}])
+
+            os.utime(claimed, (1030.0, 1030.0))
+            os.utime(want, (1020.0, 1020.0))
+
+            found = _find_recent_claude_project_log(
+                sessions_dir=root / "projects",
+                cwd="/want",
+                after_ts=1010.0,
+                exclude_paths={claimed},
+            )
+            self.assertEqual(found, want)
+
     def test_broker_fallback_finds_recent_gemini_log(self) -> None:
         with TemporaryDirectory() as td:
             root = Path(td)

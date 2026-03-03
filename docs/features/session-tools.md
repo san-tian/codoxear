@@ -30,5 +30,6 @@ Call stack:
 
 Notes:
 - Tail output is sanitized server-side to strip ANSI/control sequences.
+- Claude tails apply additional server-side noise filtering to reduce spinner/counter redraw fragments so Session Tools stays readable.
 - The modal is disabled when no session is selected.
 - Copy actions show feedback inside the Session Tools modal (success/failure), so confirmation remains visible even when topbar toast is covered by the modal backdrop.
