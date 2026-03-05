@@ -1234,7 +1234,8 @@ input[type="text"] {
         border-bottom: 1px solid var(--border);
       }
       body.file-fullscreen .fileContent,
-      body.file-fullscreen .filePreview {
+      body.file-fullscreen .filePreview,
+      body.file-fullscreen .fileImageWrap {
         margin: 12px 16px 16px;
         border-radius: 12px;
         border: 1px solid var(--border);
@@ -1346,6 +1347,29 @@ input[type="text"] {
         flex: 1 1 auto;
         min-height: 120px;
         -webkit-overflow-scrolling: touch;
+      }
+      .fileImageWrap {
+        display: none;
+        margin: 0;
+        padding: 12px;
+        border-radius: 12px;
+        border: 1px solid rgba(15, 23, 42, 0.1);
+        background: repeating-conic-gradient(from 45deg, #f8fafc 0% 25%, #eef2f7 0% 50%) 50% / 20px 20px;
+        overflow: auto;
+        flex: 1 1 auto;
+        min-height: 120px;
+        justify-content: center;
+        align-items: flex-start;
+        -webkit-overflow-scrolling: touch;
+      }
+      .fileImage {
+        display: block;
+        max-width: 100%;
+        height: auto;
+        object-fit: contain;
+        border-radius: 8px;
+        box-shadow: 0 2px 10px rgba(15, 23, 42, 0.12);
+        margin: 0 auto;
       }
       .fileEditor {
         display: none;
@@ -1683,6 +1707,48 @@ input[type="text"] {
         outline: none;
         border-color: var(--accent);
         background: var(--panel);
+      }
+      .configSecretRow {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+      .configSecretRow .configInput {
+        flex: 1;
+      }
+      .configRevealBtn {
+        min-width: 72px;
+        padding: 8px 10px;
+        border-radius: 8px;
+        border: 1px solid var(--border);
+        background: transparent;
+        color: var(--muted);
+        cursor: pointer;
+        font-size: 12px;
+        font-weight: 600;
+        transition: all 140ms ease-out;
+      }
+      .configRevealBtn:hover {
+        color: var(--text);
+        background: var(--accent-weak);
+      }
+      .configHint {
+        font-size: 12px;
+        color: var(--muted);
+      }
+      .configToggle {
+        display: inline-flex;
+        align-items: center;
+        gap: 10px;
+        font-size: 13px;
+        color: var(--text);
+        cursor: pointer;
+        user-select: none;
+      }
+      .configCheckbox {
+        width: 16px;
+        height: 16px;
+        accent-color: var(--accent);
       }
       .configActions {
         display: flex;

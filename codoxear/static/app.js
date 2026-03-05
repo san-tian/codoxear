@@ -575,6 +575,16 @@
         return url.toString();
       }
 
+      function buildFileContentUrl(path, { download = false, cacheBust = "" } = {}) {
+        const clean = String(path || "").trim();
+        if (!clean) return "";
+        const url = new URL(resolveAppUrl("/api/files/content"));
+        url.searchParams.set("path", clean);
+        if (download) url.searchParams.set("download", "1");
+        if (cacheBust) url.searchParams.set("_t", String(cacheBust));
+        return url.toString();
+      }
+
       function renderInlineMd(s, basePath) {
         const raw = String(s ?? "");
         // Updated regex to handle images: ![alt](url) and links: [text](url)
@@ -1143,7 +1153,7 @@
         const recentEventSigOrder = [];
         const RECENT_EVENT_KEYS_MAX = 320;
         const RECENT_EVENT_SIG_MAX = 360;
-	        const RECENT_EVENT_SIG_WINDOW_MS = 1600;
+	        const RECENT_EVENT_SIG_WINDOW_MS = 100;
 	                let clickLoadT0 = 0;
 	                let clickMetricPending = false;
         let preferredSpawnCli = normalizeCliName(localStorage.getItem("codexweb.spawnCli"), "codex");
@@ -1406,6 +1416,14 @@
           type: "button",
           text: "Copy name",
         });
+        const fileDownloadBtn = el("button", {
+          id: "fileDownloadBtn",
+          class: "icon-btn text-btn",
+          title: "Download file",
+          "aria-label": "Download file",
+          type: "button",
+          text: "Download",
+        });
         const filePathInput = el("input", { id: "filePathInput", type: "text", placeholder: "/path/to/file" });
         const fileOpenBtn = el("button", { id: "fileOpenBtn", class: "primary", type: "button", text: "Open" });
         const fileStatus = el("div", { class: "muted", id: "fileStatus", text: "" });
@@ -1416,6 +1434,8 @@
         ]);
         const fileStatusRow = el("div", { class: "fileStatusRow" }, [fileStatus, fileSync]);
         const fileContent = el("pre", { class: "fileContent", id: "fileContent" });
+        const fileImage = el("img", { class: "fileImage", id: "fileImage", alt: "Image preview", loading: "lazy" });
+        const fileImageWrap = el("div", { class: "fileImageWrap", id: "fileImageWrap" }, [fileImage]);
         const fileEditor = el("textarea", { class: "fileEditor", id: "fileEditor", spellcheck: "false" });
         const filePreview = el("div", { class: "filePreview md", id: "filePreview" });
         const filePathRow = el("div", { class: "filePathRow" }, [filePathInput, fileOpenBtn]);
@@ -1428,6 +1448,7 @@
               fileEditBtn,
               filePreviewBtn,
               fileSaveBtn,
+              fileDownloadBtn,
               filePopoutBtn,
               fileCopyPathBtn,
               fileCopyNameBtn,
@@ -1439,6 +1460,7 @@
           filePathRow,
           fileStatusRow,
           fileContent,
+          fileImageWrap,
           fileEditor,
           filePreview,
         ]);
@@ -1613,27 +1635,70 @@
         }
         function renderConfigForm(config) {
           configContent.innerHTML = "";
+          const env = config?.env || {};
+          const envMasked = config?.env_masked || {};
+
+          function readEnvBool(key, fallback = false) {
+            const raw = env[key];
+            if (raw == null || raw === "") return !!fallback;
+            const s = String(raw).trim().toLowerCase();
+            return !["0", "false", "no", "off"].includes(s);
+          }
+
+          function buildSecretField({ label, id, value, placeholder, masked }) {
+            const input = el("input", {
+              type: "password",
+              id,
+              class: "configInput",
+              value: value || "",
+              placeholder: placeholder || "",
+            });
+            const revealBtn = el("button", {
+              type: "button",
+              class: "configRevealBtn",
+              "aria-label": `Show ${label}`,
+              text: "Show",
+            });
+            revealBtn.onclick = () => {
+              const hidden = input.getAttribute("type") !== "text";
+              input.setAttribute("type", hidden ? "text" : "password");
+              revealBtn.textContent = hidden ? "Hide" : "Show";
+            };
+            const hintText = masked ? `Saved: ${masked}` : "Saved: (empty)";
+            return el("div", { class: "configField" }, [
+              el("label", { text: label, for: id }),
+              el("div", { class: "configSecretRow" }, [input, revealBtn]),
+              el("div", { class: "configHint", text: hintText }),
+            ]);
+          }
+
+          function buildToggleField({ label, id, checked, hint }) {
+            const checkbox = el("input", { type: "checkbox", id, class: "configCheckbox" });
+            checkbox.checked = !!checked;
+            const row = el("label", { class: "configToggle", for: id }, [checkbox, el("span", { text: label })]);
+            return el("div", { class: "configField" }, [
+              row,
+              el("div", { class: "configHint", text: hint || "" }),
+            ]);
+          }
 
           // Codex section
           const codexSection = el("div", { class: "configSection" }, [
             el("div", { class: "configSectionTitle", text: "Codex (OpenAI)" }),
-            el("div", { class: "configField" }, [
-              el("label", { text: "API Key", for: "codexApiKey" }),
-              el("input", {
-                type: "password",
-                id: "codexApiKey",
-                class: "configInput",
-                value: config.codex?.api_key || config.env?.OPENAI_API_KEY || "",
-                placeholder: "sk-..."
-              }),
-            ]),
+            buildSecretField({
+              label: "API Key",
+              id: "codexApiKey",
+              value: config.codex?.api_key || env.OPENAI_API_KEY || "",
+              placeholder: "sk-...",
+              masked: envMasked.OPENAI_API_KEY || "",
+            }),
             el("div", { class: "configField" }, [
               el("label", { text: "Base URL", for: "codexBaseUrl" }),
               el("input", {
                 type: "text",
                 id: "codexBaseUrl",
                 class: "configInput",
-                value: config.codex?.base_url || config.env?.OPENAI_BASE_URL || "",
+                value: config.codex?.base_url || env.OPENAI_BASE_URL || "",
                 placeholder: "https://api.openai.com/v1"
               }),
             ]),
@@ -1647,28 +1712,31 @@
                 placeholder: "gpt-4"
               }),
             ]),
+            buildToggleField({
+              label: "YOLO Mode",
+              id: "codexYolo",
+              checked: readEnvBool("CODEX_WEB_CODEX_YOLO", false),
+              hint: "Append --dangerously-bypass-approvals-and-sandbox for new Codex web sessions.",
+            }),
           ]);
 
           // Claude section
           const claudeSection = el("div", { class: "configSection" }, [
             el("div", { class: "configSectionTitle", text: "Claude (Anthropic)" }),
-            el("div", { class: "configField" }, [
-              el("label", { text: "API Key / Auth Token", for: "claudeApiKey" }),
-              el("input", {
-                type: "password",
-                id: "claudeApiKey",
-                class: "configInput",
-                value: config.env?.ANTHROPIC_API_KEY || config.env?.ANTHROPIC_AUTH_TOKEN || "",
-                placeholder: "sk-ant-..."
-              }),
-            ]),
+            buildSecretField({
+              label: "API Key / Auth Token",
+              id: "claudeApiKey",
+              value: env.ANTHROPIC_API_KEY || env.ANTHROPIC_AUTH_TOKEN || "",
+              placeholder: "sk-ant-...",
+              masked: envMasked.ANTHROPIC_API_KEY || envMasked.ANTHROPIC_AUTH_TOKEN || "",
+            }),
             el("div", { class: "configField" }, [
               el("label", { text: "Base URL", for: "claudeBaseUrl" }),
               el("input", {
                 type: "text",
                 id: "claudeBaseUrl",
                 class: "configInput",
-                value: config.env?.ANTHROPIC_BASE_URL || "",
+                value: env.ANTHROPIC_BASE_URL || "",
                 placeholder: "https://api.anthropic.com"
               }),
             ]),
@@ -1682,28 +1750,31 @@
                 placeholder: "opus"
               }),
             ]),
+            buildToggleField({
+              label: "YOLO Mode",
+              id: "claudeYolo",
+              checked: readEnvBool("CODEX_WEB_CLAUDE_YOLO", false),
+              hint: "Append --dangerously-skip-permissions for new Claude web sessions.",
+            }),
           ]);
 
           // Gemini section
           const geminiSection = el("div", { class: "configSection" }, [
             el("div", { class: "configSectionTitle", text: "Gemini (Google)" }),
-            el("div", { class: "configField" }, [
-              el("label", { text: "API Key", for: "geminiApiKey" }),
-              el("input", {
-                type: "password",
-                id: "geminiApiKey",
-                class: "configInput",
-                value: config.env?.GEMINI_API_KEY || "",
-                placeholder: "AIza..."
-              }),
-            ]),
+            buildSecretField({
+              label: "API Key",
+              id: "geminiApiKey",
+              value: env.GEMINI_API_KEY || "",
+              placeholder: "AIza...",
+              masked: envMasked.GEMINI_API_KEY || "",
+            }),
             el("div", { class: "configField" }, [
               el("label", { text: "Base URL", for: "geminiBaseUrl" }),
               el("input", {
                 type: "text",
                 id: "geminiBaseUrl",
                 class: "configInput",
-                value: config.env?.GOOGLE_GEMINI_BASE_URL || "",
+                value: env.GOOGLE_GEMINI_BASE_URL || "",
                 placeholder: "https://generativelanguage.googleapis.com"
               }),
             ]),
@@ -1713,10 +1784,16 @@
                 type: "text",
                 id: "geminiModel",
                 class: "configInput",
-                value: config.env?.GEMINI_MODEL || "",
+                value: env.GEMINI_MODEL || "",
                 placeholder: "gemini-pro"
               }),
             ]),
+            buildToggleField({
+              label: "YOLO Mode",
+              id: "geminiYolo",
+              checked: readEnvBool("CODEX_WEB_GEMINI_YOLO", false),
+              hint: "Append --yolo for new Gemini web sessions.",
+            }),
           ]);
 
           configContent.appendChild(codexSection);
@@ -1729,16 +1806,19 @@
               api_key: $("#codexApiKey").value.trim(),
               base_url: $("#codexBaseUrl").value.trim(),
               model: $("#codexModel").value.trim(),
+              yolo: !!$("#codexYolo").checked,
             },
             claude: {
               api_key: $("#claudeApiKey").value.trim(),
               base_url: $("#claudeBaseUrl").value.trim(),
               model: $("#claudeModel").value.trim(),
+              yolo: !!$("#claudeYolo").checked,
             },
             gemini: {
               api_key: $("#geminiApiKey").value.trim(),
               base_url: $("#geminiBaseUrl").value.trim(),
               model: $("#geminiModel").value.trim(),
+              yolo: !!$("#geminiYolo").checked,
             },
           };
           try {
@@ -2963,10 +3043,17 @@
           const idx = best.i;
           if (idx < 0) return false;
           const { id } = pending[idx];
+          const pendingEl = chatInner.querySelector(`.msg.user[data-local-id="${id}"]`);
+          if (!pendingEl) {
+            // DOM element was removed (e.g. by trimRenderedRows or resetChatRenderState).
+            // Remove the stale pending entry so it doesn't leak, but return false
+            // so the caller renders the event as a fresh row.
+            pending.splice(idx, 1);
+            if (!pending.length) clearPendingForSession(sid);
+            return false;
+          }
           pending.splice(idx, 1);
           if (!pending.length) clearPendingForSession(sid);
-          const pendingEl = chatInner.querySelector(`.msg.user[data-local-id="${id}"]`);
-          if (!pendingEl) return false;
 
           pendingEl.style.opacity = "1";
           pendingEl.removeAttribute("data-local-id");
@@ -2986,6 +3073,7 @@
           const tsEl = pendingEl.querySelector(".ts");
           if (tsEl && typeof ev.ts === "number" && Number.isFinite(ev.ts)) tsEl.textContent = time24(new Date(ev.ts * 1000));
           rebuildDecorations({ preserveScroll: true });
+          markEventSeen(ev);
           return true;
         }
 
@@ -3596,7 +3684,11 @@
 		            const clean = sanitizeUserEvent(ev, selected);
 		            if (!clean) continue;
 		            if (consumePendingUserIfMatches(clean)) continue;
-                if (isDuplicateEvent(clean)) continue;
+                // Use exact-key dedup only (role|ts|text) in init render.
+                // Sig-based dedup (role|text within time window) is skipped here
+                // to avoid falsely dropping different messages with the same text
+                // sent in quick succession (e.g. two "ok" messages 1s apart).
+                if (recentEventKeySet.has(eventKey(clean))) continue;
                 markEventSeen(clean);
 		            msgs.push(clean);
                 if (clean.role === "assistant" && typeof clean.ts === "number" && Number.isFinite(clean.ts)) {
@@ -3994,6 +4086,8 @@
         let fileStatusBase = "";
         let fileLoadedText = "";
         let fileLoadedPath = "";
+        let fileKind = "text";
+        let fileMime = "text/plain";
         let fileSyncState = "off";
         const FILE_SYNC_LABELS = {
           live: "Live",
@@ -4050,7 +4144,11 @@
           if (fileSessionOverride) return fileSessionOverride;
           return "";
         }
+        function isFileImageKind() {
+          return fileKind === "image";
+        }
         function getActiveFileScrollEl() {
+          if (fileMode === "view" && isFileImageKind()) return fileImageWrap;
           if (fileMode === "preview") return filePreview;
           if (fileMode === "edit") return fileEditor;
           return fileContent;
@@ -4070,6 +4168,10 @@
           el.scrollTop = maxScroll > 0 ? Math.round(maxScroll * state.ratio) : 0;
         }
         function updateFilePreview() {
+          if (isFileImageKind()) {
+            filePreview.innerHTML = "";
+            return;
+          }
           const text = fileEditor.value || fileContent.textContent || "";
           const currentPath = String(filePathInput.value || "").trim();
           filePreview.innerHTML = mdToHtmlCached(text, currentPath);
@@ -4123,10 +4225,25 @@
           return false;
         }
         function applyFileReadResult(res, scrollState) {
-          if (!res || typeof res.text !== "string") throw new Error("invalid response");
-          fileContent.textContent = res.text;
-          fileEditor.value = res.text;
-          fileLoadedText = res.text;
+          const isImage = Boolean(res && res.is_image);
+          if (!res || (typeof res.text !== "string" && !isImage)) throw new Error("invalid response");
+          fileKind = isImage ? "image" : "text";
+          fileMime = typeof (res && res.mime) === "string" ? String(res.mime) : (isImage ? "image/*" : "text/plain");
+          if (isImage) {
+            const imgPath = res.path ? String(res.path) : String(filePathInput.value || "").trim();
+            fileImage.src = buildFileContentUrl(imgPath, { cacheBust: Date.now() });
+            fileImage.alt = baseName(imgPath) || "Image preview";
+            fileContent.textContent = "";
+            fileEditor.value = "";
+            fileLoadedText = "";
+            if (fileMode !== "view") fileMode = "view";
+          } else {
+            fileImage.src = "";
+            fileImage.alt = "Image preview";
+            fileContent.textContent = res.text;
+            fileEditor.value = res.text;
+            fileLoadedText = res.text;
+          }
           const size = typeof res.size === "number" ? res.size : res.text.length;
           const label = res.path ? String(res.path) : String(filePathInput.value || "").trim();
           setFileTabTitle(label);
@@ -4138,18 +4255,24 @@
           requestAnimationFrame(() => restoreFileScroll(scrollState));
         }
         function setFileMode(mode) {
+          if (isFileImageKind() && mode !== "view") mode = "view";
           fileMode = mode;
           fileViewer.dataset.mode = mode;
           const isView = mode === "view";
           const isEdit = mode === "edit";
           const isPreview = mode === "preview";
-          fileContent.style.display = isView ? "block" : "none";
+          const imageView = isView && isFileImageKind();
+          fileContent.style.display = isView && !imageView ? "block" : "none";
+          fileImageWrap.style.display = imageView ? "flex" : "none";
           fileEditor.style.display = isEdit ? "block" : "none";
           filePreview.style.display = isPreview ? "block" : "none";
           fileViewBtn.classList.toggle("active", isView);
           fileEditBtn.classList.toggle("active", isEdit);
           filePreviewBtn.classList.toggle("active", isPreview);
-          fileSaveBtn.style.display = isEdit ? "inline-flex" : "none";
+          fileEditBtn.disabled = isFileImageKind();
+          filePreviewBtn.disabled = isFileImageKind();
+          fileWrapBtn.disabled = isFileImageKind();
+          fileSaveBtn.style.display = isEdit && !isFileImageKind() ? "inline-flex" : "none";
           fileSaveBtn.disabled = !(isEdit && fileDirty);
           if (isPreview) updateFilePreview();
           updateFileTitle();
@@ -4157,6 +4280,10 @@
         function updateFileTitle() {
           if (!fileFullscreenMode) {
             fileTitle.textContent = "View file";
+            return;
+          }
+          if (isFileImageKind()) {
+            fileTitle.textContent = "View image";
             return;
           }
           if (fileMode === "edit") fileTitle.textContent = "Edit file";
@@ -4197,6 +4324,38 @@
           const name = baseName(path) || path;
           const ok = await copyToClipboard(name);
           setToast(ok ? "name copied" : "copy failed");
+        }
+        function triggerDownloadLink(url, filename) {
+          const a = document.createElement("a");
+          a.href = url;
+          if (filename) a.download = filename;
+          a.rel = "noreferrer noopener";
+          a.target = "_blank";
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+        }
+        function downloadTextContent(text, filename) {
+          const blob = new Blob([String(text || "")], { type: "text/plain;charset=utf-8" });
+          const url = URL.createObjectURL(blob);
+          try {
+            triggerDownloadLink(url, filename || "download.txt");
+          } finally {
+            setTimeout(() => URL.revokeObjectURL(url), 1500);
+          }
+        }
+        function startPathDownload(path) {
+          const clean = String(path || "").trim();
+          if (!clean) throw new Error("no file path");
+          const url = buildFileContentUrl(clean, { download: true });
+          if (!url) throw new Error("invalid file path");
+          const filename = baseName(clean) || "download";
+          if (isMobile()) {
+            const win = window.open(url, "_blank", "noopener");
+            if (!win) window.location.assign(url);
+            return;
+          }
+          triggerDownloadLink(url, filename);
         }
         applyFileWrap();
         setFileMode(fileMode);
@@ -4292,9 +4451,13 @@
           fileStatus.textContent = "Loading...";
           fileContent.textContent = "";
           fileEditor.value = "";
+          fileImage.src = "";
+          fileImage.alt = "Image preview";
           filePreview.innerHTML = "";
           fileStatusBase = "";
           fileLoadedPath = "";
+          fileKind = "text";
+          fileMime = "text/plain";
           try {
             const body = { path };
             const sid = currentFileSessionId();
@@ -4330,7 +4493,7 @@
             const res = await api("/api/files/read", { method: "POST", body });
             if (!res || typeof res.text !== "string") throw new Error("invalid response");
             setFileSyncState("live");
-            if (res.text === fileLoadedText) return;
+            if (!Boolean(res.is_image) && res.text === fileLoadedText) return;
             applyFileReadResult(res, scrollState);
           } catch (e) {
             const offline = typeof navigator !== "undefined" && navigator && navigator.onLine === false;
@@ -4400,6 +4563,37 @@
           e.preventDefault();
           e.stopPropagation();
           await copyFileName();
+        };
+        fileDownloadBtn.onclick = async (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          const path = getFileCopyPath() || String(filePathInput.value || "").trim();
+          if (!path) {
+            setToast("no file path");
+            return;
+          }
+          try {
+            const canDownloadEditedText = !isFileImageKind() && fileMode === "edit" && !isMobile();
+            if (canDownloadEditedText) {
+              const content = String(fileEditor.value || "");
+              if (!content) {
+                setToast("no content to download");
+                return;
+              }
+              const filename = baseName(path) || "download.txt";
+              downloadTextContent(content, filename);
+              setToast("file downloaded");
+              return;
+            }
+            startPathDownload(path);
+            if (!isFileImageKind() && fileMode === "edit" && isMobile()) {
+              setToast("download started (saved file content)");
+            } else {
+              setToast("download started");
+            }
+          } catch (err) {
+            setToast(`download error: ${err && err.message ? err.message : "unknown error"}`);
+          }
         };
         fileOpenInlineBtn.onclick = (e) => {
           e.preventDefault();

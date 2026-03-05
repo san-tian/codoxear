@@ -517,6 +517,60 @@ class TestBrokerBusyState(unittest.TestCase):
         self.assertTrue(st.turn_has_completion_candidate)
         self.assertEqual(st.last_turn_activity_ts, 51.0)
 
+    def test_claude_assistant_stop_reason_end_turn_closes_busy_state(self) -> None:
+        st = _state()
+        _apply_rollout_obj_to_state(
+            st,
+            {"type": "user", "message": {"content": [{"type": "text", "text": "hello"}]}},
+            now_ts=52.0,
+        )
+        _apply_rollout_obj_to_state(
+            st,
+            {
+                "type": "assistant",
+                "message": {
+                    "stop_reason": "end_turn",
+                    "content": [{"type": "text", "text": "done"}],
+                },
+            },
+            now_ts=53.0,
+        )
+        self.assertFalse(st.busy)
+        self.assertFalse(st.turn_open)
+        self.assertFalse(st.turn_has_completion_candidate)
+        self.assertEqual(st.turn_end_count, 1)
+
+    def test_claude_assistant_stop_reason_tool_use_keeps_turn_open(self) -> None:
+        st = _state()
+        _apply_rollout_obj_to_state(
+            st,
+            {"type": "user", "message": {"content": [{"type": "text", "text": "hello"}]}},
+            now_ts=53.0,
+        )
+        _apply_rollout_obj_to_state(
+            st,
+            {
+                "type": "assistant",
+                "message": {
+                    "stop_reason": "tool_use",
+                    "content": [{"type": "text", "text": "calling tool"}],
+                },
+            },
+            now_ts=54.0,
+        )
+        self.assertTrue(st.busy)
+        self.assertTrue(st.turn_open)
+        self.assertEqual(st.turn_end_count, 0)
+
+    def test_claude_interrupt_hint_does_not_rearm_after_turn_closed(self) -> None:
+        st = _state()
+        st.turn_end_count = 1
+        with patch("codoxear.broker.CLI_KIND", "claude"):
+            _update_busy_from_pty_text(st, "\x1b[2mWorking (1s • esc to interrupt)\x1b[0m", now_ts=55.0)
+        self.assertFalse(st.busy)
+        self.assertEqual(st.last_turn_activity_ts, 0.0)
+        self.assertEqual(st.last_interrupt_hint_ts, 0.0)
+
     def test_claude_turn_duration_clears_busy_state(self) -> None:
         st = _state()
         st.busy = True

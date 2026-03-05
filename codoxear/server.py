@@ -8,6 +8,7 @@ import hmac
 import http.server
 import io
 import json
+import mimetypes
 import os
 import re
 import signal
@@ -63,6 +64,118 @@ def _load_env_file(path: Path) -> dict[str, str]:
             v = v[1:-1]
         if k:
             out[k] = v
+    return out
+
+
+_ENV_ASSIGN_RE = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=")
+_SECRET_ENV_VARS = frozenset(
+    {
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "GEMINI_API_KEY",
+    }
+)
+_CONFIG_ENV_VARS = (
+    "OPENAI_API_KEY",
+    "OPENAI_BASE_URL",
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_BASE_URL",
+    "GEMINI_API_KEY",
+    "GOOGLE_GEMINI_BASE_URL",
+    "GEMINI_MODEL",
+    "CODEX_WEB_CODEX_YOLO",
+    "CODEX_WEB_CLAUDE_YOLO",
+    "CODEX_WEB_GEMINI_YOLO",
+)
+
+
+def _normalize_env_value(raw: Any) -> str:
+    if raw is None:
+        return ""
+    s = str(raw).replace("\r", "").replace("\n", "").strip()
+    return s
+
+
+def _mask_secret_value(raw: str) -> str:
+    s = _normalize_env_value(raw)
+    if not s:
+        return ""
+    if len(s) <= 8:
+        return ("*" * len(s)) if len(s) > 2 else ("*" * max(len(s), 1))
+    head = s[:4]
+    tail = s[-4:]
+    return f"{head}{'*' * 6}{tail}"
+
+
+def _apply_env_updates(updates: dict[str, str]) -> None:
+    for key, value in updates.items():
+        if not isinstance(key, str) or (not key):
+            continue
+        if value:
+            os.environ[key] = value
+        else:
+            os.environ.pop(key, None)
+
+
+def _update_env_file(path: Path, updates: dict[str, str]) -> None:
+    if not updates:
+        return
+    lines: list[str] = []
+    if path.exists():
+        lines = path.read_text("utf-8").splitlines()
+
+    out_lines: list[str] = []
+    touched: set[str] = set()
+    for raw in lines:
+        m = _ENV_ASSIGN_RE.match(raw)
+        if not m:
+            out_lines.append(raw)
+            continue
+        key = m.group(1)
+        if key not in updates:
+            out_lines.append(raw)
+            continue
+        touched.add(key)
+        value = updates.get(key, "")
+        if value:
+            out_lines.append(f"{key}={value}")
+
+    for key, value in updates.items():
+        if key in touched:
+            continue
+        if value:
+            out_lines.append(f"{key}={value}")
+
+    data = "\n".join(out_lines)
+    if out_lines:
+        data += "\n"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(data, encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _effective_config_env() -> dict[str, str]:
+    out: dict[str, str] = {}
+    for key in _CONFIG_ENV_VARS:
+        val = _normalize_env_value(os.environ.get(key))
+        if val:
+            out[key] = val
+    if _DOTENV.exists():
+        try:
+            file_env = _load_env_file(_DOTENV)
+        except Exception:
+            file_env = {}
+        for key in _CONFIG_ENV_VARS:
+            if key not in file_env:
+                continue
+            val = _normalize_env_value(file_env.get(key))
+            if val:
+                out[key] = val
+            else:
+                out.pop(key, None)
     return out
 
 
@@ -609,6 +722,108 @@ def _env_flag(name: str, default: bool) -> bool:
     return raw.strip().lower() not in ("0", "false", "no", "off")
 
 
+def _normalize_bool_setting(raw: Any, *, default: bool = False) -> bool:
+    if raw is None:
+        return bool(default)
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, (int, float)):
+        return bool(raw)
+    s = str(raw).strip().lower()
+    if s in ("1", "true", "yes", "on"):
+        return True
+    if s in ("0", "false", "no", "off", ""):
+        return False
+    return bool(default)
+
+
+def _env_flag_from_map(env: dict[str, str], name: str, default: bool = False) -> bool:
+    raw = env.get(name)
+    return _normalize_bool_setting(raw, default=default)
+
+
+def _codex_args_override_yolo(args: list[str]) -> bool:
+    for a in args:
+        if not isinstance(a, str):
+            continue
+        if a in (
+            "--dangerously-bypass-approvals-and-sandbox",
+            "--full-auto",
+            "-a",
+            "--ask-for-approval",
+            "-s",
+            "--sandbox",
+        ):
+            return True
+        if a.startswith("--ask-for-approval=") or a.startswith("--sandbox="):
+            return True
+    return False
+
+
+def _claude_args_override_yolo(args: list[str]) -> bool:
+    for a in args:
+        if not isinstance(a, str):
+            continue
+        if a in ("--dangerously-skip-permissions", "--permission-mode"):
+            return True
+        if a.startswith("--permission-mode="):
+            return True
+    return False
+
+
+def _gemini_args_override_yolo(args: list[str]) -> bool:
+    for a in args:
+        if not isinstance(a, str):
+            continue
+        if a in ("-y", "--yolo", "--approval-mode"):
+            return True
+        if a.startswith("--approval-mode="):
+            return True
+    return False
+
+
+def _gemini_bin_is_custom_wrapper(env: dict[str, str]) -> bool:
+    raw = _normalize_env_value(env.get("GEMINI_BIN"))
+    if not raw:
+        return False
+    token = raw.split()[0]
+    name = Path(token).name.lower()
+    return name not in ("gemini", "gemini.exe")
+
+
+def _running_as_root() -> bool:
+    geteuid = getattr(os, "geteuid", None)
+    if not callable(geteuid):
+        return False
+    try:
+        return int(geteuid()) == 0
+    except Exception:
+        return False
+
+
+def _apply_provider_yolo_args(*, cli_name: str, cli_args: list[str], env: dict[str, str]) -> list[str]:
+    out = list(cli_args)
+    if cli_name == "claude":
+        if (
+            _env_flag_from_map(env, "CODEX_WEB_CLAUDE_YOLO", False)
+            and (not _claude_args_override_yolo(out))
+            and (not _running_as_root())
+        ):
+            out.append("--dangerously-skip-permissions")
+        return out
+    if cli_name == "gemini":
+        if _env_flag_from_map(env, "CODEX_WEB_GEMINI_YOLO", False) and (not _gemini_args_override_yolo(out)):
+            # Host wrappers (for example `gemini-web`) may already enforce
+            # yolo/approval mode internally; avoid duplicate flags that can
+            # make Gemini exit at startup.
+            if not _gemini_bin_is_custom_wrapper(env):
+                out.append("--yolo")
+        return out
+    if _env_flag_from_map(env, "CODEX_WEB_CODEX_YOLO", False) and (not _codex_args_override_yolo(out)):
+        out.append("--dangerously-bypass-approvals-and-sandbox")
+    return out
+
+
 def _claude_args_override_session(args: list[str]) -> bool:
     if not args:
         return False
@@ -918,6 +1133,55 @@ def _read_text_file_strict(path: Path, *, max_bytes: int) -> tuple[str, int]:
     return text, size
 
 
+def _resolve_user_file_path(path_raw: str) -> Path:
+    path_obj = Path(path_raw).expanduser()
+    if not path_obj.is_absolute():
+        return (Path.cwd() / path_obj).resolve()
+    return path_obj.resolve()
+
+
+def _guess_file_mime(path: Path) -> str:
+    mime, _enc = mimetypes.guess_type(str(path), strict=False)
+    if not isinstance(mime, str) or (not mime.strip()):
+        return "application/octet-stream"
+    return mime.strip()
+
+
+def _is_image_mime(mime: str) -> bool:
+    return isinstance(mime, str) and mime.startswith("image/")
+
+
+def _read_file_for_viewer(path: Path, *, max_bytes: int) -> dict[str, Any]:
+    size = int(path.stat().st_size)
+    if size > max_bytes:
+        raise ValueError(f"file too large (max {max_bytes} bytes)")
+    mime = _guess_file_mime(path)
+    if _is_image_mime(mime):
+        return {
+            "size": int(size),
+            "text": "",
+            "mime": mime,
+            "is_image": True,
+            "is_binary": True,
+        }
+    text, text_size = _read_text_file_strict(path, max_bytes=max_bytes)
+    return {
+        "size": int(text_size),
+        "text": text,
+        "mime": "text/plain; charset=utf-8",
+        "is_image": False,
+        "is_binary": False,
+    }
+
+
+def _content_disposition(path: Path, *, download: bool) -> str:
+    disp = "attachment" if download else "inline"
+    raw_name = path.name if path.name else "download"
+    safe_name = _safe_filename(raw_name) or "download"
+    quoted = urllib.parse.quote(raw_name, safe="")
+    return f'{disp}; filename="{safe_name}"; filename*=UTF-8\'\'{quoted}'
+
+
 def _safe_filename(name: str) -> str:
     out = []
     for ch in name:
@@ -1111,6 +1375,7 @@ def _read_cli_config() -> dict[str, Any]:
         "claude": {},
         "gemini": {},
         "env": {},
+        "env_masked": {},
     }
 
     # Read Codex config
@@ -1174,16 +1439,14 @@ def _read_cli_config() -> dict[str, Any]:
     except Exception as e:
         config["gemini"]["error"] = str(e)
 
-    # Read environment variables
-    env_vars = [
-        "OPENAI_API_KEY", "OPENAI_BASE_URL",
-        "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL",
-        "GEMINI_API_KEY", "GOOGLE_GEMINI_BASE_URL", "GEMINI_MODEL",
-    ]
-    for var in env_vars:
-        val = os.environ.get(var)
+    # Read environment variables (provider config prefers latest .env values).
+    effective_env = _effective_config_env()
+    for var in _CONFIG_ENV_VARS:
+        val = effective_env.get(var)
         if val:
             config["env"][var] = val
+            if var in _SECRET_ENV_VARS:
+                config["env_masked"][var] = _mask_secret_value(val)
 
     return config
 
@@ -1191,10 +1454,18 @@ def _read_cli_config() -> dict[str, Any]:
 def _save_cli_config(updates: dict[str, Any]) -> dict[str, Any]:
     """Save configuration updates for CLIs."""
     result = {"ok": True, "updated": [], "note": "Configuration saved. Restart CLI sessions for changes to take effect."}
+    updated_items = result["updated"]
+
+    def _mark_updated(name: str) -> None:
+        if name not in updated_items:
+            updated_items.append(name)
 
     # Update Codex config
     if "codex" in updates:
         codex_updates = updates["codex"]
+        if not isinstance(codex_updates, dict):
+            result["codex_error"] = "invalid codex updates"
+            codex_updates = {}
 
         # Update config.toml using simple text replacement
         if "base_url" in codex_updates or "model" in codex_updates:
@@ -1223,7 +1494,7 @@ def _save_cli_config(updates: dict[str, Any]) -> dict[str, Any]:
                         )
 
                     codex_config_path.write_text(content)
-                    result["updated"].append("codex_config")
+                    _mark_updated("codex_config")
             except Exception as e:
                 result["codex_config_error"] = str(e)
 
@@ -1243,45 +1514,102 @@ def _save_cli_config(updates: dict[str, Any]) -> dict[str, Any]:
                 with open(codex_auth_path, "w") as f:
                     json.dump(auth_data, f, indent=2)
 
-                result["updated"].append("codex_auth")
+                _mark_updated("codex_auth")
             except Exception as e:
                 result["codex_auth_error"] = str(e)
+
+        codex_env_updates: dict[str, str] = {}
+        if "yolo" in codex_updates:
+            codex_env_updates["CODEX_WEB_CODEX_YOLO"] = "1" if _normalize_bool_setting(codex_updates.get("yolo")) else "0"
+        if codex_env_updates:
+            try:
+                _update_env_file(_DOTENV, codex_env_updates)
+                _apply_env_updates(codex_env_updates)
+                _mark_updated("codex_env")
+            except Exception as e:
+                result["codex_env_error"] = str(e)
 
     # Update Claude config
     if "claude" in updates:
         claude_updates = updates["claude"]
+        if not isinstance(claude_updates, dict):
+            result["claude_error"] = "invalid claude updates"
+            claude_updates = {}
 
         # Update settings.json
-        if "model" in claude_updates and claude_updates["model"]:
+        if "model" in claude_updates:
             try:
                 claude_settings_path = Path.home() / ".claude" / "settings.json"
                 claude_data = {}
                 if claude_settings_path.exists():
                     with open(claude_settings_path, "r") as f:
                         claude_data = json.load(f)
-
-                claude_data["model"] = claude_updates["model"]
+                model = _normalize_env_value(claude_updates.get("model"))
+                if model:
+                    claude_data["model"] = model
+                else:
+                    claude_data.pop("model", None)
+                claude_settings_path.parent.mkdir(parents=True, exist_ok=True)
 
                 with open(claude_settings_path, "w") as f:
                     json.dump(claude_data, f, indent=2)
 
-                result["updated"].append("claude_settings")
+                _mark_updated("claude_settings")
             except Exception as e:
                 result["claude_error"] = str(e)
 
-        # Note: Claude API key and base URL are typically set via environment variables
-        # We'll add a note about this
-        if "api_key" in claude_updates or "base_url" in claude_updates:
-            result["claude_env_note"] = "Claude API key and base URL should be set via ANTHROPIC_API_KEY and ANTHROPIC_BASE_URL environment variables"
+        claude_env_updates: dict[str, str] = {}
+        if "api_key" in claude_updates:
+            secret = _normalize_env_value(claude_updates.get("api_key"))
+            if secret:
+                cur_api = _normalize_env_value(os.environ.get("ANTHROPIC_API_KEY"))
+                cur_auth = _normalize_env_value(os.environ.get("ANTHROPIC_AUTH_TOKEN"))
+                use_auth_token = bool(cur_auth and (not cur_api))
+                if secret.startswith("sk-ant"):
+                    use_auth_token = False
+                if use_auth_token:
+                    claude_env_updates["ANTHROPIC_AUTH_TOKEN"] = secret
+                    claude_env_updates["ANTHROPIC_API_KEY"] = ""
+                else:
+                    claude_env_updates["ANTHROPIC_API_KEY"] = secret
+                    claude_env_updates["ANTHROPIC_AUTH_TOKEN"] = ""
+            else:
+                claude_env_updates["ANTHROPIC_API_KEY"] = ""
+                claude_env_updates["ANTHROPIC_AUTH_TOKEN"] = ""
+        if "base_url" in claude_updates:
+            claude_env_updates["ANTHROPIC_BASE_URL"] = _normalize_env_value(claude_updates.get("base_url"))
+        if "yolo" in claude_updates:
+            claude_env_updates["CODEX_WEB_CLAUDE_YOLO"] = "1" if _normalize_bool_setting(claude_updates.get("yolo")) else "0"
+        if claude_env_updates:
+            try:
+                _update_env_file(_DOTENV, claude_env_updates)
+                _apply_env_updates(claude_env_updates)
+                _mark_updated("claude_env")
+            except Exception as e:
+                result["claude_env_error"] = str(e)
 
     # Update Gemini config
     if "gemini" in updates:
         gemini_updates = updates["gemini"]
-
-        # Gemini settings.json doesn't typically store API keys or base URLs
-        # These are usually in environment variables
-        if "api_key" in gemini_updates or "base_url" in gemini_updates or "model" in gemini_updates:
-            result["gemini_env_note"] = "Gemini API key, base URL, and model should be set via GEMINI_API_KEY, GOOGLE_GEMINI_BASE_URL, and GEMINI_MODEL environment variables"
+        if not isinstance(gemini_updates, dict):
+            result["gemini_error"] = "invalid gemini updates"
+            gemini_updates = {}
+        gemini_env_updates: dict[str, str] = {}
+        if "api_key" in gemini_updates:
+            gemini_env_updates["GEMINI_API_KEY"] = _normalize_env_value(gemini_updates.get("api_key"))
+        if "base_url" in gemini_updates:
+            gemini_env_updates["GOOGLE_GEMINI_BASE_URL"] = _normalize_env_value(gemini_updates.get("base_url"))
+        if "model" in gemini_updates:
+            gemini_env_updates["GEMINI_MODEL"] = _normalize_env_value(gemini_updates.get("model"))
+        if "yolo" in gemini_updates:
+            gemini_env_updates["CODEX_WEB_GEMINI_YOLO"] = "1" if _normalize_bool_setting(gemini_updates.get("yolo")) else "0"
+        if gemini_env_updates:
+            try:
+                _update_env_file(_DOTENV, gemini_env_updates)
+                _apply_env_updates(gemini_env_updates)
+                _mark_updated("gemini_env")
+            except Exception as e:
+                result["gemini_env_error"] = str(e)
 
     return result
 
@@ -2500,7 +2828,28 @@ class SessionManager:
         cli: str | None = None,
     ) -> dict[str, Any]:
         cli_name = _parse_cli_name(cli, default=DEFAULT_SPAWN_CLI)
+        env = dict(os.environ)
+        dotenv_values: dict[str, str] = {}
+        if _DOTENV.exists():
+            try:
+                dotenv_values = _load_env_file(_DOTENV)
+            except Exception:
+                dotenv_values = {}
+            for k, v in dotenv_values.items():
+                env.setdefault(k, v)
+            # Keep spawn behavior aligned with Configuration modal reads: for
+            # provider-related settings, `.env` values override inherited
+            # process env, and explicit empty values clear inherited entries.
+            for key in _CONFIG_ENV_VARS:
+                if key not in dotenv_values:
+                    continue
+                val = _normalize_env_value(dotenv_values.get(key))
+                if val:
+                    env[key] = val
+                else:
+                    env.pop(key, None)
         cli_args = list(args) if isinstance(args, list) else []
+        cli_args = _apply_provider_yolo_args(cli_name=cli_name, cli_args=cli_args, env=env)
         if cli_name == "claude" and (not _claude_args_override_session(cli_args)):
             # Keep "new web session" semantics stable even when another Claude
             # session already exists in the same workspace.
@@ -2508,11 +2857,6 @@ class SessionManager:
         argv = [sys.executable, "-m", "codoxear.broker", "--cwd", cwd, "--"]
         if cli_args:
             argv.extend(cli_args)
-
-        env = dict(os.environ)
-        if _DOTENV.exists():
-            for k, v in _load_env_file(_DOTENV).items():
-                env.setdefault(k, v)
         env["CODEX_WEB_OWNER"] = "web"
         env["CODEX_WEB_CLI"] = cli_name
         env.pop("CODEX_WEB_UNSET_ANTHROPIC_AUTH_TOKEN", None)
@@ -2891,6 +3235,51 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 _json_response(self, 200, _update_status(force=force))
                 return
 
+            if path == "/api/files/content":
+                if not _require_auth(self):
+                    self._unauthorized()
+                    return
+                qs = urllib.parse.parse_qs(u.query)
+                path_q = qs.get("path")
+                path_raw = path_q[0] if path_q else ""
+                if not isinstance(path_raw, str) or (not path_raw.strip()):
+                    _json_response(self, 400, {"error": "path required"})
+                    return
+                download_q = qs.get("download")
+                download = bool(download_q and str(download_q[0]).strip().lower() in ("1", "true", "yes", "on"))
+                path_obj = _resolve_user_file_path(path_raw)
+                if not path_obj.exists():
+                    _json_response(self, 404, {"error": "file not found"})
+                    return
+                if not path_obj.is_file():
+                    _json_response(self, 400, {"error": "path is not a file"})
+                    return
+                try:
+                    size = int(path_obj.stat().st_size)
+                except PermissionError:
+                    _json_response(self, 403, {"error": "permission denied"})
+                    return
+                if size > FILE_READ_MAX_BYTES:
+                    _json_response(self, 413, {"error": f"file too large (max {FILE_READ_MAX_BYTES} bytes)"})
+                    return
+                ctype = _guess_file_mime(path_obj)
+                self.send_response(200)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(size))
+                self.send_header("Content-Disposition", _content_disposition(path_obj, download=download))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                try:
+                    with path_obj.open("rb") as fh:
+                        while True:
+                            chunk = fh.read(64 * 1024)
+                            if not chunk:
+                                break
+                            self.wfile.write(chunk)
+                except (BrokenPipeError, ConnectionResetError):
+                    return
+                return
+
             if path.startswith("/api/sessions/") and path.endswith("/messages"):
                 if not _require_auth(self):
                     self._unauthorized()
@@ -3221,11 +3610,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 session_id = session_id_raw if isinstance(session_id_raw, str) and session_id_raw else ""
                 record_history = obj.get("record_history")
                 record_history = True if record_history is None else bool(record_history)
-                path_obj = Path(path_raw).expanduser()
-                if not path_obj.is_absolute():
-                    path_obj = (Path.cwd() / path_obj).resolve()
-                else:
-                    path_obj = path_obj.resolve()
+                path_obj = _resolve_user_file_path(path_raw)
                 if not path_obj.exists():
                     _json_response(self, 404, {"error": "file not found"})
                     return
@@ -3233,7 +3618,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     _json_response(self, 400, {"error": "path is not a file"})
                     return
                 try:
-                    text, size = _read_text_file_strict(path_obj, max_bytes=FILE_READ_MAX_BYTES)
+                    payload = _read_file_for_viewer(path_obj, max_bytes=FILE_READ_MAX_BYTES)
                 except PermissionError:
                     _json_response(self, 403, {"error": "permission denied"})
                     return
@@ -3245,7 +3630,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         MANAGER.files_add(session_id, str(path_obj))
                     except KeyError:
                         pass
-                _json_response(self, 200, {"ok": True, "path": str(path_obj), "size": int(size), "text": text})
+                _json_response(
+                    self,
+                    200,
+                    {
+                        "ok": True,
+                        "path": str(path_obj),
+                        "size": int(payload.get("size") or 0),
+                        "text": str(payload.get("text") or ""),
+                        "mime": str(payload.get("mime") or "application/octet-stream"),
+                        "is_image": bool(payload.get("is_image")),
+                        "is_binary": bool(payload.get("is_binary")),
+                    },
+                )
                 return
 
             if path == "/api/files/write":
@@ -3269,11 +3666,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     return
                 session_id_raw = obj.get("session_id")
                 session_id = session_id_raw if isinstance(session_id_raw, str) and session_id_raw else ""
-                path_obj = Path(path_raw).expanduser()
-                if not path_obj.is_absolute():
-                    path_obj = (Path.cwd() / path_obj).resolve()
-                else:
-                    path_obj = path_obj.resolve()
+                path_obj = _resolve_user_file_path(path_raw)
                 if not path_obj.exists():
                     _json_response(self, 404, {"error": "file not found"})
                     return

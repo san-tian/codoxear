@@ -423,9 +423,27 @@ def _compacting_hint_seen_in_new_text(*, tail: str, cleaned: str) -> bool:
     )
 
 
+def _claude_assistant_stop_reason_is_turn_end(obj: dict[str, Any]) -> bool:
+    if obj.get("type") != "assistant":
+        return False
+    msg = obj.get("message")
+    if not isinstance(msg, dict):
+        return False
+    stop_reason = msg.get("stop_reason")
+    if not isinstance(stop_reason, str):
+        return False
+    sr = stop_reason.strip().lower()
+    return bool(sr) and (sr != "tool_use")
+
+
 def _update_busy_from_pty_text(st: "State", text: str, now_ts: float) -> None:
     cleaned = _strip_ansi(text)
     if not cleaned:
+        return
+    # Claude can keep rendering short "esc to interrupt" status lines even while
+    # sitting at the input prompt. After we've seen at least one closed turn,
+    # treat those PTY hints as non-authoritative unless a turn is open.
+    if CLI_KIND == "claude" and (not st.turn_open) and (st.turn_end_count > 0):
         return
     tail = st.interrupt_hint_tail
     st.interrupt_hint_tail = (st.interrupt_hint_tail + cleaned)[-st.interrupt_hint_tail_max :]
@@ -588,6 +606,9 @@ def _apply_rollout_obj_to_state(st: "State", obj: dict[str, Any], now_ts: float)
         return
 
     if typ == "assistant":
+        if _claude_assistant_stop_reason_is_turn_end(obj):
+            _close_turn_state(st, mark_end=True)
+            return
         if bool(obj.get("_gemini_turn_end")):
             _close_turn_state(st, mark_end=True)
             st.last_turn_activity_ts = now_ts
@@ -1091,6 +1112,8 @@ class Broker:
                                             self.state.token = token_update
                 elif obj.get("type") == "assistant":
                     if bool(obj.get("_gemini_turn_end")):
+                        should_drain = True
+                    elif _claude_assistant_stop_reason_is_turn_end(obj):
                         should_drain = True
                 elif obj.get("type") == "system":
                     subtype = obj.get("subtype")
