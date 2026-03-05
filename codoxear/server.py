@@ -8,6 +8,7 @@ import hmac
 import http.server
 import io
 import json
+import mimetypes
 import os
 import re
 import signal
@@ -16,15 +17,22 @@ import socketserver
 import subprocess
 import struct
 import sys
+import shutil
 import threading
 import time
 import traceback
 import urllib.parse
+import uuid
 import zlib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .cli_support import cli_bin as _cli_bin
+from .cli_support import cli_home as _cli_home
+from .cli_support import infer_cli_from_log_path as _infer_cli_from_log_path
+from .cli_support import normalize_cli_name as _normalize_cli_name
+from .cli_support import parse_cli_name as _parse_cli_name
 from . import rollout_log as _rollout_log
 from .util import default_app_dir as _default_app_dir
 from .util import classify_session_log as _classify_session_log
@@ -56,6 +64,118 @@ def _load_env_file(path: Path) -> dict[str, str]:
             v = v[1:-1]
         if k:
             out[k] = v
+    return out
+
+
+_ENV_ASSIGN_RE = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=")
+_SECRET_ENV_VARS = frozenset(
+    {
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "GEMINI_API_KEY",
+    }
+)
+_CONFIG_ENV_VARS = (
+    "OPENAI_API_KEY",
+    "OPENAI_BASE_URL",
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_BASE_URL",
+    "GEMINI_API_KEY",
+    "GOOGLE_GEMINI_BASE_URL",
+    "GEMINI_MODEL",
+    "CODEX_WEB_CODEX_YOLO",
+    "CODEX_WEB_CLAUDE_YOLO",
+    "CODEX_WEB_GEMINI_YOLO",
+)
+
+
+def _normalize_env_value(raw: Any) -> str:
+    if raw is None:
+        return ""
+    s = str(raw).replace("\r", "").replace("\n", "").strip()
+    return s
+
+
+def _mask_secret_value(raw: str) -> str:
+    s = _normalize_env_value(raw)
+    if not s:
+        return ""
+    if len(s) <= 8:
+        return ("*" * len(s)) if len(s) > 2 else ("*" * max(len(s), 1))
+    head = s[:4]
+    tail = s[-4:]
+    return f"{head}{'*' * 6}{tail}"
+
+
+def _apply_env_updates(updates: dict[str, str]) -> None:
+    for key, value in updates.items():
+        if not isinstance(key, str) or (not key):
+            continue
+        if value:
+            os.environ[key] = value
+        else:
+            os.environ.pop(key, None)
+
+
+def _update_env_file(path: Path, updates: dict[str, str]) -> None:
+    if not updates:
+        return
+    lines: list[str] = []
+    if path.exists():
+        lines = path.read_text("utf-8").splitlines()
+
+    out_lines: list[str] = []
+    touched: set[str] = set()
+    for raw in lines:
+        m = _ENV_ASSIGN_RE.match(raw)
+        if not m:
+            out_lines.append(raw)
+            continue
+        key = m.group(1)
+        if key not in updates:
+            out_lines.append(raw)
+            continue
+        touched.add(key)
+        value = updates.get(key, "")
+        if value:
+            out_lines.append(f"{key}={value}")
+
+    for key, value in updates.items():
+        if key in touched:
+            continue
+        if value:
+            out_lines.append(f"{key}={value}")
+
+    data = "\n".join(out_lines)
+    if out_lines:
+        data += "\n"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(data, encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _effective_config_env() -> dict[str, str]:
+    out: dict[str, str] = {}
+    for key in _CONFIG_ENV_VARS:
+        val = _normalize_env_value(os.environ.get(key))
+        if val:
+            out[key] = val
+    if _DOTENV.exists():
+        try:
+            file_env = _load_env_file(_DOTENV)
+        except Exception:
+            file_env = {}
+        for key in _CONFIG_ENV_VARS:
+            if key not in file_env:
+                continue
+            val = _normalize_env_value(file_env.get(key))
+            if val:
+                out[key] = val
+            else:
+                out.pop(key, None)
     return out
 
 
@@ -115,6 +235,7 @@ if _CODEX_HOME_ENV is None or (not _CODEX_HOME_ENV.strip()):
 else:
     CODEX_HOME = Path(_CODEX_HOME_ENV)
 CODEX_SESSIONS_DIR = CODEX_HOME / "sessions"
+DEFAULT_SPAWN_CLI = _normalize_cli_name(os.environ.get("CODEX_WEB_DEFAULT_CLI"), default="codex")
 
 DEFAULT_HOST = os.environ.get("CODEX_WEB_HOST", "::")
 DEFAULT_PORT = int(os.environ.get("CODEX_WEB_PORT", "8743"))
@@ -122,6 +243,7 @@ HARNESS_IDLE_SECONDS = int(os.environ.get("CODEX_WEB_HARNESS_IDLE_SECONDS", "300
 HARNESS_SWEEP_SECONDS = float(os.environ.get("CODEX_WEB_HARNESS_SWEEP_SECONDS", "2.5"))
 HARNESS_MAX_SCAN_BYTES = int(os.environ.get("CODEX_WEB_HARNESS_MAX_SCAN_BYTES", str(8 * 1024 * 1024)))
 DISCOVER_MIN_INTERVAL_SECONDS = float(os.environ.get("CODEX_WEB_DISCOVER_MIN_INTERVAL_SECONDS", "1.0"))
+LOG_BUSY_FROM_LOG_STALE_SECONDS = float(os.environ.get("CODEX_WEB_LOG_BUSY_FROM_LOG_STALE_SECONDS", "45.0"))
 CHAT_INIT_SEED_SCAN_BYTES = int(os.environ.get("CODEX_WEB_CHAT_INIT_SEED_SCAN_BYTES", str(512 * 1024)))
 CHAT_INIT_MAX_SCAN_BYTES = int(os.environ.get("CODEX_WEB_CHAT_INIT_MAX_SCAN_BYTES", str(128 * 1024 * 1024)))
 CHAT_INDEX_INCREMENT_BYTES = int(os.environ.get("CODEX_WEB_CHAT_INDEX_INCREMENT_BYTES", str(2 * 1024 * 1024)))
@@ -129,7 +251,12 @@ CHAT_INDEX_RESEED_THRESHOLD_BYTES = int(os.environ.get("CODEX_WEB_CHAT_INDEX_RES
 CHAT_INDEX_MAX_EVENTS = int(os.environ.get("CODEX_WEB_CHAT_INDEX_MAX_EVENTS", "12000"))
 METRICS_WINDOW = int(os.environ.get("CODEX_WEB_METRICS_WINDOW", "256"))
 FILE_READ_MAX_BYTES = int(os.environ.get("CODEX_WEB_FILE_READ_MAX_BYTES", str(2 * 1024 * 1024)))
+FILE_WRITE_MAX_BYTES = int(os.environ.get("CODEX_WEB_FILE_WRITE_MAX_BYTES", str(FILE_READ_MAX_BYTES)))
 FILE_HISTORY_MAX = int(os.environ.get("CODEX_WEB_FILE_HISTORY_MAX", "20"))
+UPDATE_CHECK_TTL_SECONDS = float(os.environ.get("CODEX_WEB_UPDATE_CHECK_TTL_SECONDS", "600"))
+UPDATE_CHECK_TIMEOUT_SECONDS = float(os.environ.get("CODEX_WEB_UPDATE_CHECK_TIMEOUT_SECONDS", "2.0"))
+UPDATE_CHECK_REMOTE = str(os.environ.get("CODEX_WEB_UPDATE_REMOTE", "")).strip()
+UPDATE_CHECK_BRANCH = str(os.environ.get("CODEX_WEB_UPDATE_BRANCH", "")).strip()
 HARNESS_PROMPT_PREFIX = """Unattended-mode instructions (optimize for 8+ hours, minimal turns, minimal repetition, maximal progress)
 
 - Maintain three live lists: Deliverables, Next actions, Parked questions.
@@ -172,9 +299,164 @@ def _render_harness_prompt(request: str | None) -> str:
         return base + "\n"
     return base + "\n\n---\n\nAdditional request from user: " + r + "\n"
 
+
+def _normalize_queue_list(raw: list[Any]) -> list[str]:
+    out: list[str] = []
+    for item in raw:
+        if not isinstance(item, str):
+            continue
+        if not item.strip():
+            continue
+        out.append(item)
+    return out
+
+
+def _normalize_outgoing_text_for_cli(text: str, cli: str) -> str:
+    raw = text if isinstance(text, str) else ""
+    if _normalize_cli_name(cli, default="codex") != "claude":
+        return raw
+    # Claude CLI treats a leading "!" as local shell command. Escape markdown
+    # image prefix so `![...]` stays literal text in chat prompts.
+    return re.sub(r"^(\s*)!\[", r"\1\\![", raw, count=1)
+
 _SESSION_ID_RE = re.compile(r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})", re.I)
+_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
+_GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$", re.I)
+_TAIL_SHORT_SHARD_RE = re.compile(r"^[A-Za-z0-9·✢✶✻✽*\.]+$")
 _METRICS_LOCK = threading.Lock()
 _METRICS: dict[str, list[float]] = {}
+_UPDATE_CHECK_LOCK = threading.Lock()
+_UPDATE_CHECK_CACHE: dict[str, Any] | None = None
+
+def _strip_ansi_sequences(text: str) -> str:
+    out: list[str] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch != "\x1b":
+            out.append(ch)
+            i += 1
+            continue
+        i += 1
+        if i >= n:
+            break
+        nxt = text[i]
+        if nxt == "[":
+            i += 1
+            while i < n:
+                c = text[i]
+                if 0x40 <= ord(c) <= 0x7E:
+                    i += 1
+                    break
+                i += 1
+            continue
+        if nxt == "]":
+            i += 1
+            while i < n:
+                c = text[i]
+                if c == "\x07":
+                    i += 1
+                    break
+                if c == "\x1b" and (i + 1) < n and text[i + 1] == "\\":
+                    i += 2
+                    break
+                i += 1
+            continue
+        if nxt in ("P", "^", "_"):
+            i += 1
+            while i < n:
+                if text[i] == "\x1b" and (i + 1) < n and text[i + 1] == "\\":
+                    i += 2
+                    break
+                i += 1
+            continue
+        if nxt in ("(", ")", "*", "+", "-", ".", "/"):
+            i += 1
+            if i < n:
+                i += 1
+            continue
+        i += 1
+    return "".join(out)
+
+
+def _sanitize_tail_text(text: str) -> str:
+    cleaned = _strip_ansi_sequences(text)
+    cleaned = cleaned.replace("\r\n", "\n").replace("\r", "\n")
+    return _CONTROL_RE.sub("", cleaned)
+
+
+def _has_cjk(text: str) -> bool:
+    for ch in text:
+        code = ord(ch)
+        if (0x4E00 <= code <= 0x9FFF) or (0x3400 <= code <= 0x4DBF):
+            return True
+    return False
+
+
+def _sanitize_claude_tail_text(text: str) -> str:
+    lines = text.split("\n")
+    out: list[str] = []
+    blank = False
+    box_chars = "│─╭╮╰╯▐▛▜▝▘"
+    for raw in lines:
+        line = raw.rstrip()
+        stripped = line.strip()
+        if not stripped:
+            if not blank:
+                out.append("")
+            blank = True
+            continue
+        blank = False
+        flat = "".join(stripped.split()).lower()
+        if flat in ("esctointerrupt", "?forshortcuts"):
+            continue
+        if ("flowing…" in flat) or ("flowing..." in flat) or ("brewedfor" in flat):
+            continue
+        if len(stripped) >= 8:
+            box_count = sum(1 for ch in stripped if ch in box_chars)
+            if (box_count / float(len(stripped))) > 0.35:
+                continue
+        if stripped and all(not ch.isalnum() for ch in stripped):
+            if stripped not in ("❯", "↯", "───"):
+                continue
+        if _has_cjk(stripped):
+            out.append(line)
+            continue
+        if (" " not in stripped) and len(stripped) <= 6:
+            up = stripped.upper()
+            if up not in ("OK", "DONE", "YES", "NO") and not stripped.startswith(("❯", "●", "⎿", "↯")):
+                continue
+        if (
+            len(stripped) <= 8
+            and bool(_TAIL_SHORT_SHARD_RE.fullmatch(stripped))
+            and any(ch.isdigit() for ch in stripped)
+        ):
+            continue
+        if (
+            re.search(r"[A-Za-z]{3,}", stripped)
+            or ("/" in stripped)
+            or ("\\" in stripped)
+            or stripped.startswith(("●", "⎿", "❯", "↯", "───"))
+        ):
+            out.append(line)
+            continue
+        if len(stripped) >= 10:
+            out.append(line)
+            continue
+    compact: list[str] = []
+    prev_blank = False
+    for line in out:
+        is_blank = not line.strip()
+        if is_blank and prev_blank:
+            continue
+        compact.append(line)
+        prev_blank = is_blank
+    while compact and (not compact[0].strip()):
+        compact.pop(0)
+    while compact and (not compact[-1].strip()):
+        compact.pop()
+    return "\n".join(compact)
 
 
 def _record_metric(name: str, value_ms: float) -> None:
@@ -223,6 +505,195 @@ def _metrics_snapshot() -> dict[str, dict[str, float | int]]:
     return out
 
 
+def _git_run(args: list[str], *, required: bool = True, timeout_s: float | None = None) -> str:
+    timeout = UPDATE_CHECK_TIMEOUT_SECONDS if timeout_s is None else float(timeout_s)
+    timeout = max(0.2, timeout)
+    repo_dir = Path(__file__).resolve().parent.parent
+    cmd = ["git", *args]
+    try:
+        res = subprocess.run(
+            cmd,
+            cwd=str(repo_dir),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except FileNotFoundError as e:
+        if required:
+            raise RuntimeError("git is not installed") from e
+        return ""
+    except subprocess.TimeoutExpired as e:
+        if required:
+            raise RuntimeError(f"git {' '.join(args)} timed out after {timeout:.1f}s") from e
+        return ""
+    if res.returncode != 0:
+        if required:
+            detail = (res.stderr or res.stdout or "").strip()
+            if detail:
+                raise RuntimeError(f"git {' '.join(args)} failed: {detail}")
+            raise RuntimeError(f"git {' '.join(args)} failed (rc={res.returncode})")
+        return ""
+    return (res.stdout or "").strip()
+
+
+def _parse_upstream_ref(raw: str) -> tuple[str, str] | None:
+    text = str(raw or "").strip()
+    if not text or text == "HEAD" or "/" not in text:
+        return None
+    remote, branch = text.split("/", 1)
+    remote = remote.strip()
+    branch = branch.strip()
+    if not remote or not branch:
+        return None
+    return remote, branch
+
+
+def _select_update_remote_branch(local_branch: str) -> tuple[str, str]:
+    remote = UPDATE_CHECK_REMOTE
+    branch = UPDATE_CHECK_BRANCH
+    if not (remote and branch):
+        upstream_raw = _git_run(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"], required=False)
+        upstream = _parse_upstream_ref(upstream_raw)
+        if upstream is not None:
+            up_remote, up_branch = upstream
+            if not remote:
+                remote = up_remote
+            if not branch:
+                branch = up_branch
+    if not remote:
+        remote = "origin"
+    if not branch:
+        branch = local_branch
+    if not branch or branch == "HEAD":
+        branch = "main"
+    return remote, branch
+
+
+def _parse_ls_remote_head(raw: str, *, branch: str, remote: str) -> str:
+    target_ref = f"refs/heads/{branch}"
+    for line in str(raw or "").splitlines():
+        parts = line.strip().split()
+        if len(parts) < 2:
+            continue
+        sha, ref = parts[0], parts[1]
+        if ref != target_ref:
+            continue
+        if _GIT_SHA_RE.fullmatch(sha):
+            return sha.lower()
+    raise RuntimeError(f"remote branch not found: {remote}/{branch}")
+
+
+def _git_divergence(local_commit: str, remote_commit: str) -> tuple[int, int]:
+    raw = _git_run(["rev-list", "--left-right", "--count", f"{local_commit}...{remote_commit}"])
+    parts = raw.split()
+    if len(parts) < 2:
+        raise RuntimeError(f"unexpected rev-list output: {raw!r}")
+    try:
+        local_only = int(parts[0])
+        remote_only = int(parts[1])
+    except ValueError as e:
+        raise RuntimeError(f"unexpected rev-list output: {raw!r}") from e
+    return local_only, remote_only
+
+
+def _github_repo_base(remote_url: str) -> str | None:
+    raw = str(remote_url or "").strip()
+    if not raw:
+        return None
+    path = ""
+    if raw.startswith("git@github.com:"):
+        path = raw[len("git@github.com:") :]
+    elif raw.startswith("ssh://git@github.com/"):
+        path = raw[len("ssh://git@github.com/") :]
+    elif raw.startswith("https://github.com/"):
+        path = raw[len("https://github.com/") :]
+    elif raw.startswith("http://github.com/"):
+        path = raw[len("http://github.com/") :]
+    elif raw.startswith("git://github.com/"):
+        path = raw[len("git://github.com/") :]
+    else:
+        return None
+    path = path.strip().lstrip("/").rstrip("/")
+    if path.endswith(".git"):
+        path = path[:-4]
+    if "/" not in path:
+        return None
+    return f"https://github.com/{path}"
+
+
+def _github_compare_url(remote_url: str, local_commit: str, remote_commit: str) -> str | None:
+    base = _github_repo_base(remote_url)
+    if not base:
+        return None
+    return f"{base}/compare/{local_commit}...{remote_commit}"
+
+
+def _check_update_status_now() -> dict[str, Any]:
+    checked_at = int(time.time())
+    try:
+        _git_run(["rev-parse", "--is-inside-work-tree"])
+        local_commit = _git_run(["rev-parse", "HEAD"]).strip().lower()
+        if not _GIT_SHA_RE.fullmatch(local_commit):
+            raise RuntimeError(f"invalid local commit: {local_commit!r}")
+        local_branch = _git_run(["rev-parse", "--abbrev-ref", "HEAD"], required=False).strip() or "HEAD"
+        remote, branch = _select_update_remote_branch(local_branch)
+        remote_head_raw = _git_run(["ls-remote", "--heads", remote, branch])
+        remote_commit = _parse_ls_remote_head(remote_head_raw, branch=branch, remote=remote)
+        if remote_commit == local_commit:
+            local_only, remote_only = 0, 0
+        else:
+            try:
+                local_only, remote_only = _git_divergence(local_commit, remote_commit)
+            except Exception:
+                # The remote head object may not exist in the local object database
+                # yet (no fetch). A commit mismatch still means a newer remote state
+                # is visible from ls-remote, so surface it as update-available.
+                local_only, remote_only = 0, 1
+        remote_url = _git_run(["remote", "get-url", remote], required=False)
+        out: dict[str, Any] = {
+            "ok": True,
+            "checked_at": checked_at,
+            "update_available": bool(remote_only > 0),
+            "remote": remote,
+            "branch": branch,
+            "local_commit": local_commit,
+            "remote_commit": remote_commit,
+            "local_only_commits": int(local_only),
+            "remote_only_commits": int(remote_only),
+        }
+        compare_url = _github_compare_url(remote_url, local_commit, remote_commit)
+        if compare_url:
+            out["compare_url"] = compare_url
+        return out
+    except Exception as e:
+        return {
+            "ok": False,
+            "checked_at": checked_at,
+            "update_available": False,
+            "error": str(e),
+        }
+
+
+def _update_status(force: bool = False) -> dict[str, Any]:
+    global _UPDATE_CHECK_CACHE
+    now = float(time.time())
+    ttl = max(5.0, float(UPDATE_CHECK_TTL_SECONDS))
+    if not force:
+        with _UPDATE_CHECK_LOCK:
+            cached = _UPDATE_CHECK_CACHE
+            if isinstance(cached, dict):
+                ts = float(cached.get("ts", 0.0))
+                if ts > 0 and (now - ts) < ttl:
+                    data = cached.get("data")
+                    if isinstance(data, dict):
+                        return dict(data)
+    data = _check_update_status_now()
+    with _UPDATE_CHECK_LOCK:
+        _UPDATE_CHECK_CACHE = {"ts": now, "data": dict(data)}
+    return data
+
+
 def _wait_or_raise(proc: subprocess.Popen[bytes], *, label: str, timeout_s: float = 1.5) -> None:
     deadline = time.time() + float(timeout_s)
     while time.time() < deadline:
@@ -243,6 +714,174 @@ def _drain_stream(f: Any) -> None:
         if not b:
             break
     f.close()
+
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return bool(default)
+    return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
+def _normalize_bool_setting(raw: Any, *, default: bool = False) -> bool:
+    if raw is None:
+        return bool(default)
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, (int, float)):
+        return bool(raw)
+    s = str(raw).strip().lower()
+    if s in ("1", "true", "yes", "on"):
+        return True
+    if s in ("0", "false", "no", "off", ""):
+        return False
+    return bool(default)
+
+
+def _env_flag_from_map(env: dict[str, str], name: str, default: bool = False) -> bool:
+    raw = env.get(name)
+    return _normalize_bool_setting(raw, default=default)
+
+
+def _codex_args_override_yolo(args: list[str]) -> bool:
+    for a in args:
+        if not isinstance(a, str):
+            continue
+        if a in (
+            "--dangerously-bypass-approvals-and-sandbox",
+            "--full-auto",
+            "-a",
+            "--ask-for-approval",
+            "-s",
+            "--sandbox",
+        ):
+            return True
+        if a.startswith("--ask-for-approval=") or a.startswith("--sandbox="):
+            return True
+    return False
+
+
+def _claude_args_override_yolo(args: list[str]) -> bool:
+    for a in args:
+        if not isinstance(a, str):
+            continue
+        if a in ("--dangerously-skip-permissions", "--permission-mode"):
+            return True
+        if a.startswith("--permission-mode="):
+            return True
+    return False
+
+
+def _gemini_args_override_yolo(args: list[str]) -> bool:
+    for a in args:
+        if not isinstance(a, str):
+            continue
+        if a in ("-y", "--yolo", "--approval-mode"):
+            return True
+        if a.startswith("--approval-mode="):
+            return True
+    return False
+
+
+def _gemini_bin_is_custom_wrapper(env: dict[str, str]) -> bool:
+    raw = _normalize_env_value(env.get("GEMINI_BIN"))
+    if not raw:
+        return False
+    token = raw.split()[0]
+    name = Path(token).name.lower()
+    return name not in ("gemini", "gemini.exe")
+
+
+def _running_as_root() -> bool:
+    geteuid = getattr(os, "geteuid", None)
+    if not callable(geteuid):
+        return False
+    try:
+        return int(geteuid()) == 0
+    except Exception:
+        return False
+
+
+def _apply_provider_yolo_args(*, cli_name: str, cli_args: list[str], env: dict[str, str]) -> list[str]:
+    out = list(cli_args)
+    if cli_name == "claude":
+        if (
+            _env_flag_from_map(env, "CODEX_WEB_CLAUDE_YOLO", False)
+            and (not _claude_args_override_yolo(out))
+            and (not _running_as_root())
+        ):
+            out.append("--dangerously-skip-permissions")
+        return out
+    if cli_name == "gemini":
+        if _env_flag_from_map(env, "CODEX_WEB_GEMINI_YOLO", False) and (not _gemini_args_override_yolo(out)):
+            # Host wrappers (for example `gemini-web`) may already enforce
+            # yolo/approval mode internally; avoid duplicate flags that can
+            # make Gemini exit at startup.
+            if not _gemini_bin_is_custom_wrapper(env):
+                out.append("--yolo")
+        return out
+    if _env_flag_from_map(env, "CODEX_WEB_CODEX_YOLO", False) and (not _codex_args_override_yolo(out)):
+        out.append("--dangerously-bypass-approvals-and-sandbox")
+    return out
+
+
+def _claude_args_override_session(args: list[str]) -> bool:
+    if not args:
+        return False
+    for a in args:
+        if not isinstance(a, str):
+            continue
+        if a in ("-c", "--continue", "-r", "--resume", "--session-id", "--from-pr"):
+            return True
+        if a.startswith("--resume=") or a.startswith("--session-id=") or a.startswith("--from-pr="):
+            return True
+    return False
+
+def _tmux_pane_pid(tmux_bin: str, session_name: str, env: dict[str, str]) -> int | None:
+    try:
+        res = subprocess.run(
+            [tmux_bin, "list-panes", "-t", session_name, "-F", "#{pane_pid}"],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=1.5,
+        )
+    except Exception:
+        return None
+    if res.returncode != 0:
+        return None
+    for line in (res.stdout or "").splitlines():
+        try:
+            pid = int(line.strip())
+        except Exception:
+            continue
+        if pid > 0:
+            return pid
+    return None
+
+
+def _tmux_global_env_has_nonempty(tmux_bin: str, key: str, env: dict[str, str]) -> bool:
+    if not key:
+        return False
+    try:
+        res = subprocess.run(
+            [tmux_bin, "show-environment", "-g", key],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=1.5,
+            check=False,
+        )
+    except Exception:
+        return False
+    if res.returncode != 0:
+        return False
+    line = (res.stdout or "").strip()
+    if not line or line.startswith("-"):
+        return False
+    prefix = key + "="
+    if line.startswith(prefix):
+        return bool(line[len(prefix) :].strip())
+    return line == key
 
 
 def _pid_alive(pid: int) -> bool:
@@ -335,6 +974,9 @@ def _json_response(handler: http.server.BaseHTTPRequestHandler, status: int, obj
     handler.send_response(status)
     handler.send_header("Content-Type", "application/json; charset=utf-8")
     handler.send_header("Content-Length", str(len(body)))
+    handler.send_header("Cache-Control", "no-store")
+    handler.send_header("Pragma", "no-cache")
+    handler.send_header("Expires", "0")
     handler.end_headers()
     handler.wfile.write(body)
 
@@ -491,6 +1133,55 @@ def _read_text_file_strict(path: Path, *, max_bytes: int) -> tuple[str, int]:
     return text, size
 
 
+def _resolve_user_file_path(path_raw: str) -> Path:
+    path_obj = Path(path_raw).expanduser()
+    if not path_obj.is_absolute():
+        return (Path.cwd() / path_obj).resolve()
+    return path_obj.resolve()
+
+
+def _guess_file_mime(path: Path) -> str:
+    mime, _enc = mimetypes.guess_type(str(path), strict=False)
+    if not isinstance(mime, str) or (not mime.strip()):
+        return "application/octet-stream"
+    return mime.strip()
+
+
+def _is_image_mime(mime: str) -> bool:
+    return isinstance(mime, str) and mime.startswith("image/")
+
+
+def _read_file_for_viewer(path: Path, *, max_bytes: int) -> dict[str, Any]:
+    size = int(path.stat().st_size)
+    if size > max_bytes:
+        raise ValueError(f"file too large (max {max_bytes} bytes)")
+    mime = _guess_file_mime(path)
+    if _is_image_mime(mime):
+        return {
+            "size": int(size),
+            "text": "",
+            "mime": mime,
+            "is_image": True,
+            "is_binary": True,
+        }
+    text, text_size = _read_text_file_strict(path, max_bytes=max_bytes)
+    return {
+        "size": int(text_size),
+        "text": text,
+        "mime": "text/plain; charset=utf-8",
+        "is_image": False,
+        "is_binary": False,
+    }
+
+
+def _content_disposition(path: Path, *, download: bool) -> str:
+    disp = "attachment" if download else "inline"
+    raw_name = path.name if path.name else "download"
+    safe_name = _safe_filename(raw_name) or "download"
+    quoted = urllib.parse.quote(raw_name, safe="")
+    return f'{disp}; filename="{safe_name}"; filename*=UTF-8\'\'{quoted}'
+
+
 def _safe_filename(name: str) -> str:
     out = []
     for ch in name:
@@ -567,7 +1258,12 @@ def _read_session_meta(log_path: Path) -> dict[str, Any]:
 
 
 def _coerce_main_thread_log(*, thread_id: str, log_path: Path) -> tuple[str, Path]:
-    sm = _read_session_meta(log_path)
+    try:
+        sm = _read_session_meta(log_path)
+    except Exception:
+        # Non-Codex logs (for example Claude project logs) do not start with
+        # session_meta; keep the original path untouched.
+        return thread_id, log_path
     if not sm:
         return thread_id, log_path
     if not _is_subagent_session_meta(sm):
@@ -624,7 +1320,7 @@ def _has_assistant_output_text(obj: dict[str, Any]) -> bool:
 
 def _analyze_log_chunk(
     objs: list[dict[str, Any]],
-) -> tuple[int, int, int, float | None, dict[str, Any] | None, list[dict[str, Any]]]:
+) -> tuple[int, int, int, float | None, float | None, dict[str, Any] | None, list[dict[str, Any]]]:
     return _rollout_log._analyze_log_chunk(objs)
 
 
@@ -648,22 +1344,295 @@ def _last_chat_role_ts_from_tail(
     return _rollout_log._last_chat_role_ts_from_tail(path, max_scan_bytes=max_scan_bytes)
 
 
+def _last_assistant_ts_from_tail(
+    path: Path,
+    *,
+    max_scan_bytes: int,
+) -> float | None:
+    return _rollout_log._last_assistant_ts_from_tail(path, max_scan_bytes=max_scan_bytes)
+
+
+def _busy_from_state_and_log_idle(*, state_busy: bool, idle_from_log: bool, log_path: Path | None) -> bool:
+    # Broker runtime state is primary. Log-based busy is only used as a short
+    # fallback window to avoid stale "busy" when no new events arrive.
+    if state_busy:
+        return True
+    if idle_from_log:
+        return False
+    if log_path is None:
+        return False
+    try:
+        age = max(0.0, time.time() - float(log_path.stat().st_mtime))
+    except Exception:
+        return True
+    return age <= max(float(LOG_BUSY_FROM_LOG_STALE_SECONDS), 0.0)
+
+
+def _read_cli_config() -> dict[str, Any]:
+    """Read configuration for all three CLIs from files and environment."""
+    config: dict[str, Any] = {
+        "codex": {},
+        "claude": {},
+        "gemini": {},
+        "env": {},
+        "env_masked": {},
+    }
+
+    # Read Codex config
+    try:
+        codex_config_path = Path.home() / ".codex" / "config.toml"
+        if codex_config_path.exists():
+            try:
+                import tomllib
+            except ImportError:
+                try:
+                    import tomli as tomllib  # type: ignore
+                except ImportError:
+                    config["codex"]["error"] = "toml library not available"
+                    tomllib = None
+
+            if tomllib:
+                with open(codex_config_path, "rb") as f:
+                    codex_data = tomllib.load(f)
+                    config["codex"]["config_toml"] = codex_data
+                    # Extract commonly used fields
+                    if "model_providers" in codex_data:
+                        for provider_name, provider_data in codex_data["model_providers"].items():
+                            if isinstance(provider_data, dict) and "base_url" in provider_data:
+                                config["codex"]["base_url"] = provider_data["base_url"]
+                                break
+                    if "model" in codex_data:
+                        config["codex"]["model"] = codex_data["model"]
+    except Exception as e:
+        config["codex"]["error"] = str(e)
+
+    try:
+        codex_auth_path = Path.home() / ".codex" / "auth.json"
+        if codex_auth_path.exists():
+            with open(codex_auth_path, "r") as f:
+                auth_data = json.load(f)
+                config["codex"]["auth_json"] = auth_data
+                if "OPENAI_API_KEY" in auth_data:
+                    config["codex"]["api_key"] = auth_data["OPENAI_API_KEY"]
+    except Exception as e:
+        config["codex"]["auth_error"] = str(e)
+
+    # Read Claude config
+    try:
+        claude_settings_path = Path.home() / ".claude" / "settings.json"
+        if claude_settings_path.exists():
+            with open(claude_settings_path, "r") as f:
+                claude_data = json.load(f)
+                config["claude"]["settings_json"] = claude_data
+                if "model" in claude_data:
+                    config["claude"]["model"] = claude_data["model"]
+    except Exception as e:
+        config["claude"]["error"] = str(e)
+
+    # Read Gemini config
+    try:
+        gemini_settings_path = Path.home() / ".gemini" / "settings.json"
+        if gemini_settings_path.exists():
+            with open(gemini_settings_path, "r") as f:
+                gemini_data = json.load(f)
+                config["gemini"]["settings_json"] = gemini_data
+    except Exception as e:
+        config["gemini"]["error"] = str(e)
+
+    # Read environment variables (provider config prefers latest .env values).
+    effective_env = _effective_config_env()
+    for var in _CONFIG_ENV_VARS:
+        val = effective_env.get(var)
+        if val:
+            config["env"][var] = val
+            if var in _SECRET_ENV_VARS:
+                config["env_masked"][var] = _mask_secret_value(val)
+
+    return config
+
+
+def _save_cli_config(updates: dict[str, Any]) -> dict[str, Any]:
+    """Save configuration updates for CLIs."""
+    result = {"ok": True, "updated": [], "note": "Configuration saved. Restart CLI sessions for changes to take effect."}
+    updated_items = result["updated"]
+
+    def _mark_updated(name: str) -> None:
+        if name not in updated_items:
+            updated_items.append(name)
+
+    # Update Codex config
+    if "codex" in updates:
+        codex_updates = updates["codex"]
+        if not isinstance(codex_updates, dict):
+            result["codex_error"] = "invalid codex updates"
+            codex_updates = {}
+
+        # Update config.toml using simple text replacement
+        if "base_url" in codex_updates or "model" in codex_updates:
+            try:
+                codex_config_path = Path.home() / ".codex" / "config.toml"
+                if codex_config_path.exists():
+                    content = codex_config_path.read_text()
+
+                    # Update base_url
+                    if "base_url" in codex_updates and codex_updates["base_url"]:
+                        import re
+                        content = re.sub(
+                            r'(base_url\s*=\s*")[^"]*(")',
+                            r'\1' + codex_updates["base_url"] + r'\2',
+                            content
+                        )
+
+                    # Update model
+                    if "model" in codex_updates and codex_updates["model"]:
+                        import re
+                        content = re.sub(
+                            r'^(model\s*=\s*")[^"]*(")',
+                            r'\1' + codex_updates["model"] + r'\2',
+                            content,
+                            flags=re.MULTILINE
+                        )
+
+                    codex_config_path.write_text(content)
+                    _mark_updated("codex_config")
+            except Exception as e:
+                result["codex_config_error"] = str(e)
+
+        # Update auth.json
+        if "api_key" in codex_updates and codex_updates["api_key"]:
+            try:
+                codex_auth_path = Path.home() / ".codex" / "auth.json"
+                auth_data = {}
+                if codex_auth_path.exists():
+                    with open(codex_auth_path, "r") as f:
+                        auth_data = json.load(f)
+
+                auth_data["OPENAI_API_KEY"] = codex_updates["api_key"]
+                if "auth_mode" not in auth_data:
+                    auth_data["auth_mode"] = "apikey"
+
+                with open(codex_auth_path, "w") as f:
+                    json.dump(auth_data, f, indent=2)
+
+                _mark_updated("codex_auth")
+            except Exception as e:
+                result["codex_auth_error"] = str(e)
+
+        codex_env_updates: dict[str, str] = {}
+        if "yolo" in codex_updates:
+            codex_env_updates["CODEX_WEB_CODEX_YOLO"] = "1" if _normalize_bool_setting(codex_updates.get("yolo")) else "0"
+        if codex_env_updates:
+            try:
+                _update_env_file(_DOTENV, codex_env_updates)
+                _apply_env_updates(codex_env_updates)
+                _mark_updated("codex_env")
+            except Exception as e:
+                result["codex_env_error"] = str(e)
+
+    # Update Claude config
+    if "claude" in updates:
+        claude_updates = updates["claude"]
+        if not isinstance(claude_updates, dict):
+            result["claude_error"] = "invalid claude updates"
+            claude_updates = {}
+
+        # Update settings.json
+        if "model" in claude_updates:
+            try:
+                claude_settings_path = Path.home() / ".claude" / "settings.json"
+                claude_data = {}
+                if claude_settings_path.exists():
+                    with open(claude_settings_path, "r") as f:
+                        claude_data = json.load(f)
+                model = _normalize_env_value(claude_updates.get("model"))
+                if model:
+                    claude_data["model"] = model
+                else:
+                    claude_data.pop("model", None)
+                claude_settings_path.parent.mkdir(parents=True, exist_ok=True)
+
+                with open(claude_settings_path, "w") as f:
+                    json.dump(claude_data, f, indent=2)
+
+                _mark_updated("claude_settings")
+            except Exception as e:
+                result["claude_error"] = str(e)
+
+        claude_env_updates: dict[str, str] = {}
+        if "api_key" in claude_updates:
+            secret = _normalize_env_value(claude_updates.get("api_key"))
+            if secret:
+                cur_api = _normalize_env_value(os.environ.get("ANTHROPIC_API_KEY"))
+                cur_auth = _normalize_env_value(os.environ.get("ANTHROPIC_AUTH_TOKEN"))
+                use_auth_token = bool(cur_auth and (not cur_api))
+                if secret.startswith("sk-ant"):
+                    use_auth_token = False
+                if use_auth_token:
+                    claude_env_updates["ANTHROPIC_AUTH_TOKEN"] = secret
+                    claude_env_updates["ANTHROPIC_API_KEY"] = ""
+                else:
+                    claude_env_updates["ANTHROPIC_API_KEY"] = secret
+                    claude_env_updates["ANTHROPIC_AUTH_TOKEN"] = ""
+            else:
+                claude_env_updates["ANTHROPIC_API_KEY"] = ""
+                claude_env_updates["ANTHROPIC_AUTH_TOKEN"] = ""
+        if "base_url" in claude_updates:
+            claude_env_updates["ANTHROPIC_BASE_URL"] = _normalize_env_value(claude_updates.get("base_url"))
+        if "yolo" in claude_updates:
+            claude_env_updates["CODEX_WEB_CLAUDE_YOLO"] = "1" if _normalize_bool_setting(claude_updates.get("yolo")) else "0"
+        if claude_env_updates:
+            try:
+                _update_env_file(_DOTENV, claude_env_updates)
+                _apply_env_updates(claude_env_updates)
+                _mark_updated("claude_env")
+            except Exception as e:
+                result["claude_env_error"] = str(e)
+
+    # Update Gemini config
+    if "gemini" in updates:
+        gemini_updates = updates["gemini"]
+        if not isinstance(gemini_updates, dict):
+            result["gemini_error"] = "invalid gemini updates"
+            gemini_updates = {}
+        gemini_env_updates: dict[str, str] = {}
+        if "api_key" in gemini_updates:
+            gemini_env_updates["GEMINI_API_KEY"] = _normalize_env_value(gemini_updates.get("api_key"))
+        if "base_url" in gemini_updates:
+            gemini_env_updates["GOOGLE_GEMINI_BASE_URL"] = _normalize_env_value(gemini_updates.get("base_url"))
+        if "model" in gemini_updates:
+            gemini_env_updates["GEMINI_MODEL"] = _normalize_env_value(gemini_updates.get("model"))
+        if "yolo" in gemini_updates:
+            gemini_env_updates["CODEX_WEB_GEMINI_YOLO"] = "1" if _normalize_bool_setting(gemini_updates.get("yolo")) else "0"
+        if gemini_env_updates:
+            try:
+                _update_env_file(_DOTENV, gemini_env_updates)
+                _apply_env_updates(gemini_env_updates)
+                _mark_updated("gemini_env")
+            except Exception as e:
+                result["gemini_env_error"] = str(e)
+
+    return result
+
+
 @dataclass
 class Session:
     session_id: str
     thread_id: str
     broker_pid: int
     codex_pid: int
+    cli: str
     owned: bool
     start_ts: float
     cwd: str
     log_path: Path | None
     sock_path: Path
+    tmux_name: str | None = None
     busy: bool = False
     queue_len: int = 0
     token: dict[str, Any] | None = None
     last_turn_id: str | None = None
     last_chat_ts: float | None = None
+    last_assistant_ts: float | None = None
     meta_thinking: int = 0
     meta_tools: int = 0
     meta_system: int = 0
@@ -702,6 +1671,7 @@ class SessionManager:
         s.meta_tools = 0
         s.meta_system = 0
         s.last_chat_ts = None
+        s.last_assistant_ts = None
         s.meta_log_off = int(meta_log_off)
         s.chat_index_events = []
         s.chat_index_scan_bytes = 0
@@ -845,6 +1815,20 @@ class SessionManager:
         tmp.write_text(json.dumps(obj, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
         os.replace(tmp, FILE_HISTORY_PATH)
 
+    def _cwd_key_from_value(self, cwd_raw: str) -> str | None:
+        if not isinstance(cwd_raw, str):
+            return None
+        cwd = cwd_raw.strip()
+        if not cwd or cwd == "?":
+            return None
+        try:
+            cwd_norm = str(Path(cwd).expanduser().resolve())
+        except Exception:
+            cwd_norm = cwd
+        if not cwd_norm:
+            return None
+        return f"cwd:{cwd_norm}"
+
     def _files_key_for_session(self, session_id: str) -> tuple[str, list[str], "Session"]:
         s = self._sessions.get(session_id)
         if not s:
@@ -910,6 +1894,145 @@ class SessionManager:
             self._files[key] = cur
         self._save_files()
         return list(cur)
+
+    def files_remove(self, session_id: str, path: str) -> list[str]:
+        p = str(path).strip()
+        if not p:
+            return self.files_get(session_id)
+        dirty = False
+        with self._lock:
+            key, legacy_keys, _s = self._files_key_for_session(session_id)
+            cur = list(self._files.get(key, []))
+            if not cur:
+                for lk in legacy_keys:
+                    legacy = self._files.get(lk)
+                    if isinstance(legacy, list) and legacy:
+                        cur = list(legacy)
+                        if lk != key:
+                            self._files.pop(lk, None)
+                            dirty = True
+                        break
+            if not cur:
+                return []
+            next_list = [x for x in cur if x != p]
+            if next_list:
+                self._files[key] = next_list
+            else:
+                if key in self._files:
+                    self._files.pop(key, None)
+            for lk in legacy_keys:
+                if lk == key:
+                    continue
+                legacy = self._files.get(lk)
+                if isinstance(legacy, list):
+                    legacy_next = [x for x in legacy if x != p]
+                    if legacy_next:
+                        self._files[lk] = legacy_next
+                    else:
+                        self._files.pop(lk, None)
+            dirty = True
+        if dirty:
+            self._save_files()
+        return list(next_list)
+
+    def files_remove_cwd(self, cwd_raw: str, path: str) -> list[str]:
+        p = str(path).strip()
+        if not p:
+            return []
+        cwd_key = self._cwd_key_from_value(cwd_raw)
+        if not cwd_key:
+            return []
+        dirty = False
+        out: list[str] = []
+        with self._lock:
+            keys = {cwd_key}
+            for s in self._sessions.values():
+                try:
+                    key, legacy_keys, _sref = self._files_key_for_session(s.session_id)
+                except KeyError:
+                    continue
+                if key != cwd_key:
+                    continue
+                for lk in legacy_keys:
+                    keys.add(lk)
+            for key in keys:
+                cur = self._files.get(key)
+                if not isinstance(cur, list) or not cur:
+                    continue
+                next_list = [x for x in cur if x != p]
+                if next_list == cur:
+                    continue
+                dirty = True
+                if next_list:
+                    self._files[key] = next_list
+                else:
+                    self._files.pop(key, None)
+            cur = self._files.get(cwd_key)
+            if isinstance(cur, list) and cur:
+                out = list(cur)
+        if dirty:
+            self._save_files()
+        return list(out)
+
+    def files_remove_all(self, path: str) -> int:
+        p = str(path).strip()
+        if not p:
+            return 0
+        dirty = False
+        removed = 0
+        with self._lock:
+            for key, cur in list(self._files.items()):
+                if not isinstance(cur, list) or not cur:
+                    continue
+                next_list = [x for x in cur if x != p]
+                if next_list == cur:
+                    continue
+                removed += len(cur) - len(next_list)
+                dirty = True
+                if next_list:
+                    self._files[key] = next_list
+                else:
+                    self._files.pop(key, None)
+        if dirty:
+            self._save_files()
+        return removed
+
+    def files_clear_scope(self, session_id: str) -> None:
+        dirty = False
+        with self._lock:
+            key, legacy_keys, _s = self._files_key_for_session(session_id)
+            for lk in legacy_keys:
+                if lk in self._files:
+                    self._files.pop(lk, None)
+                    dirty = True
+            if key in self._files:
+                self._files.pop(key, None)
+                dirty = True
+        if dirty:
+            self._save_files()
+
+    def files_clear_cwd(self, cwd_raw: str) -> None:
+        cwd_key = self._cwd_key_from_value(cwd_raw)
+        if not cwd_key:
+            return
+        dirty = False
+        with self._lock:
+            keys = {cwd_key}
+            for s in self._sessions.values():
+                try:
+                    key, legacy_keys, _sref = self._files_key_for_session(s.session_id)
+                except KeyError:
+                    continue
+                if key != cwd_key:
+                    continue
+                for lk in legacy_keys:
+                    keys.add(lk)
+            for key in keys:
+                if key in self._files:
+                    self._files.pop(key, None)
+                    dirty = True
+        if dirty:
+            self._save_files()
 
     def files_clear(self, session_id: str) -> None:
         dirty = False
@@ -1059,6 +2182,10 @@ class SessionManager:
             codex_pid = int(codex_pid_raw)
             broker_pid = int(broker_pid_raw)
             owned = (meta.get("owner") == "web") if isinstance(meta.get("owner"), str) else False
+            cli_raw = meta.get("cli") if isinstance(meta.get("cli"), str) else ""
+            cli = _normalize_cli_name(cli_raw, default=DEFAULT_SPAWN_CLI)
+            tmux_raw = meta.get("tmux_name")
+            tmux_name = tmux_raw.strip() if isinstance(tmux_raw, str) and tmux_raw.strip() else None
 
             log_path: Path | None = None
             if "log_path" not in meta:
@@ -1070,8 +2197,13 @@ class SessionManager:
                 if not isinstance(log_path_raw, str) or (not log_path_raw.strip()):
                     raise ValueError(f"invalid log_path in metadata for socket {sock}")
                 log_path = Path(log_path_raw)
+            if log_path is not None and not cli_raw:
+                inferred = _infer_cli_from_log_path(log_path)
+                if isinstance(inferred, str):
+                    cli = _normalize_cli_name(inferred, default=cli)
             if log_path is not None and log_path.exists():
-                thread_id, log_path = _coerce_main_thread_log(thread_id=thread_id, log_path=log_path)
+                if cli == "codex":
+                    thread_id, log_path = _coerce_main_thread_log(thread_id=thread_id, log_path=log_path)
             else:
                 log_path = None
 
@@ -1108,20 +2240,32 @@ class SessionManager:
                 meta_log_off = int(log_path.stat().st_size)
             else:
                 meta_log_off = 0
+            prev: Session | None
+            with self._lock:
+                prev = self._sessions.get(session_id)
+            last_assistant_ts: float | None = None
+            if log_path is not None and log_path.exists():
+                if prev and prev.log_path == log_path and prev.last_assistant_ts is not None:
+                    last_assistant_ts = prev.last_assistant_ts
+                else:
+                    last_assistant_ts = _last_assistant_ts_from_tail(log_path, max_scan_bytes=CHAT_INIT_MAX_SCAN_BYTES)
 
             s = Session(
                 session_id=session_id,
                 thread_id=thread_id,
                 broker_pid=broker_pid,
                 codex_pid=codex_pid,
+                cli=cli,
                 owned=owned,
                 start_ts=float(start_ts),
                 cwd=str(cwd),
                 log_path=log_path,
                 sock_path=sock,
+                tmux_name=tmux_name,
                 busy=bool(resp.get("busy")),
                 queue_len=int(resp.get("queue_len")),
                 token=(resp.get("token") if isinstance(resp.get("token"), (dict, type(None))) else None),
+                last_assistant_ts=last_assistant_ts,
                 meta_thinking=0,
                 meta_tools=0,
                 meta_system=0,
@@ -1137,15 +2281,19 @@ class SessionManager:
                     prev.thread_id = s.thread_id
                     prev.broker_pid = s.broker_pid
                     prev.codex_pid = s.codex_pid
+                    prev.cli = s.cli
                     prev.owned = s.owned
                     prev.start_ts = s.start_ts
                     prev.cwd = s.cwd
                     prev.busy = s.busy
                     prev.queue_len = s.queue_len
                     prev.token = s.token
+                    prev.tmux_name = s.tmux_name
                     if prev.log_path != s.log_path:
                         prev.log_path = s.log_path
                         self._reset_log_caches(prev, meta_log_off=meta_log_off)
+                    if s.last_assistant_ts is not None:
+                        prev.last_assistant_ts = s.last_assistant_ts
         with self._lock:
             self._last_discover_ts = time.time()
 
@@ -1209,18 +2357,23 @@ class SessionManager:
             total_tools = 0
             total_sys = 0
             latest_chat_ts: float | None = None
+            latest_assistant_ts: float | None = None
             latest_token: dict[str, Any] | None = None
             loops = 0
             while off < sz and loops < 16:
                 objs, new_off = _read_jsonl_from_offset(lp, off, max_bytes=256 * 1024)
                 if new_off <= off:
                     break
-                d_th, d_tools, d_sys, chunk_chat_ts, token_update, _chat_events = _analyze_log_chunk(objs)
+                d_th, d_tools, d_sys, chunk_chat_ts, chunk_assistant_ts, token_update, _chat_events = _analyze_log_chunk(objs)
                 total_th += d_th
                 total_tools += d_tools
                 total_sys += d_sys
                 if chunk_chat_ts is not None:
                     latest_chat_ts = chunk_chat_ts if latest_chat_ts is None else max(latest_chat_ts, chunk_chat_ts)
+                if chunk_assistant_ts is not None:
+                    latest_assistant_ts = (
+                        chunk_assistant_ts if latest_assistant_ts is None else max(latest_assistant_ts, chunk_assistant_ts)
+                    )
                 if token_update is not None:
                     latest_token = token_update
                 off = new_off
@@ -1232,6 +2385,10 @@ class SessionManager:
                     continue
                 if latest_chat_ts is not None:
                     s2.last_chat_ts = latest_chat_ts if s2.last_chat_ts is None else max(s2.last_chat_ts, latest_chat_ts)
+                if latest_assistant_ts is not None:
+                    s2.last_assistant_ts = (
+                        latest_assistant_ts if s2.last_assistant_ts is None else max(s2.last_assistant_ts, latest_assistant_ts)
+                    )
                 if latest_token is not None:
                     s2.token = latest_token
                 if s2.busy:
@@ -1288,6 +2445,7 @@ class SessionManager:
                         "thread_id": s.thread_id,
                         "pid": s.codex_pid,
                         "broker_pid": s.broker_pid,
+                        "cli": s.cli,
                         "owned": s.owned,
                         "cwd": s.cwd,
                         "start_ts": s.start_ts,
@@ -1300,9 +2458,11 @@ class SessionManager:
                         "thinking": int(s.meta_thinking),
                         "tools": int(s.meta_tools),
                         "system": int(s.meta_system),
+                        "last_assistant_ts": (float(s.last_assistant_ts) if isinstance(s.last_assistant_ts, (int, float)) else None),
                         "harness_enabled": h_enabled,
                         "alias": alias,
                         "files": list(files),
+                        "tmux_name": s.tmux_name if isinstance(getattr(s, "tmux_name", None), str) else None,
                     }
                 )
 
@@ -1314,9 +2474,14 @@ class SessionManager:
             if not log_exists:
                 busy_out = False
             else:
-                # When a log exists, unify semantics with /messages:
-                # busy if broker says busy OR log-derived idle is false.
-                busy_out = state_busy or (not bool(self.idle_from_log(sid)))
+                log_path_raw = it.get("log_path")
+                lp = Path(log_path_raw) if isinstance(log_path_raw, str) and log_path_raw else None
+                idle_val = bool(self.idle_from_log(sid))
+                busy_out = _busy_from_state_and_log_idle(
+                    state_busy=state_busy,
+                    idle_from_log=idle_val,
+                    log_path=lp,
+                )
             it2 = dict(it)
             it2.pop("log_exists", None)
             it2.pop("state_busy", None)
@@ -1347,6 +2512,8 @@ class SessionManager:
 
         thread_id = meta.get("session_id") if isinstance(meta.get("session_id"), str) and meta.get("session_id") else s.thread_id
         owned = (meta.get("owner") == "web") if isinstance(meta.get("owner"), str) else s.owned
+        cli_raw = meta.get("cli") if isinstance(meta.get("cli"), str) else ""
+        cli = _normalize_cli_name(cli_raw, default=s.cli)
         if "log_path" not in meta:
             raise ValueError(f"missing log_path in metadata for socket {sock}")
         log_path: Path | None
@@ -1357,8 +2524,13 @@ class SessionManager:
             if not isinstance(log_path_raw, str) or (not log_path_raw.strip()):
                 raise ValueError(f"invalid log_path in metadata for socket {sock}")
             log_path = Path(log_path_raw)
+        if log_path is not None and not cli_raw:
+            inferred = _infer_cli_from_log_path(log_path)
+            if isinstance(inferred, str):
+                cli = _normalize_cli_name(inferred, default=cli)
         if log_path is not None and log_path.exists():
-            thread_id, log_path = _coerce_main_thread_log(thread_id=thread_id, log_path=log_path)
+            if cli == "codex":
+                thread_id, log_path = _coerce_main_thread_log(thread_id=thread_id, log_path=log_path)
 
         cwd_raw = meta.get("cwd")
         if not isinstance(cwd_raw, str) or (not cwd_raw.strip()):
@@ -1370,6 +2542,7 @@ class SessionManager:
             if not s2:
                 return
             s2.thread_id = thread_id
+            s2.cli = cli
             s2.cwd = str(cwd)
             s2.owned = bool(owned)
             if s2.log_path != log_path:
@@ -1406,7 +2579,7 @@ class SessionManager:
             s = self._sessions.get(session_id)
             if not s:
                 return
-            # Deduplicate to avoid re-appending overlapping tail events across incremental scans.
+            # Deduplicate to avoid replaying overlap between repeated tail snapshots.
             tail = list(events[-CHAT_INDEX_MAX_EVENTS:])
             uniq_rev: list[dict[str, Any]] = []
             seen: set[tuple[str, int, str]] = set()
@@ -1562,7 +2735,7 @@ class SessionManager:
                     objs, new_off = _read_jsonl_from_offset(lp3, cur, max_bytes=CHAT_INDEX_INCREMENT_BYTES)
                     if new_off <= cur:
                         break
-                    _th, _tools, _sys, _last_ts, token_update, new_events = _analyze_log_chunk(objs)
+                    _th, _tools, _sys, _last_ts, _last_assistant_ts, token_update, new_events = _analyze_log_chunk(objs)
                     if token_update is not None:
                         latest_token = token_update
                     if new_events:
@@ -1590,7 +2763,7 @@ class SessionManager:
         return page, log_off2, has_older, next_before, token2
 
     def mark_log_delta(self, session_id: str, *, objs: list[dict[str, Any]], new_off: int) -> None:
-        _th, _tools, _sys, _last_ts, token_update, new_events = _analyze_log_chunk(objs)
+        _th, _tools, _sys, _last_ts, _last_assistant_ts, token_update, new_events = _analyze_log_chunk(objs)
         self._append_chat_events(session_id, new_events, new_off=new_off, latest_token=token_update)
         with self._lock:
             s = self._sessions.get(session_id)
@@ -1647,27 +2820,112 @@ class SessionManager:
         self._sock_call(s.sock_path, {"cmd": "shutdown"}, timeout_s=1.0)
         return True
 
-    def spawn_web_session(self, *, cwd: str, args: list[str] | None = None) -> dict[str, Any]:
-        if not isinstance(cwd, str) or not cwd.strip():
-            raise ValueError("cwd required")
-
-        home = str(Path.home())
-        cwd2 = cwd.strip().replace("${HOME}", home)
-        cwd2 = re.sub(r"\$HOME(?![A-Za-z0-9_])", home, cwd2)
-        cwd2 = os.path.expanduser(os.path.expandvars(cwd2))
-        if not Path(cwd2).is_dir():
-            raise ValueError(f"cwd is not a directory: {cwd2}")
-
-        argv = [sys.executable, "-m", "codoxear.broker", "--cwd", cwd2, "--"]
-        if args:
-            argv.extend(args)
-
+    def spawn_web_session(
+        self,
+        *,
+        cwd: str,
+        args: list[str] | None = None,
+        cli: str | None = None,
+    ) -> dict[str, Any]:
+        cli_name = _parse_cli_name(cli, default=DEFAULT_SPAWN_CLI)
         env = dict(os.environ)
+        dotenv_values: dict[str, str] = {}
         if _DOTENV.exists():
-            for k, v in _load_env_file(_DOTENV).items():
+            try:
+                dotenv_values = _load_env_file(_DOTENV)
+            except Exception:
+                dotenv_values = {}
+            for k, v in dotenv_values.items():
                 env.setdefault(k, v)
+            # Keep spawn behavior aligned with Configuration modal reads: for
+            # provider-related settings, `.env` values override inherited
+            # process env, and explicit empty values clear inherited entries.
+            for key in _CONFIG_ENV_VARS:
+                if key not in dotenv_values:
+                    continue
+                val = _normalize_env_value(dotenv_values.get(key))
+                if val:
+                    env[key] = val
+                else:
+                    env.pop(key, None)
+        cli_args = list(args) if isinstance(args, list) else []
+        cli_args = _apply_provider_yolo_args(cli_name=cli_name, cli_args=cli_args, env=env)
+        if cli_name == "claude" and (not _claude_args_override_session(cli_args)):
+            # Keep "new web session" semantics stable even when another Claude
+            # session already exists in the same workspace.
+            cli_args.extend(["--session-id", str(uuid.uuid4())])
+        argv = [sys.executable, "-m", "codoxear.broker", "--cwd", cwd, "--"]
+        if cli_args:
+            argv.extend(cli_args)
         env["CODEX_WEB_OWNER"] = "web"
-        env.setdefault("CODEX_HOME", str(CODEX_HOME))
+        env["CODEX_WEB_CLI"] = cli_name
+        env.pop("CODEX_WEB_UNSET_ANTHROPIC_AUTH_TOKEN", None)
+        use_tmux = _env_flag("CODEX_WEB_TMUX", True)
+        tmux_bin = shutil.which("tmux") if use_tmux else None
+        child_env_unset: list[str] = []
+        if cli_name == "claude":
+            env.setdefault("CLAUDE_HOME", str(_cli_home("claude")))
+            env.setdefault("CLAUDE_BIN", _cli_bin("claude"))
+            prefer_api_key_raw = env.get("CODEX_WEB_CLAUDE_PREFER_API_KEY")
+            prefer_api_key = (
+                True
+                if prefer_api_key_raw is None
+                else str(prefer_api_key_raw).strip().lower() not in ("0", "false", "no", "off")
+            )
+            api_key = env.get("ANTHROPIC_API_KEY")
+            auth_token = env.get("ANTHROPIC_AUTH_TOKEN")
+            has_api_key = isinstance(api_key, str) and bool(api_key.strip())
+            has_auth_token = isinstance(auth_token, str) and bool(auth_token.strip())
+            if use_tmux and tmux_bin:
+                if not has_api_key:
+                    has_api_key = _tmux_global_env_has_nonempty(tmux_bin, "ANTHROPIC_API_KEY", env)
+                if not has_auth_token:
+                    has_auth_token = _tmux_global_env_has_nonempty(tmux_bin, "ANTHROPIC_AUTH_TOKEN", env)
+            # Claude CLI can stall at auth prompts when both auth modes are set.
+            # Default behavior prefers API key for headless web-owned sessions.
+            if prefer_api_key and has_api_key and has_auth_token:
+                env.pop("ANTHROPIC_AUTH_TOKEN", None)
+                if "ANTHROPIC_AUTH_TOKEN" not in child_env_unset:
+                    child_env_unset.append("ANTHROPIC_AUTH_TOKEN")
+                env["CODEX_WEB_UNSET_ANTHROPIC_AUTH_TOKEN"] = "1"
+        elif cli_name == "gemini":
+            env.setdefault("GEMINI_HOME", str(_cli_home("gemini")))
+            env.setdefault("GEMINI_BIN", _cli_bin("gemini"))
+        else:
+            env.setdefault("CODEX_HOME", str(_cli_home("codex")))
+            env.setdefault("CODEX_BIN", _cli_bin("codex"))
+
+        if use_tmux and tmux_bin:
+            tmux_name = f"codoxear-web-{uuid.uuid4().hex[:8]}"
+            env.setdefault("CODEX_WEB_TMUX_INTERACTIVE", "1")
+            env["CODEX_WEB_TMUX_NAME"] = tmux_name
+            env_args = [f"{k}={v}" for k, v in env.items() if isinstance(k, str) and v is not None]
+            env_unset_args: list[str] = []
+            for key in child_env_unset:
+                if isinstance(key, str) and key:
+                    env_unset_args.extend(["-u", key])
+            tmux_cmd = [tmux_bin, "new-session", "-d", "-s", tmux_name, "--", "env", *env_unset_args, *env_args, *argv]
+            try:
+                proc = subprocess.run(
+                    tmux_cmd,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    env=env,
+                    check=False,
+                    text=True,
+                )
+            except Exception as e:
+                raise RuntimeError(f"tmux spawn failed: {e}") from e
+            if proc.returncode != 0:
+                msg = (proc.stderr or "").strip()
+                msg = msg[-4000:] if msg else ""
+                raise RuntimeError(f"tmux spawn failed (rc={proc.returncode}): {msg}")
+            broker_pid = _tmux_pane_pid(tmux_bin, tmux_name, env) or 0
+            return {"broker_pid": int(broker_pid), "tmux_name": tmux_name, "cli": cli_name}
+        if use_tmux and not tmux_bin:
+            sys.stderr.write("warning: CODEX_WEB_TMUX enabled but tmux not found; falling back to direct broker spawn.\n")
+            sys.stderr.flush()
 
         try:
             proc = subprocess.Popen(
@@ -1687,7 +2945,7 @@ class SessionManager:
 
         # Prevent zombies when the broker exits.
         threading.Thread(target=proc.wait, daemon=True).start()
-        return {"broker_pid": int(proc.pid)}
+        return {"broker_pid": int(proc.pid), "cli": cli_name}
 
     def delete_web_session(self, session_id: str) -> bool:
         with self._lock:
@@ -1702,14 +2960,17 @@ class SessionManager:
             self.files_clear(session_id)
         return ok
 
+
     def send(self, session_id: str, text: str) -> dict[str, Any]:
         with self._lock:
             s = self._sessions.get(session_id)
             if not s:
                 raise KeyError("unknown session")
             sock = s.sock_path
+            cli = _normalize_cli_name(s.cli, default="codex")
+        text_out = _normalize_outgoing_text_for_cli(text, cli)
         try:
-            resp = self._sock_call(sock, {"cmd": "send", "text": text}, timeout_s=3.0)
+            resp = self._sock_call(sock, {"cmd": "send", "text": text_out}, timeout_s=3.0)
         except Exception:
             if not _pid_alive(s.broker_pid) and not _pid_alive(s.codex_pid):
                 with self._lock:
@@ -1727,6 +2988,55 @@ class SessionManager:
                     raise ValueError("invalid broker send response")
                 s2.queue_len = int(resp.get("queue_len"))
         return resp
+
+    def _queue_call(self, session_id: str, req: dict[str, Any]) -> dict[str, Any]:
+        with self._lock:
+            s = self._sessions.get(session_id)
+            if not s:
+                raise KeyError("unknown session")
+            sock = s.sock_path
+        try:
+            resp = self._sock_call(sock, req, timeout_s=2.5)
+        except Exception:
+            if not _pid_alive(s.broker_pid) and not _pid_alive(s.codex_pid):
+                with self._lock:
+                    self._sessions.pop(session_id, None)
+                _unlink_quiet(sock)
+                _unlink_quiet(sock.with_suffix(".json"))
+                raise KeyError("unknown session")
+            raise
+        q_raw = resp.get("queue")
+        if not isinstance(q_raw, list):
+            raise ValueError("invalid broker queue response")
+        q = _normalize_queue_list(q_raw)
+        qlen = len(q)
+        with self._lock:
+            s2 = self._sessions.get(session_id)
+            if s2:
+                s2.queue_len = int(qlen)
+        return {"queue": q, "queue_len": int(qlen)}
+
+    def queue_get(self, session_id: str) -> dict[str, Any]:
+        return self._queue_call(session_id, {"cmd": "queue", "op": "get"})
+
+    def queue_set(self, session_id: str, queue: list[str]) -> dict[str, Any]:
+        cleaned = _normalize_queue_list(queue)
+        with self._lock:
+            s = self._sessions.get(session_id)
+            if not s:
+                raise KeyError("unknown session")
+            cli = _normalize_cli_name(s.cli, default="codex")
+        cleaned = [_normalize_outgoing_text_for_cli(item, cli) for item in cleaned]
+        return self._queue_call(session_id, {"cmd": "queue", "op": "set", "queue": cleaned})
+
+    def queue_push(self, session_id: str, text: str, *, front: bool = False) -> dict[str, Any]:
+        with self._lock:
+            s = self._sessions.get(session_id)
+            if not s:
+                raise KeyError("unknown session")
+            cli = _normalize_cli_name(s.cli, default="codex")
+        text_out = _normalize_outgoing_text_for_cli(text, cli)
+        return self._queue_call(session_id, {"cmd": "queue", "op": "push", "text": text_out, "front": bool(front)})
 
     def get_state(self, session_id: str) -> dict[str, Any]:
         with self._lock:
@@ -1763,6 +3073,7 @@ class SessionManager:
             if not s:
                 raise KeyError("unknown session")
             sock = s.sock_path
+            cli = _normalize_cli_name(getattr(s, "cli", ""), default="codex")
         try:
             resp = self._sock_call(sock, {"cmd": "tail"}, timeout_s=1.5)
         except Exception:
@@ -1778,7 +3089,10 @@ class SessionManager:
         tail = resp.get("tail")
         if not isinstance(tail, str):
             raise ValueError("invalid broker tail response")
-        return tail
+        cleaned = _sanitize_tail_text(tail)
+        if cli == "claude":
+            return _sanitize_claude_tail_text(cleaned)
+        return cleaned
 
     def inject_keys(self, session_id: str, seq: str) -> dict[str, Any]:
         with self._lock:
@@ -1911,6 +3225,61 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 _json_response(self, 200, {"metrics": _metrics_snapshot()})
                 return
 
+            if path == "/api/update":
+                if not _require_auth(self):
+                    self._unauthorized()
+                    return
+                qs = urllib.parse.parse_qs(u.query)
+                force_raw = qs.get("force")
+                force = bool(force_raw and force_raw[0] == "1")
+                _json_response(self, 200, _update_status(force=force))
+                return
+
+            if path == "/api/files/content":
+                if not _require_auth(self):
+                    self._unauthorized()
+                    return
+                qs = urllib.parse.parse_qs(u.query)
+                path_q = qs.get("path")
+                path_raw = path_q[0] if path_q else ""
+                if not isinstance(path_raw, str) or (not path_raw.strip()):
+                    _json_response(self, 400, {"error": "path required"})
+                    return
+                download_q = qs.get("download")
+                download = bool(download_q and str(download_q[0]).strip().lower() in ("1", "true", "yes", "on"))
+                path_obj = _resolve_user_file_path(path_raw)
+                if not path_obj.exists():
+                    _json_response(self, 404, {"error": "file not found"})
+                    return
+                if not path_obj.is_file():
+                    _json_response(self, 400, {"error": "path is not a file"})
+                    return
+                try:
+                    size = int(path_obj.stat().st_size)
+                except PermissionError:
+                    _json_response(self, 403, {"error": "permission denied"})
+                    return
+                if size > FILE_READ_MAX_BYTES:
+                    _json_response(self, 413, {"error": f"file too large (max {FILE_READ_MAX_BYTES} bytes)"})
+                    return
+                ctype = _guess_file_mime(path_obj)
+                self.send_response(200)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(size))
+                self.send_header("Content-Disposition", _content_disposition(path_obj, download=download))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                try:
+                    with path_obj.open("rb") as fh:
+                        while True:
+                            chunk = fh.read(64 * 1024)
+                            if not chunk:
+                                break
+                            self.wfile.write(chunk)
+                except (BrokenPipeError, ConnectionResetError):
+                    return
+                return
+
             if path.startswith("/api/sessions/") and path.endswith("/messages"):
                 if not _require_auth(self):
                     self._unauthorized()
@@ -2032,7 +3401,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 dt_idle_ms = (time.perf_counter() - t0_idle) * 1000.0
                 diag["idle_from_log_ms"] = round(dt_idle_ms, 3)
 
-                busy_val = bool(state_busy) or (not bool(idle_val))
+                busy_val = _busy_from_state_and_log_idle(
+                    state_busy=bool(state_busy),
+                    idle_from_log=bool(idle_val),
+                    log_path=s.log_path,
+                )
                 queue_val = state_queue
 
                 token_val: dict[str, Any] | None = None
@@ -2069,6 +3442,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 _record_metric("api_messages_init_ms" if init else "api_messages_poll_ms", dt_total_ms)
                 return
 
+            if path.startswith("/api/sessions/") and path.endswith("/queue"):
+                if not _require_auth(self):
+                    self._unauthorized()
+                    return
+                parts = path.split("/")
+                session_id = parts[3] if len(parts) >= 4 else ""
+                try:
+                    resp = MANAGER.queue_get(session_id)
+                except KeyError:
+                    _json_response(self, 404, {"error": "unknown session"})
+                    return
+                _json_response(self, 200, resp)
+                return
+
             if path.startswith("/api/sessions/") and path.endswith("/tail"):
                 if not _require_auth(self):
                     self._unauthorized()
@@ -2098,6 +3485,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     _json_response(self, 404, {"error": "unknown session"})
                     return
                 _json_response(self, 200, {"ok": True, **cfg})
+                return
+
+            if path == "/api/config":
+                if not _require_auth(self):
+                    self._unauthorized()
+                    return
+                config = _read_cli_config()
+                _json_response(self, 200, {"ok": True, "config": config})
                 return
 
             self.send_error(404)
@@ -2180,11 +3575,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 else:
                     _json_response(self, 400, {"error": "args must be a list of strings"})
                     return
-                try:
-                    res = MANAGER.spawn_web_session(cwd=cwd, args=args_list)
-                except ValueError as e:
-                    _json_response(self, 400, {"error": str(e)})
+                cli_raw = obj.get("cli")
+                if cli_raw is None:
+                    cli = DEFAULT_SPAWN_CLI
+                elif isinstance(cli_raw, str):
+                    try:
+                        cli = _parse_cli_name(cli_raw, default=DEFAULT_SPAWN_CLI)
+                    except ValueError:
+                        _json_response(self, 400, {"error": "unsupported cli (use codex, claude, or gemini)"})
+                        return
+                else:
+                    _json_response(self, 400, {"error": "cli must be a string"})
                     return
+                res = MANAGER.spawn_web_session(cwd=cwd, args=args_list, cli=cli)
                 _json_response(self, 200, {"ok": True, **res})
                 return
 
@@ -2205,11 +3608,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     return
                 session_id_raw = obj.get("session_id")
                 session_id = session_id_raw if isinstance(session_id_raw, str) and session_id_raw else ""
-                path_obj = Path(path_raw).expanduser()
-                if not path_obj.is_absolute():
-                    path_obj = (Path.cwd() / path_obj).resolve()
-                else:
-                    path_obj = path_obj.resolve()
+                record_history = obj.get("record_history")
+                record_history = True if record_history is None else bool(record_history)
+                path_obj = _resolve_user_file_path(path_raw)
                 if not path_obj.exists():
                     _json_response(self, 404, {"error": "file not found"})
                     return
@@ -2217,19 +3618,154 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     _json_response(self, 400, {"error": "path is not a file"})
                     return
                 try:
-                    text, size = _read_text_file_strict(path_obj, max_bytes=FILE_READ_MAX_BYTES)
+                    payload = _read_file_for_viewer(path_obj, max_bytes=FILE_READ_MAX_BYTES)
                 except PermissionError:
                     _json_response(self, 403, {"error": "permission denied"})
                     return
                 except ValueError as e:
                     _json_response(self, 400, {"error": str(e)})
                     return
+                if session_id and record_history:
+                    try:
+                        MANAGER.files_add(session_id, str(path_obj))
+                    except KeyError:
+                        pass
+                _json_response(
+                    self,
+                    200,
+                    {
+                        "ok": True,
+                        "path": str(path_obj),
+                        "size": int(payload.get("size") or 0),
+                        "text": str(payload.get("text") or ""),
+                        "mime": str(payload.get("mime") or "application/octet-stream"),
+                        "is_image": bool(payload.get("is_image")),
+                        "is_binary": bool(payload.get("is_binary")),
+                    },
+                )
+                return
+
+            if path == "/api/files/write":
+                if not _require_auth(self):
+                    self._unauthorized()
+                    return
+                body = _read_body(self)
+                body_text = body.decode("utf-8")
+                if not body_text.strip():
+                    raise ValueError("empty request body")
+                obj = json.loads(body_text)
+                if not isinstance(obj, dict):
+                    raise ValueError("invalid json body (expected object)")
+                path_raw = obj.get("path")
+                if not isinstance(path_raw, str) or not path_raw.strip():
+                    _json_response(self, 400, {"error": "path required"})
+                    return
+                text = obj.get("text")
+                if not isinstance(text, str):
+                    _json_response(self, 400, {"error": "text required"})
+                    return
+                session_id_raw = obj.get("session_id")
+                session_id = session_id_raw if isinstance(session_id_raw, str) and session_id_raw else ""
+                path_obj = _resolve_user_file_path(path_raw)
+                if not path_obj.exists():
+                    _json_response(self, 404, {"error": "file not found"})
+                    return
+                if not path_obj.is_file():
+                    _json_response(self, 400, {"error": "path is not a file"})
+                    return
+                data = text.encode("utf-8")
+                if len(data) > FILE_WRITE_MAX_BYTES:
+                    _json_response(self, 400, {"error": f"file too large (max {FILE_WRITE_MAX_BYTES} bytes)"})
+                    return
+                tmp = path_obj.with_name(path_obj.name + ".tmp")
+                try:
+                    tmp.write_bytes(data)
+                    os.replace(tmp, path_obj)
+                except PermissionError:
+                    _json_response(self, 403, {"error": "permission denied"})
+                    return
+                except Exception as e:
+                    _json_response(self, 500, {"error": f"write failed: {e}"})
+                    return
                 if session_id:
                     try:
                         MANAGER.files_add(session_id, str(path_obj))
                     except KeyError:
                         pass
-                _json_response(self, 200, {"ok": True, "path": str(path_obj), "size": int(size), "text": text})
+                _json_response(self, 200, {"ok": True, "path": str(path_obj), "size": int(len(data))})
+                return
+
+            if path == "/api/files/remove":
+                if not _require_auth(self):
+                    self._unauthorized()
+                    return
+                body = _read_body(self)
+                body_text = body.decode("utf-8")
+                if not body_text.strip():
+                    raise ValueError("empty request body")
+                obj = json.loads(body_text)
+                if not isinstance(obj, dict):
+                    raise ValueError("invalid json body (expected object)")
+                path_raw = obj.get("path")
+                if not isinstance(path_raw, str) or not path_raw.strip():
+                    _json_response(self, 400, {"error": "path required"})
+                    return
+                cwd_raw = obj.get("cwd")
+                cwd = cwd_raw if isinstance(cwd_raw, str) and cwd_raw.strip() else ""
+                scope_raw = obj.get("scope")
+                scope = scope_raw if isinstance(scope_raw, str) else ""
+                session_id_raw = obj.get("session_id")
+                session_id = session_id_raw if isinstance(session_id_raw, str) and session_id_raw else ""
+                if scope and scope not in ("cwd", "session", "all"):
+                    _json_response(self, 400, {"error": "invalid scope"})
+                    return
+                if scope == "all":
+                    removed = MANAGER.files_remove_all(path_raw)
+                    _json_response(self, 200, {"ok": True, "removed": int(removed), "files": []})
+                    return
+                if cwd:
+                    files = MANAGER.files_remove_cwd(cwd, path_raw)
+                    _json_response(self, 200, {"ok": True, "files": list(files)})
+                    return
+                if not session_id:
+                    _json_response(self, 400, {"error": "session_id required"})
+                    return
+                try:
+                    files = MANAGER.files_remove(session_id, path_raw)
+                except KeyError:
+                    _json_response(self, 404, {"error": "unknown session"})
+                    return
+                _json_response(self, 200, {"ok": True, "files": list(files)})
+                return
+
+            if path == "/api/files/clear":
+                if not _require_auth(self):
+                    self._unauthorized()
+                    return
+                body = _read_body(self)
+                body_text = body.decode("utf-8")
+                if not body_text.strip():
+                    raise ValueError("empty request body")
+                obj = json.loads(body_text)
+                if not isinstance(obj, dict):
+                    raise ValueError("invalid json body (expected object)")
+                cwd_raw = obj.get("cwd")
+                cwd = cwd_raw if isinstance(cwd_raw, str) and cwd_raw.strip() else ""
+                session_id_raw = obj.get("session_id")
+                session_id = session_id_raw if isinstance(session_id_raw, str) and session_id_raw else ""
+                if cwd:
+                    MANAGER.files_clear_cwd(cwd)
+                    _json_response(self, 200, {"ok": True, "files": []})
+                    return
+                if not session_id:
+                    _json_response(self, 400, {"error": "session_id required"})
+                    return
+                try:
+                    MANAGER.files_clear_scope(session_id)
+                except KeyError:
+                    _json_response(self, 404, {"error": "unknown session"})
+                    return
+                _json_response(self, 200, {"ok": True, "files": []})
                 return
 
             if path.startswith("/api/sessions/") and path.endswith("/delete"):
@@ -2276,6 +3812,47 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     _json_response(self, 404, {"error": "unknown session"})
                     return
                 _json_response(self, 200, {"ok": True, "alias": alias})
+                return
+
+            if path.startswith("/api/sessions/") and path.endswith("/queue"):
+                if not _require_auth(self):
+                    self._unauthorized()
+                    return
+                parts = path.split("/")
+                session_id = parts[3] if len(parts) >= 4 else ""
+                body = _read_body(self)
+                body_text = body.decode("utf-8")
+                if not body_text.strip():
+                    raise ValueError("empty request body")
+                obj = json.loads(body_text)
+                if not isinstance(obj, dict):
+                    raise ValueError("invalid json body (expected object)")
+                if "queue" in obj and "text" in obj:
+                    _json_response(self, 400, {"error": "use queue or text, not both"})
+                    return
+                if "queue" in obj:
+                    q_raw = obj.get("queue")
+                    if not isinstance(q_raw, list):
+                        _json_response(self, 400, {"error": "queue must be a list"})
+                        return
+                    try:
+                        resp = MANAGER.queue_set(session_id, _normalize_queue_list(q_raw))
+                    except KeyError:
+                        _json_response(self, 404, {"error": "unknown session"})
+                        return
+                    _json_response(self, 200, resp)
+                    return
+                text = obj.get("text")
+                if not isinstance(text, str) or not text.strip():
+                    _json_response(self, 400, {"error": "text required"})
+                    return
+                front = bool(obj.get("front"))
+                try:
+                    resp = MANAGER.queue_push(session_id, text, front=front)
+                except KeyError:
+                    _json_response(self, 404, {"error": "unknown session"})
+                    return
+                _json_response(self, 200, resp)
                 return
 
             if path.startswith("/api/sessions/") and path.endswith("/send"):
@@ -2423,6 +4000,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 # Optional integration point. Current design does not rely on this.
                 _read_body(self)
                 _json_response(self, 200, {"ignored": True})
+                return
+
+            if path == "/api/config":
+                if not _require_auth(self):
+                    self._unauthorized()
+                    return
+                body = _read_body(self)
+                body_text = body.decode("utf-8")
+                if not body_text.strip():
+                    raise ValueError("empty request body")
+                obj = json.loads(body_text)
+                if not isinstance(obj, dict):
+                    raise ValueError("invalid json body (expected object)")
+                updates = obj.get("updates")
+                if not isinstance(updates, dict):
+                    _json_response(self, 400, {"error": "updates must be an object"})
+                    return
+                result = _save_cli_config(updates)
+                _json_response(self, 200, result)
                 return
 
             self.send_error(404)

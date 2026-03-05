@@ -1,4 +1,5 @@
       const $ = (q) => document.querySelector(q);
+      const APP_TITLE = document.title || "Codoxear";
       function updateAppHeightVar() {
         const vv = window.visualViewport;
         const h = vv ? vv.height : window.innerHeight;
@@ -64,6 +65,23 @@
         for (const c of children) n.appendChild(c);
         return n;
       };
+      let lastTapAt = 0;
+      function bindTap(el, handler) {
+        if (!el) return;
+        const onTap = (e) => {
+          if (e && e.preventDefault) e.preventDefault();
+          if (e && e.stopPropagation) e.stopPropagation();
+          handler(e);
+        };
+        el.addEventListener("touchend", (e) => {
+          lastTapAt = Date.now();
+          onTap(e);
+        });
+        el.addEventListener("click", (e) => {
+          if (Date.now() - lastTapAt < 500) return;
+          onTap(e);
+        });
+      }
 
       const perfWindow = 200;
       const perfSamples = new Map();
@@ -104,6 +122,80 @@
 
       window.codoxearPerf = summarizePerf;
 
+      let relayStatusEl = null;
+      let relayStatusLabelEl = null;
+      let relayLastOkAt = 0;
+      let relayLastErrorAt = 0;
+      let relayLastNetErrorAt = 0;
+      let relayTicker = null;
+      const RELAY_OK_WINDOW_MS = 8000;
+      const RELAY_ERROR_WINDOW_MS = 8000;
+      const RELAY_NET_ERROR_WINDOW_MS = 8000;
+      const RELAY_IDLE_WINDOW_MS = 20000;
+      const RELAY_LABELS = {
+        live: "Live",
+        warn: "Degraded",
+        offline: "Offline",
+        off: "Manual",
+      };
+
+      function setRelayState(state, label) {
+        if (!relayStatusEl) return;
+        const next = state || "off";
+        relayStatusEl.classList.remove("live", "warn", "offline", "off");
+        relayStatusEl.classList.add(next);
+        if (relayStatusLabelEl) relayStatusLabelEl.textContent = "Relay";
+        const text = label || RELAY_LABELS[next] || "";
+        relayStatusEl.title = text ? `Relay: ${text}` : "Relay";
+      }
+
+      function updateRelayState() {
+        if (!relayStatusEl) return;
+        if (typeof navigator !== "undefined" && navigator && navigator.onLine === false) {
+          setRelayState("offline", "Offline");
+          return;
+        }
+        const now = Date.now();
+        if (relayLastOkAt && now - relayLastOkAt <= RELAY_OK_WINDOW_MS) {
+          setRelayState("live", "Live");
+          return;
+        }
+        if (relayLastNetErrorAt && now - relayLastNetErrorAt <= RELAY_NET_ERROR_WINDOW_MS) {
+          setRelayState("offline", "Offline");
+          return;
+        }
+        if (relayLastErrorAt && now - relayLastErrorAt <= RELAY_ERROR_WINDOW_MS) {
+          setRelayState("warn", "Degraded");
+          return;
+        }
+        if (!relayLastOkAt && !relayLastErrorAt && !relayLastNetErrorAt) {
+          setRelayState("off", "Manual");
+          return;
+        }
+        if (relayLastOkAt && now - relayLastOkAt <= RELAY_IDLE_WINDOW_MS) {
+          setRelayState("warn", "Stale");
+          return;
+        }
+        setRelayState("off", "Manual");
+      }
+
+      function markRelayOk() {
+        relayLastOkAt = Date.now();
+        updateRelayState();
+      }
+
+      function markRelayError({ network = false } = {}) {
+        const now = Date.now();
+        if (network) relayLastNetErrorAt = now;
+        else relayLastErrorAt = now;
+        updateRelayState();
+      }
+
+      function startRelayTicker() {
+        if (relayTicker) return;
+        relayTicker = setInterval(updateRelayState, 2000);
+      }
+
       const appBaseUrl = (() => {
         const here = new URL(window.location.href);
         const p0 = String(here.pathname || "/");
@@ -121,21 +213,61 @@
         return new URL(rel, appBaseUrl).toString();
       }
 
+      function normalizeFileModeValue(raw) {
+        const v = String(raw || "").trim().toLowerCase();
+        if (v === "view" || v === "edit" || v === "preview") return v;
+        return "";
+      }
+
+      function parseFileLaunchParams() {
+        const params = new URLSearchParams(window.location.search || "");
+        const path = params.get("file") || params.get("path") || "";
+        const sessionId = params.get("session_id") || params.get("sid") || "";
+        const mode = normalizeFileModeValue(params.get("mode") || params.get("file_mode"));
+        const fullscreenRaw = params.get("fullscreen") || params.get("full") || "";
+        const fullscreen = fullscreenRaw === "1" || fullscreenRaw.toLowerCase() === "true";
+        const wrapRaw = params.get("wrap");
+        const wrap = wrapRaw === null ? null : wrapRaw === "1" || wrapRaw.toLowerCase() === "true";
+        return {
+          path: String(path || "").trim(),
+          sessionId: String(sessionId || "").trim(),
+          mode,
+          fullscreen,
+          wrap,
+        };
+      }
+
+      const fileLaunchParams = parseFileLaunchParams();
+      if (fileLaunchParams.fullscreen && document.body) document.body.classList.add("file-fullscreen");
+
       async function api(path, { method = "GET", body } = {}) {
         const t0 = performance.now();
-        const opts = { method, headers: {} };
+        const opts = { method, headers: {}, cache: "no-store" };
         if (body !== undefined) {
           opts.headers["Content-Type"] = "application/json";
           opts.body = JSON.stringify(body);
         }
         const url = resolveAppUrl(path);
-        const res = await fetch(url, opts);
-        const txt = await res.text();
+        let res;
+        try {
+          res = await fetch(url, opts);
+        } catch (e) {
+          markRelayError({ network: true });
+          throw e;
+        }
+        let txt;
+        try {
+          txt = await res.text();
+        } catch (e) {
+          markRelayError({ network: true });
+          throw e;
+        }
         let obj;
         try {
           obj = JSON.parse(txt);
         } catch (e) {
           console.error("api: invalid json response", { path, url, method, txt });
+          markRelayError({ network: false });
           throw e;
         }
         const dt = performance.now() - t0;
@@ -145,7 +277,11 @@
           if (rawPath.includes("init=1")) pushPerfSample("api_messages_init_ms", dt);
           else pushPerfSample("api_messages_poll_ms", dt);
         }
-        if (!res.ok) throw Object.assign(new Error(obj.error || "request failed"), { status: res.status, obj });
+        if (!res.ok) {
+          markRelayError({ network: false });
+          throw Object.assign(new Error(obj.error || "request failed"), { status: res.status, obj });
+        }
+        markRelayOk();
         return obj;
       }
 
@@ -162,6 +298,10 @@
           return String(ts);
         }
       }
+
+      const FILE_AUTO_REFRESH_MS = 4000;
+      const UPDATE_CHECK_INTERVAL_MS = 120000;
+      const UPDATE_CHECK_START_DELAY_MS = 7000;
 
       function fmtBytes(n) {
         const v = Number(n);
@@ -204,6 +344,39 @@
         return s.slice(0, 8);
       }
 
+      function normalizeCliName(raw, fallback = "codex") {
+        const v = String(raw || "").trim().toLowerCase();
+        if (v === "gemini" || v === "google-gemini" || v === "gemini-cli" || v === "gemini_cli") return "gemini";
+        if (v === "claude" || v === "claude-code" || v === "claude_code") return "claude";
+        if (v === "codex" || v === "openai-codex" || v === "codex-cli") return "codex";
+        return fallback;
+      }
+
+      function sessionCliName(session) {
+        return normalizeCliName(session && session.cli, "codex");
+      }
+
+      function resumeCommandForSession(sid, session) {
+        const cli = sessionCliName(session);
+        if (cli === "gemini") return `gemini --resume ${sid}`;
+        if (cli === "claude") return `claude --resume ${sid}`;
+        return `codex resume ${sid}`;
+      }
+
+      function cliDisplayName(cli) {
+        const v = normalizeCliName(cli, "codex");
+        if (v === "gemini") return "Gemini";
+        if (v === "claude") return "Claude";
+        return "Codex";
+      }
+
+      function cliLogoPath(cli) {
+        const v = normalizeCliName(cli, "codex");
+        if (v === "gemini") return resolveAppUrl("/static/logos/gemini.svg");
+        if (v === "claude") return resolveAppUrl("/static/logos/claude.svg");
+        return resolveAppUrl("/static/logos/codex.svg");
+      }
+
       function sessionDisplayName(s) {
         if (!s || typeof s !== "object") return "";
         const alias = typeof s.alias === "string" ? s.alias.trim() : "";
@@ -222,6 +395,107 @@
         if (!s || typeof s !== "object") return "No session selected";
         const name = sessionDisplayName(s);
         return name || "No session selected";
+      }
+
+      function sessionSortName(s) {
+        const raw = sessionDisplayName(s);
+        return raw ? raw.toLocaleLowerCase() : "";
+      }
+
+      function isUploadPathLine(line, sid) {
+        if (!line || line[0] !== "/") return false;
+        if (!line.includes("/.local/share/codoxear/uploads/")) return false;
+        if (sid && !line.includes(`/uploads/${sid}/`)) return false;
+        return /\.(png|jpe?g|webp|gif|bmp|heic|heif)$/i.test(line);
+      }
+
+      function stripUploadPathLines(text, sid) {
+        const raw = String(text ?? "");
+        if (!raw) return { text: raw, removed: false };
+        const lines = raw.split(/\r?\n/);
+        const out = [];
+        let removed = false;
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (trimmed && isUploadPathLine(trimmed, sid)) {
+            removed = true;
+            continue;
+          }
+          out.push(line);
+        }
+        if (!removed) return { text: raw, removed: false };
+        let joined = out.join("\n");
+        joined = joined.replace(/\n{3,}/g, "\n\n");
+        return { text: joined, removed: true };
+      }
+
+      function sanitizeUserText(text, sid) {
+        const raw = typeof text === "string" ? text : "";
+        if (!raw) return { text: raw, dropped: false };
+        const { text: stripped, removed } = stripUploadPathLines(raw, sid);
+        if (!removed) return { text: raw, dropped: false };
+        if (!stripped.trim()) return { text: "", dropped: true };
+        return { text: stripped, dropped: false };
+      }
+
+      function sanitizeUserEvent(ev, sid) {
+        if (!ev || ev.role !== "user" || typeof ev.text !== "string") return ev;
+        const res = sanitizeUserText(ev.text, sid);
+        if (res.dropped) return null;
+        if (res.text !== ev.text) return { ...ev, text: res.text };
+        return ev;
+      }
+
+      const UNKNOWN_WORKSPACE_KEY = "__unknown_cwd__";
+
+      function normalizeCwd(value) {
+        if (typeof value !== "string") return "";
+        const trimmed = value.trim();
+        if (!trimmed || trimmed === "?") return "";
+        if (trimmed.length > 1) return trimmed.replace(/\/+$/, "");
+        return trimmed;
+      }
+
+      function workspaceKeyFromCwd(cwd) {
+        return cwd ? `cwd:${cwd}` : UNKNOWN_WORKSPACE_KEY;
+      }
+
+      function workspaceTitleParts(cwd) {
+        if (!cwd) return { title: "Unknown cwd", subtitle: "" };
+        const base = baseName(cwd);
+        if (base && base !== cwd) return { title: base, subtitle: cwd };
+        return { title: cwd, subtitle: "" };
+      }
+
+      function buildWorkspaces(sessions) {
+        const map = new Map();
+        for (const s of sessions) {
+          const cwd = normalizeCwd(s && s.cwd);
+          const key = workspaceKeyFromCwd(cwd);
+          let ws = map.get(key);
+          if (!ws) {
+            ws = { key, cwd, sessions: [], updated_ts: 0 };
+            map.set(key, ws);
+          }
+          ws.sessions.push(s);
+          const ts = Number(s && (s.updated_ts || s.start_ts || 0));
+          if (Number.isFinite(ts) && ts > ws.updated_ts) ws.updated_ts = ts;
+        }
+        for (const ws of map.values()) {
+          ws.sessions.sort((a, b) => {
+            const na = sessionSortName(a);
+            const nb = sessionSortName(b);
+            const cmp = na.localeCompare(nb, undefined, { numeric: true, sensitivity: "base" });
+            if (cmp) return cmp;
+            const at = Number(a && (a.updated_ts || a.start_ts || 0));
+            const bt = Number(b && (b.updated_ts || b.start_ts || 0));
+            if (Number.isFinite(at) && Number.isFinite(bt) && at !== bt) return bt - at;
+            const aid = a && a.session_id ? String(a.session_id) : "";
+            const bid = b && b.session_id ? String(b.session_id) : "";
+            return aid.localeCompare(bid, undefined, { numeric: true, sensitivity: "base" });
+          });
+        }
+        return Array.from(map.values()).sort((a, b) => (b.updated_ts || 0) - (a.updated_ts || 0));
       }
 
       function escapeHtml(s) {
@@ -243,9 +517,78 @@
         return null;
       }
 
-      function renderInlineMd(s) {
+      function stripFileRefSuffix(path) {
+        let p = String(path || "").trim();
+        if (!p) return "";
+        p = p.replace(/#L\d+(?:C\d+)?(?:-L?\d+(?:C\d+)?)?$/i, "");
+        const m = p.match(/^(\/.+):(\d+)(?::(\d+))?$/);
+        if (m) return m[1];
+        return p;
+      }
+
+      function parseLocalFilePathRef(rawRef) {
+        let raw = String(rawRef || "").trim();
+        if (!raw) return "";
+        if (raw.startsWith("<") && raw.endsWith(">")) raw = raw.slice(1, -1).trim();
+        const isRawAbsPath = raw.startsWith("/");
+        const isRawFileUrl = raw.toLowerCase().startsWith("file://");
+        const isRawAbsUrl = /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(raw);
+        if (!isRawAbsPath && !isRawFileUrl && !isRawAbsUrl) return "";
+
+        let candidate = raw;
+        if (isRawFileUrl) {
+          try {
+            candidate = new URL(raw).pathname || "";
+          } catch {
+            return "";
+          }
+        } else if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(raw) && !raw.startsWith("/")) {
+          return "";
+        } else {
+          try {
+            const asUrl = new URL(raw, location.origin);
+            if (asUrl.origin !== location.origin) return "";
+            candidate = asUrl.pathname || "";
+          } catch {
+            // Ignore and fall through to raw candidate.
+          }
+        }
+
+        try {
+          candidate = decodeURIComponent(candidate);
+        } catch {
+          // Keep undecoded path when invalid URI encoding is present.
+        }
+        candidate = stripFileRefSuffix(candidate);
+        if (!candidate.startsWith("/")) return "";
+        if (candidate === "/" || candidate.startsWith("/api/") || candidate.startsWith("/static/")) return "";
+        return candidate;
+      }
+
+      function buildFileLaunchHref(path) {
+        const clean = String(path || "").trim();
+        if (!clean) return "";
+        const url = new URL(resolveAppUrl("/"));
+        url.searchParams.set("file", clean);
+        url.searchParams.set("mode", "view");
+        url.searchParams.set("fullscreen", "1");
+        return url.toString();
+      }
+
+      function buildFileContentUrl(path, { download = false, cacheBust = "" } = {}) {
+        const clean = String(path || "").trim();
+        if (!clean) return "";
+        const url = new URL(resolveAppUrl("/api/files/content"));
+        url.searchParams.set("path", clean);
+        if (download) url.searchParams.set("download", "1");
+        if (cacheBust) url.searchParams.set("_t", String(cacheBust));
+        return url.toString();
+      }
+
+      function renderInlineMd(s, basePath) {
         const raw = String(s ?? "");
-        const re = /`([^`]+)`|\[([^\]]+)\]\(([^)]+)\)|\*\*([^*]+)\*\*/g;
+        // Updated regex to handle images: ![alt](url) and links: [text](url)
+        const re = /`([^`]+)`|!\[([^\]]*)\]\(([^)]+)\)|\[([^\]]+)\]\(([^)]+)\)|\*\*([^*]+)\*\*/g;
         let out = "";
         let last = 0;
         for (;;) {
@@ -253,13 +596,49 @@
           if (!m) break;
           out += escapeHtml(raw.slice(last, m.index));
           if (m[1] !== undefined) {
+            // Inline code: `code`
             out += `<code>${escapeHtml(m[1])}</code>`;
           } else if (m[2] !== undefined) {
-            const href = safeUrl(m[3]);
-            if (!href) out += `${escapeHtml(m[2])} (${escapeHtml(m[3])})`;
-            else out += `<a href="${escapeHtml(href)}" target="_blank" rel="noreferrer noopener">${escapeHtml(m[2])}</a>`;
+            // Image: ![alt](url)
+            const alt = m[2];
+            const url = m[3];
+
+            // Resolve relative paths
+            let resolvedUrl = url;
+            if (basePath && !url.startsWith('/') && !url.match(/^https?:\/\//)) {
+              // Relative path - resolve relative to basePath directory
+              const baseDir = basePath.substring(0, basePath.lastIndexOf('/'));
+              resolvedUrl = baseDir ? `${baseDir}/${url}` : url;
+            }
+
+            const filePath = parseLocalFilePathRef(resolvedUrl);
+            if (filePath) {
+              // Local file path
+              out += `<img src="${escapeHtml(filePath)}" alt="${escapeHtml(alt)}" loading="lazy" />`;
+            } else {
+              const href = safeUrl(resolvedUrl);
+              if (!href) out += `![${escapeHtml(alt)}](${escapeHtml(url)})`;
+              else out += `<img src="${escapeHtml(href)}" alt="${escapeHtml(alt)}" loading="lazy" />`;
+            }
           } else if (m[4] !== undefined) {
-            out += `<strong>${escapeHtml(m[4])}</strong>`;
+            // Link: [text](url)
+            const filePath = parseLocalFilePathRef(m[5]);
+            if (filePath) {
+              const href = buildFileLaunchHref(filePath);
+              if (!href) out += `${escapeHtml(m[4])} (${escapeHtml(m[5])})`;
+              else {
+                out += `<a href="${escapeHtml(href)}" target="_blank" rel="noreferrer noopener" data-file-path="${escapeHtml(filePath)}">${escapeHtml(
+                  m[4]
+                )}</a>`;
+              }
+            } else {
+              const href = safeUrl(m[5]);
+              if (!href) out += `${escapeHtml(m[4])} (${escapeHtml(m[5])})`;
+              else out += `<a href="${escapeHtml(href)}" target="_blank" rel="noreferrer noopener">${escapeHtml(m[4])}</a>`;
+            }
+          } else if (m[6] !== undefined) {
+            // Bold: **text**
+            out += `<strong>${escapeHtml(m[6])}</strong>`;
           } else {
             out += escapeHtml(m[0]);
           }
@@ -269,7 +648,7 @@
         return out;
       }
 
-      function mdToHtml(src) {
+      function mdToHtml(src, basePath) {
         const s = String(src ?? "").replaceAll("\r\n", "\n");
         const splitByFences = (input) => {
           const chunks = [];
@@ -333,7 +712,7 @@
             return { type: "ul", indent, text: t.slice(2).trimStart() };
           }
           const mOl = t.match(/^(\d+)\.\s+(.*)$/);
-          if (mOl) return { type: "ol", indent, text: (mOl[2] || "").trimStart() };
+          if (mOl) return { type: "ol", indent, text: (mOl[2] || "").trimStart(), num: Number(mOl[1]) };
           return null;
         };
 
@@ -342,6 +721,7 @@
           if (!head) throw new Error("parseList called on non-list line");
           const baseIndent = head.indent;
           const listType = head.type;
+          const listStart = listType === "ol" && Number.isFinite(head.num) ? head.num : null;
           const items = [];
 
           let i = start;
@@ -360,19 +740,103 @@
             items.push({ text: info.text, child: null });
             i += 1;
           }
-          return { node: { type: listType, items }, next: i };
+          return { node: { type: listType, items, start: listStart }, next: i };
         };
 
         const renderList = (node) => {
           const out = [];
-          out.push(node.type === "ol" ? "<ol>" : "<ul>");
+          if (node.type === "ol") {
+            const startAttr = Number.isFinite(node.start) && node.start > 1 ? ` start="${node.start}"` : "";
+            out.push(`<ol${startAttr}>`);
+          } else {
+            out.push("<ul>");
+          }
           for (const it of node.items) {
             out.push("<li>");
-            out.push(renderInlineMd(it.text || ""));
+            out.push(renderInlineMd(it.text || "", basePath));
             if (it.child) out.push(renderList(it.child));
             out.push("</li>");
           }
           out.push(node.type === "ol" ? "</ol>" : "</ul>");
+          return out.join("");
+        };
+
+        const splitTableRow = (line) => {
+          const raw = String(line ?? "");
+          if (!raw.includes("|")) return null;
+          let t = raw.trim();
+          if (t.startsWith("|")) t = t.slice(1);
+          if (t.endsWith("|")) t = t.slice(0, -1);
+          return t.split("|").map((p) => p.trim());
+        };
+
+        const isTableDivider = (cell) => {
+          const t = String(cell ?? "").trim();
+          return /^:?-{3,}:?$/.test(t);
+        };
+
+        const tableAlign = (cell) => {
+          const t = String(cell ?? "").trim();
+          const left = t.startsWith(":");
+          const right = t.endsWith(":");
+          if (left && right) return "center";
+          if (right) return "right";
+          return "left";
+        };
+
+        const parseTable = (lines, start) => {
+          if (start + 1 >= lines.length) return null;
+          const headCells = splitTableRow(lines[start]);
+          const divCells = splitTableRow(lines[start + 1]);
+          if (!headCells || !divCells) return null;
+          if (!headCells.length || !divCells.length) return null;
+          if (!divCells.every(isTableDivider)) return null;
+          const align = [];
+          for (let i = 0; i < headCells.length; i++) {
+            align.push(tableAlign(divCells[i] ?? ""));
+          }
+          const rows = [];
+          let i = start + 2;
+          while (i < lines.length) {
+            const line = lines[i];
+            if (!line || !line.trim()) break;
+            if (!line.includes("|")) break;
+            const row = splitTableRow(line);
+            if (!row) break;
+            rows.push(row);
+            i += 1;
+          }
+          return { node: { head: headCells, align, rows }, next: i };
+        };
+
+        const renderTable = (node) => {
+          const out = [];
+          out.push('<div class="md-table"><table>');
+          out.push("<thead><tr>");
+          for (let i = 0; i < node.head.length; i++) {
+            const align = node.align[i] || "left";
+            out.push(`<th style="text-align: ${align}">`);
+            out.push(renderInlineMd(node.head[i] || "", basePath));
+            out.push("</th>");
+          }
+          out.push("</tr></thead>");
+          if (node.rows.length) {
+            out.push("<tbody>");
+            for (const row of node.rows) {
+              out.push("<tr>");
+              const maxCols = Math.max(node.head.length, row.length);
+              for (let i = 0; i < maxCols; i++) {
+                const align = node.align[i] || "left";
+                const cell = row[i] ?? "";
+                out.push(`<td style="text-align: ${align}">`);
+                out.push(renderInlineMd(cell, basePath));
+                out.push("</td>");
+              }
+              out.push("</tr>");
+            }
+            out.push("</tbody>");
+          }
+          out.push("</table></div>");
           return out.join("");
         };
 
@@ -381,8 +845,13 @@
         const out = [];
         for (const c of chunks) {
           if (c.type === "code") {
-            const langAttr = c.lang ? ` data-lang="${escapeHtml(c.lang)}"` : "";
-            out.push(`<pre><code${langAttr}>${escapeHtml(c.value)}</code></pre>`);
+            const lang = String(c.lang || "").trim().toLowerCase();
+            if (lang === "mermaid" || lang === "mmd") {
+              out.push(`<div class="mermaid">${escapeHtml(c.value)}</div>`);
+            } else {
+              const langAttr = c.lang ? ` data-lang="${escapeHtml(c.lang)}"` : "";
+              out.push(`<pre><code${langAttr}>${escapeHtml(c.value)}</code></pre>`);
+            }
             continue;
           }
           const blocks = c.value.split(/\n{2,}/);
@@ -395,7 +864,7 @@
             let startIdx = 0;
             if (mHeading) {
               const level = mHeading[1].length;
-              out.push(`<h${level}>${renderInlineMd(mHeading[2])}</h${level}>`);
+              out.push(`<h${level}>${renderInlineMd(mHeading[2], basePath)}</h${level}>`);
               startIdx = 1;
             }
 
@@ -404,7 +873,7 @@
               const para = paraLines.join("\n").trim();
               paraLines = [];
               if (!para) return;
-              out.push(`<p>${renderInlineMd(para).replaceAll("\n", "<br />")}</p>`);
+              out.push(`<p>${renderInlineMd(para, basePath).replaceAll("\n", "<br />")}</p>`);
             };
 
             for (let i = startIdx; i < lines.length; i++) {
@@ -412,6 +881,13 @@
               const t = l.trim();
               if (!t) {
                 flushPara();
+                continue;
+              }
+              const table = parseTable(lines, i);
+              if (table) {
+                flushPara();
+                out.push(renderTable(table.node));
+                i = table.next - 1;
                 continue;
               }
               const info = listItemInfo(l);
@@ -431,17 +907,42 @@
       }
 
       const mdCache = new Map();
-      function mdToHtmlCached(src) {
-        const key = String(src ?? "");
+      function mdToHtmlCached(src, basePath) {
+        const key = String(src ?? "") + "|" + String(basePath ?? "");
         const hit = mdCache.get(key);
         if (hit !== undefined) return hit;
-        const html = mdToHtml(key);
+        const html = mdToHtml(src, basePath);
         mdCache.set(key, html);
         if (mdCache.size > 1200) {
           // Prevent unbounded growth; chat history is expected to be small.
           mdCache.clear();
         }
         return html;
+      }
+
+      let mermaidConfigured = false;
+      function ensureMermaidReady() {
+        const m = window.mermaid;
+        if (!m) return null;
+        if (!mermaidConfigured && typeof m.initialize === "function") {
+          try {
+            m.initialize({ startOnLoad: false, securityLevel: "strict" });
+          } catch (e) {
+            console.warn("mermaid initialize failed", e);
+          }
+          mermaidConfigured = true;
+        }
+        return m;
+      }
+
+      function renderMermaidIn(root) {
+        const m = ensureMermaidReady();
+        if (!m || !root || typeof root.querySelectorAll !== "function" || typeof m.run !== "function") return;
+        const nodes = root.querySelectorAll(".mermaid");
+        if (!nodes.length) return;
+        Promise.resolve(m.run({ nodes, suppressErrors: true })).catch((e) => {
+          console.warn("mermaid render failed", e);
+        });
       }
 
       function iconSvg(name) {
@@ -469,12 +970,18 @@
           return `<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>`;
         if (name === "file")
           return `<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8Z"/><path d="M14 2v6h6"/></svg>`;
+        if (name === "terminal")
+          return `<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 6l6 6-6 6"/><path d="M12 18h8"/></svg>`;
         if (name === "x")
           return `<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6 6 18"/><path d="M6 6l12 12"/></svg>`;
         if (name === "queue")
           return `<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 7h16"/><path d="M4 12h16"/><path d="M4 17h10"/></svg>`;
         if (name === "duplicate")
           return `<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="8" y="8" width="11" height="11" rx="2"/><rect x="5" y="5" width="11" height="11" rx="2"/></svg>`;
+        if (name === "settings")
+          return `<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 1v6m0 6v6m5.2-14.2l-4.2 4.2m0 6l4.2 4.2M23 12h-6m-6 0H1m14.2 5.2l-4.2-4.2m0-6l-4.2-4.2"/></svg>`;
+        if (name === "more")
+          return `<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="1" fill="currentColor"/><circle cx="12" cy="5" r="1" fill="currentColor"/><circle cx="12" cy="19" r="1" fill="currentColor"/></svg>`;
         return "";
       }
 
@@ -548,8 +1055,13 @@
         const INIT_PAGE_LIMIT_DESKTOP = 60;
         const INIT_PAGE_LIMIT_MOBILE = 24;
         const OLDER_PAGE_LIMIT = 60;
+        const INIT_PAGE_LIMIT_CLAUDE_DESKTOP = 200;
+        const INIT_PAGE_LIMIT_CLAUDE_MOBILE = 80;
+        const OLDER_PAGE_LIMIT_CLAUDE = 120;
         const CACHE_LIMIT = 40;
         const CHAT_DOM_WINDOW = 260;
+        const CHAT_DOM_WINDOW_CLAUDE = 520;
+        const CHAT_DOM_MIN_USER_ROWS = 24;
         let activeLogPath = null;
         let activeThreadId = null;
         let olderBefore = 0;
@@ -564,36 +1076,87 @@
 	        let pollFastUntilMs = 0;
 	        let turnOpen = false;
 	        let sessionsTimer = null;
+        let updateCheckTimer = null;
+        let updateCheckStartTimer = null;
+        let updateCheckInFlight = false;
 	        let currentRunning = false;
-	        let deferInFlight = false;
-	        const deferredBySession = new Map();
-	        const deferredLoaded = new Set();
-		        const queueSaveTimers = new Map();
+        let queueSaveTimer = null;
+        const queueCacheBySession = new Map();
+        const queueLoaded = new Set();
+        const queueFetchInFlight = new Set();
+        let currentQueueLen = 0;
+        const draftBySession = new Map();
+        const draftSaveTimers = new Map();
+        const seenAssistantBySession = new Map();
+        const userSummaryBySession = new Map();
+        const userSummarySaveTimers = new Map();
         const cacheBySession = new Map();
         const cacheLoaded = new Set();
         const cacheSaveTimers = new Map();
-	        let sessionIndex = new Map(); // session_id -> session info
+        let updateAvailableUrl = "";
+        let updateAvailableCommit = "";
+        let updateNotifiedCommit = String(localStorage.getItem("codexweb.updateNotifiedCommit") || "");
+        let sessionIndex = new Map(); // session_id -> session info
+        let sessionCardIndex = new Map(); // session_id -> session card element
+
+        function normalizeOutgoingTextForCli(raw, sid = selected) {
+          const text = typeof raw === "string" ? raw : "";
+          if (!text || !sid) return text;
+          const sess = sessionIndex.get(sid);
+          if (sessionCliName(sess) !== "claude") return text;
+          // Claude CLI treats leading "!" as local shell command; escape markdown image prefix.
+          return text.replace(/^(\s*)!\[/, "$1\\![");
+        }
+
+        function normalizeSessionName(name) {
+          return String(name || "")
+            .trim()
+            .replace(/\s+/g, " ")
+            .toLocaleLowerCase();
+        }
+        function collectSessionNameSet({ excludeId } = {}) {
+          const out = new Set();
+          for (const s of sessionIndex.values()) {
+            if (!s || (excludeId && s.session_id === excludeId)) continue;
+            const name = sessionDisplayName(s);
+            if (!name) continue;
+            out.add(normalizeSessionName(name));
+          }
+          return out;
+        }
+        function buildDuplicateAlias(baseName) {
+          const base = String(baseName || "").trim() || "Session";
+          const existing = collectSessionNameSet();
+          let candidate = `${base} duplicate`;
+          if (!existing.has(normalizeSessionName(candidate))) return candidate;
+          for (let i = 2; i < 200; i += 1) {
+            candidate = `${base} duplicate ${i}`;
+            if (!existing.has(normalizeSessionName(candidate))) return candidate;
+          }
+          return `${base} duplicate ${Date.now()}`;
+        }
 	        let sending = false;
 	        let localEchoSeq = 0;
-	        const pendingUser = [];
+        const pendingUserBySession = new Map();
 	        let attachedImages = 0;
 		        let autoScroll = true;
-			        let backfillToken = 0;
+	        let backfillToken = 0;
         let backfillState = null;
 			    let lastScrollTop = 0;
 				    let lastToken = null;
 				    let typingRow = null;
         let attachBadgeEl = null;
         let queueBadgeEl = null;
-         const recentEventKeys = [];
-         const recentEventKeySet = new Set();
-         const RECENT_EVENT_KEYS_MAX = 320;
-         let lastAssistantKey = "";
-                 let clickLoadT0 = 0;
-                 let clickMetricPending = false;
-              let harnessMenuOpen = false;
-              let harnessCfg = { enabled: false, request: "" };
-              let harnessSaveTimer = null;
+        const recentEventKeys = [];
+        const recentEventKeySet = new Set();
+        const recentEventSigTs = new Map();
+        const recentEventSigOrder = [];
+        const RECENT_EVENT_KEYS_MAX = 320;
+        const RECENT_EVENT_SIG_MAX = 360;
+	        const RECENT_EVENT_SIG_WINDOW_MS = 100;
+	                let clickLoadT0 = 0;
+	                let clickMetricPending = false;
+        let preferredSpawnCli = normalizeCliName(localStorage.getItem("codexweb.spawnCli"), "codex");
 
 				        const titleLabel = el("div", { id: "threadTitle", text: "No session selected" });
 				        const statusChip = el("span", { class: "status-chip", id: "statusChip", text: "Idle" });
@@ -609,23 +1172,14 @@
         });
         interruptBtn.style.display = "none";
         const toast = el("div", { class: "muted toast", id: "toast" });
-			        const toggleSidebarBtn = el("button", {
-	          id: "toggleSidebarBtn",
-	          class: "icon-btn",
-	          title: "Toggle sidebar",
-	          "aria-label": "Toggle sidebar",
-	          html: iconSvg("menu"),
-	        });
-        const harnessBtn = el("button", {
-          id: "harnessBtn",
+        const sidebarToggleBtn = el("button", {
+          id: "sidebarToggleBtn",
           class: "icon-btn",
-          title: "Harness mode",
-          "aria-label": "Harness mode",
-            type: "button",
-            html: iconSvg("harness"),
-          });
-          harnessBtn.disabled = true;
-          harnessBtn.classList.toggle("active", false);
+          title: "Toggle sidebar",
+          "aria-label": "Toggle sidebar",
+          type: "button",
+          html: iconSvg("menu"),
+        });
         const renameBtn = el("button", {
           id: "renameBtn",
           class: "icon-btn",
@@ -652,28 +1206,87 @@
           type: "button",
           html: iconSvg("file"),
         });
-        const harnessMenu = el("div", { id: "harnessMenu", class: "harnessMenu", role: "dialog", "aria-label": "Harness mode settings" }, [
-          el("div", { class: "row" }, [
-            el("label", {}, [
-              el("input", { type: "checkbox", id: "harnessEnabled" }),
-              el("span", { text: "Harness mode" }),
-			            ]),
-			          ]),
-			          el("div", { class: "label", text: "Additional request to append (optional; per session)" }),
-			          el("textarea", { id: "harnessRequest", "aria-label": "Additional request for harness prompt" }),
-			        ]);
+        const tmuxAttachBtn = el("button", {
+          id: "tmuxAttachBtn",
+          class: "icon-btn",
+          title: "Copy tmux attach command",
+          "aria-label": "Copy tmux attach command",
+          type: "button",
+          html: iconSvg("terminal"),
+        });
+        tmuxAttachBtn.disabled = true;
+        const sessionToolsBtn = el("button", {
+          id: "sessionToolsBtn",
+          class: "icon-btn",
+          title: "Session tools",
+          "aria-label": "Session tools",
+          type: "button",
+          html: iconSvg("more"),
+        });
+        sessionToolsBtn.disabled = true;
+        const newBtn = el("button", { id: "newBtn", class: "icon-btn primary-action", title: "New session", "aria-label": "New session", html: iconSvg("plus") });
+        const refreshBtn = el("button", { id: "refreshBtn", class: "icon-btn", title: "Refresh", "aria-label": "Refresh", html: iconSvg("refresh") });
+        const configBtn = el("button", { id: "configBtn", class: "icon-btn", title: "Configuration", "aria-label": "Configuration", html: iconSvg("settings") });
+        const updateBtn = el("button", {
+          id: "updateBtn",
+          class: "icon-btn text-btn",
+          title: "Update available",
+          "aria-label": "Update available",
+          type: "button",
+          text: "Update",
+        });
+        updateBtn.style.display = "none";
 
+        // More menu button
+        const moreBtn = el("button", {
+          id: "moreBtn",
+          class: "icon-btn more-btn",
+          title: "More options",
+          "aria-label": "More options",
+          "aria-expanded": "false",
+          html: iconSvg("more")
+        });
+
+        // Dropdown menu
+        const moreMenu = el("div", { class: "more-menu", id: "moreMenu" }, [
+          el("button", { class: "menu-item", id: "menuRefresh", type: "button" }, [
+            el("span", { class: "menu-icon", html: iconSvg("refresh") }),
+            el("span", { class: "menu-label", text: "Refresh" }),
+          ]),
+          el("button", { class: "menu-item", id: "menuConfig", type: "button" }, [
+            el("span", { class: "menu-icon", html: iconSvg("settings") }),
+            el("span", { class: "menu-label", text: "Configuration" }),
+          ]),
+        ]);
+        const relayDot = el("span", { class: "dot", "aria-hidden": "true" });
+        const relayLabel = el("span", { class: "label", text: "Relay" });
+        const relayStatus = el("div", { class: "relayStatus off", id: "relayStatus", title: "Relay: Manual" }, [
+          relayDot,
+          relayLabel,
+        ]);
+        relayStatusEl = relayStatus;
+        relayStatusLabelEl = relayLabel;
+        setRelayState("off", "Manual");
+        startRelayTicker();
+        if (!window.__codexwebRelayHandlers) {
+          const onOnline = () => updateRelayState();
+          const onOffline = () => updateRelayState();
+          window.addEventListener("online", onOnline);
+          window.addEventListener("offline", onOffline);
+          window.__codexwebRelayHandlers = { onOnline, onOffline };
+        }
         const topMeta = el("div", { class: "topMeta" }, [statusChip, ctxChip]);
         const titleRow = el("div", { class: "titleRow" }, [titleLabel, topMeta]);
         const titleWrap = el("div", { class: "titleWrap" }, [titleRow, toast]);
         const topbar = el("div", { class: "topbar" }, [
-          el("div", { class: "pill" }, [toggleSidebarBtn, titleWrap]),
+          el("div", { class: "pill" }, [sidebarToggleBtn, titleWrap]),
           el("div", { class: "actions topActions" }, [
             duplicateBtn,
             renameBtn,
             fileBtn,
+            tmuxAttachBtn,
+            sessionToolsBtn,
             interruptBtn,
-            harnessBtn,
           ]),
         ]);
 
@@ -698,10 +1311,18 @@
 
         sidebar.appendChild(
           el("header", {}, [
-            el("div", { class: "title", html: `<img class="sidebarLogo" src="/static/codoxear-icon.png" alt="" />Codoxear` }),
+            el("div", { class: "title" }, [
+              el("img", { class: "sidebarLogo", src: "/static/codoxear-icon.png", alt: "" }),
+              el("span", { text: "Codoxear" }),
+              relayStatus,
+            ]),
             el("div", { class: "actions" }, [
-              el("button", { id: "newBtn", class: "icon-btn", title: "New session", "aria-label": "New session", html: iconSvg("plus") }),
-              el("button", { id: "refreshBtn", class: "icon-btn", title: "Refresh", "aria-label": "Refresh", html: iconSvg("refresh") }),
+              newBtn,
+              el("div", { class: "more-container" }, [
+                moreBtn,
+                moreMenu,
+              ]),
+              updateBtn,
             ]),
           ])
         );
@@ -714,8 +1335,6 @@
         app.appendChild(main);
         app.appendChild(backdrop);
         root.appendChild(app);
-        root.appendChild(harnessMenu);
-
         const fileBackdrop = el("div", { class: "modalBackdrop", id: "fileBackdrop" });
         const fileCloseBtn = el("button", {
           id: "fileCloseBtn",
@@ -733,21 +1352,126 @@
           type: "button",
           text: "Wrap",
         });
+        const fileViewBtn = el("button", {
+          id: "fileViewBtn",
+          class: "icon-btn text-btn",
+          title: "View raw",
+          "aria-label": "View raw",
+          type: "button",
+          text: "View",
+        });
+        const fileEditBtn = el("button", {
+          id: "fileEditBtn",
+          class: "icon-btn text-btn",
+          title: "Edit file",
+          "aria-label": "Edit file",
+          type: "button",
+          text: "Edit",
+        });
+        const filePreviewBtn = el("button", {
+          id: "filePreviewBtn",
+          class: "icon-btn text-btn",
+          title: "Preview markdown",
+          "aria-label": "Preview markdown",
+          type: "button",
+          text: "Preview",
+        });
+        const fileOpenInlineBtn = el("button", {
+          id: "fileOpenInlineBtn",
+          class: "icon-btn text-btn",
+          title: "Open file path",
+          "aria-label": "Open file path",
+          type: "button",
+          text: "Open",
+        });
+        const fileSaveBtn = el("button", {
+          id: "fileSaveBtn",
+          class: "icon-btn primary text-btn",
+          title: "Save file",
+          "aria-label": "Save file",
+          type: "button",
+          text: "Save",
+        });
+        const filePopoutBtn = el("button", {
+          id: "filePopoutBtn",
+          class: "icon-btn text-btn",
+          title: "Open in new tab",
+          "aria-label": "Open in new tab",
+          type: "button",
+          text: "Pop out",
+        });
+        const fileCopyPathBtn = el("button", {
+          id: "fileCopyPathBtn",
+          class: "icon-btn text-btn",
+          title: "Copy full path",
+          "aria-label": "Copy full path",
+          type: "button",
+          text: "Copy path",
+        });
+        const fileCopyNameBtn = el("button", {
+          id: "fileCopyNameBtn",
+          class: "icon-btn text-btn",
+          title: "Copy file name",
+          "aria-label": "Copy file name",
+          type: "button",
+          text: "Copy name",
+        });
+        const fileDownloadBtn = el("button", {
+          id: "fileDownloadBtn",
+          class: "icon-btn text-btn",
+          title: "Download file",
+          "aria-label": "Download file",
+          type: "button",
+          text: "Download",
+        });
         const filePathInput = el("input", { id: "filePathInput", type: "text", placeholder: "/path/to/file" });
         const fileOpenBtn = el("button", { id: "fileOpenBtn", class: "primary", type: "button", text: "Open" });
         const fileStatus = el("div", { class: "muted", id: "fileStatus", text: "" });
+        const fileSyncLabel = el("span", { class: "label", text: "Manual" });
+        const fileSync = el("div", { class: "fileSync off", id: "fileSync", title: "Manual refresh" }, [
+          el("span", { class: "dot", "aria-hidden": "true" }),
+          fileSyncLabel,
+        ]);
+        const fileStatusRow = el("div", { class: "fileStatusRow" }, [fileStatus, fileSync]);
         const fileContent = el("pre", { class: "fileContent", id: "fileContent" });
+        const fileImage = el("img", { class: "fileImage", id: "fileImage", alt: "Image preview", loading: "lazy" });
+        const fileImageWrap = el("div", { class: "fileImageWrap", id: "fileImageWrap" }, [fileImage]);
+        const fileEditor = el("textarea", { class: "fileEditor", id: "fileEditor", spellcheck: "false" });
+        const filePreview = el("div", { class: "filePreview md", id: "filePreview" });
+        const filePathRow = el("div", { class: "filePathRow" }, [filePathInput, fileOpenBtn]);
+        const fileTitle = el("div", { class: "title", text: "View file" });
         const fileViewer = el("div", { class: "fileViewer", id: "fileViewer", role: "dialog", "aria-label": "File viewer" }, [
           el("div", { class: "fileViewerHeader" }, [
-            el("div", { class: "title", text: "View file" }),
-            el("div", { class: "actions" }, [fileWrapBtn, fileCloseBtn]),
+            fileTitle,
+            el("div", { class: "actions" }, [
+              fileViewBtn,
+              fileEditBtn,
+              filePreviewBtn,
+              fileSaveBtn,
+              fileDownloadBtn,
+              filePopoutBtn,
+              fileCopyPathBtn,
+              fileCopyNameBtn,
+              fileOpenInlineBtn,
+              fileWrapBtn,
+              fileCloseBtn,
+            ]),
           ]),
-          el("div", { class: "filePathRow" }, [filePathInput, fileOpenBtn]),
-          fileStatus,
+          filePathRow,
+          fileStatusRow,
           fileContent,
+          fileImageWrap,
+          fileEditor,
+          filePreview,
         ]);
         root.appendChild(fileBackdrop);
         root.appendChild(fileViewer);
+
+        const fileLaunch = fileLaunchParams;
+        const fileSessionOverride = fileLaunch.sessionId;
+        const fileFullscreenMode = Boolean(fileLaunch.fullscreen);
+        const fileLaunchActive = Boolean(fileLaunch.fullscreen || fileLaunch.path);
+        let fileLaunchHandled = false;
 
         const sendChoiceBackdrop = el("div", { class: "modalBackdrop", id: "sendChoiceBackdrop" });
         const sendChoice = el("div", { class: "sendChoice", id: "sendChoice", role: "dialog", "aria-label": "Send options" }, [
@@ -784,6 +1508,367 @@
         root.appendChild(queueBackdrop);
         root.appendChild(queueViewer);
 
+        const sessionToolsBackdrop = el("div", { class: "modalBackdrop", id: "sessionToolsBackdrop" });
+        const sessionToolsCloseBtn = el("button", {
+          id: "sessionToolsCloseBtn",
+          class: "icon-btn",
+          title: "Close",
+          "aria-label": "Close",
+          type: "button",
+          html: iconSvg("x"),
+        });
+        const sessionToolsMeta = el("div", { class: "muted", id: "sessionToolsMeta", text: "No session selected." });
+        const sessionToolsNotice = el("div", { class: "muted sessionToolsNotice", id: "sessionToolsNotice", text: "" });
+        const sessionStatusCmd = el("code", { class: "sessionToolCmd", id: "sessionStatusCmd", text: "" });
+        const sessionResumeCmd = el("code", { class: "sessionToolCmd", id: "sessionResumeCmd", text: "" });
+        const statusCopyBtn = el("button", {
+          class: "icon-btn text-btn",
+          title: "Copy status command",
+          "aria-label": "Copy status command",
+          type: "button",
+          text: "Copy",
+        });
+        const resumeCopyBtn = el("button", {
+          class: "icon-btn text-btn",
+          title: "Copy resume command",
+          "aria-label": "Copy resume command",
+          type: "button",
+          text: "Copy",
+        });
+        statusCopyBtn.disabled = true;
+        resumeCopyBtn.disabled = true;
+        const sessionTailStatus = el("div", { class: "muted", id: "sessionTailStatus", text: "" });
+        const sessionTail = el("pre", { class: "sessionTail", id: "sessionTail", text: "" });
+        const sessionTools = el("div", { class: "sessionTools", id: "sessionTools", role: "dialog", "aria-label": "Session tools" }, [
+          el("div", { class: "sessionToolsHeader" }, [
+            el("div", { class: "title", text: "Session tools" }),
+            el("div", { class: "actions" }, [sessionToolsCloseBtn]),
+          ]),
+          sessionToolsMeta,
+          sessionToolsNotice,
+          el("div", { class: "sessionToolRow" }, [
+            el("div", { class: "sessionToolLabel muted", text: "Status (SSH)" }),
+            el("div", { class: "sessionToolCmdRow" }, [sessionStatusCmd, statusCopyBtn]),
+          ]),
+          el("div", { class: "sessionToolRow" }, [
+            el("div", { class: "sessionToolLabel muted", text: "Resume in TUI" }),
+            el("div", { class: "sessionToolCmdRow" }, [sessionResumeCmd, resumeCopyBtn]),
+          ]),
+          el("div", { class: "sessionToolRow" }, [
+            el("div", { class: "sessionToolLabel muted", text: "Live tail" }),
+            sessionTailStatus,
+            sessionTail,
+          ]),
+        ]);
+        root.appendChild(sessionToolsBackdrop);
+        root.appendChild(sessionTools);
+
+        const cliChoiceBackdrop = el("div", { class: "modalBackdrop", id: "cliChoiceBackdrop" });
+        const cliChoiceTitle = el("div", { class: "title", id: "cliChoiceTitle", text: "Choose CLI" });
+        const cliChoiceCwd = el("div", { class: "muted", id: "cliChoiceCwd", text: "" });
+        const cliChoiceButtons = el("div", { class: "cliChoiceButtons" }, [
+          el("button", { class: "cliChoiceBtn", id: "cliChoiceCodex", type: "button", "data-cli": "codex" }, [
+            el("div", { class: "cliChoiceLogo" }, [
+              el("img", { src: "static/logos/codex.svg", alt: "Codex", width: "32", height: "32" }),
+            ]),
+            el("div", { class: "cliChoiceLabel", text: "Codex" }),
+          ]),
+          el("button", { class: "cliChoiceBtn", id: "cliChoiceClaude", type: "button", "data-cli": "claude" }, [
+            el("div", { class: "cliChoiceLogo" }, [
+              el("img", { src: "static/logos/claude.svg", alt: "Claude", width: "32", height: "32" }),
+            ]),
+            el("div", { class: "cliChoiceLabel", text: "Claude" }),
+          ]),
+          el("button", { class: "cliChoiceBtn", id: "cliChoiceGemini", type: "button", "data-cli": "gemini" }, [
+            el("div", { class: "cliChoiceLogo" }, [
+              el("img", { src: "static/logos/gemini.svg", alt: "Gemini", width: "32", height: "32" }),
+            ]),
+            el("div", { class: "cliChoiceLabel", text: "Gemini" }),
+          ]),
+        ]);
+        const cliChoiceCancel = el("button", { class: "cliChoiceCancel", id: "cliChoiceCancel", type: "button", text: "Cancel" });
+        const cliChoice = el("div", { class: "cliChoice", id: "cliChoice", role: "dialog", "aria-label": "Choose CLI" }, [
+          cliChoiceTitle,
+          cliChoiceCwd,
+          cliChoiceButtons,
+          cliChoiceCancel,
+        ]);
+        root.appendChild(cliChoiceBackdrop);
+        root.appendChild(cliChoice);
+
+        // Config modal
+        const configBackdrop = el("div", { class: "modalBackdrop", id: "configBackdrop" });
+        const configTitle = el("div", { class: "title", id: "configTitle", text: "CLI Configuration" });
+        const configContent = el("div", { class: "configContent", id: "configContent" });
+        const configActions = el("div", { class: "configActions" }, [
+          el("button", { class: "configCancel", id: "configCancel", type: "button", text: "Cancel" }),
+          el("button", { class: "configSave", id: "configSave", type: "button", text: "Save" }),
+        ]);
+        const configModal = el("div", { class: "configModal", id: "configModal", role: "dialog", "aria-label": "Configuration" }, [
+          configTitle,
+          configContent,
+          configActions,
+        ]);
+        root.appendChild(configBackdrop);
+        root.appendChild(configModal);
+
+        let currentConfig = null;
+        async function showConfig() {
+          try {
+            const data = await api("/api/config");
+            if (!data || !data.ok) {
+              setToast("failed to load config");
+              return;
+            }
+            currentConfig = data.config;
+            renderConfigForm(currentConfig);
+            configBackdrop.style.display = "block";
+            configModal.style.display = "flex";
+          } catch (e) {
+            setToast(`config error: ${e.message}`);
+          }
+        }
+        function hideConfig() {
+          configBackdrop.style.display = "none";
+          configModal.style.display = "none";
+          currentConfig = null;
+        }
+        function renderConfigForm(config) {
+          configContent.innerHTML = "";
+          const env = config?.env || {};
+          const envMasked = config?.env_masked || {};
+
+          function readEnvBool(key, fallback = false) {
+            const raw = env[key];
+            if (raw == null || raw === "") return !!fallback;
+            const s = String(raw).trim().toLowerCase();
+            return !["0", "false", "no", "off"].includes(s);
+          }
+
+          function buildSecretField({ label, id, value, placeholder, masked }) {
+            const input = el("input", {
+              type: "password",
+              id,
+              class: "configInput",
+              value: value || "",
+              placeholder: placeholder || "",
+            });
+            const revealBtn = el("button", {
+              type: "button",
+              class: "configRevealBtn",
+              "aria-label": `Show ${label}`,
+              text: "Show",
+            });
+            revealBtn.onclick = () => {
+              const hidden = input.getAttribute("type") !== "text";
+              input.setAttribute("type", hidden ? "text" : "password");
+              revealBtn.textContent = hidden ? "Hide" : "Show";
+            };
+            const hintText = masked ? `Saved: ${masked}` : "Saved: (empty)";
+            return el("div", { class: "configField" }, [
+              el("label", { text: label, for: id }),
+              el("div", { class: "configSecretRow" }, [input, revealBtn]),
+              el("div", { class: "configHint", text: hintText }),
+            ]);
+          }
+
+          function buildToggleField({ label, id, checked, hint }) {
+            const checkbox = el("input", { type: "checkbox", id, class: "configCheckbox" });
+            checkbox.checked = !!checked;
+            const row = el("label", { class: "configToggle", for: id }, [checkbox, el("span", { text: label })]);
+            return el("div", { class: "configField" }, [
+              row,
+              el("div", { class: "configHint", text: hint || "" }),
+            ]);
+          }
+
+          // Codex section
+          const codexSection = el("div", { class: "configSection" }, [
+            el("div", { class: "configSectionTitle", text: "Codex (OpenAI)" }),
+            buildSecretField({
+              label: "API Key",
+              id: "codexApiKey",
+              value: config.codex?.api_key || env.OPENAI_API_KEY || "",
+              placeholder: "sk-...",
+              masked: envMasked.OPENAI_API_KEY || "",
+            }),
+            el("div", { class: "configField" }, [
+              el("label", { text: "Base URL", for: "codexBaseUrl" }),
+              el("input", {
+                type: "text",
+                id: "codexBaseUrl",
+                class: "configInput",
+                value: config.codex?.base_url || env.OPENAI_BASE_URL || "",
+                placeholder: "https://api.openai.com/v1"
+              }),
+            ]),
+            el("div", { class: "configField" }, [
+              el("label", { text: "Model", for: "codexModel" }),
+              el("input", {
+                type: "text",
+                id: "codexModel",
+                class: "configInput",
+                value: config.codex?.model || "",
+                placeholder: "gpt-4"
+              }),
+            ]),
+            buildToggleField({
+              label: "YOLO Mode",
+              id: "codexYolo",
+              checked: readEnvBool("CODEX_WEB_CODEX_YOLO", false),
+              hint: "Append --dangerously-bypass-approvals-and-sandbox for new Codex web sessions.",
+            }),
+          ]);
+
+          // Claude section
+          const claudeSection = el("div", { class: "configSection" }, [
+            el("div", { class: "configSectionTitle", text: "Claude (Anthropic)" }),
+            buildSecretField({
+              label: "API Key / Auth Token",
+              id: "claudeApiKey",
+              value: env.ANTHROPIC_API_KEY || env.ANTHROPIC_AUTH_TOKEN || "",
+              placeholder: "sk-ant-...",
+              masked: envMasked.ANTHROPIC_API_KEY || envMasked.ANTHROPIC_AUTH_TOKEN || "",
+            }),
+            el("div", { class: "configField" }, [
+              el("label", { text: "Base URL", for: "claudeBaseUrl" }),
+              el("input", {
+                type: "text",
+                id: "claudeBaseUrl",
+                class: "configInput",
+                value: env.ANTHROPIC_BASE_URL || "",
+                placeholder: "https://api.anthropic.com"
+              }),
+            ]),
+            el("div", { class: "configField" }, [
+              el("label", { text: "Model", for: "claudeModel" }),
+              el("input", {
+                type: "text",
+                id: "claudeModel",
+                class: "configInput",
+                value: config.claude?.model || "",
+                placeholder: "opus"
+              }),
+            ]),
+            buildToggleField({
+              label: "YOLO Mode",
+              id: "claudeYolo",
+              checked: readEnvBool("CODEX_WEB_CLAUDE_YOLO", false),
+              hint: "Append --dangerously-skip-permissions for new Claude web sessions.",
+            }),
+          ]);
+
+          // Gemini section
+          const geminiSection = el("div", { class: "configSection" }, [
+            el("div", { class: "configSectionTitle", text: "Gemini (Google)" }),
+            buildSecretField({
+              label: "API Key",
+              id: "geminiApiKey",
+              value: env.GEMINI_API_KEY || "",
+              placeholder: "AIza...",
+              masked: envMasked.GEMINI_API_KEY || "",
+            }),
+            el("div", { class: "configField" }, [
+              el("label", { text: "Base URL", for: "geminiBaseUrl" }),
+              el("input", {
+                type: "text",
+                id: "geminiBaseUrl",
+                class: "configInput",
+                value: env.GOOGLE_GEMINI_BASE_URL || "",
+                placeholder: "https://generativelanguage.googleapis.com"
+              }),
+            ]),
+            el("div", { class: "configField" }, [
+              el("label", { text: "Model", for: "geminiModel" }),
+              el("input", {
+                type: "text",
+                id: "geminiModel",
+                class: "configInput",
+                value: env.GEMINI_MODEL || "",
+                placeholder: "gemini-pro"
+              }),
+            ]),
+            buildToggleField({
+              label: "YOLO Mode",
+              id: "geminiYolo",
+              checked: readEnvBool("CODEX_WEB_GEMINI_YOLO", false),
+              hint: "Append --yolo for new Gemini web sessions.",
+            }),
+          ]);
+
+          configContent.appendChild(codexSection);
+          configContent.appendChild(claudeSection);
+          configContent.appendChild(geminiSection);
+        }
+        async function saveConfig() {
+          const updates = {
+            codex: {
+              api_key: $("#codexApiKey").value.trim(),
+              base_url: $("#codexBaseUrl").value.trim(),
+              model: $("#codexModel").value.trim(),
+              yolo: !!$("#codexYolo").checked,
+            },
+            claude: {
+              api_key: $("#claudeApiKey").value.trim(),
+              base_url: $("#claudeBaseUrl").value.trim(),
+              model: $("#claudeModel").value.trim(),
+              yolo: !!$("#claudeYolo").checked,
+            },
+            gemini: {
+              api_key: $("#geminiApiKey").value.trim(),
+              base_url: $("#geminiBaseUrl").value.trim(),
+              model: $("#geminiModel").value.trim(),
+              yolo: !!$("#geminiYolo").checked,
+            },
+          };
+          try {
+            setToast("saving...");
+            const result = await api("/api/config", { method: "POST", body: { updates } });
+            if (result.ok) {
+              setToast("config saved");
+              hideConfig();
+            } else {
+              setToast("save failed");
+            }
+          } catch (e) {
+            setToast(`save error: ${e.message}`);
+          }
+        }
+        configBackdrop.onclick = hideConfig;
+        $("#configCancel").onclick = hideConfig;
+        $("#configSave").onclick = saveConfig;
+
+        let cliChoiceResolve = null;
+        function showCliChoice({ title, cwd } = {}) {
+          return new Promise((resolve) => {
+            cliChoiceResolve = resolve;
+            cliChoiceTitle.textContent = title || "Choose CLI";
+            cliChoiceCwd.textContent = cwd || "";
+            cliChoiceBackdrop.style.display = "block";
+            cliChoice.style.display = "flex";
+          });
+        }
+        function hideCliChoice() {
+          cliChoiceBackdrop.style.display = "none";
+          cliChoice.style.display = "none";
+          if (cliChoiceResolve) {
+            cliChoiceResolve(null);
+            cliChoiceResolve = null;
+          }
+        }
+        cliChoiceBackdrop.onclick = hideCliChoice;
+        cliChoiceCancel.onclick = hideCliChoice;
+        for (const btn of [$("#cliChoiceCodex"), $("#cliChoiceClaude"), $("#cliChoiceGemini")]) {
+          btn.onclick = () => {
+            const cli = btn.getAttribute("data-cli");
+            if (cliChoiceResolve) {
+              cliChoiceResolve(cli);
+              cliChoiceResolve = null;
+            }
+            hideCliChoice();
+          };
+        }
+
         function setToast(text) {
           toast.textContent = text || "";
           if (!text) return;
@@ -792,11 +1877,198 @@
           }, 2200);
         }
 
+        function shortCommit(raw) {
+          const s = String(raw || "").trim();
+          if (!/^[0-9a-f]{7,40}$/i.test(s)) return "";
+          return s.slice(0, 8).toLowerCase();
+        }
+
+        function setUpdateButtonVisible(visible) {
+          updateBtn.style.display = visible ? "inline-flex" : "none";
+        }
+
+        function renderUpdateButton({ available, remoteCommit, compareUrl }) {
+          if (!available) {
+            updateAvailableUrl = "";
+            updateAvailableCommit = "";
+            setUpdateButtonVisible(false);
+            return;
+          }
+          const short = shortCommit(remoteCommit);
+          updateAvailableCommit = typeof remoteCommit === "string" ? remoteCommit : "";
+          updateAvailableUrl = typeof compareUrl === "string" ? compareUrl : "";
+          updateBtn.textContent = short ? `Update ${short}` : "Update";
+          updateBtn.title = short ? `Update available (${short})` : "Update available";
+          updateBtn.setAttribute("aria-label", updateBtn.title);
+          setUpdateButtonVisible(true);
+        }
+
+        function clearUpdateTimers() {
+          if (updateCheckStartTimer) {
+            clearTimeout(updateCheckStartTimer);
+            updateCheckStartTimer = null;
+          }
+          if (updateCheckTimer) {
+            clearInterval(updateCheckTimer);
+            updateCheckTimer = null;
+          }
+        }
+
+        async function refreshUpdateStatus() {
+          if (updateCheckInFlight) return;
+          updateCheckInFlight = true;
+          try {
+            const data = await api("/api/update");
+            if (!data || data.ok !== true) return;
+            const available = Boolean(data.update_available);
+            const remoteCommit = typeof data.remote_commit === "string" ? data.remote_commit : "";
+            const compareUrl = typeof data.compare_url === "string" ? data.compare_url : "";
+            renderUpdateButton({ available, remoteCommit, compareUrl });
+            if (!available || !remoteCommit) return;
+            if (updateNotifiedCommit === remoteCommit) return;
+            updateNotifiedCommit = remoteCommit;
+            localStorage.setItem("codexweb.updateNotifiedCommit", remoteCommit);
+            const short = shortCommit(remoteCommit);
+            setToast(short ? `update available (${short})` : "update available");
+          } catch (e) {
+            console.error("update check failed", e);
+          } finally {
+            updateCheckInFlight = false;
+          }
+        }
+
+        function setPreferredSpawnCli(cli, { persist = true } = {}) {
+          preferredSpawnCli = normalizeCliName(cli, "codex");
+          if (persist) localStorage.setItem("codexweb.spawnCli", preferredSpawnCli);
+        }
+        setPreferredSpawnCli(preferredSpawnCli, { persist: false });
+
+        let sessionToolsOpen = false;
+        let sessionTailTimer = null;
+        let sessionTailInFlight = false;
+        let sessionToolsNoticeTimer = null;
+        function setSessionToolsNotice(text, { kind = "", ttlMs = 2200 } = {}) {
+          if (sessionToolsNoticeTimer) {
+            clearTimeout(sessionToolsNoticeTimer);
+            sessionToolsNoticeTimer = null;
+          }
+          const msg = String(text || "");
+          sessionToolsNotice.textContent = msg;
+          if (kind) sessionToolsNotice.setAttribute("data-kind", kind);
+          else sessionToolsNotice.removeAttribute("data-kind");
+          if (!msg) return;
+          sessionToolsNoticeTimer = setTimeout(() => {
+            if (sessionToolsNotice.textContent !== msg) return;
+            sessionToolsNotice.textContent = "";
+            sessionToolsNotice.removeAttribute("data-kind");
+          }, Math.max(0, Number(ttlMs) || 0));
+        }
+        function copyToClipboard(raw) {
+          const text = String(raw || "");
+          if (!text) return Promise.resolve(false);
+          if (navigator && navigator.clipboard && navigator.clipboard.writeText) {
+            return navigator.clipboard
+              .writeText(text)
+              .then(() => true)
+              .catch(() => false);
+          }
+          try {
+            const ta = el("textarea", {
+              value: text,
+              style: "position:fixed;left:-9999px;top:-9999px;opacity:0;",
+            });
+            document.body.appendChild(ta);
+            ta.value = text;
+            ta.focus();
+            ta.select();
+            const ok = document.execCommand("copy");
+            document.body.removeChild(ta);
+            return Promise.resolve(ok);
+          } catch {
+            return Promise.resolve(false);
+          }
+        }
+        function updateSessionToolsContent() {
+          const sid = selected;
+          if (!sid) {
+            sessionToolsMeta.textContent = "No session selected.";
+            setSessionToolsNotice("");
+            sessionStatusCmd.textContent = "";
+            sessionResumeCmd.textContent = "";
+            statusCopyBtn.disabled = true;
+            resumeCopyBtn.disabled = true;
+            sessionTailStatus.textContent = "";
+            sessionTail.textContent = "";
+            return;
+          }
+          const s = sessionIndex.get(sid);
+          const name = s ? sessionTitleWithId(s) : sid;
+          sessionToolsMeta.textContent = `${name} (${sid})`;
+          setSessionToolsNotice("");
+          sessionStatusCmd.textContent = `scripts/codoxear-status --id ${sid}`;
+          sessionResumeCmd.textContent = resumeCommandForSession(sid, s);
+          statusCopyBtn.disabled = false;
+          resumeCopyBtn.disabled = false;
+        }
+        async function refreshSessionTail() {
+          if (!sessionToolsOpen || sessionTailInFlight) return;
+          const sid = selected;
+          if (!sid) {
+            sessionTailStatus.textContent = "No session selected.";
+            sessionTail.textContent = "";
+            return;
+          }
+          sessionTailInFlight = true;
+          try {
+            const res = await api(`/api/sessions/${sid}/tail`);
+            const tail = res && typeof res.tail === "string" ? res.tail : "";
+            sessionTail.textContent = tail;
+            sessionTail.scrollTop = sessionTail.scrollHeight;
+            sessionTailStatus.textContent = `Updated ${fmtTs(Date.now() / 1000)}`;
+          } catch (e) {
+            sessionTailStatus.textContent = `Tail error: ${e && e.message ? e.message : "unknown error"}`;
+          } finally {
+            sessionTailInFlight = false;
+          }
+        }
+        function startSessionTail() {
+          if (sessionTailTimer) return;
+          void refreshSessionTail();
+          sessionTailTimer = setInterval(() => {
+            void refreshSessionTail();
+          }, 1500);
+        }
+        function stopSessionTail() {
+          if (!sessionTailTimer) return;
+          clearInterval(sessionTailTimer);
+          sessionTailTimer = null;
+        }
+        function showSessionTools() {
+          if (!selected) {
+            setToast("select a session first");
+            return;
+          }
+          sessionToolsOpen = true;
+          updateSessionToolsContent();
+          setSessionToolsNotice("");
+          sessionTailStatus.textContent = "Loading...";
+          sessionToolsBackdrop.style.display = "block";
+          sessionTools.style.display = "flex";
+          startSessionTail();
+        }
+        function hideSessionTools() {
+          sessionToolsOpen = false;
+          stopSessionTail();
+          setSessionToolsNotice("");
+          sessionToolsBackdrop.style.display = "none";
+          sessionTools.style.display = "none";
+        }
+
         function setStatus({ running, queueLen }) {
-          const q = Math.max(0, Number(queueLen) || 0);
+          const q = Number(queueLen || 0);
           const mobile = isMobile();
-          const wasRunning = currentRunning;
           currentRunning = Boolean(running);
+          if (selected) setSelectedQueueLen(q);
           if (running) {
             statusChip.style.display = "none";
             statusChip.classList.remove("running");
@@ -807,12 +2079,7 @@
           }
           interruptBtn.style.display = running && selected ? "inline-flex" : "none";
           interruptBtn.disabled = !(running && selected);
-          if (wasRunning && !currentRunning) {
-            deferInFlight = false;
-          }
-          if (!currentRunning && q === 0) {
-            maybeSendDeferred();
-          }
+          updateQueueBadge();
         }
 
 	        function setContext(tok) {
@@ -844,12 +2111,12 @@
 
         function resetChatRenderState() {
           autoScroll = true;
-          pendingUser.length = 0;
           sending = false;
           localEchoSeq = 0;
           recentEventKeys.length = 0;
           recentEventKeySet.clear();
-          lastAssistantKey = "";
+          recentEventSigTs.clear();
+          recentEventSigOrder.length = 0;
           olderBefore = 0;
           hasOlder = false;
           loadingOlder = false;
@@ -876,72 +2143,368 @@
         }
 
         function initPageLimit() {
+          const s = selected ? sessionIndex.get(selected) : null;
+          const cli = sessionCliName(s);
+          if (cli === "claude") {
+            return isMobile() ? INIT_PAGE_LIMIT_CLAUDE_MOBILE : INIT_PAGE_LIMIT_CLAUDE_DESKTOP;
+          }
           return isMobile() ? INIT_PAGE_LIMIT_MOBILE : INIT_PAGE_LIMIT_DESKTOP;
         }
 
         function olderPageLimit() {
+          const s = selected ? sessionIndex.get(selected) : null;
+          const cli = sessionCliName(s);
+          if (cli === "claude") return OLDER_PAGE_LIMIT_CLAUDE;
           return OLDER_PAGE_LIMIT;
         }
 
-        function deferredStorageKey(sid) {
-          return `codexweb.deferred.${sid}`;
-        }
-
-        function loadDeferredFromStorage(sid) {
-          if (!sid || deferredLoaded.has(sid)) return;
-          deferredLoaded.add(sid);
-          try {
-            const raw = localStorage.getItem(deferredStorageKey(sid));
-            if (!raw) return;
-            const arr = JSON.parse(raw);
-            if (!Array.isArray(arr)) return;
-            const out = [];
-            for (const v of arr) {
-              if (typeof v !== "string") continue;
-              const t = v.trim();
-              if (!t) continue;
-              out.push(t);
-            }
-            if (out.length) deferredBySession.set(sid, out);
-          } catch {
-            // ignore corrupted storage
+        function normalizeQueueList(raw) {
+          if (!Array.isArray(raw)) return [];
+          const out = [];
+          for (const item of raw) {
+            if (typeof item !== "string") continue;
+            if (!item.trim()) continue;
+            out.push(item);
           }
+          return out;
         }
 
-        function saveDeferredToStorage(sid) {
-          if (!sid) return;
-          const q = deferredBySession.get(sid) || [];
-          try {
-            localStorage.setItem(deferredStorageKey(sid), JSON.stringify(q));
-          } catch {
-            // ignore quota or serialization issues
-          }
-        }
-
-        function scheduleQueueSave(sid) {
-          if (!sid) return;
-          const existing = queueSaveTimers.get(sid);
-          if (existing) clearTimeout(existing);
-          const t = setTimeout(() => {
-            queueSaveTimers.delete(sid);
-            saveDeferredToStorage(sid);
-          }, 350);
-          queueSaveTimers.set(sid, t);
-        }
-
-        function getDeferredQueue(sid) {
+        function getQueueCache(sid) {
           if (!sid) return [];
-          loadDeferredFromStorage(sid);
-          let q = deferredBySession.get(sid);
-          if (!q) {
-            q = [];
-            deferredBySession.set(sid, q);
+          const q = queueCacheBySession.get(sid);
+          return Array.isArray(q) ? q : [];
+        }
+
+        function setSelectedQueueLen(n) {
+          const val = Number(n);
+          currentQueueLen = Number.isFinite(val) ? Math.max(0, val) : 0;
+          if (selected) {
+            const s = sessionIndex.get(selected);
+            if (s) s.queue_len = currentQueueLen;
           }
-          return q;
+        }
+
+        function getSelectedQueueLen() {
+          if (selected) {
+            const s = sessionIndex.get(selected);
+            if (s && Number.isFinite(Number(s.queue_len))) return Number(s.queue_len) || 0;
+          }
+          return Number.isFinite(currentQueueLen) ? currentQueueLen : 0;
+        }
+
+        function applyQueueResponse(sid, res) {
+          if (!sid || !res || typeof res !== "object") return [];
+          let list = null;
+          if (Array.isArray(res.queue)) {
+            list = normalizeQueueList(res.queue);
+            queueCacheBySession.set(sid, list);
+            queueLoaded.add(sid);
+          }
+          const lenRaw = res.queue_len;
+          const len = Number.isFinite(Number(lenRaw)) ? Number(lenRaw) : list ? list.length : null;
+          if (len !== null) {
+            if (sid === selected) setSelectedQueueLen(len);
+            else {
+              const s = sessionIndex.get(sid);
+              if (s) s.queue_len = len;
+            }
+          }
+          return list || getQueueCache(sid);
+        }
+
+        async function fetchQueue(sid) {
+          if (!sid) return [];
+          if (queueFetchInFlight.has(sid)) return getQueueCache(sid);
+          queueFetchInFlight.add(sid);
+          try {
+            const data = await api(`/api/sessions/${sid}/queue`);
+            return applyQueueResponse(sid, data);
+          } finally {
+            queueFetchInFlight.delete(sid);
+          }
+        }
+
+        async function saveQueueToServer(sid) {
+          if (!sid) return;
+          const q = normalizeQueueList(getQueueCache(sid)).map((x) => normalizeOutgoingTextForCli(x, sid));
+          queueCacheBySession.set(sid, q);
+          try {
+            const res = await api(`/api/sessions/${sid}/queue`, { method: "POST", body: { queue: q } });
+            applyQueueResponse(sid, res);
+          } catch (e) {
+            setToast(`queue save error: ${e && e.message ? e.message : "unknown error"}`);
+          }
+        }
+
+        function scheduleQueueSave() {
+          if (!selected) return;
+          const sid = selected;
+          if (queueSaveTimer) clearTimeout(queueSaveTimer);
+          queueSaveTimer = setTimeout(() => {
+            if (selected !== sid) return;
+            void saveQueueToServer(sid);
+          }, 350);
+        }
+
+        function clearQueueForSession(sid) {
+          if (!sid) return;
+          queueCacheBySession.delete(sid);
+          queueLoaded.delete(sid);
+          queueFetchInFlight.delete(sid);
+        }
+
+        function draftStorageKey(sid) {
+          return `codexweb.draft.${sid}`;
+        }
+
+        function loadDraftFromStorage(sid) {
+          if (!sid) return "";
+          if (draftBySession.has(sid)) return draftBySession.get(sid) || "";
+          let raw = "";
+          try {
+            raw = localStorage.getItem(draftStorageKey(sid)) || "";
+          } catch {
+            raw = "";
+          }
+          draftBySession.set(sid, raw);
+          return raw;
+        }
+
+        function saveDraftToStorage(sid, text) {
+          if (!sid) return;
+          const val = String(text || "");
+          draftBySession.set(sid, val);
+          updateSessionSummaryForSession(sid, val);
+          try {
+            if (val) localStorage.setItem(draftStorageKey(sid), val);
+            else localStorage.removeItem(draftStorageKey(sid));
+          } catch {
+            // ignore quota or storage errors
+          }
+        }
+
+        function scheduleDraftSave(sid, text) {
+          if (!sid) return;
+          const val = String(text || "");
+          draftBySession.set(sid, val);
+          updateSessionSummaryForSession(sid, val);
+          const prev = draftSaveTimers.get(sid);
+          if (prev) clearTimeout(prev);
+          const t = setTimeout(() => {
+            draftSaveTimers.delete(sid);
+            saveDraftToStorage(sid, val);
+          }, 250);
+          draftSaveTimers.set(sid, t);
+        }
+
+        function clearDraftForSession(sid) {
+          if (!sid) return;
+          const prev = draftSaveTimers.get(sid);
+          if (prev) clearTimeout(prev);
+          draftSaveTimers.delete(sid);
+          draftBySession.delete(sid);
+          try {
+            localStorage.removeItem(draftStorageKey(sid));
+          } catch {
+            // ignore
+          }
+          updateSessionSummaryForSession(sid, "");
+        }
+
+        function sessionHasDraft(sid, textOverride) {
+          if (!sid) return false;
+          const raw = typeof textOverride === "string" ? textOverride : loadDraftFromStorage(sid);
+          return Boolean(raw && raw.trim());
+        }
+
+        function applySessionSummaryEl(summaryEl, sid, textOverride) {
+          if (!summaryEl || !sid) return;
+          const hasDraft = sessionHasDraft(sid, textOverride);
+          if (hasDraft) {
+            summaryEl.textContent = "draft";
+            summaryEl.title = "Draft saved";
+            summaryEl.classList.add("draft");
+            summaryEl.style.display = "block";
+            return;
+          }
+          const summary = loadUserSummaryFromStorage(sid);
+          if (summary) {
+            summaryEl.textContent = summary;
+            summaryEl.title = summary;
+            summaryEl.classList.remove("draft");
+            summaryEl.style.display = "block";
+            return;
+          }
+          summaryEl.textContent = "";
+          summaryEl.title = "";
+          summaryEl.classList.remove("draft");
+          summaryEl.style.display = "none";
+        }
+
+        function updateSessionSummaryForSession(sid, textOverride) {
+          if (!sid) return;
+          const card = sessionCardIndex.get(String(sid));
+          if (!card) return;
+          const summaryEl = card.querySelector(".sessionSummary");
+          if (!summaryEl) return;
+          applySessionSummaryEl(summaryEl, sid, textOverride);
+        }
+
+        function seenAssistantStorageKey(sid) {
+          return `codexweb.seen.assistant.${sid}`;
+        }
+
+        function loadSeenAssistantTs(sid) {
+          if (!sid) return 0;
+          if (seenAssistantBySession.has(sid)) return seenAssistantBySession.get(sid) || 0;
+          let raw = "";
+          try {
+            raw = localStorage.getItem(seenAssistantStorageKey(sid)) || "";
+          } catch {
+            raw = "";
+          }
+          const val = Number(raw);
+          const out = Number.isFinite(val) ? val : 0;
+          seenAssistantBySession.set(sid, out);
+          return out;
+        }
+
+        function saveSeenAssistantTs(sid, ts) {
+          if (!sid) return;
+          const val = Number(ts);
+          if (!Number.isFinite(val) || val <= 0) return;
+          seenAssistantBySession.set(sid, val);
+          try {
+            localStorage.setItem(seenAssistantStorageKey(sid), String(val));
+          } catch {
+            // ignore storage issues
+          }
+        }
+
+        function markAssistantSeen(sid, ts) {
+          if (!sid) return;
+          const val = Number(ts);
+          if (!Number.isFinite(val) || val <= 0) return;
+          const cur = loadSeenAssistantTs(sid);
+          if (val > cur) saveSeenAssistantTs(sid, val);
+        }
+
+        function clearSeenAssistantForSession(sid) {
+          if (!sid) return;
+          seenAssistantBySession.delete(sid);
+          try {
+            localStorage.removeItem(seenAssistantStorageKey(sid));
+          } catch {
+            // ignore
+          }
+        }
+
+        function userSummaryStorageKey(sid) {
+          return `codexweb.summary.user.${sid}`;
+        }
+
+        function loadUserSummaryFromStorage(sid) {
+          if (!sid) return "";
+          if (userSummaryBySession.has(sid)) return userSummaryBySession.get(sid) || "";
+          let raw = "";
+          try {
+            raw = localStorage.getItem(userSummaryStorageKey(sid)) || "";
+          } catch {
+            raw = "";
+          }
+          userSummaryBySession.set(sid, raw);
+          return raw;
+        }
+
+        function saveUserSummaryToStorage(sid, text) {
+          if (!sid) return;
+          const val = String(text || "");
+          userSummaryBySession.set(sid, val);
+          updateSessionSummaryForSession(sid);
+          try {
+            if (val) localStorage.setItem(userSummaryStorageKey(sid), val);
+            else localStorage.removeItem(userSummaryStorageKey(sid));
+          } catch {
+            // ignore storage issues
+          }
+        }
+
+        function scheduleUserSummarySave(sid, text) {
+          if (!sid) return;
+          const prev = userSummarySaveTimers.get(sid);
+          if (prev) clearTimeout(prev);
+          const t = setTimeout(() => {
+            userSummarySaveTimers.delete(sid);
+            saveUserSummaryToStorage(sid, text);
+          }, 200);
+          userSummarySaveTimers.set(sid, t);
+        }
+
+        function clearUserSummaryForSession(sid) {
+          if (!sid) return;
+          const prev = userSummarySaveTimers.get(sid);
+          if (prev) clearTimeout(prev);
+          userSummarySaveTimers.delete(sid);
+          userSummaryBySession.delete(sid);
+          try {
+            localStorage.removeItem(userSummaryStorageKey(sid));
+          } catch {
+            // ignore
+          }
+          updateSessionSummaryForSession(sid);
+        }
+
+        function formatUserSummaryText(text, sid) {
+          const res = sanitizeUserText(text, sid);
+          if (res.dropped) return "";
+          let t = res.text.replace(/\s+/g, " ").trim();
+          if (!t) return "";
+          const maxLen = 220;
+          if (t.length > maxLen) {
+            t = t.slice(0, Math.max(0, maxLen - 3)) + "...";
+          }
+          return t;
+        }
+
+        function updateUserSummaryFromEvent(ev, sid) {
+          if (!sid || !ev || ev.pending || ev.role !== "user") return;
+          const line = formatUserSummaryText(ev.text, sid);
+          if (!line) return;
+          scheduleUserSummarySave(sid, line);
+        }
+
+        function updateUserSummaryFromText(sid, text) {
+          if (!sid) return;
+          const line = formatUserSummaryText(text, sid);
+          if (!line) return;
+          scheduleUserSummarySave(sid, line);
+        }
+
+        function updateUserSummaryFromEvents(events, sid) {
+          if (!sid || !Array.isArray(events) || !events.length) return;
+          let best = null;
+          let bestTs = -1;
+          for (const ev of events) {
+            if (!ev || ev.role !== "user") continue;
+            if (ev.pending) continue;
+            const ts = typeof ev.ts === "number" && Number.isFinite(ev.ts) ? ev.ts : null;
+            if (ts !== null) {
+              if (ts > bestTs) {
+                bestTs = ts;
+                best = ev;
+              }
+            } else {
+              best = ev;
+            }
+          }
+          if (!best) return;
+          const line = formatUserSummaryText(best.text, sid);
+          if (!line) return;
+          saveUserSummaryToStorage(sid, line);
         }
 
         function cacheStorageKey(sid) {
-          return `codexweb.cache.v3.${sid}`;
+          return `codexweb.cache.v4.${sid}`;
         }
 
         function normalizeCacheEvent(ev) {
@@ -949,30 +2512,6 @@
           if (typeof ev.text !== "string" || !ev.text.trim()) return null;
           const out = { role: ev.role, text: ev.text };
           if (typeof ev.ts === "number" && Number.isFinite(ev.ts)) out.ts = ev.ts;
-          return out;
-        }
-
-        function assistantTextKey(ev) {
-          if (!ev || ev.role !== "assistant") return "";
-          if (typeof ev.text !== "string") return "";
-          return pendingMatchKey(ev.text);
-        }
-
-        function isAdjacentAssistantDuplicate(prev, ev) {
-          if (!prev || !ev) return false;
-          if (prev.role !== "assistant" || ev.role !== "assistant") return false;
-          const a = assistantTextKey(prev);
-          if (!a) return false;
-          return a === assistantTextKey(ev);
-        }
-
-        function dedupeAdjacentAssistantDuplicates(events) {
-          const out = [];
-          for (const ev of events || []) {
-            const prev = out.length ? out[out.length - 1] : null;
-            if (isAdjacentAssistantDuplicate(prev, ev)) continue;
-            out.push(ev);
-          }
           return out;
         }
 
@@ -991,12 +2530,6 @@
               if (norm) events.push(norm);
             }
             if (!events.length) return;
-            const deduped = dedupeAdjacentAssistantDuplicates(events);
-            const cacheChanged = deduped.length !== events.length;
-            if (cacheChanged) {
-              events.length = 0;
-              events.push(...deduped);
-            }
             if (events.length > CACHE_LIMIT) events.splice(0, events.length - CACHE_LIMIT);
             const cache = {
               log_path: typeof obj.log_path === "string" ? obj.log_path : null,
@@ -1006,7 +2539,6 @@
               events,
             };
             cacheBySession.set(sid, cache);
-            if (cacheChanged) scheduleCacheSave(sid);
           } catch {
             // ignore corrupted cache
           }
@@ -1069,13 +2601,11 @@
           const out = [];
           for (const ev of events || []) {
             const norm = normalizeCacheEvent(ev);
-            if (!norm) continue;
-            const prev = out.length ? out[out.length - 1] : null;
-            if (isAdjacentAssistantDuplicate(prev, norm)) continue;
-            out.push(norm);
+            if (norm) out.push(norm);
           }
-          if (out.length > CACHE_LIMIT) out.splice(0, out.length - CACHE_LIMIT);
-          cache.events = out;
+          const ordered = sortChatEventsByTs(out);
+          if (ordered.length > CACHE_LIMIT) ordered.splice(0, ordered.length - CACHE_LIMIT);
+          cache.events = ordered;
           cacheBySession.set(sid, cache);
           scheduleCacheSave(sid);
         }
@@ -1085,16 +2615,13 @@
           const cache =
             getCache(sid) || { log_path: null, offset: 0, older_before: 0, has_older: false, events: [] };
           const list = Array.isArray(cache.events) ? cache.events : [];
-          let prev = list.length ? list[list.length - 1] : null;
           for (const ev of events) {
             const norm = normalizeCacheEvent(ev);
-            if (!norm) continue;
-            if (isAdjacentAssistantDuplicate(prev, norm)) continue;
-            list.push(norm);
-            prev = norm;
+            if (norm) list.push(norm);
           }
-          if (list.length > CACHE_LIMIT) list.splice(0, list.length - CACHE_LIMIT);
-          cache.events = list;
+          const ordered = sortChatEventsByTs(list);
+          if (ordered.length > CACHE_LIMIT) ordered.splice(0, ordered.length - CACHE_LIMIT);
+          cache.events = ordered;
           cacheBySession.set(sid, cache);
           scheduleCacheSave(sid);
         }
@@ -1107,6 +2634,67 @@
           localStorage.removeItem(cacheStorageKey(sid));
         }
 
+        function pendingForSession(sid, { create } = { create: false }) {
+          if (!sid) return [];
+          const key = String(sid);
+          const existing = pendingUserBySession.get(key);
+          if (Array.isArray(existing)) return existing;
+          if (!create) return [];
+          const out = [];
+          pendingUserBySession.set(key, out);
+          return out;
+        }
+
+        function clearPendingForSession(sid) {
+          if (!sid) return;
+          pendingUserBySession.delete(String(sid));
+        }
+
+        function renderPendingForSelectedSession() {
+          const sid = selected;
+          if (!sid) return;
+          const pending = pendingForSession(sid);
+          if (!pending.length) return;
+          const pendingSorted = pending.slice().sort((a, b) => Number(a.t0 || 0) - Number(b.t0 || 0));
+          let appended = false;
+          for (const item of pendingSorted) {
+            if (!item || !Number.isFinite(Number(item.id))) continue;
+            const localId = Number(item.id);
+            if (chatInner.querySelector(`.msg.user[data-local-id="${localId}"]`)) continue;
+            const text = typeof item.text === "string" ? item.text : "";
+            if (!text.trim()) continue;
+            const ts = Number.isFinite(Number(item.t0)) ? Number(item.t0) : Date.now() / 1000;
+            const { row } = makeRow({ role: "user", text, localId }, { ts, pending: true });
+            const anchor = typingRow && typingRow.isConnected ? typingRow : bottomSentinel;
+            chatInner.insertBefore(row, anchor);
+            appended = true;
+          }
+          if (!appended) return;
+          trimRenderedRows({ fromTop: true });
+          rebuildDecorations({ preserveScroll: false });
+        }
+
+        function queueEditorActive() {
+          if (queueViewer.style.display !== "flex") return false;
+          const active = document.activeElement;
+          return Boolean(active && active.classList && active.classList.contains("queueText"));
+        }
+
+        function maybeRefreshQueueList() {
+          if (!selected) return;
+          if (queueViewer.style.display !== "flex") return;
+          if (queueEditorActive()) return;
+          const cached = getQueueCache(selected);
+          const expected = getSelectedQueueLen();
+          if (!queueLoaded.has(selected) || cached.length !== expected) {
+            void fetchQueue(selected).then(() => {
+              if (queueViewer.style.display === "flex" && !queueEditorActive()) renderQueueList();
+            });
+            return;
+          }
+          renderQueueList();
+        }
+
         function updateQueueBadge() {
           if (!queueBadgeEl) return;
           if (!selected) {
@@ -1114,8 +2702,7 @@
             queueBadgeEl.style.display = "none";
             return;
           }
-          const q = getDeferredQueue(selected);
-          const n = q.length;
+          const n = getSelectedQueueLen();
           if (n > 0) {
             queueBadgeEl.textContent = String(n);
             queueBadgeEl.style.display = "inline-flex";
@@ -1123,34 +2710,34 @@
             queueBadgeEl.textContent = "";
             queueBadgeEl.style.display = "none";
           }
-          if (queueViewer.style.display === "flex") {
-            renderQueueList();
-          }
+          // Avoid tearing down the queue editor while the user is typing (IME-safe).
+          maybeRefreshQueueList();
         }
 
-        function queueLocalMessage(raw, { front = false } = {}) {
-          if (!selected) return;
-          const q = getDeferredQueue(selected);
-          if (front) q.unshift(raw);
-          else q.push(raw);
-          saveDeferredToStorage(selected);
-          updateQueueBadge();
-          setToast(`queued locally (${q.length})`);
-        }
-
-        function maybeSendDeferred() {
-          if (!selected) return;
-          if (sending || deferInFlight || currentRunning) return;
-          const q = getDeferredQueue(selected);
-          if (!q.length) {
-            updateQueueBadge();
-            return;
+        async function queueServerMessage(raw, { front = false, sid: sidOverride = null } = {}) {
+          const sid = sidOverride || selected;
+          if (!sid) {
+            setToast("select a session first");
+            return false;
           }
-          const raw = q.shift();
-          saveDeferredToStorage(selected);
-          deferInFlight = true;
-          updateQueueBadge();
-          void sendText(raw, { deferred: true });
+          const outgoing = normalizeOutgoingTextForCli(raw, sid);
+          if (!outgoing || !outgoing.trim()) return false;
+          try {
+            setToast("queueing...");
+            const res = await api(`/api/sessions/${sid}/queue`, { method: "POST", body: { text: outgoing, front: Boolean(front) } });
+            const list = applyQueueResponse(sid, res);
+            const count = Array.isArray(list) ? list.length : getSelectedQueueLen();
+            if (sid === selected) {
+              if (Number.isFinite(Number(count))) setSelectedQueueLen(count);
+              updateQueueBadge();
+              if (queueViewer.style.display === "flex" && !queueEditorActive()) renderQueueList();
+            }
+            setToast(count ? `queued (queue ${count})` : "queued");
+            return true;
+          } catch (e) {
+            setToast(`queue error: ${e && e.message ? e.message : "unknown error"}`);
+            return false;
+          }
         }
 
           function markClickFirstPaint() {
@@ -1267,10 +2854,27 @@
 
         function trimRenderedRows({ fromTop }) {
           const rows = Array.from(chatInner.querySelectorAll(".msg-row")).filter((x) => !x.classList.contains("typing-row"));
-          if (rows.length <= CHAT_DOM_WINDOW) return;
-          const extra = rows.length - CHAT_DOM_WINDOW;
+          const s = selected ? sessionIndex.get(selected) : null;
+          const cli = sessionCliName(s);
+          const windowLimit = cli === "claude" ? CHAT_DOM_WINDOW_CLAUDE : CHAT_DOM_WINDOW;
+          if (rows.length <= windowLimit) return;
+          const extra = rows.length - windowLimit;
           if (fromTop) {
-            for (const row of rows.slice(0, extra)) row.remove();
+            let removed = 0;
+            const userRows = rows.filter((row) => row.classList.contains("user"));
+            const protectedUsers = new Set(
+              userRows.slice(Math.max(0, userRows.length - CHAT_DOM_MIN_USER_ROWS)),
+            );
+            for (const row of rows) {
+              if (removed >= extra) break;
+              if (protectedUsers.has(row)) continue;
+              row.remove();
+              removed += 1;
+            }
+            if (removed < extra) {
+              const remain = Array.from(chatInner.querySelectorAll(".msg-row")).filter((x) => !x.classList.contains("typing-row"));
+              for (const row of remain.slice(0, extra - removed)) row.remove();
+            }
           } else {
             for (const row of rows.slice(rows.length - extra)) row.remove();
           }
@@ -1283,7 +2887,9 @@
           if (typeof ts === "number" && Number.isFinite(ts)) row.dataset.ts = String(ts);
 
           const bubble = el("div", { class: role === "user" ? "msg user" : "msg assistant" });
-          bubble.appendChild(el("div", { class: "md", html: mdToHtmlCached(ev.text) }));
+          const mdEl = el("div", { class: "md", html: mdToHtmlCached(ev.text) });
+          bubble.appendChild(mdEl);
+          renderMermaidIn(mdEl);
           if (typeof ts === "number" && Number.isFinite(ts)) bubble.appendChild(el("div", { class: "ts", text: time24(new Date(ts * 1000)) }));
 
           if (pending) {
@@ -1296,19 +2902,73 @@
           return { row, bubble };
         }
 
-      function normalizeTextForPendingMatch(s) {
-        // Normalize common platform newline differences to improve pending->ack reconciliation.
-        return String(s || "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
-      }
+        function normalizeTextForPendingMatch(s) {
+          // Normalize common platform newline differences to improve pending->ack reconciliation.
+          return String(s || "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+        }
 
-      function eventKey(ev) {
-        if (!ev || (ev.role !== "user" && ev.role !== "assistant")) return "";
-        const ts = typeof ev.ts === "number" && Number.isFinite(ev.ts) ? ev.ts : null;
-        if (ts === null) return "";
-        const tsMs = Math.round(ts * 1000);
-        const text = typeof ev.text === "string" ? pendingMatchKey(ev.text) : "";
-        return `${ev.role}|${tsMs}|${text}`;
-      }
+        function eventKey(ev) {
+          if (!ev || (ev.role !== "user" && ev.role !== "assistant")) return "";
+          const text = typeof ev.text === "string" ? ev.text : "";
+          const ts = typeof ev.ts === "number" && Number.isFinite(ev.ts) ? ev.ts : 0;
+          return `${ev.role}|${ts}|${text}`;
+        }
+
+        function eventSig(ev) {
+          if (!ev || (ev.role !== "user" && ev.role !== "assistant")) return "";
+          const raw = typeof ev.text === "string" ? ev.text : "";
+          const text = normalizeTextForPendingMatch(raw);
+          return `${ev.role}|${text}`;
+        }
+
+        function eventTs(ev) {
+          return typeof ev.ts === "number" && Number.isFinite(ev.ts) ? ev.ts : null;
+        }
+
+        function compareChatEventsByTs(a, b) {
+          const ta = eventTs(a);
+          const tb = eventTs(b);
+          if (ta !== null && tb !== null) {
+            if (ta !== tb) return ta - tb;
+            const ar = a && a.role === "user" ? "user" : "assistant";
+            const br = b && b.role === "user" ? "user" : "assistant";
+            if (ar !== br) return ar === "user" ? -1 : 1;
+          }
+          return 0;
+        }
+
+        function sortChatEventsByTs(events) {
+          if (!Array.isArray(events) || !events.length) return [];
+          const withIdx = events.map((ev, idx) => ({ ev, idx }));
+          withIdx.sort((a, b) => {
+            const c = compareChatEventsByTs(a.ev, b.ev);
+            return c || (a.idx - b.idx);
+          });
+          return withIdx.map((x) => x.ev);
+        }
+
+        function insertRowChronologically(row, { ts, role } = {}) {
+          const anchor = typingRow && typingRow.isConnected ? typingRow : bottomSentinel;
+          const tsNum = typeof ts === "number" && Number.isFinite(ts) ? ts : null;
+          const rowRole = role === "user" ? "user" : "assistant";
+          if (tsNum === null) {
+            chatInner.insertBefore(row, anchor);
+            return;
+          }
+          const rows = Array.from(chatInner.querySelectorAll(".msg-row")).filter(
+            (x) => !x.classList.contains("typing-row") && x !== row,
+          );
+          for (const cur of rows) {
+            const curTsRaw = Number(cur.dataset.ts || "");
+            if (!Number.isFinite(curTsRaw)) continue;
+            const curRole = cur.dataset.role === "user" ? "user" : "assistant";
+            if (curTsRaw > tsNum || (curTsRaw === tsNum && rowRole === "user" && curRole === "assistant")) {
+              chatInner.insertBefore(row, cur);
+              return;
+            }
+          }
+          chatInner.insertBefore(row, anchor);
+        }
 
         function markEventSeen(ev) {
           const key = eventKey(ev);
@@ -1320,12 +2980,32 @@
             const drop = recentEventKeys.splice(0, recentEventKeys.length - RECENT_EVENT_KEYS_MAX);
             for (const k of drop) recentEventKeySet.delete(k);
           }
+          const sig = eventSig(ev);
+          const ts = eventTs(ev);
+          if (sig && typeof ts === "number") {
+            recentEventSigTs.set(sig, ts);
+            recentEventSigOrder.push({ sig, ts });
+            if (recentEventSigOrder.length > RECENT_EVENT_SIG_MAX) {
+              const drop = recentEventSigOrder.splice(0, recentEventSigOrder.length - RECENT_EVENT_SIG_MAX);
+              for (const item of drop) {
+                if (recentEventSigTs.get(item.sig) === item.ts) {
+                  recentEventSigTs.delete(item.sig);
+                }
+              }
+            }
+          }
         }
 
         function isDuplicateEvent(ev) {
           const key = eventKey(ev);
           if (!key) return false;
-          return recentEventKeySet.has(key);
+          if (recentEventKeySet.has(key)) return true;
+          const sig = eventSig(ev);
+          const ts = eventTs(ev);
+          if (!sig || typeof ts !== "number") return false;
+          const last = recentEventSigTs.get(sig);
+          if (typeof last !== "number") return false;
+          return Math.abs(ts - last) * 1000 <= RECENT_EVENT_SIG_WINDOW_MS;
         }
 
         function pendingMatchKey(s) {
@@ -1335,14 +3015,17 @@
           return t.replace(/[ \t]+$/gm, "").replace(/\s+$/, "");
         }
 
-        function consumePendingUserIfMatches(ev) {
+        function consumePendingUserIfMatches(ev, sid = selected) {
           if (ev.role !== "user" || ev.pending) return false;
+          if (!sid) return false;
+          const pending = pendingForSession(sid);
+          if (!pending.length) return false;
           const key = pendingMatchKey(ev.text);
           const loose = normalizeTextForPendingMatch(ev.text);
           const evTs = typeof ev.ts === "number" && Number.isFinite(ev.ts) ? ev.ts : null;
           const candidates = [];
-          for (let i = 0; i < pendingUser.length; i++) {
-            const x = pendingUser[i];
+          for (let i = 0; i < pending.length; i++) {
+            const x = pending[i];
             if (x.key === key || x.loose === loose) candidates.push({ i, x });
           }
           if (!candidates.length) return false;
@@ -1359,26 +3042,37 @@
           }
           const idx = best.i;
           if (idx < 0) return false;
-          const { id } = pendingUser[idx];
-          pendingUser.splice(idx, 1);
+          const { id } = pending[idx];
           const pendingEl = chatInner.querySelector(`.msg.user[data-local-id="${id}"]`);
-          if (!pendingEl) return false;
+          if (!pendingEl) {
+            // DOM element was removed (e.g. by trimRenderedRows or resetChatRenderState).
+            // Remove the stale pending entry so it doesn't leak, but return false
+            // so the caller renders the event as a fresh row.
+            pending.splice(idx, 1);
+            if (!pending.length) clearPendingForSession(sid);
+            return false;
+          }
+          pending.splice(idx, 1);
+          if (!pending.length) clearPendingForSession(sid);
 
           pendingEl.style.opacity = "1";
           pendingEl.removeAttribute("data-local-id");
           pendingEl.removeAttribute("data-pending");
 
           const mdEl = pendingEl.querySelector(".md");
-          if (mdEl && typeof ev.text === "string") mdEl.innerHTML = mdToHtmlCached(ev.text);
+          if (mdEl && typeof ev.text === "string") {
+            mdEl.innerHTML = mdToHtmlCached(ev.text);
+            renderMermaidIn(mdEl);
+          }
 
           const row = pendingEl.closest(".msg-row");
-          if (row && typeof ev.ts === "number" && Number.isFinite(ev.ts)) row.dataset.ts = String(ev.ts);
+          if (row && typeof ev.ts === "number" && Number.isFinite(ev.ts)) {
+            row.dataset.ts = String(ev.ts);
+            insertRowChronologically(row, { ts: ev.ts, role: "user" });
+          }
           const tsEl = pendingEl.querySelector(".ts");
           if (tsEl && typeof ev.ts === "number" && Number.isFinite(ev.ts)) tsEl.textContent = time24(new Date(ev.ts * 1000));
           rebuildDecorations({ preserveScroll: true });
-          if (selected) {
-            appendCacheEvents(selected, [ev]);
-          }
           markEventSeen(ev);
           return true;
         }
@@ -1407,53 +3101,331 @@
           }
         }
 
-	        async function refreshSessions() {
-	          const data = await api("/api/sessions");
-	          sessionsWrap.innerHTML = "";
-	          sessionIndex = new Map();
-	          const sessions = (data.sessions || [])
-              .slice()
-              .sort((a, b) => (b.updated_ts || b.start_ts || 0) - (a.updated_ts || a.start_ts || 0));
-		          for (const s of sessions) {
-		            sessionIndex.set(s.session_id, s);
-		            const badge = el("span", { class: "badge" + (s.busy ? " busy" : ""), text: s.busy ? "busy" : "idle" });
-		            const q = s.queue_len ? el("span", { class: "badge queue", text: `queue ${s.queue_len}` }) : null;
-		            const card = el("div", { class: "session" + (selected === s.session_id ? " active" : "") });
+        function getLastAssistantTs(s) {
+          const v = Number(s && s.last_assistant_ts);
+          return Number.isFinite(v) ? v : 0;
+        }
 
-            const title = sessionDisplayName(s);
-            const files = listFromFilesField(s.files);
-		            const badges = [];
-		            if (s.harness_enabled) badges.push(el("span", { class: "badge harness", text: "harness", title: "Harness mode enabled" }));
-		            badges.push(badge);
-		            if (q) badges.push(q);
-            let delBtn = null;
-            const renameCardBtn = el("button", {
-              class: "icon-btn",
-              title: "Rename session",
-              "aria-label": "Rename session",
+        function isSessionUnread(s) {
+          if (!s || !s.session_id) return false;
+          if (selected === s.session_id) return false;
+          const last = getLastAssistantTs(s);
+          if (!last) return false;
+          const seen = loadSeenAssistantTs(s.session_id);
+          return last > seen + 0.0001;
+        }
+
+        function workspaceHasSelected(ws) {
+          if (!selected) return false;
+          return ws.sessions.some((s) => s && s.session_id === selected);
+        }
+
+        function workspacePreferredSessionId(ws) {
+          if (workspaceHasSelected(ws)) return selected;
+          const first = ws.sessions[0];
+          return first ? first.session_id : null;
+        }
+
+        function workspaceSessionIds(ws) {
+          const out = [];
+          const seen = new Set();
+          const sessions = ws && Array.isArray(ws.sessions) ? ws.sessions : [];
+          for (const s of sessions) {
+            const sid = s && s.session_id ? String(s.session_id) : "";
+            if (!sid || seen.has(sid)) continue;
+            seen.add(sid);
+            out.push(sid);
+          }
+          return out;
+        }
+
+        function workspaceOwnedSessionIds(ws) {
+          const out = [];
+          const seen = new Set();
+          const sessions = ws && Array.isArray(ws.sessions) ? ws.sessions : [];
+          for (const s of sessions) {
+            if (!s || !s.owned) continue;
+            const sid = s.session_id ? String(s.session_id) : "";
+            if (!sid || seen.has(sid)) continue;
+            seen.add(sid);
+            out.push(sid);
+          }
+          return out;
+        }
+
+        function collectWorkspaceFiles(ws) {
+          const out = [];
+          const seen = new Set();
+          const owners = new Map();
+          for (const s of ws.sessions) {
+            const files = listFromFilesField(s && s.files);
+            for (const p of files) {
+              const sid = s && s.session_id ? String(s.session_id) : "";
+              if (sid) {
+                const list = owners.get(p);
+                if (list) {
+                  if (!list.includes(sid)) list.push(sid);
+                } else {
+                  owners.set(p, [sid]);
+                }
+              }
+              if (seen.has(p)) continue;
+              seen.add(p);
+              out.push(p);
+            }
+          }
+          return { files: out, owners };
+        }
+
+        async function removeWorkspaceFile(ws, path, sessionIds = []) {
+          const cwd = ws && ws.cwd ? String(ws.cwd).trim() : "";
+          const targetPath = String(path || "");
+          if (cwd) {
+            try {
+              const res = await api("/api/files/remove", { method: "POST", body: { path: targetPath, cwd } });
+              if (res && Array.isArray(res.files) && res.files.includes(targetPath)) {
+                await api("/api/files/remove", { method: "POST", body: { path: targetPath, scope: "all" } });
+              }
+              await refreshSessions();
+              setToast("removed");
+              return;
+            } catch (e) {
+              console.warn("removeWorkspaceFile: cwd remove failed", e);
+            }
+          }
+          const fallback = workspacePreferredSessionId(ws);
+          const sids = [];
+          const seen = new Set();
+          const addSid = (sid) => {
+            const clean = typeof sid === "string" ? sid : sid != null ? String(sid) : "";
+            if (!clean || seen.has(clean)) return;
+            seen.add(clean);
+            sids.push(clean);
+          };
+          if (Array.isArray(sessionIds)) sessionIds.forEach(addSid);
+          else if (sessionIds) addSid(sessionIds);
+          if (!sids.length && fallback) addSid(fallback);
+          if (!sids.length) {
+            setToast("session unavailable");
+            return;
+          }
+          try {
+            const requests = sids.map((sid) => api("/api/files/remove", { method: "POST", body: { session_id: sid, path: targetPath } }));
+            const results = await Promise.allSettled(requests);
+            await refreshSessions();
+            const errors = results.filter((r) => r.status === "rejected");
+            if (errors.length) throw errors[0].reason;
+            setToast("removed");
+          } catch (e) {
+            setToast(`remove error: ${e && e.message ? e.message : "unknown error"}`);
+          }
+        }
+
+        async function clearWorkspaceFiles(ws) {
+          const cwd = ws && ws.cwd ? String(ws.cwd).trim() : "";
+          if (cwd) {
+            if (!confirm("Clear file history for this workspace?")) return;
+            try {
+              await api("/api/files/clear", { method: "POST", body: { cwd } });
+              await refreshSessions();
+              setToast("cleared");
+              return;
+            } catch (e) {
+              console.warn("clearWorkspaceFiles: cwd clear failed", e);
+            }
+          }
+          const sids = workspaceSessionIds(ws);
+          if (!sids.length) {
+            setToast("session unavailable");
+            return;
+          }
+          if (!confirm("Clear file history for this workspace?")) return;
+          try {
+            const requests = sids.map((sid) => api("/api/files/clear", { method: "POST", body: { session_id: sid } }));
+            const results = await Promise.allSettled(requests);
+            await refreshSessions();
+            const errors = results.filter((r) => r.status === "rejected");
+            if (errors.length) throw errors[0].reason;
+            setToast("cleared");
+          } catch (e) {
+            setToast(`clear error: ${e && e.message ? e.message : "unknown error"}`);
+          }
+        }
+
+        async function closeWorkspace(ws) {
+          const allSids = workspaceSessionIds(ws);
+          if (!allSids.length) {
+            setToast("session unavailable");
+            return;
+          }
+          const ownedSids = workspaceOwnedSessionIds(ws);
+          if (!ownedSids.length) {
+            setToast("no web-owned sessions to close");
+            return;
+          }
+          const skippedCount = Math.max(0, allSids.length - ownedSids.length);
+          const ownedLabel = ownedSids.length === 1 ? "session" : "sessions";
+          const skippedLabel = skippedCount === 1 ? "session" : "sessions";
+          let confirmText = `Close workspace and delete ${ownedSids.length} web-owned ${ownedLabel}?`;
+          if (skippedCount > 0) confirmText += ` ${skippedCount} non-web ${skippedLabel} will remain.`;
+          if (!confirm(confirmText)) return;
+          try {
+            const requests = ownedSids.map((sid) => api(`/api/sessions/${sid}/delete`, { method: "POST", body: {} }));
+            const results = await Promise.allSettled(requests);
+            const deletedSids = [];
+            let firstErr = null;
+            for (let i = 0; i < results.length; i++) {
+              const res = results[i];
+              const sid = ownedSids[i];
+              if (res.status === "fulfilled") {
+                deletedSids.push(sid);
+              } else if (!firstErr) {
+                firstErr = res.reason;
+              }
+            }
+            for (const sid of deletedSids) {
+              clearCache(sid);
+              clearQueueForSession(sid);
+              clearPendingForSession(sid);
+              clearDraftForSession(sid);
+              clearSeenAssistantForSession(sid);
+              clearUserSummaryForSession(sid);
+            }
+            if (selected && deletedSids.includes(selected)) {
+              selected = null;
+              offset = 0;
+              activeLogPath = null;
+              activeThreadId = null;
+              turnOpen = false;
+              localStorage.removeItem("codexweb.selected");
+              titleLabel.textContent = "No session selected";
+              setStatus({ running: false, queueLen: 0 });
+              setContext(null);
+              setTyping(false);
+              setAttachCount(0);
+              resetChatRenderState();
+              updateQueueBadge();
+              updateActionBtnState();
+            }
+            await refreshSessions();
+            if (!deletedSids.length) throw firstErr || new Error("failed to close workspace");
+            const failedCount = ownedSids.length - deletedSids.length;
+            if (!failedCount && !skippedCount) {
+              setToast("workspace closed");
+              return;
+            }
+            const details = [`closed ${deletedSids.length}`];
+            if (failedCount) details.push(`${failedCount} failed`);
+            if (skippedCount) details.push(`${skippedCount} non-web`);
+            setToast(details.join(", "));
+          } catch (e) {
+            setToast(`close error: ${e && e.message ? e.message : "unknown error"}`);
+          }
+        }
+
+        function buildWorkspaceFiles(ws, files, owners) {
+          if (!files.length) return null;
+          const canClear = workspaceSessionIds(ws).length > 0;
+          const maxShow = 5;
+          const show = files.slice(0, maxShow);
+          const fileRows = show.map((p) => {
+            const row = el("div", { class: "workspaceFileRow" });
+            const btn = el("button", { class: "workspaceFile", title: p, "aria-label": `Open ${p}`, text: baseName(p) || p });
+            const removeBtn = el("button", {
+              class: "icon-btn danger workspaceFileRemove",
+              title: "Remove from history",
+              "aria-label": `Remove ${p}`,
               type: "button",
-              html: iconSvg("edit"),
+              html: iconSvg("x"),
             });
-            renameCardBtn.onclick = (e) => {
+            bindTap(btn, () => {
+              const sid = workspacePreferredSessionId(ws);
+              if (sid && sid !== selected) void selectSession(sid);
+              showFileViewer();
+              filePathInput.value = p;
+              openFilePath();
+            });
+            bindTap(removeBtn, () => {
+              row.remove();
+              const ownerIds = owners && owners.get ? owners.get(p) : [];
+              void removeWorkspaceFile(ws, p, ownerIds);
+            });
+            row.appendChild(btn);
+            row.appendChild(removeBtn);
+            return row;
+          });
+          const more = files.length > maxShow ? el("div", { class: "workspaceFilesMore muted", text: `+${files.length - maxShow} more` }) : null;
+          const clearBtn = el("button", {
+            class: "workspaceFilesClear",
+            type: "button",
+            text: "Clear",
+            title: "Clear file history",
+            "aria-label": "Clear file history",
+          });
+          clearBtn.disabled = !canClear;
+          bindTap(clearBtn, () => {
+            void clearWorkspaceFiles(ws);
+          });
+          return el("div", { class: "workspaceFiles" }, [
+            el("div", { class: "workspaceFilesHeader" }, [
+              el("div", { class: "workspaceFilesLabel", text: "Files" }),
+              el("div", { class: "workspaceFilesActions" }, [clearBtn]),
+            ]),
+            ...fileRows,
+            ...(more ? [more] : []),
+          ]);
+        }
+
+        function buildSessionCard(s) {
+          const badge = el("span", { class: "badge" + (s.busy ? " busy" : ""), text: s.busy ? "busy" : "idle" });
+          const q = s.queue_len ? el("span", { class: "badge queue", text: `queue ${s.queue_len}` }) : null;
+          const card = el("div", { class: "session" + (selected === s.session_id ? " active" : "") });
+          if (s && s.session_id) {
+            const sid = String(s.session_id);
+            card.dataset.sessionId = sid;
+            sessionCardIndex.set(sid, card);
+          }
+
+          const title = sessionDisplayName(s);
+          const cliName = sessionCliName(s);
+          const cliLabel = cliDisplayName(cliName);
+          const badges = [];
+          badges.push(badge);
+          if (q) badges.push(q);
+          if (isSessionUnread(s)) badges.push(el("span", { class: "unreadDot", title: "Unread response" }));
+          let delBtn = null;
+          const renameCardBtn = el("button", {
+            class: "icon-btn",
+            title: "Rename session",
+            "aria-label": "Rename session",
+            type: "button",
+            html: iconSvg("edit"),
+          });
+          renameCardBtn.onclick = (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            void renameSessionId(s.session_id);
+          };
+          if (s.owned) {
+            delBtn = el("button", {
+              class: "icon-btn danger sessionDel",
+              title: "Delete session",
+              "aria-label": "Delete session",
+              type: "button",
+              html: iconSvg("trash"),
+            });
+            delBtn.onclick = async (e) => {
               e.preventDefault();
               e.stopPropagation();
-              void renameSessionId(s.session_id);
-            };
-            if (s.owned) {
-              delBtn = el("button", {
-                class: "icon-btn danger sessionDel",
-                title: "Delete session",
-                "aria-label": "Delete session",
-                type: "button",
-                html: iconSvg("trash"),
-	              });
-              delBtn.onclick = async (e) => {
-                e.preventDefault();
-                e.stopPropagation();
-                if (!confirm("Delete this session?")) return;
-                try {
-	                  await api(`/api/sessions/${s.session_id}/delete`, { method: "POST", body: {} });
-                  clearCache(s.session_id);
+              if (!confirm("Delete this session?")) return;
+              try {
+                await api(`/api/sessions/${s.session_id}/delete`, { method: "POST", body: {} });
+                clearCache(s.session_id);
+                clearQueueForSession(s.session_id);
+                clearPendingForSession(s.session_id);
+                clearDraftForSession(s.session_id);
+                clearSeenAssistantForSession(s.session_id);
+                clearUserSummaryForSession(s.session_id);
                 if (selected === s.session_id) {
                   selected = null;
                   offset = 0;
@@ -1468,74 +3440,123 @@
                   setAttachCount(0);
                   resetChatRenderState();
                   updateQueueBadge();
-                  if (harnessMenuOpen) hideHarnessMenu();
-                  updateHarnessBtnState();
+                  updateActionBtnState();
                 }
-	                  await refreshSessions();
-	                } catch (err) {
-                  setToast(`delete error: ${err.message}`);
-	                }
-	              };
-	            }
-		            const top = el("div", { class: "row" }, [
-		              el("div", { class: "titleLine", text: title, title: s.cwd || "" }),
-		              el("div", {}, badges),
-		            ]);
-              const updatedTs = typeof s.updated_ts === "number" && Number.isFinite(s.updated_ts) ? s.updated_ts : s.start_ts;
-	            const meta = el("div", { class: "muted subLine", text: updatedTs ? `last ${fmtTs(updatedTs)}` : "" });
-            const mainCol = el("div", { class: "sessionMain" }, [top, meta]);
-            if (selected === s.session_id && files.length) {
-              const maxShow = 5;
-              const show = files.slice(0, maxShow);
-              const fileRows = show.map((p) =>
-                el("button", { class: "sessionFile", title: p, "aria-label": `Open ${p}`, text: baseName(p) || p })
-              );
-              for (const row of fileRows) {
-                row.onclick = (e) => {
-                  e.preventDefault();
-                  e.stopPropagation();
-                  showFileViewer();
-                  filePathInput.value = row.title || row.textContent || "";
-                  openFilePath();
-                };
+                await refreshSessions();
+              } catch (err) {
+                setToast(`delete error: ${err.message}`);
               }
-              const more = files.length > maxShow ? el("div", { class: "sessionFilesMore muted", text: `+${files.length - maxShow} more` }) : null;
-              const filesWrap = el("div", { class: "sessionFiles" }, [
-                el("div", { class: "sessionFilesLabel", text: "Files" }),
-                ...fileRows,
-                ...(more ? [more] : []),
-              ]);
-              mainCol.appendChild(filesWrap);
-            }
-            card.appendChild(mainCol);
-            const actionButtons = [renameCardBtn];
-            const dupBtn = el("button", {
-              class: "icon-btn",
-              title: "Duplicate session",
-              "aria-label": "Duplicate session",
-              type: "button",
-              html: iconSvg("duplicate"),
-            });
-            dupBtn.onclick = async (e) => {
-              e.preventDefault();
-              e.stopPropagation();
-              const cwd = s && s.cwd && s.cwd !== "?" ? s.cwd : "";
-              if (!cwd) {
-                setToast("cwd unavailable");
-                return;
-              }
-              await spawnSessionWithCwd(cwd);
             };
-            actionButtons.unshift(dupBtn);
-            if (delBtn) actionButtons.push(delBtn);
-            card.appendChild(el("div", { class: "sessionAction" }, actionButtons));
-            card.onclick = () => {
-              if (isMobile()) setSidebarOpen(false);
-              selectSession(s.session_id);
-	            };
-	            sessionsWrap.appendChild(card);
-	          }
+          }
+          const top = el("div", { class: "row" }, [
+            el("div", { class: "sessionTitleWrap" }, [
+              el("span", {
+                class: `sessionCliBadge ${cliName}`,
+                title: `CLI: ${cliLabel}`,
+                "aria-label": `CLI: ${cliLabel}`,
+              }, [
+                el("img", {
+                  class: "sessionCliIcon",
+                  src: cliLogoPath(cliName),
+                  alt: `${cliLabel} logo`,
+                  loading: "lazy",
+                  decoding: "async",
+                }),
+              ]),
+              el("div", { class: "titleLine", text: title, title: s.cwd || "" }),
+            ]),
+            el("div", { class: "sessionBadges" }, badges),
+          ]);
+          const updatedTs = typeof s.updated_ts === "number" && Number.isFinite(s.updated_ts) ? s.updated_ts : s.start_ts;
+          const meta = el("div", { class: "muted subLine", text: updatedTs ? `last ${fmtTs(updatedTs)}` : "" });
+          const summaryEl = el("div", { class: "sessionSummary muted", text: "" });
+          applySessionSummaryEl(summaryEl, s.session_id);
+          const mainCol = el("div", { class: "sessionMain" }, [top, meta, summaryEl]);
+          // Session file lists are shown at the workspace level instead.
+          card.appendChild(mainCol);
+          const actionButtons = [renameCardBtn];
+          const dupBtn = el("button", {
+            class: "icon-btn",
+            title: "Duplicate session",
+            "aria-label": "Duplicate session",
+            type: "button",
+            html: iconSvg("duplicate"),
+          });
+          dupBtn.onclick = async (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            const cwd = s && s.cwd && s.cwd !== "?" ? s.cwd : "";
+            if (!cwd) {
+              setToast("cwd unavailable");
+              return;
+            }
+            const base = sessionDisplayName(s) || baseName(cwd) || "Session";
+            const alias = buildDuplicateAlias(base);
+            const cli = await showCliChoice({ title: "Choose CLI for duplicate session", cwd });
+            if (!cli) return;
+            await spawnSessionWithCwd(cwd, { alias, cli });
+          };
+          actionButtons.unshift(dupBtn);
+          if (delBtn) actionButtons.push(delBtn);
+          card.appendChild(el("div", { class: "sessionAction" }, actionButtons));
+          card.onclick = () => {
+            if (isMobile()) setSidebarOpen(false);
+            selectSession(s.session_id);
+          };
+          return card;
+        }
+
+	        async function refreshSessions() {
+	          const data = await api("/api/sessions");
+	          sessionsWrap.innerHTML = "";
+	          sessionIndex = new Map();
+	          sessionCardIndex = new Map();
+	          const sessions = (data.sessions || [])
+              .slice()
+              .sort((a, b) => (b.updated_ts || b.start_ts || 0) - (a.updated_ts || a.start_ts || 0));
+            for (const s of sessions) {
+              sessionIndex.set(s.session_id, s);
+            }
+            const workspaces = buildWorkspaces(sessions);
+            for (const ws of workspaces) {
+              const title = workspaceTitleParts(ws.cwd);
+              const countLabel = `${ws.sessions.length} session${ws.sessions.length === 1 ? "" : "s"}`;
+              const closeBtn = el("button", {
+                class: "workspaceClose danger",
+                type: "button",
+                text: "Close",
+                title: "Close workspace (delete web-owned sessions)",
+                "aria-label": "Close workspace",
+              });
+              closeBtn.disabled = workspaceOwnedSessionIds(ws).length < 1;
+              bindTap(closeBtn, () => {
+                void closeWorkspace(ws);
+              });
+              const header = el("div", { class: "workspaceHeader" }, [
+                el("div", { class: "workspaceTitleRow" }, [
+                  el("div", { class: "workspaceTitle", text: title.title, title: ws.cwd || "Unknown cwd" }),
+                  el("div", { class: "workspaceTitleActions" }, [
+                    el("div", { class: "workspaceMeta muted", text: countLabel }),
+                    closeBtn,
+                  ]),
+                ]),
+                title.subtitle ? el("div", { class: "workspacePath muted", text: title.subtitle, title: title.subtitle }) : null,
+              ].filter(Boolean));
+              const { files, owners } = collectWorkspaceFiles(ws);
+              const filesWrap = buildWorkspaceFiles(ws, files, owners);
+              const sessionWrap = el("div", { class: "workspaceSessions" });
+              for (const s of ws.sessions) {
+                sessionWrap.appendChild(buildSessionCard(s));
+              }
+              const wsEl = el("div", { class: "workspace" + (workspaceHasSelected(ws) ? " active" : "") });
+              wsEl.appendChild(header);
+              if (filesWrap) wsEl.appendChild(filesWrap);
+              wsEl.appendChild(sessionWrap);
+              sessionsWrap.appendChild(wsEl);
+            }
           if (selected && !sessionIndex.has(selected)) {
+            clearQueueForSession(selected);
+            clearPendingForSession(selected);
             selected = null;
             offset = 0;
             activeLogPath = null;
@@ -1550,39 +3571,40 @@
             setTyping(false);
             resetChatRenderState();
             turnOpen = false;
-            if (harnessMenuOpen) hideHarnessMenu();
-            updateHarnessBtnState();
             updateQueueBadge();
+            updateActionBtnState();
           } else if (selected) {
             const s = sessionIndex.get(selected);
             if (s) titleLabel.textContent = sessionTitleWithId(s);
+            if (s && Number.isFinite(Number(s.queue_len))) setSelectedQueueLen(s.queue_len);
           }
-          updateHarnessBtnState();
+          updateActionBtnState();
           updateQueueBadge();
           return sessions;
         }
 
         function appendEvent(ev) {
-          if (!ev || (ev.role !== "user" && ev.role !== "assistant")) return;
+          const clean = sanitizeUserEvent(ev, selected);
+          if (!clean) return;
+          ev = clean;
           if (consumePendingUserIfMatches(ev)) return;
-          if (!ev.pending && ev.role === "assistant") {
-            const k = assistantTextKey(ev);
-            if (k && k === lastAssistantKey) return;
-          }
-          if (isDuplicateEvent(ev)) return;
+          if (!ev.pending && isDuplicateEvent(ev)) return;
 
           const stick = autoScroll || isNearBottom();
           const ts = typeof ev.ts === "number" && Number.isFinite(ev.ts) ? ev.ts : ev.pending ? Date.now() / 1000 : null;
-           const { row } = makeRow(ev, { ts, pending: Boolean(ev.pending) });
-	          const anchor = typingRow && typingRow.isConnected ? typingRow : bottomSentinel;
-	          chatInner.insertBefore(row, anchor);
+	          const { row } = makeRow(ev, { ts, pending: Boolean(ev.pending) });
+	          insertRowChronologically(row, { ts, role: ev.role });
             trimRenderedRows({ fromTop: true });
           rebuildDecorations({ preserveScroll: false });
             if (!ev.pending) markClickFirstPaint();
             if (!ev.pending && selected) {
               appendCacheEvents(selected, [ev]);
             }
-          markEventSeen(ev);
+          if (!ev.pending) markEventSeen(ev);
+          if (!ev.pending && selected && ev.role === "assistant" && typeof ev.ts === "number" && Number.isFinite(ev.ts)) {
+            markAssistantSeen(selected, ev.ts);
+          }
+          if (selected) updateUserSummaryFromEvent(ev, selected);
 
           if (stick) {
             requestAnimationFrame(() => scrollToBottom());
@@ -1590,21 +3612,22 @@
           } else {
             jumpBtn.style.display = "inline-flex";
           }
-          if (ev.role === "user") lastAssistantKey = "";
-          else if (!ev.pending && ev.role === "assistant") lastAssistantKey = assistantTextKey(ev) || "";
         }
 
         function prependOlderEvents(allEvents) {
           const msgs = [];
           for (const ev of allEvents) {
             if (!ev || (ev.role !== "user" && ev.role !== "assistant")) continue;
-            msgs.push(ev);
+            const clean = sanitizeUserEvent(ev, selected);
+            if (!clean) continue;
+            msgs.push(clean);
           }
-          if (!msgs.length) return;
+          const orderedMsgs = sortChatEventsByTs(msgs);
+          if (!orderedMsgs.length) return;
           const oldTop = chat.scrollTop;
           const oldH = chat.scrollHeight;
           const frag = document.createDocumentFragment();
-          for (const ev of msgs) {
+          for (const ev of orderedMsgs) {
             const ts = typeof ev.ts === "number" && Number.isFinite(ev.ts) ? ev.ts : null;
             frag.appendChild(makeRow(ev, { ts, pending: false }).row);
           }
@@ -1646,41 +3669,42 @@
           void loadOlderMessages({ auto: true });
         }
 
-       function startInitialRender(allEvents) {
-         backfillToken += 1;
-         const myToken = backfillToken;
+        function startInitialRender(allEvents) {
+          backfillToken += 1;
+          const myToken = backfillToken;
 
-         const msgs = [];
-         const initDedup = new Set();
-         for (const ev of allEvents) {
-               if (!ev || (ev.role !== "user" && ev.role !== "assistant")) continue;
-               if (consumePendingUserIfMatches(ev)) continue;
-             const k = eventKey(ev);
-             if (k && initDedup.has(k)) continue;
-             if (k) initDedup.add(k);
-             const prev = msgs.length ? msgs[msgs.length - 1] : null;
-             if (isAdjacentAssistantDuplicate(prev, ev)) continue;
-               msgs.push(ev);
-         }
-           if (!msgs.length) return;
-           lastAssistantKey = "";
-           for (let i = msgs.length - 1; i >= 0; i--) {
-             const ev = msgs[i];
-             if (!ev) continue;
-             if (ev.role === "user") break;
-             if (ev.role === "assistant") {
-               lastAssistantKey = assistantTextKey(ev) || "";
-               break;
-             }
-           }
-           if (selected) replaceCacheEvents(selected, msgs);
-           recentEventKeys.length = 0;
-           recentEventKeySet.clear();
-           for (const ev of msgs) {
-             markEventSeen(ev);
+          const msgs = [];
+          let latestAssistantTs = null;
+          recentEventKeys.length = 0;
+          recentEventKeySet.clear();
+          recentEventSigTs.clear();
+          recentEventSigOrder.length = 0;
+          for (const ev of allEvents) {
+		            if (!ev || (ev.role !== "user" && ev.role !== "assistant")) continue;
+		            const clean = sanitizeUserEvent(ev, selected);
+		            if (!clean) continue;
+		            if (consumePendingUserIfMatches(clean)) continue;
+                // Use exact-key dedup only (role|ts|text) in init render.
+                // Sig-based dedup (role|text within time window) is skipped here
+                // to avoid falsely dropping different messages with the same text
+                // sent in quick succession (e.g. two "ok" messages 1s apart).
+                if (recentEventKeySet.has(eventKey(clean))) continue;
+                markEventSeen(clean);
+		            msgs.push(clean);
+                if (clean.role === "assistant" && typeof clean.ts === "number" && Number.isFinite(clean.ts)) {
+                  latestAssistantTs =
+                    latestAssistantTs === null ? clean.ts : Math.max(latestAssistantTs, clean.ts);
+                }
           }
+          const orderedMsgs = sortChatEventsByTs(msgs);
+          if (!orderedMsgs.length) return;
+          if (selected) replaceCacheEvents(selected, orderedMsgs);
+          if (selected && latestAssistantTs !== null) {
+            markAssistantSeen(selected, latestAssistantTs);
+          }
+          if (selected) updateUserSummaryFromEvents(orderedMsgs, selected);
 	          const frag = document.createDocumentFragment();
-          for (const ev of msgs) {
+          for (const ev of orderedMsgs) {
             const ts = typeof ev.ts === "number" && Number.isFinite(ev.ts) ? ev.ts : null;
             frag.appendChild(makeRow(ev, { ts, pending: false }).row);
 	          }
@@ -1722,11 +3746,11 @@
 	              turnOpen = false;
 	              setOlderState({ hasMore: false, isLoading: false });
 	              olderBefore = 0;
-	              setStatus({ running: Boolean(nowBusy), queueLen: data.queue_len });
-	              setContext(data.token);
-	              setTyping(Boolean(nowBusy));
-	              return;
-	            }
+              setStatus({ running: Boolean(nowBusy), queueLen: data.queue_len });
+              setContext(data.token);
+              setTyping(Boolean(nowBusy));
+              return;
+            }
 	            if (activeLogPath && lp && lp !== activeLogPath) {
 	              activeLogPath = lp;
 	              activeThreadId = tid;
@@ -1744,6 +3768,7 @@
                 offset = d2.offset;
                 const evs2 = Array.isArray(d2.events) ? d2.events : [];
                 if (evs2.length) startInitialRender(evs2);
+                renderPendingForSelectedSession();
                 olderBefore = Number.isFinite(Number(d2.next_before)) ? Number(d2.next_before) : 0;
                 setOlderState({ hasMore: Boolean(d2.has_older), isLoading: false });
                 setCacheMeta(sid, {
@@ -1752,12 +3777,12 @@
                   olderBefore,
                   hasOlder: Boolean(d2.has_older),
                 });
-	                const nowBusy2 = Boolean(d2.busy);
-	                const turnStart2 = Boolean(d2.turn_start);
-	                const turnEnd2 = Boolean(d2.turn_end);
-	                const turnAborted2 = Boolean(d2.turn_aborted);
-	                if (turnStart2 || nowBusy2) turnOpen = true;
-	                if (turnEnd2 || turnAborted2 || !nowBusy2) turnOpen = false;
+                const nowBusy2 = Boolean(d2.busy);
+                const turnStart2 = Boolean(d2.turn_start);
+                const turnEnd2 = Boolean(d2.turn_end);
+                const turnAborted2 = Boolean(d2.turn_aborted);
+                if (turnStart2 || nowBusy2) turnOpen = true;
+                if (turnEnd2 || turnAborted2 || !nowBusy2) turnOpen = false;
                 setStatus({ running: Boolean(turnOpen || nowBusy2), queueLen: d2.queue_len });
                 setContext(d2.token);
                 setTyping(Boolean(turnOpen || nowBusy2));
@@ -1773,6 +3798,7 @@
 	            const evs = Array.isArray(data.events) ? data.events : [];
 	            if (prevOffset === 0 && !chatInner.querySelector(".msg-row:not(.typing-row)") && evs.length) {
 	              startInitialRender(evs);
+                renderPendingForSelectedSession();
             } else {
               for (const ev of evs) appendEvent(ev);
             }
@@ -1797,11 +3823,12 @@
 				            setStatus({ running: Boolean(turnOpen || nowBusy), queueLen: data.queue_len });
 				            setContext(data.token);
 				            setTyping(Boolean(turnOpen || nowBusy));
-	            const s = sessionIndex.get(sid);
+            const s = sessionIndex.get(sid);
             if (s) titleLabel.textContent = sessionTitleWithId(s);
 		          } catch (e) {
             if (gen !== pollGen || sid !== selected) return;
             if (e && e.status === 404) {
+              clearPendingForSession(sid);
               selected = null;
               offset = 0;
               activeLogPath = null;
@@ -1876,6 +3903,11 @@
 	            pollTimer = null;
 	          }
 		          pollKickPending = false;
+            const prevSid = selected;
+            if (prevSid) {
+              const prevTa = $("#msg");
+              if (prevTa) saveDraftToStorage(prevSid, prevTa.value);
+            }
             const sid = id;
             selected = sid;
             offset = 0;
@@ -1891,27 +3923,75 @@
             turnOpen = false;
 		          {
 		            const s = sessionIndex.get(sid);
-            if (s) titleLabel.textContent = sessionTitleWithId(s);
-            else titleLabel.textContent = sid ? String(sid) : "No session selected";
+                if (s) titleLabel.textContent = sessionTitleWithId(s);
+                else titleLabel.textContent = sid ? String(sid) : "No session selected";
+                if (s && Number.isFinite(Number(s.queue_len))) setSelectedQueueLen(s.queue_len);
+                updateQueueBadge();
+                const lastSeenTs = getLastAssistantTs(s);
+                if (lastSeenTs) saveSeenAssistantTs(sid, lastSeenTs);
 		          }
+                const draft = loadDraftFromStorage(sid);
+                const ta = $("#msg");
+                if (ta) {
+                  ta.value = draft;
+                  const ph = $("#msgPh");
+                  if (ph) ph.style.display = ta.value ? "none" : "flex";
+                  autoGrow();
+                }
                 clickLoadT0 = performance.now();
                 clickMetricPending = true;
           if (pollGen !== myGen || selected !== sid) return;
 			          const s0 = sessionIndex.get(sid);
 			          if (s0 && s0.token) setContext(s0.token);
-                const cached = getCache(sid);
+                let cached = getCache(sid);
+                if (cached && Array.isArray(cached.events) && cached.events.length) {
+                  const hasUser = cached.events.some((ev) => ev && ev.role === "user");
+                  const hasAssistant = cached.events.some((ev) => ev && ev.role === "assistant");
+                  if (!hasUser && hasAssistant) {
+                    clearCache(sid);
+                    cached = null;
+                  }
+                }
                 const hasCached = Boolean(
                   cached &&
                     Array.isArray(cached.events) &&
                     cached.events.length &&
                     Number(cached.offset) > 0
                 );
+                try {
+			            const data = await api(`/api/sessions/${sid}/messages?offset=0&init=1&limit=${initPageLimit()}&before=0`);
+		            if (pollGen !== myGen || selected !== sid) return;
+                  if (data && typeof data.log_path === "string") activeLogPath = data.log_path;
+                  if (data && typeof data.thread_id === "string") activeThreadId = data.thread_id;
+			            offset = data.offset;
+			            const evs = Array.isArray(data.events) ? data.events : [];
+			            if (evs.length) startInitialRender(evs);
+                  renderPendingForSelectedSession();
+                  olderBefore = Number.isFinite(Number(data.next_before)) ? Number(data.next_before) : 0;
+                  setOlderState({ hasMore: Boolean(data.has_older), isLoading: false });
+                  setCacheMeta(sid, {
+                    logPath: activeLogPath,
+                    offset,
+                    olderBefore,
+                    hasOlder: Boolean(data.has_older),
+                  });
+			            const nowBusy = Boolean(data.busy);
+	          const turnStart = Boolean(data.turn_start);
+	          const turnEnd = Boolean(data.turn_end);
+	          const turnAborted = Boolean(data.turn_aborted);
+			            if (turnStart || nowBusy) turnOpen = true;
+			            if (turnEnd || turnAborted || !nowBusy) turnOpen = false;
+			            setStatus({ running: Boolean(turnOpen || nowBusy), queueLen: data.queue_len });
+			            setContext(data.token);
+			            setTyping(Boolean(turnOpen || nowBusy));
+		          } catch {
                 if (hasCached) {
                   activeLogPath = typeof cached.log_path === "string" ? cached.log_path : null;
                   offset = Number(cached.offset) || 0;
                   olderBefore = Number(cached.older_before) || 0;
                   setOlderState({ hasMore: Boolean(cached.has_older), isLoading: false });
                   startInitialRender(cached.events);
+                  renderPendingForSelectedSession();
                   try {
                     await pollMessages(sid, myGen);
                   } catch {
@@ -1919,147 +3999,56 @@
                   }
                   if (pollGen !== myGen || selected !== sid) return;
                 } else {
-				            try {
-						            const data = await api(`/api/sessions/${sid}/messages?offset=0&init=1&limit=${initPageLimit()}&before=0`);
-					            if (pollGen !== myGen || selected !== sid) return;
-                    if (data && typeof data.log_path === "string") activeLogPath = data.log_path;
-                    if (data && typeof data.thread_id === "string") activeThreadId = data.thread_id;
-				            offset = data.offset;
-				            const evs = Array.isArray(data.events) ? data.events : [];
-					            if (evs.length) startInitialRender(evs);
-                    olderBefore = Number.isFinite(Number(data.next_before)) ? Number(data.next_before) : 0;
-                    setOlderState({ hasMore: Boolean(data.has_older), isLoading: false });
-                    setCacheMeta(sid, {
-                      logPath: activeLogPath,
-                      offset,
-                      olderBefore,
-                      hasOlder: Boolean(data.has_older),
-                    });
-				            const nowBusy = Boolean(data.busy);
-	            const turnStart = Boolean(data.turn_start);
-	            const turnEnd = Boolean(data.turn_end);
-	            const turnAborted = Boolean(data.turn_aborted);
-				            if (turnStart || nowBusy) turnOpen = true;
-				            if (turnEnd || turnAborted || !nowBusy) turnOpen = false;
-				            setStatus({ running: Boolean(turnOpen || nowBusy), queueLen: data.queue_len });
-				            setContext(data.token);
-				            setTyping(Boolean(turnOpen || nowBusy));
-			          } catch {
-			            await pollMessages(sid, myGen);
-			            if (pollGen !== myGen || selected !== sid) return;
-			          }
+                  await pollMessages(sid, myGen);
+                  if (pollGen !== myGen || selected !== sid) return;
                 }
-            refreshSessions().catch((e) => console.error("refreshSessions failed", e));
+		          }
+           refreshSessions().catch((e) => console.error("refreshSessions failed", e));
            kickPoll(900);
            if (isMobile()) setSidebarOpen(false);
-           updateHarnessBtnState();
+           updateActionBtnState();
          }
 
-			        $("#refreshBtn").onclick = refreshSessions;
-        function updateHarnessBtnState() {
-          const s = selected ? sessionIndex.get(selected) : null;
-          const on = Boolean(s && s.harness_enabled);
-          harnessBtn.disabled = !selected;
-          harnessBtn.classList.toggle("active", Boolean(selected && on));
+			        refreshBtn.onclick = async () => {
+                const sid = selected;
+                if (!sid) {
+                  await refreshSessions();
+                  setToast("refreshed");
+                  return;
+                }
+                clearCache(sid);
+                try {
+                  await refreshSessions();
+                } catch (e) {
+                  console.error("refreshSessions failed", e);
+                  setToast(`refresh error: ${e && e.message ? e.message : "unknown error"}`);
+                  return;
+                }
+                if (selected !== sid) return;
+                if (sessionIndex.has(sid)) {
+                  await selectSession(sid);
+                }
+                setToast("refreshed");
+              };
+        function updateActionBtnState() {
           renameBtn.disabled = !selected;
           duplicateBtn.disabled = !selected;
-        }
-           async function loadHarnessCfgForSelected() {
-             if (!selected) return;
-             const sid = selected;
-              const d = await api(`/api/sessions/${sid}/harness`);
-              if (selected !== sid) return;
-              if (!d || typeof d !== "object") throw new Error("invalid harness response");
-              if (typeof d.enabled !== "boolean") throw new Error("invalid harness.enabled");
-              if (typeof d.request !== "string") throw new Error("invalid harness.request");
-              harnessCfg = { enabled: d.enabled, request: d.request };
-             const enabledEl = $("#harnessEnabled");
-             const requestEl = $("#harnessRequest");
-             if (enabledEl) enabledEl.checked = harnessCfg.enabled;
-             if (requestEl) requestEl.value = harnessCfg.request;
-           }
-			        function scheduleHarnessSave() {
-			          if (!selected) return;
-			          const sid = selected;
-			          if (harnessSaveTimer) clearTimeout(harnessSaveTimer);
-			          harnessSaveTimer = setTimeout(async () => {
-			            if (selected !== sid) return;
-               try {
-                 await api(`/api/sessions/${sid}/harness`, { method: "POST", body: { enabled: harnessCfg.enabled, request: harnessCfg.request } });
-                 await refreshSessions();
-               } catch (e) {
-                 console.error("save harness failed", e);
-                 setToast(`harness save error: ${e && e.message ? e.message : "unknown error"}`);
-               }
-               updateHarnessBtnState();
-             }, 450);
-           }
-			        function hideHarnessMenu() {
-			          harnessMenuOpen = false;
-			          harnessMenu.style.display = "none";
-			        }
-			        async function showHarnessMenu() {
-			          if (!selected) return;
-			          harnessMenuOpen = true;
-			          harnessMenu.style.display = "block";
-			          const rect = harnessBtn.getBoundingClientRect();
-			          const top = Math.min(window.innerHeight - 12, rect.bottom + 8);
-			          harnessMenu.style.top = `${top}px`;
-			          harnessMenu.style.left = "12px";
-			          harnessMenu.style.right = "auto";
-             const w = harnessMenu.offsetWidth || 320;
-             const left = Math.max(12, Math.min(window.innerWidth - 12 - w, rect.right - w));
-             harnessMenu.style.left = `${left}px`;
-             try {
-               await loadHarnessCfgForSelected();
-             } catch (e) {
-               console.error("load harness failed", e);
-               setToast(`harness load error: ${e && e.message ? e.message : "unknown error"}`);
-               hideHarnessMenu();
-             }
-           }
-			        function toggleHarnessMenu() {
-			          if (harnessMenuOpen) hideHarnessMenu();
-			          else showHarnessMenu();
-			        }
+          sessionToolsBtn.disabled = !selected;
 
-			        harnessBtn.onclick = (e) => {
-			          e.preventDefault();
-			          e.stopPropagation();
-		          toggleHarnessMenu();
-		        };
-		        harnessMenu.onclick = (e) => e.stopPropagation();
-		        if (window.__codexwebHarnessGlobalHandlers) {
-		          const h = window.__codexwebHarnessGlobalHandlers;
-		          if (h.docClick) document.removeEventListener("click", h.docClick);
-		          if (h.resize) window.removeEventListener("resize", h.resize);
-		        }
-		        const onDocClick = () => {
-		          if (harnessMenuOpen) hideHarnessMenu();
-		        };
-		        const onResize = () => {
-		          if (harnessMenuOpen) hideHarnessMenu();
-		        };
-			        window.__codexwebHarnessGlobalHandlers = { docClick: onDocClick, resize: onResize };
-			        document.addEventListener("click", onDocClick);
-			        window.addEventListener("resize", onResize);
-			        const harnessEnabledEl = $("#harnessEnabled");
-			        const harnessRequestEl = $("#harnessRequest");
-			        if (harnessEnabledEl)
-			          harnessEnabledEl.onchange = (e) => {
-			            if (!selected) return;
-			            harnessCfg.enabled = Boolean(e.target.checked);
-			            const s = sessionIndex.get(selected);
-			            if (s) s.harness_enabled = harnessCfg.enabled;
-			            updateHarnessBtnState();
-			            scheduleHarnessSave();
-			          };
-        if (harnessRequestEl)
-          harnessRequestEl.oninput = (e) => {
-            if (!selected) return;
-            harnessCfg.request = String(e.target.value ?? "");
-            scheduleHarnessSave();
-          };
+          // Update tmux attach button state
+          const s = selected ? sessionIndex.get(selected) : null;
+          const tmuxName = s && typeof s.tmux_name === "string" ? s.tmux_name.trim() : "";
+          tmuxAttachBtn.disabled = !tmuxName;
+          if (tmuxName) {
+            tmuxAttachBtn.title = `Copy tmux attach command: tmux attach -t ${tmuxName}`;
+          } else {
+            tmuxAttachBtn.title = "Tmux attach not available";
+          }
+
+          if (!selected && sessionToolsOpen) hideSessionTools();
+          updateSessionToolsContent();
+        }
+
         async function renameSessionId(sid) {
           if (!sid) return;
           const s = sessionIndex.get(sid);
@@ -2088,26 +4077,368 @@
           void renameSessionId(selected);
         };
         let fileWrap = localStorage.getItem("codexweb.fileWrap") === "1";
+        if (fileLaunch.wrap !== null) {
+          fileWrap = Boolean(fileLaunch.wrap);
+          localStorage.setItem("codexweb.fileWrap", fileWrap ? "1" : "0");
+        }
+        let fileMode = fileLaunch.mode || (fileFullscreenMode ? "edit" : "view");
+        let fileDirty = false;
+        let fileStatusBase = "";
+        let fileLoadedText = "";
+        let fileLoadedPath = "";
+        let fileKind = "text";
+        let fileMime = "text/plain";
+        let fileSyncState = "off";
+        const FILE_SYNC_LABELS = {
+          live: "Live",
+          warn: "Reconnecting",
+          offline: "Offline",
+          paused: "Paused",
+          off: "Manual",
+        };
+        function setFileSyncState(state, label) {
+          const next = state || "off";
+          fileSyncState = next;
+          fileSync.classList.remove("live", "warn", "offline", "paused", "off");
+          fileSync.classList.add(next);
+          const text = label || FILE_SYNC_LABELS[next] || "";
+          fileSyncLabel.textContent = text;
+          fileSync.title = text ? `File sync: ${text}` : "File sync";
+        }
+        function syncFileStateForMode() {
+          if (!fileFullscreenMode) {
+            setFileSyncState("off");
+            return;
+          }
+          if (typeof navigator !== "undefined" && navigator && navigator.onLine === false) {
+            setFileSyncState("offline");
+            return;
+          }
+          if (fileDirty) {
+            setFileSyncState("paused");
+            return;
+          }
+          setFileSyncState("live");
+        }
+        let fileAutoRefreshTimer = null;
+        let fileAutoRefreshInFlight = false;
         function applyFileWrap() {
           fileViewer.classList.toggle("wrap", fileWrap);
           fileWrapBtn.classList.toggle("active", fileWrap);
+          fileEditor.wrap = fileWrap ? "soft" : "off";
+          fileEditor.style.whiteSpace = fileWrap ? "pre-wrap" : "pre";
+        }
+        function updateFileStatus() {
+          const suffix = fileDirty ? " (modified)" : "";
+          fileStatus.textContent = `${fileStatusBase}${suffix}`;
+          fileStatus.title = `${fileStatusBase}${suffix}`.trim();
+        }
+        function setFileDirty(next) {
+          fileDirty = Boolean(next);
+          updateFileStatus();
+          syncFileStateForMode();
+          fileSaveBtn.disabled = !(fileMode === "edit" && fileDirty);
+        }
+        function currentFileSessionId() {
+          if (selected) return selected;
+          if (fileSessionOverride) return fileSessionOverride;
+          return "";
+        }
+        function isFileImageKind() {
+          return fileKind === "image";
+        }
+        function getActiveFileScrollEl() {
+          if (fileMode === "view" && isFileImageKind()) return fileImageWrap;
+          if (fileMode === "preview") return filePreview;
+          if (fileMode === "edit") return fileEditor;
+          return fileContent;
+        }
+        function captureFileScrollState() {
+          const el = getActiveFileScrollEl();
+          if (!el) return null;
+          const maxScroll = Math.max(0, el.scrollHeight - el.clientHeight);
+          const ratio = maxScroll > 0 ? el.scrollTop / maxScroll : 0;
+          return { mode: fileMode, ratio };
+        }
+        function restoreFileScroll(state) {
+          if (!state || (state.mode && state.mode !== fileMode)) return;
+          const el = getActiveFileScrollEl();
+          if (!el) return;
+          const maxScroll = Math.max(0, el.scrollHeight - el.clientHeight);
+          el.scrollTop = maxScroll > 0 ? Math.round(maxScroll * state.ratio) : 0;
+        }
+        function updateFilePreview() {
+          if (isFileImageKind()) {
+            filePreview.innerHTML = "";
+            return;
+          }
+          const text = fileEditor.value || fileContent.textContent || "";
+          const currentPath = String(filePathInput.value || "").trim();
+          filePreview.innerHTML = mdToHtmlCached(text, currentPath);
+          renderMermaidIn(filePreview);
+        }
+        function buildFileEditorUrl({ path, sessionId, mode, fullscreen, wrap }) {
+          const url = new URL(resolveAppUrl("/"));
+          if (path) url.searchParams.set("file", path);
+          if (sessionId) url.searchParams.set("session_id", sessionId);
+          if (mode) url.searchParams.set("mode", mode);
+          if (fullscreen) url.searchParams.set("fullscreen", "1");
+          if (wrap) url.searchParams.set("wrap", "1");
+          return url.toString();
+        }
+        function exitFileFullscreen() {
+          document.body.classList.remove("file-fullscreen");
+          const base = resolveAppUrl("/");
+          window.close();
+          setTimeout(() => {
+            if (!window.closed) window.location.href = base;
+          }, 200);
+        }
+        function openFileEditorTab() {
+          const path = String(filePathInput.value || "").trim();
+          if (!path) {
+            setToast("enter a file path first");
+            return;
+          }
+          const mode = fileMode === "preview" ? "preview" : "edit";
+          openLinkedFilePath(path, { mode });
+        }
+        function openLinkedFilePath(path, { mode = "view" } = {}) {
+          const cleanPath = String(path || "").trim();
+          if (!cleanPath) return false;
+          const sid = currentFileSessionId();
+          const nextMode = normalizeFileModeValue(mode) || "view";
+          const url = buildFileEditorUrl({
+            path: cleanPath,
+            sessionId: sid,
+            mode: nextMode,
+            fullscreen: true,
+            wrap: fileWrap,
+          });
+          const win = window.open(url, "_blank", "noopener");
+          if (win) return true;
+          showFileViewer();
+          filePathInput.value = cleanPath;
+          setFileMode(nextMode === "preview" ? "preview" : "view");
+          void openFilePath();
+          setToast("popup blocked, opened inline");
+          return false;
+        }
+        function applyFileReadResult(res, scrollState) {
+          const isImage = Boolean(res && res.is_image);
+          if (!res || (typeof res.text !== "string" && !isImage)) throw new Error("invalid response");
+          fileKind = isImage ? "image" : "text";
+          fileMime = typeof (res && res.mime) === "string" ? String(res.mime) : (isImage ? "image/*" : "text/plain");
+          if (isImage) {
+            const imgPath = res.path ? String(res.path) : String(filePathInput.value || "").trim();
+            fileImage.src = buildFileContentUrl(imgPath, { cacheBust: Date.now() });
+            fileImage.alt = baseName(imgPath) || "Image preview";
+            fileContent.textContent = "";
+            fileEditor.value = "";
+            fileLoadedText = "";
+            if (fileMode !== "view") fileMode = "view";
+          } else {
+            fileImage.src = "";
+            fileImage.alt = "Image preview";
+            fileContent.textContent = res.text;
+            fileEditor.value = res.text;
+            fileLoadedText = res.text;
+          }
+          const size = typeof res.size === "number" ? res.size : res.text.length;
+          const label = res.path ? String(res.path) : String(filePathInput.value || "").trim();
+          setFileTabTitle(label);
+          fileLoadedPath = label;
+          fileStatusBase = `${label} (${fmtBytes(size)})`;
+          setFileDirty(false);
+          syncFileStateForMode();
+          setFileMode(fileMode);
+          requestAnimationFrame(() => restoreFileScroll(scrollState));
+        }
+        function setFileMode(mode) {
+          if (isFileImageKind() && mode !== "view") mode = "view";
+          fileMode = mode;
+          fileViewer.dataset.mode = mode;
+          const isView = mode === "view";
+          const isEdit = mode === "edit";
+          const isPreview = mode === "preview";
+          const imageView = isView && isFileImageKind();
+          fileContent.style.display = isView && !imageView ? "block" : "none";
+          fileImageWrap.style.display = imageView ? "flex" : "none";
+          fileEditor.style.display = isEdit ? "block" : "none";
+          filePreview.style.display = isPreview ? "block" : "none";
+          fileViewBtn.classList.toggle("active", isView);
+          fileEditBtn.classList.toggle("active", isEdit);
+          filePreviewBtn.classList.toggle("active", isPreview);
+          fileEditBtn.disabled = isFileImageKind();
+          filePreviewBtn.disabled = isFileImageKind();
+          fileWrapBtn.disabled = isFileImageKind();
+          fileSaveBtn.style.display = isEdit && !isFileImageKind() ? "inline-flex" : "none";
+          fileSaveBtn.disabled = !(isEdit && fileDirty);
+          if (isPreview) updateFilePreview();
+          updateFileTitle();
+        }
+        function updateFileTitle() {
+          if (!fileFullscreenMode) {
+            fileTitle.textContent = "View file";
+            return;
+          }
+          if (isFileImageKind()) {
+            fileTitle.textContent = "View image";
+            return;
+          }
+          if (fileMode === "edit") fileTitle.textContent = "Edit file";
+          else if (fileMode === "preview") fileTitle.textContent = "Preview file";
+          else fileTitle.textContent = "Read file";
+        }
+        function fileTabTitleFromPath(path) {
+          const trimmed = String(path || "").trim();
+          if (!trimmed) return "";
+          const base = baseName(trimmed);
+          return base || trimmed;
+        }
+        function setFileTabTitle(path) {
+          if (!fileFullscreenMode) return;
+          const next = fileTabTitleFromPath(path);
+          document.title = next || APP_TITLE;
+        }
+        function getFileCopyPath() {
+          const loaded = String(fileLoadedPath || "").trim();
+          if (loaded) return loaded;
+          return String(filePathInput.value || "").trim();
+        }
+        async function copyFilePath() {
+          const path = getFileCopyPath();
+          if (!path) {
+            setToast("no file loaded");
+            return;
+          }
+          const ok = await copyToClipboard(path);
+          setToast(ok ? "path copied" : "copy failed");
+        }
+        async function copyFileName() {
+          const path = getFileCopyPath();
+          if (!path) {
+            setToast("no file loaded");
+            return;
+          }
+          const name = baseName(path) || path;
+          const ok = await copyToClipboard(name);
+          setToast(ok ? "name copied" : "copy failed");
+        }
+        function triggerDownloadLink(url, filename) {
+          const a = document.createElement("a");
+          a.href = url;
+          if (filename) a.download = filename;
+          a.rel = "noreferrer noopener";
+          a.target = "_blank";
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+        }
+        function downloadTextContent(text, filename) {
+          const blob = new Blob([String(text || "")], { type: "text/plain;charset=utf-8" });
+          const url = URL.createObjectURL(blob);
+          try {
+            triggerDownloadLink(url, filename || "download.txt");
+          } finally {
+            setTimeout(() => URL.revokeObjectURL(url), 1500);
+          }
+        }
+        function startPathDownload(path) {
+          const clean = String(path || "").trim();
+          if (!clean) throw new Error("no file path");
+          const url = buildFileContentUrl(clean, { download: true });
+          if (!url) throw new Error("invalid file path");
+          const filename = baseName(clean) || "download";
+          if (isMobile()) {
+            const win = window.open(url, "_blank", "noopener");
+            if (!win) window.location.assign(url);
+            return;
+          }
+          triggerDownloadLink(url, filename);
         }
         applyFileWrap();
+        setFileMode(fileMode);
+        if (fileFullscreenMode) filePopoutBtn.style.display = "none";
+        fileOpenInlineBtn.style.display = fileFullscreenMode ? "inline-flex" : "none";
+        if (fileFullscreenMode) filePathRow.style.display = "none";
+
+        function promptFilePath() {
+          const current = String(filePathInput.value || "").trim() || localStorage.getItem("codexweb.filePath") || "";
+          const next = prompt("Open file path:", current);
+          if (next === null) return;
+          const trimmed = String(next || "").trim();
+          if (!trimmed) return;
+          filePathInput.value = trimmed;
+          openFilePath();
+        }
 
         function showFileViewer() {
-          fileBackdrop.style.display = "block";
+          if (fileFullscreenMode) document.body.classList.add("file-fullscreen");
+          fileBackdrop.style.display = fileFullscreenMode ? "none" : "block";
           fileViewer.style.display = "flex";
           applyFileWrap();
+          startFileAutoRefresh();
+          syncFileStateForMode();
           const s = selected ? sessionIndex.get(selected) : null;
           const last = localStorage.getItem("codexweb.filePath") || "";
           const def = last || (s && s.cwd ? String(s.cwd) : "");
           if (!filePathInput.value.trim()) filePathInput.value = def;
-          filePathInput.focus();
-          filePathInput.select();
+          if (!fileFullscreenMode) {
+            filePathInput.focus();
+            filePathInput.select();
+          } else if (fileMode === "edit") {
+            fileEditor.focus();
+          }
         }
+        root.addEventListener("click", (e) => {
+          if (!e || e.defaultPrevented) return;
+          if (e.metaKey || e.ctrlKey || e.altKey || e.shiftKey) return;
+          const node = e.target && typeof e.target.closest === "function" ? e.target.closest("a[data-file-path]") : null;
+          if (!node) return;
+          const rawPath = node.getAttribute("data-file-path") || "";
+          const filePath = parseLocalFilePathRef(rawPath);
+          if (!filePath) return;
+          e.preventDefault();
+          e.stopPropagation();
+          openLinkedFilePath(filePath, { mode: "view" });
+        });
         function hideFileViewer() {
+          if (fileFullscreenMode) {
+            exitFileFullscreen();
+            return;
+          }
+          stopFileAutoRefresh();
+          setFileSyncState("off");
           fileBackdrop.style.display = "none";
           fileViewer.style.display = "none";
+        }
+        async function saveFilePath() {
+          const path = String(filePathInput.value || "").trim();
+          if (!path) {
+            fileStatus.textContent = "Enter a file path.";
+            return;
+          }
+          fileStatus.textContent = "Saving...";
+          try {
+            const body = { path, text: String(fileEditor.value || "") };
+            const sid = currentFileSessionId();
+            if (sid) body.session_id = sid;
+            const res = await api("/api/files/write", { method: "POST", body });
+            if (!res || res.ok !== true) throw new Error("invalid response");
+            fileLoadedText = fileEditor.value || "";
+            fileContent.textContent = fileLoadedText;
+            const size = typeof res.size === "number" ? res.size : fileLoadedText.length;
+            const label = res.path ? String(res.path) : path;
+            fileStatusBase = `${label} (${fmtBytes(size)})`;
+            fileLoadedPath = label;
+            setFileDirty(false);
+            setToast("saved");
+            if (fileMode === "preview") updateFilePreview();
+            if (selected || fileSessionOverride) refreshSessions().catch((e) => console.error("refreshSessions failed", e));
+          } catch (e) {
+            fileStatus.textContent = `save error: ${e && e.message ? e.message : "unknown error"}`;
+          }
         }
         async function openFilePath() {
           const path = String(filePathInput.value || "").trim();
@@ -2115,34 +4446,164 @@
             fileStatus.textContent = "Enter a file path.";
             return;
           }
+          setFileTabTitle(path);
+          const scrollState = captureFileScrollState();
           fileStatus.textContent = "Loading...";
           fileContent.textContent = "";
+          fileEditor.value = "";
+          fileImage.src = "";
+          fileImage.alt = "Image preview";
+          filePreview.innerHTML = "";
+          fileStatusBase = "";
+          fileLoadedPath = "";
+          fileKind = "text";
+          fileMime = "text/plain";
           try {
             const body = { path };
-            if (selected) body.session_id = selected;
+            const sid = currentFileSessionId();
+            if (sid) body.session_id = sid;
             const res = await api("/api/files/read", { method: "POST", body });
-            if (!res || typeof res.text !== "string") throw new Error("invalid response");
-            fileContent.textContent = res.text;
-            const size = typeof res.size === "number" ? res.size : res.text.length;
-            const label = res.path ? String(res.path) : path;
-            fileStatus.textContent = `${label} (${fmtBytes(size)})`;
+            applyFileReadResult(res, scrollState);
             localStorage.setItem("codexweb.filePath", path);
-            if (selected) refreshSessions().catch((e) => console.error("refreshSessions failed", e));
+            if (selected || fileSessionOverride) refreshSessions().catch((e) => console.error("refreshSessions failed", e));
           } catch (e) {
             fileStatus.textContent = `error: ${e && e.message ? e.message : "unknown error"}`;
           }
         }
-        fileBtn.onclick = (e) => {
-          e.preventDefault();
-          e.stopPropagation();
+        async function autoRefreshFileIfChanged() {
+          if (!fileFullscreenMode) return;
+          if (document.hidden) return;
+          if (fileAutoRefreshInFlight) return;
+          if (typeof navigator !== "undefined" && navigator && navigator.onLine === false) {
+            setFileSyncState("offline");
+            return;
+          }
+          if (fileDirty) {
+            setFileSyncState("paused");
+            return;
+          }
+          const path = String(filePathInput.value || "").trim();
+          if (!path) return;
+          const scrollState = captureFileScrollState();
+          fileAutoRefreshInFlight = true;
+          try {
+            const body = { path, record_history: false };
+            const sid = currentFileSessionId();
+            if (sid) body.session_id = sid;
+            const res = await api("/api/files/read", { method: "POST", body });
+            if (!res || typeof res.text !== "string") throw new Error("invalid response");
+            setFileSyncState("live");
+            if (!Boolean(res.is_image) && res.text === fileLoadedText) return;
+            applyFileReadResult(res, scrollState);
+          } catch (e) {
+            const offline = typeof navigator !== "undefined" && navigator && navigator.onLine === false;
+            setFileSyncState(offline ? "offline" : "warn");
+            console.error("file auto-refresh failed", e);
+          } finally {
+            fileAutoRefreshInFlight = false;
+          }
+        }
+        function startFileAutoRefresh() {
+          if (!fileFullscreenMode) return;
+          if (fileAutoRefreshTimer) return;
+          fileAutoRefreshTimer = setInterval(() => {
+            void autoRefreshFileIfChanged();
+          }, FILE_AUTO_REFRESH_MS);
+        }
+        function stopFileAutoRefresh() {
+          if (!fileAutoRefreshTimer) return;
+          clearInterval(fileAutoRefreshTimer);
+          fileAutoRefreshTimer = null;
+        }
+        function maybeLaunchFileViewer() {
+          if (fileLaunchHandled || !fileLaunchActive) return;
+          fileLaunchHandled = true;
           showFileViewer();
-        };
+          if (fileLaunch.path) {
+            filePathInput.value = fileLaunch.path;
+            openFilePath();
+          }
+        }
+        bindTap(fileBtn, () => {
+          showFileViewer();
+        });
         fileWrapBtn.onclick = (e) => {
           e.preventDefault();
           e.stopPropagation();
           fileWrap = !fileWrap;
           localStorage.setItem("codexweb.fileWrap", fileWrap ? "1" : "0");
           applyFileWrap();
+        };
+        fileViewBtn.onclick = (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          setFileMode("view");
+        };
+        fileEditBtn.onclick = (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          setFileMode("edit");
+        };
+        filePreviewBtn.onclick = (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          setFileMode("preview");
+        };
+        filePopoutBtn.onclick = (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          openFileEditorTab();
+        };
+        fileCopyPathBtn.onclick = async (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          await copyFilePath();
+        };
+        fileCopyNameBtn.onclick = async (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          await copyFileName();
+        };
+        fileDownloadBtn.onclick = async (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          const path = getFileCopyPath() || String(filePathInput.value || "").trim();
+          if (!path) {
+            setToast("no file path");
+            return;
+          }
+          try {
+            const canDownloadEditedText = !isFileImageKind() && fileMode === "edit" && !isMobile();
+            if (canDownloadEditedText) {
+              const content = String(fileEditor.value || "");
+              if (!content) {
+                setToast("no content to download");
+                return;
+              }
+              const filename = baseName(path) || "download.txt";
+              downloadTextContent(content, filename);
+              setToast("file downloaded");
+              return;
+            }
+            startPathDownload(path);
+            if (!isFileImageKind() && fileMode === "edit" && isMobile()) {
+              setToast("download started (saved file content)");
+            } else {
+              setToast("download started");
+            }
+          } catch (err) {
+            setToast(`download error: ${err && err.message ? err.message : "unknown error"}`);
+          }
+        };
+        fileOpenInlineBtn.onclick = (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          promptFilePath();
+        };
+        fileSaveBtn.onclick = (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          if (fileMode === "edit") saveFilePath();
         };
         fileCloseBtn.onclick = (e) => {
           e.preventDefault();
@@ -2156,11 +4617,23 @@
           e.preventDefault();
           openFilePath();
         });
+        fileEditor.addEventListener("input", () => {
+          setFileDirty(fileEditor.value !== fileLoadedText);
+          if (fileMode === "preview") updateFilePreview();
+        });
+        window.addEventListener("online", () => syncFileStateForMode());
+        window.addEventListener("offline", () => syncFileStateForMode());
+        document.addEventListener("visibilitychange", () => {
+          if (!fileFullscreenMode) return;
+          if (document.visibilityState !== "visible") return;
+          void autoRefreshFileIfChanged();
+        });
         document.addEventListener("keydown", (e) => {
           if (e.key !== "Escape") return;
           if (fileViewer.style.display === "flex") hideFileViewer();
           if (sendChoice.style.display === "flex") hideSendChoice();
           if (queueViewer.style.display === "flex") hideQueueViewer();
+          if (sessionTools.style.display === "flex") hideSessionTools();
         });
 
         let sendChoicePending = null;
@@ -2186,12 +4659,13 @@
             await sendText(raw);
           };
         if (sendChoiceLaterBtn)
-          sendChoiceLaterBtn.onclick = () => {
+          sendChoiceLaterBtn.onclick = async () => {
             const raw = sendChoicePending;
+            const sid = selected;
             hideSendChoice();
-            if (!raw) return;
-            clearComposer();
-            queueLocalMessage(raw);
+            if (!raw || !sid) return;
+            const ok = await queueServerMessage(raw, { sid });
+            if (ok) clearComposer(sid);
           };
         if (sendChoiceCancelBtn)
           sendChoiceCancelBtn.onclick = () => {
@@ -2206,7 +4680,7 @@
             queueEmpty.style.display = "block";
             return;
           }
-          const q = getDeferredQueue(sid);
+          const q = getQueueCache(sid);
           queueEmpty.style.display = q.length ? "none" : "block";
           if (!q.length) return;
           q.forEach((text, idx) => {
@@ -2214,19 +4688,22 @@
             const ta = el("textarea", { class: "queueText", "aria-label": `Queued message ${idx + 1}` });
             ta.value = text;
             ta.oninput = () => {
-              const q2 = getDeferredQueue(sid);
+              const q2 = getQueueCache(sid);
               if (idx >= q2.length) return;
               q2[idx] = String(ta.value || "");
-              scheduleQueueSave(sid);
+              queueCacheBySession.set(sid, q2);
+              scheduleQueueSave();
+              updateQueueBadge();
             };
             const del = el("button", { class: "icon-btn danger", title: "Delete", "aria-label": "Delete", type: "button", html: iconSvg("trash") });
             del.onclick = (e) => {
               e.preventDefault();
               e.stopPropagation();
-              const q2 = getDeferredQueue(sid);
+              const q2 = getQueueCache(sid);
               if (idx >= q2.length) return;
               q2.splice(idx, 1);
-              saveDeferredToStorage(sid);
+              queueCacheBySession.set(sid, q2);
+              scheduleQueueSave();
               updateQueueBadge();
               renderQueueList();
             };
@@ -2236,9 +4713,17 @@
           });
         }
 
-        function showQueueViewer() {
+        async function showQueueViewer() {
           queueBackdrop.style.display = "block";
           queueViewer.style.display = "flex";
+          queueEmpty.textContent = "Loading...";
+          try {
+            if (selected) await fetchQueue(selected);
+          } catch (e) {
+            setToast(`queue load error: ${e && e.message ? e.message : "unknown error"}`);
+          }
+          queueEmpty.textContent = "No queued messages.";
+          updateQueueBadge();
           renderQueueList();
         }
 
@@ -2255,37 +4740,101 @@
             showQueueViewer();
           };
         }
+        sessionToolsBtn.onclick = (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          showSessionTools();
+        };
+        sessionToolsCloseBtn.onclick = (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          hideSessionTools();
+        };
+        sessionToolsBackdrop.onclick = () => hideSessionTools();
+        statusCopyBtn.onclick = async (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          const ok = await copyToClipboard(sessionStatusCmd.textContent || "");
+          const msg = ok ? "status command copied" : "copy failed";
+          setToast(msg);
+          setSessionToolsNotice(msg, { kind: ok ? "success" : "error" });
+        };
+        resumeCopyBtn.onclick = async (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          const ok = await copyToClipboard(sessionResumeCmd.textContent || "");
+          const msg = ok ? "resume command copied" : "copy failed";
+          setToast(msg);
+          setSessionToolsNotice(msg, { kind: ok ? "success" : "error" });
+        };
+        tmuxAttachBtn.onclick = async (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          const s = selected ? sessionIndex.get(selected) : null;
+          const tmuxName = s && typeof s.tmux_name === "string" ? s.tmux_name.trim() : "";
+          if (!tmuxName) {
+            setToast("tmux attach not available");
+            return;
+          }
+          const cmd = `tmux attach -t ${tmuxName}`;
+          const ok = await copyToClipboard(cmd);
+          setToast(ok ? "tmux command copied" : "copy failed");
+        };
         queueCloseBtn.onclick = (e) => {
           e.preventDefault();
           e.stopPropagation();
           hideQueueViewer();
         };
         queueBackdrop.onclick = () => hideQueueViewer();
-        async function spawnSessionWithCwd(cwd) {
+        async function applySessionAlias(sessionId, alias) {
+          if (!sessionId || !alias) return;
+          try {
+            const res = await api(`/api/sessions/${sessionId}/rename`, { method: "POST", body: { name: alias } });
+            const nextAlias = res && typeof res.alias === "string" ? res.alias : alias;
+            const s = sessionIndex.get(sessionId);
+            if (s) s.alias = nextAlias;
+          } catch (e) {
+            console.warn("auto rename failed", e);
+          }
+        }
+
+        async function waitForSessionByBrokerPid(brokerPid, { alias } = {}) {
+          if (!brokerPid) return null;
+          for (let i = 0; i < 60; i++) {
+            const sessions = await refreshSessions();
+            const found = (sessions || []).find((x) => Number(x.broker_pid || 0) === brokerPid);
+            if (found) {
+              if (alias) await applySessionAlias(found.session_id, alias);
+              selectSession(found.session_id);
+              return brokerPid;
+            }
+            await new Promise((r) => setTimeout(r, 250));
+          }
+          setToast("session will appear once the CLI creates a session log");
+          return brokerPid;
+        }
+
+        async function spawnSessionWithCwd(cwd, { alias, cli } = {}) {
           if (!cwd || !String(cwd).trim()) {
             setToast("cwd unavailable");
             return null;
           }
+          const cliName = normalizeCliName(cli, "");
+          if (!cliName) {
+            setToast("invalid cli (use codex, claude, or gemini)");
+            return null;
+          }
           try {
             setToast("starting...");
-            const res = await api("/api/sessions", { method: "POST", body: { cwd: String(cwd) } });
+            const res = await api("/api/sessions", { method: "POST", body: { cwd: String(cwd), cli: cliName } });
             const brokerPid = res && res.broker_pid ? Number(res.broker_pid) : null;
             if (!brokerPid) {
               setToast("start failed");
               return null;
             }
+            setPreferredSpawnCli(cliName);
             setToast(`started (broker ${brokerPid})`);
-            for (let i = 0; i < 60; i++) {
-              const sessions = await refreshSessions();
-              const found = (sessions || []).find((x) => Number(x.broker_pid || 0) === brokerPid);
-              if (found) {
-                selectSession(found.session_id);
-                return brokerPid;
-              }
-              await new Promise((r) => setTimeout(r, 250));
-            }
-            setToast("session will appear once Codex creates a rollout log");
-            return brokerPid;
+            return await waitForSessionByBrokerPid(brokerPid, { alias });
           } catch (e) {
             setToast(`start error: ${e.message}`);
             return null;
@@ -2296,8 +4845,52 @@
           const def = cur && cur.cwd && cur.cwd !== "?" ? cur.cwd : "";
           const cwd = prompt("New session cwd:", def);
           if (!cwd) return;
-          await spawnSessionWithCwd(cwd);
+          const cli = await showCliChoice({ title: "Choose CLI for new session", cwd });
+          if (!cli) return;
+          await spawnSessionWithCwd(cwd, { cli });
         };
+
+        // More menu toggle
+        let moreMenuOpen = false;
+        function toggleMoreMenu() {
+          moreMenuOpen = !moreMenuOpen;
+          const menu = $("#moreMenu");
+          const btn = $("#moreBtn");
+          if (moreMenuOpen) {
+            menu.classList.add("open");
+            btn.setAttribute("aria-expanded", "true");
+          } else {
+            menu.classList.remove("open");
+            btn.setAttribute("aria-expanded", "false");
+          }
+        }
+        function closeMoreMenu() {
+          if (moreMenuOpen) {
+            moreMenuOpen = false;
+            $("#moreMenu").classList.remove("open");
+            $("#moreBtn").setAttribute("aria-expanded", "false");
+          }
+        }
+        moreBtn.onclick = (e) => {
+          e.stopPropagation();
+          toggleMoreMenu();
+        };
+        document.addEventListener("click", (e) => {
+          if (moreMenuOpen && !e.target.closest(".more-container")) {
+            closeMoreMenu();
+          }
+        });
+
+        // Menu item handlers
+        $("#menuRefresh").onclick = () => {
+          closeMoreMenu();
+          refreshBtn.click();
+        };
+        $("#menuConfig").onclick = () => {
+          closeMoreMenu();
+          configBtn.click();
+        };
+
 	        interruptBtn.onclick = async () => {
 	          if (!selected) return;
 	          try {
@@ -2311,8 +4904,34 @@
         };
 
         $("#logoutBtnSide").onclick = async () => {
+          clearUpdateTimers();
           await api("/api/logout", { method: "POST" });
           renderLogin(renderApp);
+        };
+
+        updateBtn.onclick = () => {
+          if (updateAvailableUrl) {
+            window.open(updateAvailableUrl, "_blank", "noopener,noreferrer");
+            return;
+          }
+          if (updateAvailableCommit) {
+            const short = shortCommit(updateAvailableCommit);
+            setToast(short ? `update available (${short})` : "update available");
+            return;
+          }
+          setToast("already up to date");
+        };
+
+        configBtn.onclick = () => {
+          showConfig();
+        };
+
+        sidebarToggleBtn.onclick = () => {
+          if (isMobile()) {
+            setSidebarOpen(!document.body.classList.contains("sidebar-open"));
+            return;
+          }
+          setSidebarCollapsed(!document.body.classList.contains("sidebar-collapsed"));
         };
 
         duplicateBtn.onclick = async () => {
@@ -2323,16 +4942,13 @@
             setToast("cwd unavailable");
             return;
           }
-          await spawnSessionWithCwd(cwd);
+          const base = sessionDisplayName(s) || baseName(cwd) || "Session";
+          const alias = buildDuplicateAlias(base);
+          const cli = await showCliChoice({ title: "Choose CLI for duplicate session", cwd });
+          if (!cli) return;
+          await spawnSessionWithCwd(cwd, { alias, cli });
         };
 
-        toggleSidebarBtn.onclick = () => {
-          if (isMobile()) {
-            setSidebarOpen(!document.body.classList.contains("sidebar-open"));
-            return;
-          }
-          setSidebarCollapsed(!document.body.classList.contains("sidebar-collapsed"));
-        };
 	        backdrop.onclick = () => setSidebarOpen(false);
 
 	        chat.addEventListener("scroll", () => {
@@ -2414,6 +5030,7 @@
         };
         setAttachCount(0);
         updateQueueBadge();
+
 	        function autoGrow() {
 	          const basePx = parseFloat(getComputedStyle(textarea).minHeight || "0") || 32;
 	          const maxPx = 180;
@@ -2430,7 +5047,10 @@
 	          textarea.style.overflowY = h > maxPx ? "auto" : "hidden";
 	          if (autoScroll) requestAnimationFrame(() => scrollToBottom());
 	        }
-	        textarea.addEventListener("input", autoGrow);
+	        textarea.addEventListener("input", () => {
+            autoGrow();
+            if (selected) scheduleDraftSave(selected, textarea.value);
+          });
 	        textarea.addEventListener(
 	          "focus",
 	          () => {
@@ -2460,6 +5080,36 @@
           e.preventDefault();
           form.requestSubmit();
         });
+        textarea.addEventListener("paste", (e) => {
+          const cd = e.clipboardData;
+          if (!cd) return;
+          let f = null;
+          if (cd.files && cd.files.length) {
+            f = cd.files[0];
+          } else if (cd.items && cd.items.length) {
+            for (const item of cd.items) {
+              if (!item || item.kind !== "file") continue;
+              const file = item.getAsFile();
+              if (!file) continue;
+              f = file;
+              break;
+            }
+          }
+          if (!f) return;
+          const t = String(f.type || "").toLowerCase();
+          const name = String(f.name || "").toLowerCase();
+          const isImg =
+            t.startsWith("image/") ||
+            name.endsWith(".png") ||
+            name.endsWith(".jpg") ||
+            name.endsWith(".jpeg") ||
+            name.endsWith(".webp") ||
+            name.endsWith(".heic") ||
+            name.endsWith(".heif");
+          if (!isImg) return;
+          e.preventDefault();
+          void handleImageFile(f);
+        });
         window.addEventListener("resize", () => {
           if (autoScroll) requestAnimationFrame(() => scrollToBottom());
         });
@@ -2469,9 +5119,8 @@
 	          imgInput.value = "";
 	          imgInput.click();
 	        };
-		        imgInput.addEventListener("change", async () => {
+		        async function handleImageFile(f) {
 		          if (!selected) return;
-		          const f = imgInput.files && imgInput.files[0];
 		          if (!f) return;
 		          if (sending) return;
 		          try {
@@ -2576,16 +5225,27 @@
 		          } catch (e) {
 	            setToast(`attach error: ${e.message}`);
 	          }
-	        });
+		        }
+		        imgInput.addEventListener("change", async () => {
+		          const f = imgInput.files && imgInput.files[0];
+		          await handleImageFile(f);
+		          imgInput.value = "";
+		        });
 
-        function clearComposer() {
-          $("#msg").value = "";
-          autoGrow();
+        function clearComposer(sid = selected) {
+          const ta = $("#msg");
+          if (ta && sid && sid === selected) {
+            ta.value = "";
+            autoGrow();
+          }
+          if (sid) saveDraftToStorage(sid, "");
         }
 
-        async function sendText(raw, { deferred = false } = {}) {
+        async function sendText(raw) {
           if (!selected) return;
-          if (!raw || !raw.trim()) return;
+          const sid = selected;
+          const outgoing = normalizeOutgoingTextForCli(raw, sid);
+          if (!outgoing || !outgoing.trim()) return;
           if (sending) return;
           sending = true;
           $("#sendBtn").disabled = true;
@@ -2593,14 +5253,29 @@
 
           const localId = ++localEchoSeq;
           const t0 = Date.now() / 1000;
-          pendingUser.push({ id: localId, key: pendingMatchKey(raw), loose: normalizeTextForPendingMatch(raw), t0, text: raw });
-          appendEvent({ role: "user", text: raw, pending: true, localId, ts: t0 });
+          pendingForSession(sid, { create: true }).push({
+            id: localId,
+            key: pendingMatchKey(outgoing),
+            loose: normalizeTextForPendingMatch(outgoing),
+            t0,
+            text: outgoing,
+          });
+          appendEvent({ role: "user", text: outgoing, pending: true, localId, ts: t0 });
           turnOpen = true;
-          currentRunning = true;
+          updateUserSummaryFromText(sid, outgoing);
           try {
-            const res = await api(`/api/sessions/${selected}/send`, { method: "POST", body: { text: raw } });
-            if (res.queued) setToast(`queued (queue ${res.queue_len})`);
-            else setToast("sent");
+            const res = await api(`/api/sessions/${sid}/send`, { method: "POST", body: { text: outgoing } });
+            if (res.queued) {
+              setToast(`queued (queue ${res.queue_len})`);
+              if (Array.isArray(res.queue)) {
+                applyQueueResponse(sid, res);
+                updateQueueBadge();
+              } else {
+                void fetchQueue(sid).then(() => updateQueueBadge());
+              }
+            } else {
+              setToast("sent");
+            }
             setAttachCount(0);
             pollFastUntilMs = Date.now() + 5000;
             kickPoll(0);
@@ -2613,13 +5288,9 @@
               pendingEl.style.borderColor = "rgba(185, 28, 28, 0.7)";
               pendingEl.style.boxShadow = "0 0 0 2px rgba(185, 28, 28, 0.12)";
             }
-            if (deferred && selected) {
-              queueLocalMessage(raw, { front: true });
-            }
           } finally {
             sending = false;
             $("#sendBtn").disabled = false;
-            if (deferred) deferInFlight = false;
           }
         }
 
@@ -2645,8 +5316,10 @@
 	            const sessions = await refreshSessions();
 	            const remembered = localStorage.getItem("codexweb.selected");
 	            const first = sessions && sessions.length ? sessions[0].session_id : null;
-	            const pick = remembered && sessionIndex.has(remembered) ? remembered : first;
-	            if (pick) selectSession(pick);
+	            let pick = remembered && sessionIndex.has(remembered) ? remembered : first;
+	            if (fileLaunch.sessionId && sessionIndex.has(fileLaunch.sessionId)) pick = fileLaunch.sessionId;
+	            if (pick) await selectSession(pick);
+              if (fileLaunchActive) maybeLaunchFileViewer();
 	          } catch (e) {
 	            if (e && e.status === 401) {
 	              renderLogin(renderApp);
@@ -2666,12 +5339,22 @@
 	                if (e2 && e2.status === 401) {
 	                  if (sessionsTimer) clearInterval(sessionsTimer);
 	                  sessionsTimer = null;
+                    clearUpdateTimers();
 	                  renderLogin(renderApp);
 	                  return;
 	                }
 	                console.error("refreshSessions timer failed", e2);
 	              }
 	            }, 2500);
+
+              clearUpdateTimers();
+              updateCheckStartTimer = setTimeout(() => {
+                void refreshUpdateStatus();
+                updateCheckStartTimer = null;
+              }, UPDATE_CHECK_START_DELAY_MS);
+              updateCheckTimer = setInterval(() => {
+                void refreshUpdateStatus();
+              }, UPDATE_CHECK_INTERVAL_MS);
 	          }
 	        })();
       }

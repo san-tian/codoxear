@@ -1,0 +1,208 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+APP_DIR="${CODEX_WEB_APP_DIR:-$HOME/.local/share/codoxear}"
+SOCK_DIR="${APP_DIR}/socks"
+
+usage() {
+  cat <<'USAGE'
+Usage: codoxear-status [--list] [--last] [--id <session_id>] [--web | --terminal]
+
+Quick status helper for Codoxear sessions (busy/idle, queue, last update).
+
+Options:
+  --list        List sessions and exit (default)
+  --last        Show the most recently updated session
+  --id <id>     Show a specific session id (prefix match allowed)
+  --web         Show only web-owned sessions
+  --terminal    Show only terminal-owned sessions
+USAGE
+}
+
+mode="list"
+filter_owner=""
+target_id=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --list)
+      mode="list"
+      shift
+      ;;
+    --last)
+      mode="last"
+      shift
+      ;;
+    --id)
+      if [[ -z "${2:-}" ]]; then
+        echo "error: --id requires a session id" >&2
+        exit 1
+      fi
+      mode="id"
+      target_id="$2"
+      shift 2
+      ;;
+    --web)
+      filter_owner="web"
+      shift
+      ;;
+    --terminal)
+      filter_owner="terminal"
+      shift
+      ;;
+    *)
+      echo "error: unknown argument $1" >&2
+      usage >&2
+      exit 1
+      ;;
+  esac
+done
+
+if [[ ! -d "$SOCK_DIR" ]]; then
+  echo "error: no sessions dir at $SOCK_DIR" >&2
+  exit 1
+fi
+
+SOCK_DIR="$SOCK_DIR" FILTER_OWNER="$filter_owner" TARGET_ID="$target_id" MODE="$mode" python3 - <<'PY'
+import json
+import os
+import socket
+import sys
+import time
+from pathlib import Path
+
+sock_dir = Path(os.environ["SOCK_DIR"])
+filter_owner = os.environ.get("FILTER_OWNER", "").strip()
+target_id = os.environ.get("TARGET_ID", "").strip()
+mode = os.environ.get("MODE", "list").strip()
+
+
+def fmt_ts(ts: float) -> str:
+    if not ts:
+        return "?"
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
+
+
+def sock_state(sock_path: Path | None):
+    if not sock_path:
+        return None, None, "missing socket"
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(0.5)
+        s.connect(str(sock_path))
+        f = s.makefile("rwb")
+        f.write((json.dumps({"cmd": "state"}) + "\n").encode("utf-8"))
+        f.flush()
+        line = f.readline()
+        if not line:
+            return None, None, "no response"
+        resp = json.loads(line.decode("utf-8"))
+        if isinstance(resp, dict) and resp.get("error"):
+            return None, None, str(resp.get("error"))
+        return resp.get("busy"), resp.get("queue_len"), None
+    except Exception as exc:
+        return None, None, f"{type(exc).__name__}: {exc}"
+    finally:
+        try:
+            s.close()
+        except Exception:
+            pass
+
+
+def score_item(item: dict) -> float:
+    return max(item.get("log_ts", 0.0), item.get("start_ts", 0.0), item.get("meta_ts", 0.0))
+
+
+items_by_sid: dict[str, dict] = {}
+for meta_path in sorted(sock_dir.glob("*.json")):
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    except Exception:
+        continue
+    sid = meta.get("session_id") if isinstance(meta.get("session_id"), str) else ""
+    if not sid:
+        sid = meta_path.stem
+    owner = meta.get("owner") if isinstance(meta.get("owner"), str) else "terminal"
+    if filter_owner and owner != filter_owner:
+        continue
+    cwd = meta.get("cwd") if isinstance(meta.get("cwd"), str) else "?"
+    start_ts = meta.get("start_ts") if isinstance(meta.get("start_ts"), (int, float)) else 0.0
+    sock_path = meta.get("sock_path") if isinstance(meta.get("sock_path"), str) else ""
+    log_path = meta.get("log_path") if isinstance(meta.get("log_path"), str) else ""
+    log_ts = 0.0
+    if log_path:
+        try:
+            log_ts = float(Path(log_path).stat().st_mtime)
+        except Exception:
+            log_ts = 0.0
+    try:
+        meta_ts = float(meta_path.stat().st_mtime)
+    except Exception:
+        meta_ts = 0.0
+    item = {
+        "sid": sid,
+        "owner": owner,
+        "cwd": cwd,
+        "start_ts": float(start_ts) if start_ts else 0.0,
+        "sock_path": Path(sock_path) if sock_path else None,
+        "log_path": log_path,
+        "log_ts": log_ts,
+        "meta_ts": meta_ts,
+    }
+    existing = items_by_sid.get(sid)
+    if existing is None or score_item(item) >= score_item(existing):
+        items_by_sid[sid] = item
+
+items = list(items_by_sid.values())
+
+if target_id:
+    matches = [it for it in items if it["sid"] == target_id]
+    if not matches:
+        matches = [it for it in items if it["sid"].startswith(target_id)]
+    if not matches:
+        sys.stderr.write(f"error: no session matching {target_id}\n")
+        sys.exit(1)
+    if len(matches) > 1:
+        ids = ", ".join(it["sid"] for it in matches[:5])
+        sys.stderr.write(f"error: multiple sessions match {target_id}: {ids}\n")
+        sys.exit(1)
+    items = matches
+
+if not items:
+    sys.stderr.write("no sessions found\n")
+    sys.exit(1)
+
+items.sort(key=score_item, reverse=True)
+if mode == "last":
+    items = items[:1]
+
+rows = []
+for idx, item in enumerate(items, 1):
+    busy, queue_len, err = sock_state(item.get("sock_path"))
+    if err:
+        state = "down"
+    else:
+        state = "running" if busy else "idle"
+    queue = "?" if err else str(int(queue_len or 0))
+    updated = fmt_ts(item.get("log_ts", 0.0))
+    rows.append(
+        {
+            "idx": str(idx),
+            "sid": item.get("sid", ""),
+            "owner": item.get("owner", ""),
+            "state": state,
+            "queue": queue,
+            "updated": updated,
+            "cwd": item.get("cwd", ""),
+        }
+    )
+
+print("Idx  Session ID                           Owner     State    Queue  Updated              CWD")
+for row in rows:
+    print(
+        f"{row['idx']:<4} {row['sid']:<36} {row['owner']:<9} {row['state']:<8} {row['queue']:<5} {row['updated']:<19} {row['cwd']}"
+    )
+PY

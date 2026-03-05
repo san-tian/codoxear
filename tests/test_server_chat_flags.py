@@ -15,6 +15,17 @@ class TestServerChatFlags(unittest.TestCase):
         self.assertFalse(flags["turn_end"])
         self.assertFalse(flags["turn_aborted"])
 
+    def test_task_complete_sets_turn_end(self) -> None:
+        _events, _meta, flags, _diag = _extract_chat_events(
+            [
+                {"type": "event_msg", "payload": {"type": "user_message", "message": "hello"}},
+                {"type": "event_msg", "payload": {"type": "task_complete"}},
+            ]
+        )
+        self.assertTrue(flags["turn_start"])
+        self.assertTrue(flags["turn_end"])
+        self.assertFalse(flags["turn_aborted"])
+
     def test_turn_aborted_sets_abort_flag(self) -> None:
         _events, _meta, flags, _diag = _extract_chat_events(
             [
@@ -34,6 +45,89 @@ class TestServerChatFlags(unittest.TestCase):
             ]
         )
         self.assertEqual(meta["tool"], 2)
+
+    def test_claude_turn_duration_sets_turn_end(self) -> None:
+        _events, _meta, flags, _diag = _extract_chat_events(
+            [
+                {"type": "user", "message": {"content": [{"type": "text", "text": "hello"}]}},
+                {"type": "assistant", "message": {"content": [{"type": "text", "text": "done"}]}},
+                {"type": "system", "subtype": "turn_duration"},
+            ]
+        )
+        self.assertTrue(flags["turn_start"])
+        self.assertTrue(flags["turn_end"])
+        self.assertFalse(flags["turn_aborted"])
+
+    def test_claude_tool_use_and_thinking_increment_meta(self) -> None:
+        _events, meta, flags, diag = _extract_chat_events(
+            [
+                {"type": "user", "message": {"content": [{"type": "text", "text": "hello"}]}},
+                {
+                    "type": "assistant",
+                    "message": {
+                        "content": [
+                            {"type": "thinking", "text": "hmm"},
+                            {"type": "tool_use", "id": "t1", "name": "Read", "input": {"file": "a"}},
+                        ]
+                    },
+                },
+                {"type": "system", "subtype": "api_error"},
+            ]
+        )
+        self.assertEqual(meta["thinking"], 1)
+        self.assertEqual(meta["tool"], 1)
+        self.assertTrue(flags["turn_aborted"])
+        self.assertIn("Read", diag["tool_names"])
+
+    def test_claude_dot_placeholder_does_not_render_chat_event(self) -> None:
+        events, _meta, _flags, _diag = _extract_chat_events(
+            [
+                {"type": "user", "message": {"content": [{"type": "text", "text": "hello"}]}},
+                {
+                    "type": "assistant",
+                    "message": {
+                        "stop_reason": None,
+                        "usage": {"output_tokens": 1},
+                        "content": [{"type": "text", "text": "."}],
+                    },
+                },
+                {
+                    "type": "assistant",
+                    "message": {"content": [{"type": "text", "text": "done"}]},
+                },
+            ]
+        )
+        self.assertEqual([e["role"] for e in events], ["user", "assistant"])
+        self.assertEqual(events[-1]["text"], "done")
+
+    def test_gemini_assistant_marks_turn_end(self) -> None:
+        _events, _meta, flags, _diag = _extract_chat_events(
+            [
+                {"type": "user", "message": {"content": [{"type": "text", "text": "hello"}]}},
+                {
+                    "type": "assistant",
+                    "_gemini_turn_end": True,
+                    "message": {"content": [{"type": "text", "text": "done"}]},
+                },
+            ]
+        )
+        self.assertTrue(flags["turn_start"])
+        self.assertTrue(flags["turn_end"])
+        self.assertFalse(flags["turn_aborted"])
+
+    def test_gemini_thinking_without_turn_end_does_not_set_turn_end(self) -> None:
+        _events, _meta, flags, _diag = _extract_chat_events(
+            [
+                {"type": "user", "message": {"content": [{"type": "text", "text": "hello"}]}},
+                {
+                    "type": "assistant",
+                    "message": {"content": [{"type": "thinking"}]},
+                },
+            ]
+        )
+        self.assertTrue(flags["turn_start"])
+        self.assertFalse(flags["turn_end"])
+        self.assertFalse(flags["turn_aborted"])
 
 
 if __name__ == "__main__":

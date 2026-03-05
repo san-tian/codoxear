@@ -1,13 +1,24 @@
+import json
+import os
 import unittest
 from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from codoxear.broker import (
     BUSY_INTERRUPT_GRACE_SECONDS,
     BUSY_QUIET_SECONDS,
+    IDLE_TURN_END_QUIET_SECONDS,
+    Broker,
     State,
     _apply_rollout_obj_to_state,
     _maybe_detach_on_new_session_hint,
+    _queue_item_ready,
+    _queue_release_gate_for_now,
+    _should_idle_fallback_clear_busy_without_queue,
+    _should_idle_fallback_release_queue,
     _should_clear_busy_state,
+    _rollout_tail_offset,
     _update_busy_from_pty_text,
 )
 
@@ -24,6 +35,37 @@ def _state() -> State:
 
 
 class TestBrokerBusyState(unittest.TestCase):
+    def test_register_from_gemini_log_uses_virtual_tail_offset(self) -> None:
+        with TemporaryDirectory() as td:
+            gem_home = Path(td) / ".gemini"
+            chats = gem_home / "tmp" / "proj" / "chats"
+            chats.mkdir(parents=True, exist_ok=True)
+            log = chats / "session-2026-03-02T00-00-abcd1234.json"
+            log.write_text(
+                json.dumps(
+                    {
+                        "sessionId": "aaaaaaaa-1111-2222-3333-bbbbbbbbbbbb",
+                        "messages": [
+                            {"type": "user", "timestamp": "2026-03-02T00:00:00.000Z", "content": [{"text": "hello"}]},
+                            {"type": "gemini", "timestamp": "2026-03-02T00:00:01.000Z", "content": "done"},
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with patch.dict(os.environ, {"GEMINI_HOME": str(gem_home)}, clear=False):
+                expected_off = _rollout_tail_offset(log)
+                self.assertGreater(expected_off, 0)
+                self.assertNotEqual(expected_off, int(log.stat().st_size))
+                broker = Broker(cwd=td, codex_args=[])
+                broker.state = _state()
+                broker.state.sessions_dir = gem_home / "tmp"
+                broker.state.codex_home = gem_home
+                with patch("codoxear.broker.CLI_KIND", "gemini"), patch("codoxear.broker.OWNER_TAG", "web"):
+                    ok = broker._register_from_log(log_path=log)
+                self.assertTrue(ok)
+                self.assertEqual(broker.state.log_off, expected_off)
+
     def test_new_session_hint_detaches_rollout(self) -> None:
         st = _state()
         st.log_path = Path("/tmp/sessions/rollout-old.jsonl")
@@ -212,6 +254,122 @@ class TestBrokerBusyState(unittest.TestCase):
         self.assertFalse(st.turn_has_completion_candidate)
         self.assertEqual(st.pending_calls, set())
         self.assertEqual(st.last_turn_activity_ts, 0.0)
+        self.assertEqual(st.turn_end_count, 1)
+
+    def test_duplicate_turn_end_marker_does_not_double_count(self) -> None:
+        st = _state()
+        st.busy = True
+        st.turn_open = True
+        st.last_turn_activity_ts = 10.0
+        _apply_rollout_obj_to_state(
+            st,
+            {"type": "event_msg", "payload": {"type": "task_complete"}},
+            now_ts=11.0,
+        )
+        self.assertEqual(st.turn_end_count, 1)
+        _apply_rollout_obj_to_state(
+            st,
+            {"type": "event_msg", "payload": {"type": "task_complete"}},
+            now_ts=12.0,
+        )
+        self.assertEqual(st.turn_end_count, 1)
+
+    def test_commentary_phase_is_not_completion_candidate(self) -> None:
+        st = _state()
+        _apply_rollout_obj_to_state(
+            st,
+            {"type": "event_msg", "payload": {"type": "user_message", "message": "hello"}},
+            now_ts=10.0,
+        )
+        _apply_rollout_obj_to_state(
+            st,
+            {"type": "event_msg", "payload": {"type": "agent_message", "message": "working", "phase": "commentary"}},
+            now_ts=11.0,
+        )
+        self.assertFalse(st.turn_has_completion_candidate)
+        self.assertFalse(
+            _should_clear_busy_state(
+                st,
+                now_ts=11.0 + IDLE_TURN_END_QUIET_SECONDS + 0.2,
+                quiet_seconds=IDLE_TURN_END_QUIET_SECONDS,
+            )
+        )
+
+    def test_final_phase_marks_completion_candidate(self) -> None:
+        st = _state()
+        _apply_rollout_obj_to_state(
+            st,
+            {"type": "event_msg", "payload": {"type": "user_message", "message": "hello"}},
+            now_ts=10.0,
+        )
+        _apply_rollout_obj_to_state(
+            st,
+            {"type": "event_msg", "payload": {"type": "agent_message", "message": "done", "phase": "final_answer"}},
+            now_ts=11.0,
+        )
+        self.assertTrue(st.turn_has_completion_candidate)
+
+    def test_queue_gate_waits_for_turn_end_or_idle_fallback(self) -> None:
+        st = _state()
+        _apply_rollout_obj_to_state(
+            st,
+            {"type": "event_msg", "payload": {"type": "user_message", "message": "hello"}},
+            now_ts=10.0,
+        )
+        gate = _queue_release_gate_for_now(st)
+        self.assertEqual(gate, 1)
+        self.assertFalse(_queue_item_ready(st, gate, now_ts=10.0 + IDLE_TURN_END_QUIET_SECONDS + 0.5))
+
+        _apply_rollout_obj_to_state(
+            st,
+            {"type": "event_msg", "payload": {"type": "agent_message", "message": "done", "phase": "final_answer"}},
+            now_ts=11.0,
+        )
+        self.assertFalse(_queue_item_ready(st, gate, now_ts=11.0 + max(IDLE_TURN_END_QUIET_SECONDS - 0.1, 0.0)))
+        self.assertTrue(_queue_item_ready(st, gate, now_ts=11.0 + IDLE_TURN_END_QUIET_SECONDS + 0.1))
+
+        _apply_rollout_obj_to_state(
+            st,
+            {"type": "event_msg", "payload": {"type": "task_complete"}},
+            now_ts=12.0,
+        )
+        self.assertTrue(_queue_item_ready(st, gate, now_ts=12.0))
+
+    def test_idle_fallback_release_requires_non_empty_queue(self) -> None:
+        st = _state()
+        st.busy = True
+        st.turn_open = True
+        st.turn_has_completion_candidate = True
+        st.last_turn_activity_ts = 10.0
+        self.assertFalse(_should_idle_fallback_release_queue(st, now_ts=10.0 + IDLE_TURN_END_QUIET_SECONDS + 1.0))
+        st.queue.append("next")
+        self.assertTrue(_should_idle_fallback_release_queue(st, now_ts=10.0 + IDLE_TURN_END_QUIET_SECONDS + 1.0))
+
+    def test_claude_non_queue_idle_fallback_can_clear_busy(self) -> None:
+        st = _state()
+        st.busy = True
+        st.turn_open = True
+        st.turn_has_completion_candidate = True
+        st.last_turn_activity_ts = 10.0
+        with patch("codoxear.broker.CLI_KIND", "claude"):
+            self.assertTrue(
+                _should_idle_fallback_clear_busy_without_queue(
+                    st, now_ts=10.0 + IDLE_TURN_END_QUIET_SECONDS + 0.2
+                )
+            )
+
+    def test_non_claude_non_queue_idle_fallback_does_not_clear_busy(self) -> None:
+        st = _state()
+        st.busy = True
+        st.turn_open = True
+        st.turn_has_completion_candidate = True
+        st.last_turn_activity_ts = 10.0
+        with patch("codoxear.broker.CLI_KIND", "codex"):
+            self.assertFalse(
+                _should_idle_fallback_clear_busy_without_queue(
+                    st, now_ts=10.0 + IDLE_TURN_END_QUIET_SECONDS + 0.2
+                )
+            )
 
     def test_reasoning_item_can_mark_busy_without_user_message(self) -> None:
         st = _state()
@@ -329,6 +487,141 @@ class TestBrokerBusyState(unittest.TestCase):
         _update_busy_from_pty_text(st, " •", now_ts=20.0)
         self.assertEqual(st.last_turn_activity_ts, 10.0)
         self.assertEqual(st.last_interrupt_hint_ts, 10.0)
+
+    def test_claude_user_message_starts_busy_turn(self) -> None:
+        st = _state()
+        _apply_rollout_obj_to_state(
+            st,
+            {"type": "user", "message": {"content": [{"type": "text", "text": "hello"}]}},
+            now_ts=40.0,
+        )
+        self.assertTrue(st.busy)
+        self.assertTrue(st.turn_open)
+        self.assertFalse(st.turn_has_completion_candidate)
+        self.assertEqual(st.last_turn_activity_ts, 40.0)
+
+    def test_claude_assistant_text_marks_completion_candidate(self) -> None:
+        st = _state()
+        _apply_rollout_obj_to_state(
+            st,
+            {"type": "user", "message": {"content": [{"type": "text", "text": "hello"}]}},
+            now_ts=50.0,
+        )
+        _apply_rollout_obj_to_state(
+            st,
+            {"type": "assistant", "message": {"content": [{"type": "text", "text": "done"}]}},
+            now_ts=51.0,
+        )
+        self.assertTrue(st.busy)
+        self.assertTrue(st.turn_open)
+        self.assertTrue(st.turn_has_completion_candidate)
+        self.assertEqual(st.last_turn_activity_ts, 51.0)
+
+    def test_claude_assistant_stop_reason_end_turn_closes_busy_state(self) -> None:
+        st = _state()
+        _apply_rollout_obj_to_state(
+            st,
+            {"type": "user", "message": {"content": [{"type": "text", "text": "hello"}]}},
+            now_ts=52.0,
+        )
+        _apply_rollout_obj_to_state(
+            st,
+            {
+                "type": "assistant",
+                "message": {
+                    "stop_reason": "end_turn",
+                    "content": [{"type": "text", "text": "done"}],
+                },
+            },
+            now_ts=53.0,
+        )
+        self.assertFalse(st.busy)
+        self.assertFalse(st.turn_open)
+        self.assertFalse(st.turn_has_completion_candidate)
+        self.assertEqual(st.turn_end_count, 1)
+
+    def test_claude_assistant_stop_reason_tool_use_keeps_turn_open(self) -> None:
+        st = _state()
+        _apply_rollout_obj_to_state(
+            st,
+            {"type": "user", "message": {"content": [{"type": "text", "text": "hello"}]}},
+            now_ts=53.0,
+        )
+        _apply_rollout_obj_to_state(
+            st,
+            {
+                "type": "assistant",
+                "message": {
+                    "stop_reason": "tool_use",
+                    "content": [{"type": "text", "text": "calling tool"}],
+                },
+            },
+            now_ts=54.0,
+        )
+        self.assertTrue(st.busy)
+        self.assertTrue(st.turn_open)
+        self.assertEqual(st.turn_end_count, 0)
+
+    def test_claude_interrupt_hint_does_not_rearm_after_turn_closed(self) -> None:
+        st = _state()
+        st.turn_end_count = 1
+        with patch("codoxear.broker.CLI_KIND", "claude"):
+            _update_busy_from_pty_text(st, "\x1b[2mWorking (1s • esc to interrupt)\x1b[0m", now_ts=55.0)
+        self.assertFalse(st.busy)
+        self.assertEqual(st.last_turn_activity_ts, 0.0)
+        self.assertEqual(st.last_interrupt_hint_ts, 0.0)
+
+    def test_claude_turn_duration_clears_busy_state(self) -> None:
+        st = _state()
+        st.busy = True
+        st.turn_open = True
+        st.turn_has_completion_candidate = True
+        st.last_turn_activity_ts = 60.0
+        _apply_rollout_obj_to_state(st, {"type": "system", "subtype": "turn_duration"}, now_ts=61.0)
+        self.assertFalse(st.busy)
+        self.assertFalse(st.turn_open)
+        self.assertFalse(st.turn_has_completion_candidate)
+        self.assertEqual(st.last_turn_activity_ts, 0.0)
+
+    def test_gemini_assistant_turn_end_closes_busy_state(self) -> None:
+        st = _state()
+        _apply_rollout_obj_to_state(
+            st,
+            {"type": "user", "message": {"content": [{"type": "text", "text": "hello"}]}},
+            now_ts=70.0,
+        )
+        _apply_rollout_obj_to_state(
+            st,
+            {
+                "type": "assistant",
+                "_gemini_turn_end": True,
+                "message": {"content": [{"type": "text", "text": "done"}]},
+            },
+            now_ts=71.0,
+        )
+        self.assertFalse(st.busy)
+        self.assertFalse(st.turn_open)
+        self.assertEqual(st.turn_end_count, 1)
+
+    def test_gemini_thinking_without_turn_end_keeps_busy_state(self) -> None:
+        st = _state()
+        _apply_rollout_obj_to_state(
+            st,
+            {"type": "user", "message": {"content": [{"type": "text", "text": "hello"}]}},
+            now_ts=72.0,
+        )
+        _apply_rollout_obj_to_state(
+            st,
+            {
+                "type": "assistant",
+                "message": {"content": [{"type": "thinking"}]},
+            },
+            now_ts=73.0,
+        )
+        self.assertTrue(st.busy)
+        self.assertTrue(st.turn_open)
+        self.assertFalse(st.turn_has_completion_candidate)
+        self.assertEqual(st.turn_end_count, 0)
 
 
 if __name__ == "__main__":

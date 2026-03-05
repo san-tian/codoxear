@@ -1,7 +1,11 @@
+from __future__ import annotations
+
 import json
+import os
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from codoxear.server import _compute_idle_from_log
 
@@ -119,6 +123,150 @@ class TestIdleHeuristics(unittest.TestCase):
                 ],
             )
             self.assertIs(_compute_idle_from_log(p, max_scan_bytes=64 * 1024), True)
+
+    def test_claude_turn_duration_is_idle(self) -> None:
+        with TemporaryDirectory() as td:
+            p = Path(td) / "claude.jsonl"
+            _write_jsonl(
+                p,
+                [
+                    {"type": "user", "message": {"content": [{"type": "text", "text": "hi"}]}},
+                    {"type": "assistant", "message": {"content": [{"type": "text", "text": "done"}]}},
+                    {"type": "system", "subtype": "turn_duration"},
+                ],
+            )
+            self.assertIs(_compute_idle_from_log(p, max_scan_bytes=64 * 1024), True)
+
+    def test_claude_tool_use_after_text_is_busy(self) -> None:
+        with TemporaryDirectory() as td:
+            p = Path(td) / "claude.jsonl"
+            _write_jsonl(
+                p,
+                [
+                    {"type": "user", "message": {"content": [{"type": "text", "text": "hi"}]}},
+                    {"type": "assistant", "message": {"content": [{"type": "text", "text": "starting"}]}},
+                    {"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "t1", "name": "Read"}]}},
+                ],
+            )
+            self.assertIs(_compute_idle_from_log(p, max_scan_bytes=64 * 1024), False)
+
+    def test_claude_api_error_is_idle(self) -> None:
+        with TemporaryDirectory() as td:
+            p = Path(td) / "claude.jsonl"
+            _write_jsonl(
+                p,
+                [
+                    {"type": "user", "message": {"content": [{"type": "text", "text": "hi"}]}},
+                    {"type": "system", "subtype": "api_error"},
+                ],
+            )
+            self.assertIs(_compute_idle_from_log(p, max_scan_bytes=64 * 1024), True)
+
+    def test_claude_thinking_only_stays_busy(self) -> None:
+        with TemporaryDirectory() as td:
+            p = Path(td) / "claude.jsonl"
+            _write_jsonl(
+                p,
+                [
+                    {"type": "user", "message": {"content": [{"type": "text", "text": "hi"}]}},
+                    {"type": "assistant", "message": {"content": [{"type": "thinking", "thinking": "analyzing..."}]}},
+                ],
+            )
+            self.assertIs(_compute_idle_from_log(p, max_scan_bytes=64 * 1024), False)
+
+    def test_claude_text_then_thinking_stays_busy(self) -> None:
+        with TemporaryDirectory() as td:
+            p = Path(td) / "claude.jsonl"
+            _write_jsonl(
+                p,
+                [
+                    {"type": "user", "message": {"content": [{"type": "text", "text": "hi"}]}},
+                    {"type": "assistant", "message": {"content": [{"type": "text", "text": "Let me think..."}]}},
+                    {"type": "assistant", "message": {"content": [{"type": "thinking", "thinking": "long reasoning..."}]}},
+                ],
+            )
+            self.assertIs(_compute_idle_from_log(p, max_scan_bytes=64 * 1024), False)
+
+    def test_claude_text_and_thinking_in_same_message_stays_busy(self) -> None:
+        with TemporaryDirectory() as td:
+            p = Path(td) / "claude.jsonl"
+            _write_jsonl(
+                p,
+                [
+                    {"type": "user", "message": {"content": [{"type": "text", "text": "hi"}]}},
+                    {
+                        "type": "assistant",
+                        "message": {
+                            "content": [
+                                {"type": "text", "text": "Let me analyze this..."},
+                                {"type": "thinking", "thinking": "deep reasoning in progress..."},
+                            ]
+                        },
+                    },
+                ],
+            )
+            self.assertIs(_compute_idle_from_log(p, max_scan_bytes=64 * 1024), False)
+
+    def test_claude_text_without_turn_end_is_idle_false_positive(self) -> None:
+        """
+        Regression test: when Claude outputs text but hasn't finished the turn,
+        and is still thinking (no new log writes), it should stay busy.
+        """
+        with TemporaryDirectory() as td:
+            p = Path(td) / "claude.jsonl"
+            _write_jsonl(
+                p,
+                [
+                    {"type": "user", "message": {"content": [{"type": "text", "text": "complex task"}]}},
+                    {"type": "assistant", "message": {"content": [{"type": "text", "text": "I'll work on this..."}]}},
+                    # Model is now thinking for a long time, no new log entries
+                ],
+            )
+            # After fix: should return False (busy) because turn is not closed
+            result = _compute_idle_from_log(p, max_scan_bytes=64 * 1024)
+            self.assertIs(result, False)  # Fixed: correctly busy
+
+    def test_gemini_chat_json_with_assistant_reply_is_idle(self) -> None:
+        with TemporaryDirectory() as td:
+            gem_home = Path(td) / ".gemini"
+            chats = gem_home / "tmp" / "proj" / "chats"
+            chats.mkdir(parents=True, exist_ok=True)
+            p = chats / "session-2026-03-02T00-00-abcd1234.json"
+            p.write_text(
+                json.dumps(
+                    {
+                        "sessionId": "aaaaaaaa-1111-2222-3333-bbbbbbbbbbbb",
+                        "messages": [
+                            {"type": "user", "timestamp": "2026-03-02T00:00:00.000Z", "content": [{"text": "hi"}]},
+                            {"type": "gemini", "timestamp": "2026-03-02T00:00:01.000Z", "content": "done"},
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with patch.dict(os.environ, {"GEMINI_HOME": str(gem_home)}, clear=False):
+                self.assertIs(_compute_idle_from_log(p, max_scan_bytes=64 * 1024), True)
+
+    def test_gemini_chat_json_thinking_only_stays_busy(self) -> None:
+        with TemporaryDirectory() as td:
+            gem_home = Path(td) / ".gemini"
+            chats = gem_home / "tmp" / "proj" / "chats"
+            chats.mkdir(parents=True, exist_ok=True)
+            p = chats / "session-2026-03-02T00-00-abcd1234.json"
+            p.write_text(
+                json.dumps(
+                    {
+                        "sessionId": "aaaaaaaa-1111-2222-3333-bbbbbbbbbbbb",
+                        "messages": [
+                            {"type": "user", "timestamp": "2026-03-02T00:00:00.000Z", "content": [{"text": "hi"}]},
+                            {"type": "gemini", "timestamp": "2026-03-02T00:00:01.000Z", "thoughts": [{"text": "thinking"}]},
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with patch.dict(os.environ, {"GEMINI_HOME": str(gem_home)}, clear=False):
+                self.assertIs(_compute_idle_from_log(p, max_scan_bytes=64 * 1024), False)
 
 
 if __name__ == "__main__":

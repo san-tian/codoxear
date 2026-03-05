@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import codecs
 import json
 import os
 import pty
@@ -85,8 +86,27 @@ class Sessiond:
         self._stop = threading.Event()
         self._lock = threading.Lock()
         self.state: State | None = None
+        self._pty_decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         self.codex_home = DEFAULT_CODEX_HOME
         self.sessions_dir = self.codex_home / "sessions"
+
+    def _drain_queue_once(self) -> None:
+        fd: int | None = None
+        msg: str | None = None
+        with self._lock:
+            st = self.state
+            if not st:
+                return
+            if st.queue:
+                msg = st.queue.pop(0)
+                st.busy = True
+            fd = st.pty_master_fd
+        if fd is None or msg is None:
+            return
+        try:
+            os.write(fd, msg.encode("utf-8") + _encode_enter())
+        except Exception:
+            traceback.print_exc()
 
     def _pty_reader(self) -> None:
         st = self.state
@@ -115,7 +135,7 @@ class Sessiond:
                         os.write(fd, b"\x1b[4;0;0t")
                     except Exception:
                         traceback.print_exc()
-                s = b.decode("utf-8", errors="replace")
+                s = self._pty_decoder.decode(b)
                 with self._lock:
                     st2 = self.state
                     if not st2:
@@ -182,22 +202,7 @@ class Sessiond:
                     if not self.state:
                         continue
                     self.state.busy = False
-                    q = self.state.queue[:]
-                    self.state.queue.clear()
-                    fd = self.state.pty_master_fd
-
-                if q:
-                    wrote_any = False
-                    for msg in q:
-                        try:
-                            os.write(fd, msg.encode("utf-8") + _encode_enter())
-                            wrote_any = True
-                        except Exception:
-                            break
-                    if wrote_any:
-                        with self._lock:
-                            if self.state:
-                                self.state.busy = True
+                self._drain_queue_once()
 
     def _sock_server(self) -> None:
         st = self.state
@@ -274,6 +279,70 @@ class Sessiond:
                 f.write((json.dumps(resp) + "\n").encode("utf-8"))
                 f.flush()
                 return
+
+            if cmd == "queue":
+                op = req.get("op")
+                if op is None:
+                    op = "get"
+                if op == "get":
+                    with self._lock:
+                        st = self.state
+                        if not st:
+                            resp = {"error": "no state"}
+                        else:
+                            resp = {"queue": list(st.queue), "queue_len": len(st.queue)}
+                    f.write((json.dumps(resp) + "\n").encode("utf-8"))
+                    f.flush()
+                    return
+                if op == "set":
+                    raw = req.get("queue")
+                    if not isinstance(raw, list):
+                        resp = {"error": "queue must be a list"}
+                    else:
+                        cleaned = []
+                        for item in raw:
+                            if not isinstance(item, str):
+                                continue
+                            if not item.strip():
+                                continue
+                            cleaned.append(item)
+                        should_drain = False
+                        with self._lock:
+                            st = self.state
+                            if not st:
+                                resp = {"error": "no state"}
+                            else:
+                                st.queue = list(cleaned)
+                                resp = {"queue": list(st.queue), "queue_len": len(st.queue)}
+                                should_drain = bool(st.queue) and (not st.busy)
+                        if should_drain:
+                            self._drain_queue_once()
+                    f.write((json.dumps(resp) + "\n").encode("utf-8"))
+                    f.flush()
+                    return
+                if op == "push":
+                    text = req.get("text")
+                    if not isinstance(text, str) or not text.strip():
+                        resp = {"error": "text required"}
+                    else:
+                        front = bool(req.get("front"))
+                        should_drain = False
+                        with self._lock:
+                            st = self.state
+                            if not st:
+                                resp = {"error": "no state"}
+                            else:
+                                if front:
+                                    st.queue.insert(0, text)
+                                else:
+                                    st.queue.append(text)
+                                resp = {"queue": list(st.queue), "queue_len": len(st.queue)}
+                                should_drain = bool(st.queue) and (not st.busy)
+                        if should_drain:
+                            self._drain_queue_once()
+                    f.write((json.dumps(resp) + "\n").encode("utf-8"))
+                    f.flush()
+                    return
 
             if cmd == "keys":
                 seq = req.get("seq")

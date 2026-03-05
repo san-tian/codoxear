@@ -22,11 +22,27 @@ from pathlib import Path
 from typing import Any
 
 from codoxear.constants import CONTEXT_WINDOW_BASELINE_TOKENS
+from codoxear.cli_support import claude_assistant_text as _claude_assistant_text
+from codoxear.cli_support import claude_assistant_thinking_count as _claude_assistant_thinking_count
+from codoxear.cli_support import claude_assistant_tool_use_count as _claude_assistant_tool_use_count
+from codoxear.cli_support import claude_user_text as _claude_user_text
+from codoxear.cli_support import cli_bin as _cli_bin
+from codoxear.cli_support import cli_home as _cli_home
+from codoxear.cli_support import cli_logs_dir as _cli_logs_dir
+from codoxear.cli_support import is_claude_project_log_path as _is_claude_project_log_path
+from codoxear.cli_support import is_codex_rollout_log_path as _is_codex_rollout_log_path
+from codoxear.cli_support import is_gemini_chat_log_path as _is_gemini_chat_log_path
+from codoxear.cli_support import normalize_cli_name as _normalize_cli_name
+from codoxear.cli_support import read_claude_log_cwd as _read_claude_log_cwd
+from codoxear.cli_support import read_gemini_log_cwd as _read_gemini_log_cwd
+from codoxear.cli_support import session_id_from_log_path as _session_id_from_log_path
 from codoxear import pty_util as _pty_util
 from codoxear.util import default_app_dir as _default_app_dir
 from codoxear.util import find_session_log_for_session_id as _find_session_log_for_session_id
+from codoxear.util import gemini_virtual_tail_offset as _gemini_virtual_tail_offset
 from codoxear.util import is_subagent_session_meta as _is_subagent_session_meta
 from codoxear.util import proc_find_open_rollout_log as _proc_find_open_rollout_log
+from codoxear.util import read_jsonl_from_offset as _read_jsonl_from_offset_impl
 from codoxear.util import read_session_meta_payload as _read_session_meta_payload
 from codoxear.util import subagent_parent_thread_id as _subagent_parent_thread_id
 
@@ -35,13 +51,12 @@ APP_DIR = _default_app_dir()
 SOCK_DIR = APP_DIR / "socks"
 PROC_ROOT = Path("/proc")
 
-CODEX_BIN = os.environ.get("CODEX_BIN", "codex")
+CLI_KIND = _normalize_cli_name(os.environ.get("CODEX_WEB_CLI"), default="codex")
+CODEX_BIN = _cli_bin(CLI_KIND)
 OWNER_TAG = os.environ.get("CODEX_WEB_OWNER", "")
-_CODEX_HOME_ENV = os.environ.get("CODEX_HOME")
-if _CODEX_HOME_ENV is None or (not _CODEX_HOME_ENV.strip()):
-    DEFAULT_CODEX_HOME = Path.home() / ".codex"
-else:
-    DEFAULT_CODEX_HOME = Path(_CODEX_HOME_ENV)
+TMUX_NAME = os.environ.get("CODEX_WEB_TMUX_NAME", "")
+DEFAULT_CODEX_HOME = _cli_home(CLI_KIND)
+DEFAULT_LOGS_DIR = _cli_logs_dir(CLI_KIND)
 DEBUG = os.environ.get("CODEX_WEB_BROKER_DEBUG", "0") == "1"
 _BUSY_QUIET_RAW = os.environ.get("CODEX_WEB_BUSY_QUIET_SECONDS")
 if _BUSY_QUIET_RAW is None or (not _BUSY_QUIET_RAW.strip()):
@@ -52,10 +67,13 @@ _BUSY_INTERRUPT_GRACE_RAW = os.environ.get("CODEX_WEB_BUSY_INTERRUPT_GRACE_SECON
 if _BUSY_INTERRUPT_GRACE_RAW is None or (not _BUSY_INTERRUPT_GRACE_RAW.strip()):
     _BUSY_INTERRUPT_GRACE_RAW = "3.0"
 BUSY_INTERRUPT_GRACE_SECONDS = max(float(_BUSY_INTERRUPT_GRACE_RAW), 0.0)
+_IDLE_TURN_END_QUIET_RAW = os.environ.get("CODEX_WEB_IDLE_TURN_END_QUIET_SECONDS")
+if _IDLE_TURN_END_QUIET_RAW is None or (not _IDLE_TURN_END_QUIET_RAW.strip()):
+    _IDLE_TURN_END_QUIET_RAW = str(max(BUSY_QUIET_SECONDS, 8.0))
+IDLE_TURN_END_QUIET_SECONDS = max(float(_IDLE_TURN_END_QUIET_RAW), 0.0)
 
 INTERRUPT_HINT_TAIL_MAX = 4096
 
-_SESSION_ID_RE = re.compile(r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})", re.I)
 _ANSI_OSC_RE = re.compile("\x1B\\][^\x07]*(?:\x07|\x1B\\\\)")
 _ANSI_CSI_RE = re.compile("\x1B(?:[@-Z\\-_]|\\[[0-?]*[ -/]*[@-~])")
 
@@ -65,6 +83,13 @@ def _dprint(msg: str) -> None:
         return
     sys.stderr.write(msg.rstrip("\n") + "\n")
     sys.stderr.flush()
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return bool(default)
+    return raw.strip().lower() not in ("0", "false", "no", "off")
 
 
 def _now() -> float:
@@ -148,6 +173,9 @@ def _exec_codex_via_login_shell(*, cwd: str, codex_args: list[str]) -> None:
     q = shlex.quote
     argv = [CODEX_BIN, *codex_args]
     cmd = "exec " + " ".join(q(x) for x in argv)
+    if _env_flag("CODEX_WEB_UNSET_ANTHROPIC_AUTH_TOKEN", False):
+        # Login shells can re-export vars from rc files; unset right before exec.
+        cmd = "unset ANTHROPIC_AUTH_TOKEN; " + cmd
     shell_argv = _shell_argv_for_command(cmd)
     os.chdir(cwd)
     os.execvpe(shell_argv[0], shell_argv, os.environ)
@@ -224,6 +252,116 @@ def _paths_match(a: Path, b: Path) -> bool:
             return str(a) == str(b)
 
 
+def _path_is_excluded(path: Path, excluded_paths: set[Path] | None) -> bool:
+    if not excluded_paths:
+        return False
+    for p in excluded_paths:
+        if _paths_match(path, p):
+            return True
+    return False
+
+
+def _find_recent_claude_project_log(
+    *,
+    sessions_dir: Path,
+    cwd: str,
+    after_ts: float,
+    exclude_paths: set[Path] | None = None,
+) -> Path | None:
+    if not isinstance(cwd, str) or (not cwd):
+        return None
+    if not sessions_dir.exists():
+        return None
+    cands: list[tuple[float, Path]] = []
+    for p in sessions_dir.rglob("*.jsonl"):
+        if not _is_claude_project_log_path(p, claude_projects_dir=sessions_dir):
+            continue
+        try:
+            mt = float(p.stat().st_mtime)
+        except FileNotFoundError:
+            continue
+        except Exception:
+            continue
+        if mt < float(after_ts) - 2.0:
+            continue
+        cands.append((mt, p))
+    if not cands:
+        return None
+    cands.sort(key=lambda t: t[0], reverse=True)
+    for _mt, p in cands:
+        if _path_is_excluded(p, exclude_paths):
+            continue
+        pcwd = _read_claude_log_cwd(p)
+        if isinstance(pcwd, str) and pcwd == cwd:
+            return p
+    return None
+
+
+def _find_recent_gemini_chat_log(
+    *,
+    sessions_dir: Path,
+    cwd: str,
+    after_ts: float,
+    exclude_paths: set[Path] | None = None,
+) -> Path | None:
+    if not isinstance(cwd, str) or (not cwd):
+        return None
+    if not sessions_dir.exists():
+        return None
+    cands: list[tuple[float, Path]] = []
+    for p in sessions_dir.rglob("session-*.json"):
+        if not _is_gemini_chat_log_path(p, gemini_tmp_dir=sessions_dir):
+            continue
+        try:
+            mt = float(p.stat().st_mtime)
+        except FileNotFoundError:
+            continue
+        except Exception:
+            continue
+        if mt < float(after_ts) - 2.0:
+            continue
+        cands.append((mt, p))
+    if not cands:
+        return None
+    cands.sort(key=lambda t: t[0], reverse=True)
+    for _mt, p in cands:
+        if _path_is_excluded(p, exclude_paths):
+            continue
+        pcwd = _read_gemini_log_cwd(p)
+        if isinstance(pcwd, str) and pcwd == cwd:
+            return p
+    return None
+
+
+def _claimed_rollout_paths_from_sock_meta(*, sock_dir: Path, exclude_sock: Path | None = None) -> set[Path]:
+    out: set[Path] = set()
+    if not sock_dir.exists():
+        return out
+    for meta_path in sock_dir.glob("*.json"):
+        sock_path = meta_path.with_suffix(".sock")
+        if exclude_sock is not None and _paths_match(sock_path, exclude_sock):
+            continue
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if not isinstance(meta, dict):
+            continue
+        log_path_raw = meta.get("log_path")
+        if not isinstance(log_path_raw, str) or (not log_path_raw.strip()):
+            continue
+        broker_pid = int(meta.get("broker_pid")) if isinstance(meta.get("broker_pid"), int) else 0
+        codex_pid = int(meta.get("codex_pid")) if isinstance(meta.get("codex_pid"), int) else 0
+        if (broker_pid > 0 or codex_pid > 0) and (not _pid_alive(broker_pid)) and (not _pid_alive(codex_pid)):
+            continue
+        p = Path(log_path_raw)
+        try:
+            out.add(p.resolve())
+        except Exception:
+            out.add(p)
+    return out
+
+
 def _maybe_detach_on_new_session_hint(*, st: "State", tail: str, cleaned: str) -> bool:
     # Codex TUI prints this line when closing a thread on /new and similar flows.
     # The line can be split across PTY reads and may include ANSI escape sequences.
@@ -243,22 +381,16 @@ def _maybe_detach_on_new_session_hint(*, st: "State", tail: str, cleaned: str) -
 
 
 def _read_jsonl_from_offset(path: Path, offset: int, max_bytes: int = 256 * 1024) -> tuple[list[dict[str, Any]], int]:
-    try:
-        with path.open("rb") as f:
-            f.seek(offset)
-            data = f.read(max_bytes)
-            new_off = f.tell()
-    except FileNotFoundError:
-        return [], offset
+    return _read_jsonl_from_offset_impl(path, offset, max_bytes=max_bytes)
 
-    lines = data.splitlines()
-    out: list[dict[str, Any]] = []
-    for line in lines:
-        try:
-            out.append(json.loads(line))
-        except Exception:
-            continue
-    return out, new_off
+
+def _rollout_tail_offset(path: Path) -> int:
+    try:
+        if _is_gemini_chat_log_path(path, gemini_tmp_dir=_cli_logs_dir("gemini")):
+            return int(_gemini_virtual_tail_offset(path))
+        return int(path.stat().st_size)
+    except Exception:
+        return 0
 
 
 def _strip_ansi(text: str) -> str:
@@ -291,9 +423,27 @@ def _compacting_hint_seen_in_new_text(*, tail: str, cleaned: str) -> bool:
     )
 
 
+def _claude_assistant_stop_reason_is_turn_end(obj: dict[str, Any]) -> bool:
+    if obj.get("type") != "assistant":
+        return False
+    msg = obj.get("message")
+    if not isinstance(msg, dict):
+        return False
+    stop_reason = msg.get("stop_reason")
+    if not isinstance(stop_reason, str):
+        return False
+    sr = stop_reason.strip().lower()
+    return bool(sr) and (sr != "tool_use")
+
+
 def _update_busy_from_pty_text(st: "State", text: str, now_ts: float) -> None:
     cleaned = _strip_ansi(text)
     if not cleaned:
+        return
+    # Claude can keep rendering short "esc to interrupt" status lines even while
+    # sitting at the input prompt. After we've seen at least one closed turn,
+    # treat those PTY hints as non-authoritative unless a turn is open.
+    if CLI_KIND == "claude" and (not st.turn_open) and (st.turn_end_count > 0):
         return
     tail = st.interrupt_hint_tail
     st.interrupt_hint_tail = (st.interrupt_hint_tail + cleaned)[-st.interrupt_hint_tail_max :]
@@ -326,10 +476,102 @@ def _response_call_finished(payload: dict[str, Any]) -> str | None:
     return call_id if isinstance(call_id, str) and call_id else None
 
 
-def _should_clear_busy_state(st: "State", now_ts: float) -> bool:
-    if not st.busy:
+def _assistant_phase_is_completion_candidate(phase_raw: Any) -> bool:
+    if not isinstance(phase_raw, str):
+        return True
+    phase = phase_raw.strip().lower()
+    if phase in ("commentary", "analysis", "thinking", "progress", "status", "intermediate"):
+        return False
+    return True
+
+
+def _assistant_payload_is_completion_candidate(payload: dict[str, Any]) -> bool:
+    return _assistant_phase_is_completion_candidate(payload.get("phase"))
+
+
+def _assistant_obj_is_completion_candidate(obj: dict[str, Any]) -> bool:
+    return _assistant_phase_is_completion_candidate(obj.get("phase"))
+
+
+def _close_turn_state(st: "State", *, mark_end: bool) -> None:
+    had_active_turn = st.turn_open or st.busy or bool(st.pending_calls) or (st.last_turn_activity_ts > 0.0)
+    st.pending_calls.clear()
+    st.busy = False
+    st.turn_open = False
+    st.turn_has_completion_candidate = False
+    st.last_interrupt_hint_ts = 0.0
+    st.last_turn_activity_ts = 0.0
+    if mark_end and had_active_turn:
+        st.turn_end_count += 1
+
+
+def _queue_release_gate_for_now(st: "State") -> int:
+    # While a turn is active, queue items should wait for the *next* turn-end marker.
+    return int(st.turn_end_count) + (1 if (st.busy or st.turn_open) else 0)
+
+
+def _sync_queue_release_gates(st: "State") -> None:
+    if len(st.queue_release_after) > len(st.queue):
+        del st.queue_release_after[len(st.queue) :]
+    if len(st.queue_release_after) < len(st.queue):
+        gate = _queue_release_gate_for_now(st)
+        missing = len(st.queue) - len(st.queue_release_after)
+        st.queue_release_after.extend([gate] * missing)
+
+
+def _queue_item_ready(st: "State", gate: int, now_ts: float) -> bool:
+    if int(st.turn_end_count) >= int(gate):
+        return True
+    # No explicit end marker yet; allow a cautious idle fallback if the turn looks done.
+    if not st.turn_open:
+        return False
+    if st.pending_calls:
+        return False
+    if not st.turn_has_completion_candidate:
+        return False
+    if st.last_interrupt_hint_ts > 0.0 and (now_ts - st.last_interrupt_hint_ts) < BUSY_INTERRUPT_GRACE_SECONDS:
+        return False
+    if st.last_turn_activity_ts <= 0.0:
+        return False
+    return (now_ts - st.last_turn_activity_ts) >= IDLE_TURN_END_QUIET_SECONDS
+
+
+def _should_idle_fallback_release_queue(st: "State", now_ts: float) -> bool:
+    if not (st.queue or st.key_queue):
+        return False
+    return _should_clear_busy_state(
+        st,
+        now_ts,
+        ignore_queue=True,
+        quiet_seconds=IDLE_TURN_END_QUIET_SECONDS,
+    )
+
+
+def _should_idle_fallback_clear_busy_without_queue(st: "State", now_ts: float) -> bool:
+    # Claude may not always emit explicit turn-end markers; allow a conservative
+    # quiet-window close for non-queued turns so "running" can return to idle.
+    if CLI_KIND != "claude":
         return False
     if st.queue or st.key_queue:
+        return False
+    return _should_clear_busy_state(
+        st,
+        now_ts,
+        ignore_queue=True,
+        quiet_seconds=IDLE_TURN_END_QUIET_SECONDS,
+    )
+
+
+def _should_clear_busy_state(
+    st: "State",
+    now_ts: float,
+    *,
+    ignore_queue: bool = False,
+    quiet_seconds: float = BUSY_QUIET_SECONDS,
+) -> bool:
+    if not st.busy:
+        return False
+    if (not ignore_queue) and (st.queue or st.key_queue):
         return False
     if st.pending_calls:
         return False
@@ -339,7 +581,7 @@ def _should_clear_busy_state(st: "State", now_ts: float) -> bool:
         return False
     if st.last_turn_activity_ts <= 0.0:
         return False
-    return (now_ts - st.last_turn_activity_ts) >= BUSY_QUIET_SECONDS
+    return (now_ts - st.last_turn_activity_ts) >= max(float(quiet_seconds), 0.0)
 
 
 def _reopen_turn_on_activity(st: "State") -> None:
@@ -351,6 +593,53 @@ def _reopen_turn_on_activity(st: "State") -> None:
 
 def _apply_rollout_obj_to_state(st: "State", obj: dict[str, Any], now_ts: float) -> None:
     typ = obj.get("type")
+
+    if typ == "user":
+        msg = _claude_user_text(obj)
+        if isinstance(msg, str) and msg.strip():
+            st.pending_calls.clear()
+            st.busy = True
+            st.turn_open = True
+            st.turn_has_completion_candidate = False
+            st.last_interrupt_hint_ts = 0.0
+            st.last_turn_activity_ts = now_ts
+        return
+
+    if typ == "assistant":
+        if _claude_assistant_stop_reason_is_turn_end(obj):
+            _close_turn_state(st, mark_end=True)
+            return
+        if bool(obj.get("_gemini_turn_end")):
+            _close_turn_state(st, mark_end=True)
+            st.last_turn_activity_ts = now_ts
+            return
+        has_text = bool(_claude_assistant_text(obj))
+        tool_count = _claude_assistant_tool_use_count(obj)
+        thinking_count = _claude_assistant_thinking_count(obj)
+        if has_text:
+            if st.turn_open and _assistant_obj_is_completion_candidate(obj):
+                st.turn_has_completion_candidate = True
+            st.busy = True
+            st.last_turn_activity_ts = now_ts
+            return
+        if tool_count > 0 or thinking_count > 0:
+            _reopen_turn_on_activity(st)
+            if st.turn_open:
+                st.turn_has_completion_candidate = False
+            st.busy = True
+            st.last_turn_activity_ts = now_ts
+            return
+        return
+
+    if typ == "system":
+        sub = obj.get("subtype")
+        if sub == "turn_duration":
+            _close_turn_state(st, mark_end=True)
+            return
+        if sub == "api_error":
+            _close_turn_state(st, mark_end=True)
+            return
+        return
 
     if typ == "event_msg":
         payload = obj.get("payload")
@@ -368,24 +657,19 @@ def _apply_rollout_obj_to_state(st: "State", obj: dict[str, Any], now_ts: float)
                 st.last_turn_activity_ts = now_ts
             return
         if ev_type in ("turn_aborted", "thread_rolled_back"):
-            st.pending_calls.clear()
-            st.busy = False
-            st.turn_open = False
-            st.turn_has_completion_candidate = False
-            st.last_interrupt_hint_ts = 0.0
-            st.last_turn_activity_ts = 0.0
+            _close_turn_state(st, mark_end=True)
             return
         if ev_type == "task_complete":
-            st.pending_calls.clear()
-            st.busy = False
-            st.turn_open = False
-            st.turn_has_completion_candidate = False
-            st.last_interrupt_hint_ts = 0.0
-            st.last_turn_activity_ts = 0.0
+            _close_turn_state(st, mark_end=True)
             return
         if ev_type == "agent_message":
             msg = payload.get("message")
-            if isinstance(msg, str) and msg.strip() and st.turn_open:
+            if (
+                isinstance(msg, str)
+                and msg.strip()
+                and st.turn_open
+                and _assistant_payload_is_completion_candidate(payload)
+            ):
                 st.turn_has_completion_candidate = True
             st.busy = True
             st.last_turn_activity_ts = now_ts
@@ -456,7 +740,7 @@ def _apply_rollout_obj_to_state(st: "State", obj: dict[str, Any], now_ts: float)
             and part.get("text")
             for part in content
         )
-        if has_text and st.turn_open:
+        if has_text and st.turn_open and _assistant_payload_is_completion_candidate(payload):
             st.turn_has_completion_candidate = True
         st.busy = True
         st.last_turn_activity_ts = now_ts
@@ -477,6 +761,7 @@ class State:
     busy: bool = False
     stdin_eof: bool = False
     queue: list[str] = field(default_factory=list)
+    queue_release_after: list[int] = field(default_factory=list)
     key_queue: list[bytes] = field(default_factory=list)
     output_tail: str = ""
     output_tail_max: int = 256 * 1024
@@ -487,6 +772,7 @@ class State:
     pending_calls: set[str] = field(default_factory=set)
     turn_open: bool = False
     turn_has_completion_candidate: bool = False
+    turn_end_count: int = 0
     interrupt_hint_tail: str = ""
     interrupt_hint_tail_max: int = INTERRUPT_HINT_TAIL_MAX
     new_session_hint_tail: str = ""
@@ -502,7 +788,7 @@ class Broker:
         self.cwd = cwd
         # Headless web sessions need different defaults for robust injection and log discovery.
         # These flags are forwarded to the interactive Codex CLI.
-        if OWNER_TAG == "web":
+        if OWNER_TAG == "web" and CLI_KIND == "codex":
             forced = ["-c", "disable_response_storage=false", "-c", "disable_paste_burst=true"]
             self.codex_args = forced + codex_args
         else:
@@ -513,9 +799,50 @@ class Broker:
         self._emulate_terminal = (os.environ.get("CODEX_WEB_EMULATE_TERMINAL", "0") == "1") or (not sys.stdin.isatty())
         self._term_query_buf = b""
         self._stdin_termios: list[Any] | None = None
+        self._pty_decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
 
         self.codex_home = DEFAULT_CODEX_HOME
-        self.sessions_dir = self.codex_home / "sessions"
+        self.sessions_dir = DEFAULT_LOGS_DIR
+
+    def _drain_queue_once(self) -> None:
+        fd: int | None = None
+        msg: str | None = None
+        kq: list[bytes] = []
+        now_ts = _now()
+        with self._lock:
+            st = self.state
+            if not st:
+                return
+            if st.key_queue:
+                kq = st.key_queue[:]
+                st.key_queue.clear()
+            if st.queue:
+                _sync_queue_release_gates(st)
+                gate = st.queue_release_after[0] if st.queue_release_after else _queue_release_gate_for_now(st)
+                if _queue_item_ready(st, gate, now_ts):
+                    msg = st.queue.pop(0)
+                    if st.queue_release_after:
+                        st.queue_release_after.pop(0)
+                    st.pending_calls.clear()
+                    st.busy = True
+                    st.turn_open = True
+                    st.turn_has_completion_candidate = False
+                    st.last_interrupt_hint_ts = 0.0
+                    if now_ts > st.last_turn_activity_ts:
+                        st.last_turn_activity_ts = now_ts
+            fd = st.pty_master_fd
+        if fd is None:
+            return
+        for b in kq:
+            try:
+                os.write(fd, b)
+            except Exception:
+                break
+        if msg is not None:
+            try:
+                _inject(fd, text=msg, suffix=_encode_enter())
+            except Exception:
+                pass
 
     def _discover_log_watcher(self) -> None:
         try:
@@ -526,6 +853,8 @@ class Broker:
                         return
                     need = (st.log_path is None) or (not st.log_path.exists())
                     root_pid = int(st.codex_pid)
+                    start_ts = float(st.start_ts)
+                    sock_path = st.sock_path
                 if not need:
                     time.sleep(0.25)
                     continue
@@ -535,6 +864,36 @@ class Broker:
                         self._maybe_register_or_switch_rollout(log_path=lp)
                         time.sleep(0.25)
                         continue
+                    if CLI_KIND == "claude":
+                        claimed_paths = _claimed_rollout_paths_from_sock_meta(
+                            sock_dir=SOCK_DIR,
+                            exclude_sock=sock_path,
+                        )
+                        fallback = _find_recent_claude_project_log(
+                            sessions_dir=self.sessions_dir,
+                            cwd=self.cwd,
+                            after_ts=start_ts,
+                            exclude_paths=claimed_paths,
+                        )
+                        if fallback and fallback.exists():
+                            self._maybe_register_or_switch_rollout(log_path=fallback)
+                            time.sleep(0.25)
+                            continue
+                    if CLI_KIND == "gemini":
+                        claimed_paths = _claimed_rollout_paths_from_sock_meta(
+                            sock_dir=SOCK_DIR,
+                            exclude_sock=sock_path,
+                        )
+                        fallback = _find_recent_gemini_chat_log(
+                            sessions_dir=self.sessions_dir,
+                            cwd=self.cwd,
+                            after_ts=start_ts,
+                            exclude_paths=claimed_paths,
+                        )
+                        if fallback and fallback.exists():
+                            self._maybe_register_or_switch_rollout(log_path=fallback)
+                            time.sleep(0.25)
+                            continue
                     # Exit early if Codex is gone.
                     try:
                         wpid, _status = os.waitpid(root_pid, os.WNOHANG)
@@ -558,11 +917,12 @@ class Broker:
             return False
 
         try:
-            off = log_path.stat().st_size
+            off = _rollout_tail_offset(log_path)
         except Exception:
             off = 0
 
         headless = (OWNER_TAG == "web")
+        allow_input = (not headless) or _env_flag("CODEX_WEB_TMUX_INTERACTIVE", False)
         sock_path = SOCK_DIR / f"{sid}-{os.getpid()}.sock"
         with self._lock:
             st = self.state
@@ -641,7 +1001,7 @@ class Broker:
                     break
                 os.write(out_fd, b)
                 self._maybe_reply_to_terminal_queries(fd=fd, b=b)
-                s = b.decode("utf-8", errors="replace")
+                s = self._pty_decoder.decode(b)
                 if s:
                     with self._lock:
                         st2 = self.state
@@ -697,50 +1057,19 @@ class Broker:
                 continue
 
             objs, new_off = _read_jsonl_from_offset(log_path, off, max_bytes=256 * 1024)
-            def drain_queues(*, clear_busy: bool) -> None:
-                q: list[str] = []
-                kq: list[bytes] = []
-                fd: int | None = None
-                with self._lock:
-                    st3 = self.state
-                    if not st3:
-                        return
-                    if clear_busy:
-                        st3.busy = False
-                    if not st3.queue and not st3.key_queue:
-                        return
-                    kq = st3.key_queue[:]
-                    st3.key_queue.clear()
-                    q = st3.queue[:]
-                    st3.queue.clear()
-                    fd = st3.pty_master_fd
-                if fd is None:
-                    return
-                for b in kq:
-                    try:
-                        os.write(fd, b)
-                    except Exception:
-                        break
-                for msg in q:
-                    try:
-                        _inject(fd, text=msg, suffix=_encode_enter())
-                    except Exception:
-                        break
-
             def maybe_mark_idle() -> None:
                 now_ts = _now()
-                should_clear = False
+                should_drain = False
                 with self._lock:
                     st3 = self.state
-                    if st3 and _should_clear_busy_state(st3, now_ts):
-                        st3.busy = False
-                        st3.turn_open = False
-                        st3.turn_has_completion_candidate = False
-                        st3.last_turn_activity_ts = 0.0
-                        st3.last_interrupt_hint_ts = 0.0
-                        should_clear = bool(st3.queue or st3.key_queue)
-                if should_clear:
-                    drain_queues(clear_busy=False)
+                    if st3:
+                        if _should_idle_fallback_release_queue(st3, now_ts):
+                            _close_turn_state(st3, mark_end=True)
+                            should_drain = bool(st3.queue or st3.key_queue)
+                        elif _should_idle_fallback_clear_busy_without_queue(st3, now_ts):
+                            _close_turn_state(st3, mark_end=True)
+                if should_drain:
+                    self._drain_queue_once()
 
             if new_off == off:
                 maybe_mark_idle()
@@ -752,16 +1081,16 @@ class Broker:
                 if st2:
                     st2.log_off = new_off
 
+            should_drain = False
             for obj in objs:
                 now_ts = _now()
-                aborted_or_rolled_back = False
                 if obj.get("type") == "event_msg":
                     p = obj.get("payload")
                     if not isinstance(p, dict):
                         raise ValueError("invalid rollout event_msg payload")
                     pt = p.get("type")
-                    if pt in ("turn_aborted", "thread_rolled_back"):
-                        aborted_or_rolled_back = True
+                    if pt in ("turn_aborted", "thread_rolled_back", "task_complete"):
+                        should_drain = True
                     if pt == "token_count":
                         info = p.get("info")
                         if isinstance(info, dict) and isinstance(info.get("total_token_usage"), dict):
@@ -781,12 +1110,21 @@ class Broker:
                                     with self._lock:
                                         if self.state:
                                             self.state.token = token_update
+                elif obj.get("type") == "assistant":
+                    if bool(obj.get("_gemini_turn_end")):
+                        should_drain = True
+                    elif _claude_assistant_stop_reason_is_turn_end(obj):
+                        should_drain = True
+                elif obj.get("type") == "system":
+                    subtype = obj.get("subtype")
+                    if subtype in ("turn_duration", "api_error"):
+                        should_drain = True
                 with self._lock:
                     st3 = self.state
                     if st3:
                         _apply_rollout_obj_to_state(st3, obj, now_ts=now_ts)
-                if aborted_or_rolled_back:
-                    drain_queues(clear_busy=False)
+            if should_drain:
+                self._drain_queue_once()
 
             maybe_mark_idle()
 
@@ -797,6 +1135,7 @@ class Broker:
         meta = {
             "session_id": st.session_id,
             "owner": OWNER_TAG if OWNER_TAG else None,
+            "cli": CLI_KIND,
             "broker_pid": os.getpid(),
             "sessiond_pid": os.getpid(),
             "codex_pid": st.codex_pid,
@@ -804,6 +1143,7 @@ class Broker:
             "start_ts": st.start_ts,
             "log_path": str(st.log_path) if st.log_path else None,
             "sock_path": str(st.sock_path),
+            "tmux_name": TMUX_NAME if TMUX_NAME else None,
         }
         meta_path = st.sock_path.with_suffix(".json")
         SOCK_DIR.mkdir(parents=True, exist_ok=True)
@@ -890,6 +1230,77 @@ class Broker:
                 f.flush()
                 return
 
+            if cmd == "queue":
+                op = req.get("op")
+                if op is None:
+                    op = "get"
+                if op == "get":
+                    with self._lock:
+                        st = self.state
+                        if not st:
+                            resp = {"error": "no state"}
+                        else:
+                            _sync_queue_release_gates(st)
+                            resp = {"queue": list(st.queue), "queue_len": len(st.queue)}
+                    f.write((json.dumps(resp) + "\n").encode("utf-8"))
+                    f.flush()
+                    return
+                if op == "set":
+                    raw = req.get("queue")
+                    if not isinstance(raw, list):
+                        resp = {"error": "queue must be a list"}
+                    else:
+                        cleaned = []
+                        for item in raw:
+                            if not isinstance(item, str):
+                                continue
+                            if not item.strip():
+                                continue
+                            cleaned.append(item)
+                        should_drain = False
+                        with self._lock:
+                            st = self.state
+                            if not st:
+                                resp = {"error": "no state"}
+                            else:
+                                st.queue = list(cleaned)
+                                gate = _queue_release_gate_for_now(st)
+                                st.queue_release_after = [gate] * len(st.queue)
+                                resp = {"queue": list(st.queue), "queue_len": len(st.queue)}
+                                should_drain = bool(st.queue) and (not st.busy)
+                        if should_drain:
+                            self._drain_queue_once()
+                    f.write((json.dumps(resp) + "\n").encode("utf-8"))
+                    f.flush()
+                    return
+                if op == "push":
+                    text = req.get("text")
+                    if not isinstance(text, str) or not text.strip():
+                        resp = {"error": "text required"}
+                    else:
+                        front = bool(req.get("front"))
+                        should_drain = False
+                        with self._lock:
+                            st = self.state
+                            if not st:
+                                resp = {"error": "no state"}
+                            else:
+                                _sync_queue_release_gates(st)
+                                gate = _queue_release_gate_for_now(st)
+                                if front:
+                                    st.queue.insert(0, text)
+                                    st.queue_release_after.insert(0, gate)
+                                else:
+                                    st.queue.append(text)
+                                    st.queue_release_after.append(gate)
+                                resp = {"queue": list(st.queue), "queue_len": len(st.queue)}
+                                should_drain = bool(st.queue) and (not st.busy)
+                        if should_drain:
+                            self._drain_queue_once()
+                    f.write((json.dumps(resp) + "\n").encode("utf-8"))
+                    f.flush()
+                    return
+
             if cmd == "keys":
                 seq_raw = req.get("seq")
                 if not isinstance(seq_raw, str) or not seq_raw:
@@ -944,11 +1355,7 @@ class Broker:
                 traceback.print_exc()
 
     def _session_id_from_rollout_path(self, log_path: Path) -> str | None:
-        # Codex stores rollout logs under date-based directories (e.g. ~/.codex/sessions/2026/01/22/rollout-...-<id>.jsonl),
-        # so path components are not a stable session id. Extract the id from the filename.
-        name = log_path.name
-        m = _SESSION_ID_RE.findall(name)
-        return m[-1] if m else None
+        return _session_id_from_log_path(log_path, cli=CLI_KIND)
 
     def _maybe_register_or_switch_rollout(self, *, log_path: Path) -> None:
         try:
@@ -959,34 +1366,44 @@ class Broker:
             lp.resolve().relative_to(self.sessions_dir.resolve())
         except Exception:
             return
-        if lp.name.startswith("rollout-") and lp.name.endswith(".jsonl"):
-            pass
+        sid: str | None = None
+        if CLI_KIND == "codex":
+            if not _is_codex_rollout_log_path(lp):
+                return
+            payload = _read_session_meta_payload(lp, timeout_s=1.5)
+            if not payload:
+                return
+            if _is_subagent_session_meta(payload):
+                parent = _subagent_parent_thread_id(payload)
+                if not parent:
+                    return
+                parent_log = _find_session_log_for_session_id(self.sessions_dir, parent)
+                if not parent_log:
+                    return
+                parent_payload = _read_session_meta_payload(parent_log, timeout_s=0.2)
+                if not parent_payload:
+                    return
+                if _is_subagent_session_meta(parent_payload):
+                    return
+                lp = parent_log
+                payload = parent_payload
+            sid_raw = payload.get("id")
+            if isinstance(sid_raw, str) and sid_raw:
+                sid = sid_raw
+            else:
+                sid = self._session_id_from_rollout_path(lp)
+                if sid is None:
+                    raise RuntimeError(f"unable to determine session_id from rollout filename: {lp}")
+        elif CLI_KIND == "claude":
+            if not _is_claude_project_log_path(lp, claude_projects_dir=self.sessions_dir):
+                return
+            sid = self._session_id_from_rollout_path(lp)
+        elif CLI_KIND == "gemini":
+            if not _is_gemini_chat_log_path(lp, gemini_tmp_dir=self.sessions_dir):
+                return
+            sid = self._session_id_from_rollout_path(lp)
         else:
             return
-
-        payload = _read_session_meta_payload(lp, timeout_s=1.5)
-        if not payload:
-            return
-        if _is_subagent_session_meta(payload):
-            parent = _subagent_parent_thread_id(payload)
-            if not parent:
-                return
-            parent_log = _find_session_log_for_session_id(self.sessions_dir, parent)
-            if not parent_log:
-                return
-            parent_payload = _read_session_meta_payload(parent_log, timeout_s=0.2)
-            if not parent_payload:
-                return
-            if _is_subagent_session_meta(parent_payload):
-                return
-            lp = parent_log
-            payload = parent_payload
-
-        sid = payload.get("id")
-        if not isinstance(sid, str) or not sid:
-            sid = self._session_id_from_rollout_path(lp)
-            if sid is None:
-                raise RuntimeError(f"unable to determine session_id from rollout filename: {lp}")
         if not sid:
             return
 
@@ -1003,7 +1420,7 @@ class Broker:
             st.session_id = sid
             st.log_path = lp
             try:
-                st.log_off = int(lp.stat().st_size)
+                st.log_off = _rollout_tail_offset(lp)
             except Exception:
                 st.log_off = 0
 
@@ -1023,6 +1440,7 @@ class Broker:
         self.sessions_dir.mkdir(parents=True, exist_ok=True)
         start_ts = _now()
         headless = (OWNER_TAG == "web")
+        allow_input = (not headless) or _env_flag("CODEX_WEB_TMUX_INTERACTIVE", False)
 
         pid, master_fd = pty.fork()
         if pid == 0:
@@ -1035,7 +1453,14 @@ class Broker:
                 os.environ.setdefault("TERM", term)
                 os.environ["COLUMNS"] = str(cols)
                 os.environ["LINES"] = str(rows)
-                os.environ["CODEX_HOME"] = str(self.codex_home)
+                if CLI_KIND == "claude":
+                    os.environ["CLAUDE_HOME"] = str(self.codex_home)
+                elif CLI_KIND == "gemini":
+                    os.environ["GEMINI_HOME"] = str(self.codex_home)
+                else:
+                    os.environ["CODEX_HOME"] = str(self.codex_home)
+                if _env_flag("CODEX_WEB_UNSET_ANTHROPIC_AUTH_TOKEN", False):
+                    os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
                 if sys.stdin.isatty():
                     try:
                         fd = sys.stdin.fileno()
@@ -1053,7 +1478,7 @@ class Broker:
                 traceback.print_exc()
                 os._exit(127)
 
-        if (not headless) and (not self._emulate_terminal) and sys.stdin.isatty():
+        if allow_input and (not self._emulate_terminal) and sys.stdin.isatty():
             try:
                 fd = sys.stdin.fileno()
                 self._stdin_termios = termios.tcgetattr(fd)
@@ -1091,7 +1516,7 @@ class Broker:
         self._write_meta()
         threading.Thread(target=self._sock_server, daemon=True).start()
         threading.Thread(target=self._pty_to_stdout, daemon=True).start()
-        if not headless:
+        if allow_input and sys.stdin.isatty():
             threading.Thread(target=self._stdin_to_pty, daemon=True).start()
         threading.Thread(target=self._log_watcher, daemon=True).start()
         threading.Thread(target=self._discover_log_watcher, daemon=True).start()
@@ -1140,10 +1565,10 @@ class Broker:
 def main() -> None:
     _require_proc()
     ap = argparse.ArgumentParser(
-        description="Foreground PTY broker for codex: preserves terminal UX and registers a control socket for Codoxear."
+        description="Foreground PTY broker for codex/claude/gemini: preserves terminal UX and registers a control socket for Codoxear."
     )
-    ap.add_argument("--cwd", default=os.getcwd(), help="Directory to run codex in (default: current directory)")
-    ap.add_argument("args", nargs=argparse.REMAINDER, help="Arguments after -- are passed to codex")
+    ap.add_argument("--cwd", default=os.getcwd(), help="Directory to run the target CLI in (default: current directory)")
+    ap.add_argument("args", nargs=argparse.REMAINDER, help="Arguments after -- are passed to the target CLI")
     ns = ap.parse_args()
 
     args = list(ns.args)
