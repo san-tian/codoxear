@@ -3,6 +3,7 @@
 This document summarizes the team's current work focus. Each session appears under its own heading, and the detailed record lives under `docs/records/sessions/`.
 
 ## Current Focus by Session
+- `docs/records/sessions/2026-03-07-codex-busy-strict-turn-markers.md`: Make Codex busy detection rely on explicit turn markers from Codex rollout/app protocol semantics instead of PTY redraw/status heuristics.
 - `docs/records/sessions/2026-03-02-markdown-preview-image-support.md`: Add image rendering support to markdown preview with proper relative path resolution.
 - `docs/records/sessions/2026-03-02-sidebar-collapse-toggle-button.md`: Add a topbar menu button to collapse/expand the left navigation on desktop and open/close the sidebar drawer on mobile.
 - `docs/records/sessions/2026-03-02-tmux-attach-button-relocation.md`: Move tmux attach button from Session Tools modal to topbar actions for better accessibility.

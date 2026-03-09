@@ -42,18 +42,21 @@ Files:
 
 Key flow:
 1. Scan recent log tail for user/assistant terminal events.
-2. Track whether a turn is open and if a completion candidate exists.
-3. Close turns on terminal markers:
+2. For Codex, keep expanding the scanned tail until an explicit turn boundary is found (`task_started` / `user_message` or `task_complete` / `turn_aborted` / `thread_rolled_back`) or the scan budget is exhausted.
+3. Track whether a turn is open and if a completion candidate exists.
+4. Close turns on terminal markers:
    - Codex: `task_complete`, `turn_aborted`, `thread_rolled_back`
    - Claude: `system.subtype=turn_duration|api_error`
    - Gemini: synthesized assistant turn-end markers from completion rows in session-file updates
-4. Return idle based on format-specific logic:
+5. Return idle based on format-specific logic:
+   - **Codex**: Requires explicit turn closure (`task_complete` / `turn_aborted` / `thread_rolled_back`). Assistant text alone does not mark the session idle.
    - **Claude**: Requires explicit turn closure (`turn_duration`/`api_error`). Open turns stay busy even with text output, preventing false idle during long thinking phases.
-   - **Codex/Gemini**: Returns idle when turn is closed with assistant/aborted terminal event, or when an open turn has an assistant completion candidate.
+   - **Gemini**: Returns idle when the turn is closed by a synthesized completion marker, or when an open turn has an assistant completion candidate.
 
 Notes:
 - The server combines broker `busy` state with log-derived idle state.
 - Large logs cap their scan size with `CODEX_WEB_CHAT_INIT_MAX_SCAN_BYTES` and related settings.
+- If a Codex scan sees assistant output but cannot find an explicit turn boundary within the scan budget, it conservatively stays busy.
 - Claude and Gemini thinking/tool-only phases do not close turns; they keep the turn open so long-running reasoning is not misclassified as idle.
 
 ## Token statistics

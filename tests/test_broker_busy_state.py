@@ -34,6 +34,10 @@ def _state() -> State:
     )
 
 
+def _write_jsonl(path: Path, objs: list) -> None:
+    path.write_text("".join(json.dumps(o) + "\n" for o in objs), encoding="utf-8")
+
+
 class TestBrokerBusyState(unittest.TestCase):
     def test_register_from_gemini_log_uses_virtual_tail_offset(self) -> None:
         with TemporaryDirectory() as td:
@@ -102,6 +106,18 @@ class TestBrokerBusyState(unittest.TestCase):
         self.assertTrue(st.busy)
         self.assertEqual(st.pending_calls, set())
         self.assertEqual(st.last_turn_activity_ts, 10.0)
+
+    def test_task_started_starts_turn(self) -> None:
+        st = _state()
+        _apply_rollout_obj_to_state(
+            st,
+            {"type": "event_msg", "payload": {"type": "task_started"}},
+            now_ts=9.0,
+        )
+        self.assertTrue(st.busy)
+        self.assertTrue(st.turn_open)
+        self.assertFalse(st.turn_has_completion_candidate)
+        self.assertEqual(st.last_turn_activity_ts, 9.0)
 
     def test_agent_progress_message_does_not_clear_busy(self) -> None:
         st = _state()
@@ -371,17 +387,18 @@ class TestBrokerBusyState(unittest.TestCase):
                 )
             )
 
-    def test_reasoning_item_can_mark_busy_without_user_message(self) -> None:
+    def test_codex_reasoning_item_without_explicit_turn_stays_idle(self) -> None:
         st = _state()
         _apply_rollout_obj_to_state(
             st,
             {"type": "response_item", "payload": {"type": "reasoning"}},
             now_ts=15.0,
         )
-        self.assertTrue(st.busy)
-        self.assertEqual(st.last_turn_activity_ts, 15.0)
+        self.assertFalse(st.busy)
+        self.assertFalse(st.turn_open)
+        self.assertEqual(st.last_turn_activity_ts, 0.0)
 
-    def test_reasoning_reopens_turn_after_idle_clear(self) -> None:
+    def test_codex_reasoning_does_not_reopen_closed_turn_without_new_start(self) -> None:
         st = _state()
         _apply_rollout_obj_to_state(
             st,
@@ -413,20 +430,20 @@ class TestBrokerBusyState(unittest.TestCase):
             {"type": "event_msg", "payload": {"type": "agent_reasoning"}},
             now_ts=15.0,
         )
-        self.assertTrue(st.busy)
-        self.assertTrue(st.turn_open)
+        self.assertFalse(st.busy)
+        self.assertFalse(st.turn_open)
         self.assertFalse(st.turn_has_completion_candidate)
-        self.assertFalse(_should_clear_busy_state(st, now_ts=15.0 + BUSY_QUIET_SECONDS + 60.0))
+        self.assertEqual(st.last_turn_activity_ts, 0.0)
 
-    def test_tool_call_reopens_turn_after_idle_clear(self) -> None:
+    def test_codex_tool_call_without_explicit_turn_stays_idle(self) -> None:
         st = _state()
         _apply_rollout_obj_to_state(
             st,
             {"type": "response_item", "payload": {"type": "function_call", "call_id": "call-1"}},
             now_ts=20.0,
         )
-        self.assertTrue(st.busy)
-        self.assertTrue(st.turn_open)
+        self.assertFalse(st.busy)
+        self.assertFalse(st.turn_open)
         self.assertFalse(st.turn_has_completion_candidate)
 
     def test_agent_message_does_not_reopen_closed_turn(self) -> None:
@@ -439,7 +456,7 @@ class TestBrokerBusyState(unittest.TestCase):
             {"type": "event_msg", "payload": {"type": "agent_message", "message": "done"}},
             now_ts=25.0,
         )
-        self.assertTrue(st.busy)
+        self.assertFalse(st.busy)
         self.assertFalse(st.turn_open)
         self.assertFalse(st.turn_has_completion_candidate)
 
@@ -453,9 +470,17 @@ class TestBrokerBusyState(unittest.TestCase):
         self.assertFalse(st.busy)
         self.assertEqual(st.last_turn_activity_ts, 0.0)
 
-    def test_interrupt_hint_from_pty_marks_busy(self) -> None:
+    def test_codex_interrupt_hint_from_pty_does_not_mark_busy(self) -> None:
         st = _state()
         _update_busy_from_pty_text(st, "\x1b[2mWorking (1s • esc to interrupt)\x1b[0m", now_ts=20.0)
+        self.assertFalse(st.busy)
+        self.assertEqual(st.last_interrupt_hint_ts, 0.0)
+        self.assertEqual(st.last_turn_activity_ts, 0.0)
+
+    def test_non_codex_interrupt_hint_from_pty_marks_busy(self) -> None:
+        st = _state()
+        with patch("codoxear.broker.CLI_KIND", "claude"):
+            _update_busy_from_pty_text(st, "\x1b[2mWorking (1s • esc to interrupt)\x1b[0m", now_ts=20.0)
         self.assertTrue(st.busy)
         self.assertEqual(st.last_interrupt_hint_ts, 20.0)
         self.assertEqual(st.last_turn_activity_ts, 20.0)
@@ -472,21 +497,50 @@ class TestBrokerBusyState(unittest.TestCase):
         )
         self.assertTrue(_should_clear_busy_state(st, now_ts=clear_ts))
 
-    def test_compacting_hint_from_pty_marks_busy(self) -> None:
+    def test_non_codex_compacting_hint_from_pty_marks_busy(self) -> None:
         st = _state()
-        _update_busy_from_pty_text(st, "\x1b[2mCompacting context...\x1b[0m", now_ts=30.0)
+        with patch("codoxear.broker.CLI_KIND", "claude"):
+            _update_busy_from_pty_text(st, "\x1b[2mCompacting context...\x1b[0m", now_ts=30.0)
         self.assertTrue(st.busy)
         self.assertEqual(st.last_turn_activity_ts, 30.0)
         self.assertEqual(st.last_interrupt_hint_ts, 0.0)
 
-    def test_stale_interrupt_tail_does_not_rearm_busy_on_unrelated_text(self) -> None:
+    def test_non_codex_stale_interrupt_tail_does_not_rearm_busy_on_unrelated_text(self) -> None:
         st = _state()
-        _update_busy_from_pty_text(st, "\x1b[2mWorking (1s • esc to interrupt)\x1b[0m", now_ts=10.0)
+        with patch("codoxear.broker.CLI_KIND", "claude"):
+            _update_busy_from_pty_text(st, "\x1b[2mWorking (1s • esc to interrupt)\x1b[0m", now_ts=10.0)
         self.assertTrue(st.busy)
         self.assertEqual(st.last_turn_activity_ts, 10.0)
-        _update_busy_from_pty_text(st, " •", now_ts=20.0)
+        with patch("codoxear.broker.CLI_KIND", "claude"):
+            _update_busy_from_pty_text(st, " •", now_ts=20.0)
         self.assertEqual(st.last_turn_activity_ts, 10.0)
         self.assertEqual(st.last_interrupt_hint_ts, 10.0)
+
+    def test_register_from_log_seeds_codex_busy_from_existing_rollout(self) -> None:
+        with TemporaryDirectory() as td:
+            log_path = Path(td) / "rollout-2026-03-07T18-01-46-019ccb2d-dec5-76f1-b2b1-ac7464c8c364.jsonl"
+            _write_jsonl(
+                log_path,
+                [
+                    {"type": "session_meta", "payload": {"id": "019ccb2d-dec5-76f1-b2b1-ac7464c8c364"}},
+                    {"timestamp": "2026-03-08T02:41:00.000Z", "type": "event_msg", "payload": {"type": "task_started"}},
+                    {"timestamp": "2026-03-08T02:41:01.000Z", "type": "event_msg", "payload": {"type": "user_message", "message": "hello"}},
+                    {"timestamp": "2026-03-08T02:41:02.000Z", "type": "event_msg", "payload": {"type": "agent_message", "message": "working"}},
+                ],
+            )
+            broker = Broker(cwd=td, codex_args=[])
+            broker.state = _state()
+            broker.state.sessions_dir = Path(td)
+            broker.state.codex_home = Path(td)
+            with patch("codoxear.broker.CLI_KIND", "codex"), patch("codoxear.broker.OWNER_TAG", "web"):
+                ok = broker._register_from_log(log_path=log_path)
+            self.assertTrue(ok)
+            self.assertIsNotNone(broker.state)
+            assert broker.state is not None
+            self.assertTrue(broker.state.busy)
+            self.assertTrue(broker.state.turn_open)
+            self.assertEqual(broker.state.session_id, "019ccb2d-dec5-76f1-b2b1-ac7464c8c364")
+            self.assertEqual(broker.state.log_off, int(log_path.stat().st_size))
 
     def test_claude_user_message_starts_busy_turn(self) -> None:
         st = _state()

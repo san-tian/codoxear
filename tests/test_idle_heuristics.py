@@ -17,13 +17,13 @@ def _write_jsonl(path: Path, objs: list[dict]) -> None:
 class TestIdleHeuristics(unittest.TestCase):
     def test_fresh_session_is_idle(self) -> None:
         with TemporaryDirectory() as td:
-            p = Path(td) / "rollout.jsonl"
+            p = Path(td) / "rollout-2026-03-07T00-00-00-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa.jsonl"
             _write_jsonl(p, [{"type": "session_meta", "payload": {"id": "s"}}])
             self.assertIs(_compute_idle_from_log(p, max_scan_bytes=64 * 1024), True)
 
     def test_open_turn_without_assistant_candidate_is_busy(self) -> None:
         with TemporaryDirectory() as td:
-            p = Path(td) / "rollout.jsonl"
+            p = Path(td) / "rollout-2026-03-07T00-00-00-bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb.jsonl"
             _write_jsonl(
                 p,
                 [
@@ -34,9 +34,9 @@ class TestIdleHeuristics(unittest.TestCase):
             )
             self.assertIs(_compute_idle_from_log(p, max_scan_bytes=64 * 1024), False)
 
-    def test_assistant_candidate_after_user_is_idle(self) -> None:
+    def test_codex_assistant_output_without_task_complete_stays_busy(self) -> None:
         with TemporaryDirectory() as td:
-            p = Path(td) / "rollout.jsonl"
+            p = Path(td) / "rollout-2026-03-07T00-00-00-cccccccc-cccc-cccc-cccc-cccccccccccc.jsonl"
             _write_jsonl(
                 p,
                 [
@@ -52,11 +52,11 @@ class TestIdleHeuristics(unittest.TestCase):
                     },
                 ],
             )
-            self.assertIs(_compute_idle_from_log(p, max_scan_bytes=64 * 1024), True)
+            self.assertIs(_compute_idle_from_log(p, max_scan_bytes=64 * 1024), False)
 
     def test_tool_after_assistant_reopens_busy(self) -> None:
         with TemporaryDirectory() as td:
-            p = Path(td) / "rollout.jsonl"
+            p = Path(td) / "rollout-2026-03-07T00-00-00-dddddddd-dddd-dddd-dddd-dddddddddddd.jsonl"
             _write_jsonl(
                 p,
                 [
@@ -70,7 +70,7 @@ class TestIdleHeuristics(unittest.TestCase):
 
     def test_web_search_after_assistant_reopens_busy(self) -> None:
         with TemporaryDirectory() as td:
-            p = Path(td) / "rollout.jsonl"
+            p = Path(td) / "rollout-2026-03-07T00-00-00-eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee.jsonl"
             _write_jsonl(
                 p,
                 [
@@ -84,7 +84,7 @@ class TestIdleHeuristics(unittest.TestCase):
 
     def test_local_shell_after_assistant_reopens_busy(self) -> None:
         with TemporaryDirectory() as td:
-            p = Path(td) / "rollout.jsonl"
+            p = Path(td) / "rollout-2026-03-07T00-00-00-ffffffff-ffff-ffff-ffff-ffffffffffff.jsonl"
             _write_jsonl(
                 p,
                 [
@@ -98,7 +98,7 @@ class TestIdleHeuristics(unittest.TestCase):
 
     def test_turn_aborted_is_idle(self) -> None:
         with TemporaryDirectory() as td:
-            p = Path(td) / "rollout.jsonl"
+            p = Path(td) / "rollout-2026-03-07T00-00-00-11111111-1111-1111-1111-111111111111.jsonl"
             _write_jsonl(
                 p,
                 [
@@ -111,7 +111,7 @@ class TestIdleHeuristics(unittest.TestCase):
 
     def test_task_complete_is_idle(self) -> None:
         with TemporaryDirectory() as td:
-            p = Path(td) / "rollout.jsonl"
+            p = Path(td) / "rollout-2026-03-07T00-00-00-22222222-2222-2222-2222-222222222222.jsonl"
             _write_jsonl(
                 p,
                 [
@@ -123,6 +123,19 @@ class TestIdleHeuristics(unittest.TestCase):
                 ],
             )
             self.assertIs(_compute_idle_from_log(p, max_scan_bytes=64 * 1024), True)
+
+    def test_task_started_without_task_complete_is_busy(self) -> None:
+        with TemporaryDirectory() as td:
+            p = Path(td) / "rollout-2026-03-07T00-00-00-33333333-3333-3333-3333-333333333333.jsonl"
+            _write_jsonl(
+                p,
+                [
+                    {"type": "session_meta", "payload": {"id": "s"}},
+                    {"type": "event_msg", "payload": {"type": "task_started"}},
+                    {"type": "event_msg", "payload": {"type": "agent_message", "message": "working"}},
+                ],
+            )
+            self.assertIs(_compute_idle_from_log(p, max_scan_bytes=64 * 1024), False)
 
     def test_claude_turn_duration_is_idle(self) -> None:
         with TemporaryDirectory() as td:

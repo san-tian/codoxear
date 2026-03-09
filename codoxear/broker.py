@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import codecs
+import datetime
 import json
 import os
 import pty
@@ -440,6 +441,8 @@ def _update_busy_from_pty_text(st: "State", text: str, now_ts: float) -> None:
     cleaned = _strip_ansi(text)
     if not cleaned:
         return
+    if CLI_KIND == "codex":
+        return
     # Claude can keep rendering short "esc to interrupt" status lines even while
     # sitting at the input prompt. After we've seen at least one closed turn,
     # treat those PTY hints as non-authoritative unless a turn is open.
@@ -591,6 +594,44 @@ def _reopen_turn_on_activity(st: "State") -> None:
     st.turn_has_completion_candidate = False
 
 
+def _obj_event_ts(obj: dict[str, Any]) -> float | None:
+    ts = obj.get("ts")
+    if isinstance(ts, (int, float)):
+        return float(ts)
+    ts2 = obj.get("timestamp")
+    if isinstance(ts2, (int, float)):
+        return float(ts2)
+    if isinstance(ts2, str):
+        raw = ts2.strip()
+        if raw.endswith("Z"):
+            raw = raw[:-1] + "+00:00"
+        try:
+            return float(datetime.datetime.fromisoformat(raw).timestamp())
+        except ValueError:
+            return None
+    return None
+
+
+def _seed_codex_state_from_rollout(st: "State", log_path: Path) -> None:
+    if CLI_KIND != "codex":
+        return
+    st.pending_calls.clear()
+    st.busy = False
+    st.turn_open = False
+    st.turn_has_completion_candidate = False
+    st.turn_end_count = 0
+    st.last_interrupt_hint_ts = 0.0
+    st.last_turn_activity_ts = 0.0
+    off = 0
+    while True:
+        objs, new_off = _read_jsonl_from_offset(log_path, off, max_bytes=256 * 1024)
+        if new_off <= off:
+            break
+        for obj in objs:
+            _apply_rollout_obj_to_state(st, obj, now_ts=_obj_event_ts(obj) or _now())
+        off = new_off
+
+
 def _apply_rollout_obj_to_state(st: "State", obj: dict[str, Any], now_ts: float) -> None:
     typ = obj.get("type")
 
@@ -646,6 +687,14 @@ def _apply_rollout_obj_to_state(st: "State", obj: dict[str, Any], now_ts: float)
         if not isinstance(payload, dict):
             raise ValueError("invalid rollout event_msg payload")
         ev_type = payload.get("type")
+        if ev_type == "task_started":
+            st.pending_calls.clear()
+            st.busy = True
+            st.turn_open = True
+            st.turn_has_completion_candidate = False
+            st.last_interrupt_hint_ts = 0.0
+            st.last_turn_activity_ts = now_ts
+            return
         if ev_type == "user_message":
             msg = payload.get("message")
             if isinstance(msg, str) and msg.strip():
@@ -663,6 +712,8 @@ def _apply_rollout_obj_to_state(st: "State", obj: dict[str, Any], now_ts: float)
             _close_turn_state(st, mark_end=True)
             return
         if ev_type == "agent_message":
+            if CLI_KIND == "codex" and not st.turn_open:
+                return
             msg = payload.get("message")
             if (
                 isinstance(msg, str)
@@ -675,6 +726,13 @@ def _apply_rollout_obj_to_state(st: "State", obj: dict[str, Any], now_ts: float)
             st.last_turn_activity_ts = now_ts
             return
         if ev_type == "agent_reasoning":
+            if CLI_KIND == "codex":
+                if not st.turn_open:
+                    return
+                st.turn_has_completion_candidate = False
+                st.busy = True
+                st.last_turn_activity_ts = now_ts
+                return
             _reopen_turn_on_activity(st)
             if st.turn_open:
                 st.turn_has_completion_candidate = False
@@ -694,8 +752,11 @@ def _apply_rollout_obj_to_state(st: "State", obj: dict[str, Any], now_ts: float)
 
     started = _response_call_started(payload)
     if started is not None:
+        if CLI_KIND == "codex" and not st.turn_open:
+            return
         st.pending_calls.add(started)
-        _reopen_turn_on_activity(st)
+        if CLI_KIND != "codex":
+            _reopen_turn_on_activity(st)
         if st.turn_open:
             st.turn_has_completion_candidate = False
         st.busy = True
@@ -704,8 +765,11 @@ def _apply_rollout_obj_to_state(st: "State", obj: dict[str, Any], now_ts: float)
 
     finished = _response_call_finished(payload)
     if finished is not None:
+        if CLI_KIND == "codex" and (not st.turn_open) and (finished not in st.pending_calls):
+            return
         st.pending_calls.discard(finished)
-        _reopen_turn_on_activity(st)
+        if CLI_KIND != "codex":
+            _reopen_turn_on_activity(st)
         if st.turn_open:
             st.turn_has_completion_candidate = False
         st.busy = True
@@ -723,13 +787,18 @@ def _apply_rollout_obj_to_state(st: "State", obj: dict[str, Any], now_ts: float)
         "web_search_call",
         "local_shell_call",
     ):
-        _reopen_turn_on_activity(st)
+        if CLI_KIND == "codex" and not st.turn_open:
+            return
+        if CLI_KIND != "codex":
+            _reopen_turn_on_activity(st)
         if st.turn_open:
             st.turn_has_completion_candidate = False
         st.busy = True
         st.last_turn_activity_ts = now_ts
         return
     if item_type == "message" and role == "assistant":
+        if CLI_KIND == "codex" and not st.turn_open:
+            return
         content = payload.get("content")
         if not isinstance(content, list):
             raise ValueError("invalid assistant message content")
@@ -932,6 +1001,7 @@ class Broker:
             st.session_id = sid
             if not headless:
                 st.sock_path = sock_path
+            _seed_codex_state_from_rollout(st, log_path)
             st.log_off = off
 
         _dprint(f"broker: registered session_id={sid} log_path={log_path} sock_path={sock_path}")

@@ -60,7 +60,9 @@ Notes:
 - `send` injects directly; queued messages use the `queue` command instead.
 - Queue items are gate-tagged and released one at a time after their required turn-end marker.
 - Idle fallback can synthesize a turn end when a queued item is pending, the turn has a completion candidate, and output remains quiet.
-- For Codex, quiet idle fallback is queue-only; without queued items, busy/idle transitions rely on explicit turn-end markers.
+- For Codex, non-queued busy/idle transitions use explicit rollout turn markers only (`task_started` / `user_message` open a turn; `task_complete` / `turn_aborted` / `thread_rolled_back` close it).
+- Codex PTY status hints (for example `esc to interrupt` or `Compacting context...`) do not affect Codex busy state.
+- Codex queue drain still keeps the queue-only idle fallback as a compatibility fallback when an explicit turn-end marker never arrives.
 - For Claude, if no explicit turn-end marker arrives, the broker also allows a conservative quiet-window fallback to clear `busy` for non-queued turns after a completion candidate.
 - Enter sequence is configurable with `CODEX_WEB_ENTER_SEQ`.
 
@@ -81,7 +83,7 @@ Key flow:
    - Claude: `~/.claude/projects/**/*.jsonl` (project UUID logs, excluding `subagents`)
    - Gemini: `~/.gemini/tmp/**/chats/session-*.json`
 2. Prefer `/proc` open-fd discovery and fall back to recent CLI-specific logs by `cwd`/mtime when the CLI does not keep the active file descriptor open.
-3. Register `session_id` and write metadata JSON beside the socket.
+3. Register `session_id`, seed current turn state from the existing Codex rollout when applicable, and write metadata JSON beside the socket.
 4. Tail the log and update busy/idle heuristics.
 
 Call stack:
@@ -94,6 +96,7 @@ Call stack:
 Notes:
 - When a new `/new` thread hint is detected, the broker clears the current log binding and re-discovers.
 - Claude/Gemini fallback discovery skips log files already claimed by other live broker sidecars, so creating a new session in the same `cwd` does not attach to an existing session's log.
+- When a Codex broker binds to an existing rollout, it replays the current rollout once before tailing from EOF so terminal-owned or tmux-backed sessions recover the exact current turn-open/busy state without relying on PTY redraw hints.
 - `CODEX_WEB_BUSY_QUIET_SECONDS` and `CODEX_WEB_BUSY_INTERRUPT_GRACE_SECONDS` tune busy clearing heuristics.
 - `CODEX_WEB_IDLE_TURN_END_QUIET_SECONDS` controls the quiet window for idle turn-end fallback used by queue release.
 - Assistant phase `commentary` does not count as a completion candidate; `final_answer` (or messages without phase) does.

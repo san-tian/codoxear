@@ -27,6 +27,7 @@ Pytest can still run the unittest suite if you install it, but it's optional:
 ## Notes
 - Tests rely on static fixtures and do not require a running broker.
 - When adding new behavior around log parsing or idle detection, extend tests in `tests/`.
+- Codex strict turn-marker coverage now lives in `test_broker_busy_state` and `test_idle_heuristics` (explicit `task_started` / `task_complete`, no Codex PTY-hint busy rearm, and no assistant-text-only idle for Codex).
 - Claude and Gemini support coverage currently lives in `test_broker_proc_rollout`, `test_broker_spawn_env`, `test_cli_support`, `test_idle_heuristics`, `test_server_chat_flags`, `test_server_spawn_cli`, and `test_util_gemini_offset`.
 - Tail sanitization coverage lives in `test_tail_sanitize` (including Claude live-tail noise filtering).
 - Claude thinking idle false-positive regression coverage lives in `test_idle_heuristics` (tests that Claude sessions stay busy during long thinking phases after initial text output).

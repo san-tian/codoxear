@@ -13,6 +13,7 @@ from .cli_support import claude_assistant_text as _claude_assistant_text
 from .cli_support import claude_assistant_thinking_count as _claude_assistant_thinking_count
 from .cli_support import claude_assistant_tool_use_count as _claude_assistant_tool_use_count
 from .cli_support import claude_user_text as _claude_user_text
+from .cli_support import is_codex_rollout_log_path as _is_codex_rollout_log_path
 from .cli_support import is_gemini_chat_log_path as _is_gemini_chat_log_path
 from .cli_support import read_gemini_rollout_objs as _read_gemini_rollout_objs
 
@@ -538,6 +539,8 @@ def _last_assistant_ts_from_tail(
 
 def _compute_idle_from_log(path: Path, max_scan_bytes: int = 8 * 1024 * 1024) -> bool | None:
     sz = int(path.stat().st_size)
+    is_codex_format = _is_codex_rollout_log_path(path)
+    is_gemini_format = _is_gemini_chat_log_path(path, gemini_tmp_dir=_cli_logs_dir("gemini"))
 
     scan = min(256 * 1024, max_scan_bytes)
     if scan <= 0:
@@ -548,6 +551,9 @@ def _compute_idle_from_log(path: Path, max_scan_bytes: int = 8 * 1024 * 1024) ->
     turn_has_completion_candidate = False
     last_terminal_event: str | None = None
     is_claude_format = False  # Track if we see Claude-specific message types
+    saw_codex_turn_start = False
+    saw_codex_turn_end = False
+    saw_codex_assistant_output = False
 
     while True:
         objs = _read_jsonl_tail(path, scan)
@@ -614,8 +620,16 @@ def _compute_idle_from_log(path: Path, max_scan_bytes: int = 8 * 1024 * 1024) ->
                 if not isinstance(p, dict):
                     raise ValueError("invalid event_msg payload")
                 pt = p.get("type")
+                if is_codex_format and pt == "task_started":
+                    saw_codex_turn_start = True
+                    turn_open = True
+                    turn_has_completion_candidate = False
+                    last_terminal_event = "user"
+                    continue
                 if pt == "user_message" and isinstance(p.get("message"), str):
                     saw_user = True
+                    if is_codex_format:
+                        saw_codex_turn_start = True
                     turn_open = True
                     turn_has_completion_candidate = False
                     last_terminal_event = "user"
@@ -623,14 +637,20 @@ def _compute_idle_from_log(path: Path, max_scan_bytes: int = 8 * 1024 * 1024) ->
                 if pt == "agent_message":
                     msg = p.get("message")
                     if isinstance(msg, str) and msg.strip():
+                        if is_codex_format:
+                            saw_codex_assistant_output = True
                         last_terminal_event = "assistant"
                         continue
                 if pt in ("turn_aborted", "thread_rolled_back"):
+                    if is_codex_format:
+                        saw_codex_turn_end = True
                     turn_open = False
                     turn_has_completion_candidate = False
                     last_terminal_event = "aborted"
                     continue
                 if pt == "task_complete":
+                    if is_codex_format:
+                        saw_codex_turn_end = True
                     turn_open = False
                     turn_has_completion_candidate = False
                     last_terminal_event = "assistant"
@@ -644,7 +664,9 @@ def _compute_idle_from_log(path: Path, max_scan_bytes: int = 8 * 1024 * 1024) ->
                     raise ValueError("invalid response_item payload")
                 pt = p.get("type")
                 if _has_assistant_output_text(obj):
-                    if turn_open:
+                    if is_codex_format:
+                        saw_codex_assistant_output = True
+                    if turn_open and (not is_codex_format):
                         turn_has_completion_candidate = True
                     last_terminal_event = "assistant"
                     continue
@@ -660,7 +682,10 @@ def _compute_idle_from_log(path: Path, max_scan_bytes: int = 8 * 1024 * 1024) ->
                     turn_has_completion_candidate = False
                     continue
 
-        if saw_user or (last_terminal_event is not None) or scan >= max_scan_bytes:
+        if is_codex_format:
+            if saw_codex_turn_start or saw_codex_turn_end or scan >= max_scan_bytes:
+                break
+        elif saw_user or (last_terminal_event is not None) or scan >= max_scan_bytes:
             break
         scan *= 2
 
@@ -671,12 +696,16 @@ def _compute_idle_from_log(path: Path, max_scan_bytes: int = 8 * 1024 * 1024) ->
         return True if sz <= 128 * 1024 else False
 
     if turn_open:
-        # For Claude format: require explicit turn closure (turn_duration/api_error)
-        # Don't trust completion_candidate alone, as model may still be thinking
-        if is_claude_format:
+        # For Claude and Codex: require explicit turn closure.
+        # Codex has `task_complete` / `turn_aborted` / `thread_rolled_back`.
+        # Claude has `turn_duration` / `api_error`.
+        if is_claude_format or is_codex_format:
             return False  # Stay busy until turn explicitly closes
-        # For Codex/Gemini: use completion candidate heuristic
+        # For Gemini: use completion candidate heuristic
         return bool(turn_has_completion_candidate)
+
+    if is_codex_format and saw_codex_assistant_output and (not saw_codex_turn_end):
+        return False
 
     if last_terminal_event in ("assistant", "aborted"):
         return True
