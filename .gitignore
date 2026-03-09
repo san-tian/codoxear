@@ -1,5 +1,7 @@
 .env
 env
+AGENTS.md
+docs/
 LOG.md
 PROMPT.md
 
