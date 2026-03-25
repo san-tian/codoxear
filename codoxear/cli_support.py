@@ -33,13 +33,13 @@ def parse_cli_name(raw: str | None, *, default: str = CODEX_CLI) -> str:
     if not s:
         return default
     out = normalize_cli_name(s, default="")
-    if out not in SUPPORTED_CLIS:
+    if out != CODEX_CLI:
         raise ValueError(f"unsupported cli: {raw}")
     return out
 
 
 def default_cli_name() -> str:
-    return normalize_cli_name(os.environ.get("CODEX_WEB_DEFAULT_CLI"), default=CODEX_CLI)
+    return CODEX_CLI
 
 
 def cli_home(cli: str) -> Path:

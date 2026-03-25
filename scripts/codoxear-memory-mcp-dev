@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+CALLER_CWD="$PWD"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT_DIR"
+
+export CODOXEAR_MEMORY_CALLER_CWD="$CALLER_CWD"
+
+exec python3 -m codoxear.memory_mcp "$@"

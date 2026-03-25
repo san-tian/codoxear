@@ -62,6 +62,15 @@ def _read_jsonl_from_offset(path: Path, offset: int, max_bytes: int = 256 * 1024
     return _read_jsonl_from_offset_impl(path, offset, max_bytes=max_bytes)
 
 
+def _write_all(fd: int, data: bytes) -> None:
+    view = memoryview(data)
+    while view:
+        n = os.write(fd, view)
+        if n <= 0:
+            raise OSError("pty write returned no progress")
+        view = view[n:]
+
+
 @dataclass
 class State:
     session_id: str | None
@@ -104,7 +113,7 @@ class Sessiond:
         if fd is None or msg is None:
             return
         try:
-            os.write(fd, msg.encode("utf-8") + _encode_enter())
+            _write_all(fd, msg.encode("utf-8") + _encode_enter())
         except Exception:
             traceback.print_exc()
 
@@ -272,10 +281,16 @@ class Sessiond:
                             fd = st.pty_master_fd
                             resp = {"queued": False, "queue_len": len(st.queue)}
                     if fd is not None:
-                        os.write(fd, text.encode("utf-8"))
-                        if enter:
-                            time.sleep(0.2)
-                            os.write(fd, enter)
+                        f.write((json.dumps(resp) + "\n").encode("utf-8"))
+                        f.flush()
+                        try:
+                            _write_all(fd, text.encode("utf-8"))
+                            if enter:
+                                time.sleep(0.2)
+                                _write_all(fd, enter)
+                        except Exception:
+                            traceback.print_exc()
+                        return
                 f.write((json.dumps(resp) + "\n").encode("utf-8"))
                 f.flush()
                 return

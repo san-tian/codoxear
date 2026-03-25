@@ -14,6 +14,8 @@ dependencies = ["Pillow>=9.0"]
 [project.scripts]
 codoxear-server = "codoxear.server:main"
 codoxear-broker = "codoxear.broker:main"
+codoxear-memory-index = "codoxear.memory_index:main"
+codoxear-memory-mcp = "codoxear.memory_mcp:main"
 
 [tool.setuptools]
 packages = ["codoxear"]
@@ -21,4 +23,3 @@ include-package-data = true
 
 [tool.setuptools.package-data]
 codoxear = ["static/*"]
-

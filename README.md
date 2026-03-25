@@ -4,40 +4,13 @@
   <img src="codoxear/static/codoxear-icon.png" alt="Codoxear icon" width="140" />
 </p>
 
-Unofficial mobile handoff for Codex, Claude Code, and Gemini CLI TUI sessions.
+Unofficial mobile handoff for Codex CLI TUI sessions.
 
 Codoxear runs a small web server on your computer and exposes a phone-friendly UI for continuing the same live Codex TUI session from mobile. Your environment stays local (filesystem, tools, credentials). The phone is a view/controller.
 
 Name: "codoxear" = "codex dogear" (dog-ear a page so you can pick up where you left off), meaning you can seamlessly continue the same work from different devices.
 
-Not affiliated with OpenAI, Anthropic, or Google. "Codex", "Claude", and "Gemini" are referenced only for CLI compatibility.
-
-## Major feature: Gemini support
-
-Gemini is a first-class CLI in Codoxear (alongside Codex and Claude), not an adapter workaround.
-
-- One UI supports all three CLIs: create, continue, and manage sessions in the same workspace view.
-- Web-owned sessions support `cli=gemini` and pass `GEMINI_HOME` / `GEMINI_BIN` to the runtime.
-- Terminal-owned Gemini sessions are discovered from `~/.gemini/tmp/**/chats/session-*.json`.
-- Session tools and resume helpers support Gemini resume commands (`gemini --resume <session_id>`).
-- Gemini chat JSON is parsed into unified user/assistant events with turn-end markers for queue/busy/idle behavior.
-
-See implementation details in `docs/features/multi-cli-support.md`.
-
-### Gemini all-approve mode for web-owned sessions
-
-If you want Codoxear-launched Gemini sessions to run in "all approve" mode, point `GEMINI_BIN` to a wrapper script:
-
-```bash
-#!/usr/bin/env bash
-exec gemini --approval-mode yolo "$@"
-```
-
-Example host setup:
-
-- wrapper: `/usr/local/bin/gemini-web`
-- env: `GEMINI_BIN=/usr/local/bin/gemini-web`
-- daemon restart: `supervisorctl restart codoxear`
+Not affiliated with OpenAI. "Codex" is referenced only for CLI compatibility.
 
 ## Platform support
 
@@ -70,7 +43,7 @@ Install Codoxear (installs `codoxear-server` and `codoxear-broker`):
     - Default bind: `::` (IPv6, usually reachable on LAN)
     - Default port: `8743`
 
-3. Wrap your local CLI(s) with the broker (zsh/bash function, not an alias):
+3. Wrap your local Codex CLI with the broker (zsh/bash function, not an alias):
 
    Add to `~/.zshrc` or `~/.bashrc`:
 
@@ -78,19 +51,9 @@ Install Codoxear (installs `codoxear-server` and `codoxear-broker`):
    codex() {
      CODEX_WEB_CLI=codex codoxear-broker -- "$@"
    }
-
-   claude() {
-     CODEX_WEB_CLI=claude codoxear-broker -- "$@"
-   }
-
-   gemini() {
-     CODEX_WEB_CLI=gemini codoxear-broker -- "$@"
-   }
    ```
 
-   If you only use one CLI, keep just that function.
-
-4. Start the CLI in your terminal as usual (via the wrapper). Codoxear will discover the session.
+4. Start Codex in your terminal as usual (via the wrapper). Codoxear will discover the session.
 
 5. On your phone, open `http://<your-computer>:8743`, enter the password, and select the session.
 
@@ -111,24 +74,66 @@ If you want to see whether a web-owned session is still running without opening 
 
 The status helper reads the broker socket sidecars and reports `running/idle`, queue length, and last log update time.
 
+## Local memory MCP for Codex
+
+If you want Codex on this machine to quickly search this project's local docs and `AGENTS.md`, Codoxear now ships a small local-memory indexer plus MCP server.
+
+- Source docs: repo `.memory/docs/` and root `AGENTS.md`
+- Index/cache dir: `.memory/` (local only; ignored by Git)
+- CLI entrypoints:
+  - `codoxear-memory-index`
+  - `codoxear-memory-mcp`
+
+Recommended first build from the repo root:
+
+```bash
+scripts/codoxear-memory-index-dev
+```
+
+Recommended shared Codex MCP registration:
+
+```bash
+codex mcp add workspace-memory -- \
+  /root/code/codoxear/scripts/codoxear-memory-mcp-dev
+```
+
+This single registration can serve multiple projects. The MCP server auto-detects the active project root from the current working directory (or explicit `root` / `cwd` tool arguments) and then uses that project's local `.memory/docs/` plus `AGENTS.md`. If you are editing a different target project from the current Codex working directory, pass `cwd` or `root` explicitly to memory tools.
+
+The MCP server exposes three tools:
+
+- `memory_search` — semantic search over local docs
+- `memory_read` — read a full note by `note_id`
+- `memory_refresh` — rebuild the `.memory/` index
+
+Embedding backend selection:
+
+- Recommended semantic mode: set `CODOXEAR_MEMORY_OPENAI_API_KEY` (preferred) or `OPENAI_API_KEY` and let the default `openai` provider build/query embeddings.
+- You can point memory embeddings at a dedicated gateway without affecting other OpenAI-compatible tools by setting:
+  - `CODOXEAR_MEMORY_OPENAI_BASE_URL`
+  - `CODOXEAR_MEMORY_OPENAI_API_KEY`
+- Fallback local mode: set `CODOXEAR_MEMORY_EMBED_PROVIDER=hash` for a deterministic no-network vector fallback (useful for testing, but less semantic than real embeddings).
+
+Local-only note:
+
+- `AGENTS.md`, `.memory/docs/`, and `.memory/index/` are local collaboration artifacts for this machine.
+- Do not commit them to Git or upload/sync them to Git remotes, cloud drives, or other shared services unless you explicitly want to publish that local memory corpus.
+
 ## User stories
 
-- Desktop Linux: start Codex, Claude, or Gemini in your GUI terminal emulator, then continue the same live session on your phone or a laptop browser.
-- Headless Linux: start Codex, Claude, or Gemini inside `tmux`, then attach from your phone or a laptop browser. This avoids using a mobile terminal emulator for TUI interaction (for example Termius).
-- Web-owned sessions: start a new Codex/Claude/Gemini session from the Codoxear UI, use it from mobile, and kill it from the UI when finished.
+- Desktop Linux: start Codex in your GUI terminal emulator, then continue the same live session on your phone or a laptop browser.
+- Headless Linux: start Codex inside `tmux`, then attach from your phone or a laptop browser. This avoids using a mobile terminal emulator for TUI interaction (for example Termius).
+- Web-owned sessions: start a new Codex session from the Codoxear UI, use it from mobile, and kill it from the UI when finished.
 
 ## Session ownership
 
-Codoxear shows two kinds of sessions (for either CLI):
+Codoxear shows two kinds of sessions:
 
 - Terminal-owned: sessions started from your local terminal (via the wrapper). Codoxear can attach, but it does not offer a kill button.
 - Web-owned: sessions started from the Codoxear UI ("New session"). These are owned by the web server and show a delete button in the session list.
 
 If you start a web-owned session and later want to continue it in your terminal, use:
 - Codex: `codex resume <session_id>`
-- Claude: `claude --resume <session_id>`
-- Gemini: `gemini --resume <session_id>`
-- Or use `scripts/codoxear-resume` to pick the right command automatically from metadata.
+- Or use `scripts/codoxear-resume`.
 
 ## Known limitations
 
@@ -161,15 +166,15 @@ Set these in `.env` (or in the process environment):
 - `CODEX_WEB_HOST` (default `::`)
 - `CODEX_WEB_PORT` (default `8743`)
 - `CODEX_WEB_URL_PREFIX` (default empty). Example: `/codoxear` serves the UI at `/codoxear/` and the API under `/codoxear/api/*`.
-- `CODEX_WEB_DEFAULT_CLI` (default `codex`) - default CLI used for new web sessions when `cli` is omitted (`codex`, `claude`, or `gemini`).
 - `CODEX_HOME` (default `~/.codex`)
 - `CODEX_BIN` (default `codex`)
-- `CLAUDE_HOME` (default `~/.claude`)
-- `CLAUDE_BIN` (default `claude`)
-- `GEMINI_HOME` (default `~/.gemini`)
-- `GEMINI_BIN` (default `gemini`). Can point to a wrapper such as `/usr/local/bin/gemini-web` to enforce `--approval-mode yolo` for web-owned Gemini sessions.
 - `CODEX_WEB_HARNESS_IDLE_SECONDS` (default `60`)
 - `CODEX_WEB_FD_POLL_SECONDS` (default `1.0`) - how often the broker scans `/proc` to detect the active `rollout-*.jsonl`
+
+The browser Configuration modal edits the native Codex files directly:
+
+- `~/.codex/config.toml`
+- `~/.codex/auth.json`
 
 Runtime state is stored under `~/.local/share/codoxear` (legacy `~/.local/share/codex-web` is no longer used).
 
@@ -177,8 +182,11 @@ Runtime state is stored under `~/.local/share/codoxear` (legacy `~/.local/share/
 
 Branch and sync policy for this fork is documented in:
 
-- `docs/flows/DEVELOPMENT.md`
+- `.memory/docs/flows/DEVELOPMENT.md`
 
 ## License
 
 MIT, see `LICENSE`.
+- `memory_refresh` only rebuilds the index when `.memory/docs/` or `AGENTS.md` changed; otherwise it returns an up-to-date result without re-embedding everything.
+- `memory_search` also performs the same stale-index check and lazily refreshes only when sources changed or the index is missing.
+- Shared memory tools accept explicit `root`, `cwd`, or `project_path` for cross-project use. `memory_search` also tries to infer a target project root automatically when the query text contains a path.

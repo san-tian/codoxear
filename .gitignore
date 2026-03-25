@@ -2,6 +2,7 @@
 env
 AGENTS.md
 docs/
+.memory/
 LOG.md
 PROMPT.md
 

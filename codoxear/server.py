@@ -67,116 +67,11 @@ def _load_env_file(path: Path) -> dict[str, str]:
     return out
 
 
-_ENV_ASSIGN_RE = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=")
-_SECRET_ENV_VARS = frozenset(
-    {
-        "OPENAI_API_KEY",
-        "ANTHROPIC_API_KEY",
-        "ANTHROPIC_AUTH_TOKEN",
-        "GEMINI_API_KEY",
-    }
-)
-_CONFIG_ENV_VARS = (
-    "OPENAI_API_KEY",
-    "OPENAI_BASE_URL",
-    "ANTHROPIC_API_KEY",
-    "ANTHROPIC_AUTH_TOKEN",
-    "ANTHROPIC_BASE_URL",
-    "GEMINI_API_KEY",
-    "GOOGLE_GEMINI_BASE_URL",
-    "GEMINI_MODEL",
-    "CODEX_WEB_CODEX_YOLO",
-    "CODEX_WEB_CLAUDE_YOLO",
-    "CODEX_WEB_GEMINI_YOLO",
-)
-
-
 def _normalize_env_value(raw: Any) -> str:
     if raw is None:
         return ""
     s = str(raw).replace("\r", "").replace("\n", "").strip()
     return s
-
-
-def _mask_secret_value(raw: str) -> str:
-    s = _normalize_env_value(raw)
-    if not s:
-        return ""
-    if len(s) <= 8:
-        return ("*" * len(s)) if len(s) > 2 else ("*" * max(len(s), 1))
-    head = s[:4]
-    tail = s[-4:]
-    return f"{head}{'*' * 6}{tail}"
-
-
-def _apply_env_updates(updates: dict[str, str]) -> None:
-    for key, value in updates.items():
-        if not isinstance(key, str) or (not key):
-            continue
-        if value:
-            os.environ[key] = value
-        else:
-            os.environ.pop(key, None)
-
-
-def _update_env_file(path: Path, updates: dict[str, str]) -> None:
-    if not updates:
-        return
-    lines: list[str] = []
-    if path.exists():
-        lines = path.read_text("utf-8").splitlines()
-
-    out_lines: list[str] = []
-    touched: set[str] = set()
-    for raw in lines:
-        m = _ENV_ASSIGN_RE.match(raw)
-        if not m:
-            out_lines.append(raw)
-            continue
-        key = m.group(1)
-        if key not in updates:
-            out_lines.append(raw)
-            continue
-        touched.add(key)
-        value = updates.get(key, "")
-        if value:
-            out_lines.append(f"{key}={value}")
-
-    for key, value in updates.items():
-        if key in touched:
-            continue
-        if value:
-            out_lines.append(f"{key}={value}")
-
-    data = "\n".join(out_lines)
-    if out_lines:
-        data += "\n"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(data, encoding="utf-8")
-    os.replace(tmp, path)
-
-
-def _effective_config_env() -> dict[str, str]:
-    out: dict[str, str] = {}
-    for key in _CONFIG_ENV_VARS:
-        val = _normalize_env_value(os.environ.get(key))
-        if val:
-            out[key] = val
-    if _DOTENV.exists():
-        try:
-            file_env = _load_env_file(_DOTENV)
-        except Exception:
-            file_env = {}
-        for key in _CONFIG_ENV_VARS:
-            if key not in file_env:
-                continue
-            val = _normalize_env_value(file_env.get(key))
-            if val:
-                out[key] = val
-            else:
-                out.pop(key, None)
-    return out
 
 
 def _normalize_url_prefix(raw: str | None) -> str:
@@ -235,7 +130,7 @@ if _CODEX_HOME_ENV is None or (not _CODEX_HOME_ENV.strip()):
 else:
     CODEX_HOME = Path(_CODEX_HOME_ENV)
 CODEX_SESSIONS_DIR = CODEX_HOME / "sessions"
-DEFAULT_SPAWN_CLI = _normalize_cli_name(os.environ.get("CODEX_WEB_DEFAULT_CLI"), default="codex")
+DEFAULT_SPAWN_CLI = "codex"
 
 DEFAULT_HOST = os.environ.get("CODEX_WEB_HOST", "::")
 DEFAULT_PORT = int(os.environ.get("CODEX_WEB_PORT", "8743"))
@@ -252,11 +147,15 @@ CHAT_INDEX_MAX_EVENTS = int(os.environ.get("CODEX_WEB_CHAT_INDEX_MAX_EVENTS", "1
 METRICS_WINDOW = int(os.environ.get("CODEX_WEB_METRICS_WINDOW", "256"))
 FILE_READ_MAX_BYTES = int(os.environ.get("CODEX_WEB_FILE_READ_MAX_BYTES", str(2 * 1024 * 1024)))
 FILE_WRITE_MAX_BYTES = int(os.environ.get("CODEX_WEB_FILE_WRITE_MAX_BYTES", str(FILE_READ_MAX_BYTES)))
+MESSAGE_BODY_MAX_BYTES = int(os.environ.get("CODEX_WEB_MESSAGE_BODY_MAX_BYTES", str(8 * 1024 * 1024)))
 FILE_HISTORY_MAX = int(os.environ.get("CODEX_WEB_FILE_HISTORY_MAX", "20"))
 UPDATE_CHECK_TTL_SECONDS = float(os.environ.get("CODEX_WEB_UPDATE_CHECK_TTL_SECONDS", "600"))
 UPDATE_CHECK_TIMEOUT_SECONDS = float(os.environ.get("CODEX_WEB_UPDATE_CHECK_TIMEOUT_SECONDS", "2.0"))
+GIT_BRANCH_CACHE_TTL_SECONDS = float(os.environ.get("CODEX_WEB_GIT_BRANCH_CACHE_TTL_SECONDS", "5.0"))
 UPDATE_CHECK_REMOTE = str(os.environ.get("CODEX_WEB_UPDATE_REMOTE", "")).strip()
 UPDATE_CHECK_BRANCH = str(os.environ.get("CODEX_WEB_UPDATE_BRANCH", "")).strip()
+SEND_STARTUP_RETRY_WINDOW_SECONDS = float(os.environ.get("CODEX_WEB_SEND_STARTUP_RETRY_WINDOW_SECONDS", "8.0"))
+SEND_STARTUP_RETRY_INTERVAL_SECONDS = float(os.environ.get("CODEX_WEB_SEND_STARTUP_RETRY_INTERVAL_SECONDS", "0.25"))
 HARNESS_PROMPT_PREFIX = """Unattended-mode instructions (optimize for 8+ hours, minimal turns, minimal repetition, maximal progress)
 
 - Maintain three live lists: Deliverables, Next actions, Parked questions.
@@ -312,12 +211,7 @@ def _normalize_queue_list(raw: list[Any]) -> list[str]:
 
 
 def _normalize_outgoing_text_for_cli(text: str, cli: str) -> str:
-    raw = text if isinstance(text, str) else ""
-    if _normalize_cli_name(cli, default="codex") != "claude":
-        return raw
-    # Claude CLI treats a leading "!" as local shell command. Escape markdown
-    # image prefix so `![...]` stays literal text in chat prompts.
-    return re.sub(r"^(\s*)!\[", r"\1\\![", raw, count=1)
+    return text if isinstance(text, str) else ""
 
 _SESSION_ID_RE = re.compile(r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})", re.I)
 _CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
@@ -327,6 +221,8 @@ _METRICS_LOCK = threading.Lock()
 _METRICS: dict[str, list[float]] = {}
 _UPDATE_CHECK_LOCK = threading.Lock()
 _UPDATE_CHECK_CACHE: dict[str, Any] | None = None
+_GIT_BRANCH_CACHE_LOCK = threading.Lock()
+_GIT_BRANCH_CACHE: dict[str, tuple[float, str]] = {}
 
 def _strip_ansi_sequences(text: str) -> str:
     out: list[str] = []
@@ -392,71 +288,6 @@ def _has_cjk(text: str) -> bool:
         if (0x4E00 <= code <= 0x9FFF) or (0x3400 <= code <= 0x4DBF):
             return True
     return False
-
-
-def _sanitize_claude_tail_text(text: str) -> str:
-    lines = text.split("\n")
-    out: list[str] = []
-    blank = False
-    box_chars = "│─╭╮╰╯▐▛▜▝▘"
-    for raw in lines:
-        line = raw.rstrip()
-        stripped = line.strip()
-        if not stripped:
-            if not blank:
-                out.append("")
-            blank = True
-            continue
-        blank = False
-        flat = "".join(stripped.split()).lower()
-        if flat in ("esctointerrupt", "?forshortcuts"):
-            continue
-        if ("flowing…" in flat) or ("flowing..." in flat) or ("brewedfor" in flat):
-            continue
-        if len(stripped) >= 8:
-            box_count = sum(1 for ch in stripped if ch in box_chars)
-            if (box_count / float(len(stripped))) > 0.35:
-                continue
-        if stripped and all(not ch.isalnum() for ch in stripped):
-            if stripped not in ("❯", "↯", "───"):
-                continue
-        if _has_cjk(stripped):
-            out.append(line)
-            continue
-        if (" " not in stripped) and len(stripped) <= 6:
-            up = stripped.upper()
-            if up not in ("OK", "DONE", "YES", "NO") and not stripped.startswith(("❯", "●", "⎿", "↯")):
-                continue
-        if (
-            len(stripped) <= 8
-            and bool(_TAIL_SHORT_SHARD_RE.fullmatch(stripped))
-            and any(ch.isdigit() for ch in stripped)
-        ):
-            continue
-        if (
-            re.search(r"[A-Za-z]{3,}", stripped)
-            or ("/" in stripped)
-            or ("\\" in stripped)
-            or stripped.startswith(("●", "⎿", "❯", "↯", "───"))
-        ):
-            out.append(line)
-            continue
-        if len(stripped) >= 10:
-            out.append(line)
-            continue
-    compact: list[str] = []
-    prev_blank = False
-    for line in out:
-        is_blank = not line.strip()
-        if is_blank and prev_blank:
-            continue
-        compact.append(line)
-        prev_blank = is_blank
-    while compact and (not compact[0].strip()):
-        compact.pop(0)
-    while compact and (not compact[-1].strip()):
-        compact.pop()
-    return "\n".join(compact)
 
 
 def _record_metric(name: str, value_ms: float) -> None:
@@ -535,6 +366,52 @@ def _git_run(args: list[str], *, required: bool = True, timeout_s: float | None 
             raise RuntimeError(f"git {' '.join(args)} failed (rc={res.returncode})")
         return ""
     return (res.stdout or "").strip()
+
+
+def _normalize_git_cwd(cwd_raw: str) -> str:
+    cwd = str(cwd_raw or "").strip()
+    if not cwd or cwd == "?":
+        return ""
+    try:
+        return str(Path(cwd).expanduser().resolve())
+    except Exception:
+        return cwd
+
+
+def _git_branch_for_cwd(cwd_raw: str) -> str:
+    cwd = _normalize_git_cwd(cwd_raw)
+    if not cwd:
+        return ""
+    now_ts = time.time()
+    ttl = max(0.0, float(GIT_BRANCH_CACHE_TTL_SECONDS))
+    with _GIT_BRANCH_CACHE_LOCK:
+        cached = _GIT_BRANCH_CACHE.get(cwd)
+    if cached is not None:
+        checked_at, branch = cached
+        if now_ts - checked_at <= ttl:
+            return branch
+    branch = ""
+    timeout = max(0.2, min(float(UPDATE_CHECK_TIMEOUT_SECONDS), 1.5))
+    try:
+        res = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+        if res.returncode == 0:
+            raw = (res.stdout or "").strip()
+            if raw == "HEAD":
+                branch = "detached"
+            elif raw:
+                branch = raw
+    except Exception:
+        branch = ""
+    with _GIT_BRANCH_CACHE_LOCK:
+        _GIT_BRANCH_CACHE[cwd] = (now_ts, branch)
+    return branch
 
 
 def _parse_upstream_ref(raw: str) -> tuple[str, str] | None:
@@ -722,120 +599,6 @@ def _env_flag(name: str, default: bool) -> bool:
     return raw.strip().lower() not in ("0", "false", "no", "off")
 
 
-def _normalize_bool_setting(raw: Any, *, default: bool = False) -> bool:
-    if raw is None:
-        return bool(default)
-    if isinstance(raw, bool):
-        return raw
-    if isinstance(raw, (int, float)):
-        return bool(raw)
-    s = str(raw).strip().lower()
-    if s in ("1", "true", "yes", "on"):
-        return True
-    if s in ("0", "false", "no", "off", ""):
-        return False
-    return bool(default)
-
-
-def _env_flag_from_map(env: dict[str, str], name: str, default: bool = False) -> bool:
-    raw = env.get(name)
-    return _normalize_bool_setting(raw, default=default)
-
-
-def _codex_args_override_yolo(args: list[str]) -> bool:
-    for a in args:
-        if not isinstance(a, str):
-            continue
-        if a in (
-            "--dangerously-bypass-approvals-and-sandbox",
-            "--full-auto",
-            "-a",
-            "--ask-for-approval",
-            "-s",
-            "--sandbox",
-        ):
-            return True
-        if a.startswith("--ask-for-approval=") or a.startswith("--sandbox="):
-            return True
-    return False
-
-
-def _claude_args_override_yolo(args: list[str]) -> bool:
-    for a in args:
-        if not isinstance(a, str):
-            continue
-        if a in ("--dangerously-skip-permissions", "--permission-mode"):
-            return True
-        if a.startswith("--permission-mode="):
-            return True
-    return False
-
-
-def _gemini_args_override_yolo(args: list[str]) -> bool:
-    for a in args:
-        if not isinstance(a, str):
-            continue
-        if a in ("-y", "--yolo", "--approval-mode"):
-            return True
-        if a.startswith("--approval-mode="):
-            return True
-    return False
-
-
-def _gemini_bin_is_custom_wrapper(env: dict[str, str]) -> bool:
-    raw = _normalize_env_value(env.get("GEMINI_BIN"))
-    if not raw:
-        return False
-    token = raw.split()[0]
-    name = Path(token).name.lower()
-    return name not in ("gemini", "gemini.exe")
-
-
-def _running_as_root() -> bool:
-    geteuid = getattr(os, "geteuid", None)
-    if not callable(geteuid):
-        return False
-    try:
-        return int(geteuid()) == 0
-    except Exception:
-        return False
-
-
-def _apply_provider_yolo_args(*, cli_name: str, cli_args: list[str], env: dict[str, str]) -> list[str]:
-    out = list(cli_args)
-    if cli_name == "claude":
-        if (
-            _env_flag_from_map(env, "CODEX_WEB_CLAUDE_YOLO", False)
-            and (not _claude_args_override_yolo(out))
-            and (not _running_as_root())
-        ):
-            out.append("--dangerously-skip-permissions")
-        return out
-    if cli_name == "gemini":
-        if _env_flag_from_map(env, "CODEX_WEB_GEMINI_YOLO", False) and (not _gemini_args_override_yolo(out)):
-            # Host wrappers (for example `gemini-web`) may already enforce
-            # yolo/approval mode internally; avoid duplicate flags that can
-            # make Gemini exit at startup.
-            if not _gemini_bin_is_custom_wrapper(env):
-                out.append("--yolo")
-        return out
-    if _env_flag_from_map(env, "CODEX_WEB_CODEX_YOLO", False) and (not _codex_args_override_yolo(out)):
-        out.append("--dangerously-bypass-approvals-and-sandbox")
-    return out
-
-
-def _claude_args_override_session(args: list[str]) -> bool:
-    if not args:
-        return False
-    for a in args:
-        if not isinstance(a, str):
-            continue
-        if a in ("-c", "--continue", "-r", "--resume", "--session-id", "--from-pr"):
-            return True
-        if a.startswith("--resume=") or a.startswith("--session-id=") or a.startswith("--from-pr="):
-            return True
-    return False
-
 def _tmux_pane_pid(tmux_bin: str, session_name: str, env: dict[str, str]) -> int | None:
     try:
         res = subprocess.run(
@@ -857,31 +620,6 @@ def _tmux_pane_pid(tmux_bin: str, session_name: str, env: dict[str, str]) -> int
         if pid > 0:
             return pid
     return None
-
-
-def _tmux_global_env_has_nonempty(tmux_bin: str, key: str, env: dict[str, str]) -> bool:
-    if not key:
-        return False
-    try:
-        res = subprocess.run(
-            [tmux_bin, "show-environment", "-g", key],
-            capture_output=True,
-            text=True,
-            env=env,
-            timeout=1.5,
-            check=False,
-        )
-    except Exception:
-        return False
-    if res.returncode != 0:
-        return False
-    line = (res.stdout or "").strip()
-    if not line or line.startswith("-"):
-        return False
-    prefix = key + "="
-    if line.startswith(prefix):
-        return bool(line[len(prefix) :].strip())
-    return line == key
 
 
 def _pid_alive(pid: int) -> bool:
@@ -981,6 +719,14 @@ def _json_response(handler: http.server.BaseHTTPRequestHandler, status: int, obj
     handler.wfile.write(body)
 
 
+class PayloadTooLargeError(ValueError):
+    def __init__(self, *, actual: int, limit: int, label: str = "request body too large") -> None:
+        self.actual = int(actual)
+        self.limit = int(limit)
+        self.label = str(label)
+        super().__init__(f"{self.label} (max {self.limit} bytes)")
+
+
 def _read_body(handler: http.server.BaseHTTPRequestHandler, limit: int = 2 * 1024 * 1024) -> bytes:
     cl = handler.headers.get("Content-Length")
     if cl is None:
@@ -988,10 +734,19 @@ def _read_body(handler: http.server.BaseHTTPRequestHandler, limit: int = 2 * 102
     cl2 = str(cl).strip()
     if not cl2:
         cl2 = "0"
-    n = int(cl2)
-    if n < 0 or n > limit:
+    try:
+        n = int(cl2)
+    except ValueError as e:
+        raise ValueError(f"invalid content-length: {cl2}") from e
+    if n < 0:
         raise ValueError(f"invalid content-length: {n}")
+    if n > limit:
+        raise PayloadTooLargeError(actual=n, limit=limit)
     return handler.rfile.read(n)
+
+
+def _api_limits_payload() -> dict[str, int]:
+    return {"message_body_max_bytes": int(MESSAGE_BODY_MAX_BYTES)}
 
 
 def _sha256_hex(data: bytes) -> str:
@@ -1352,7 +1107,13 @@ def _last_assistant_ts_from_tail(
     return _rollout_log._last_assistant_ts_from_tail(path, max_scan_bytes=max_scan_bytes)
 
 
-def _busy_from_state_and_log_idle(*, state_busy: bool, idle_from_log: bool, log_path: Path | None) -> bool:
+def _busy_from_state_and_log_idle(
+    *,
+    state_busy: bool,
+    idle_from_log: bool,
+    log_path: Path | None,
+    cli_name: str | None = None,
+) -> bool:
     # Broker runtime state is primary. Log-based busy is only used as a short
     # fallback window to avoid stale "busy" when no new events arrive.
     if state_busy:
@@ -1360,6 +1121,8 @@ def _busy_from_state_and_log_idle(*, state_busy: bool, idle_from_log: bool, log_
     if idle_from_log:
         return False
     if log_path is None:
+        return False
+    if _normalize_cli_name(cli_name, default="codex") == "codex":
         return False
     try:
         age = max(0.0, time.time() - float(log_path.stat().st_mtime))
@@ -1369,91 +1132,37 @@ def _busy_from_state_and_log_idle(*, state_busy: bool, idle_from_log: bool, log_
 
 
 def _read_cli_config() -> dict[str, Any]:
-    """Read configuration for all three CLIs from files and environment."""
+    """Read raw native Codex configuration files for direct editing."""
+    codex_dir = Path.home() / ".codex"
+    config_path = codex_dir / "config.toml"
+    auth_path = codex_dir / "auth.json"
     config: dict[str, Any] = {
-        "codex": {},
-        "claude": {},
-        "gemini": {},
-        "env": {},
-        "env_masked": {},
+        "codex": {
+            "config_toml_path": str(config_path),
+            "auth_json_path": str(auth_path),
+            "config_toml_text": "",
+            "auth_json_text": "",
+        },
     }
 
-    # Read Codex config
     try:
-        codex_config_path = Path.home() / ".codex" / "config.toml"
-        if codex_config_path.exists():
-            try:
-                import tomllib
-            except ImportError:
-                try:
-                    import tomli as tomllib  # type: ignore
-                except ImportError:
-                    config["codex"]["error"] = "toml library not available"
-                    tomllib = None
-
-            if tomllib:
-                with open(codex_config_path, "rb") as f:
-                    codex_data = tomllib.load(f)
-                    config["codex"]["config_toml"] = codex_data
-                    # Extract commonly used fields
-                    if "model_providers" in codex_data:
-                        for provider_name, provider_data in codex_data["model_providers"].items():
-                            if isinstance(provider_data, dict) and "base_url" in provider_data:
-                                config["codex"]["base_url"] = provider_data["base_url"]
-                                break
-                    if "model" in codex_data:
-                        config["codex"]["model"] = codex_data["model"]
+        if config_path.exists():
+            config["codex"]["config_toml_text"] = config_path.read_text(encoding="utf-8")
     except Exception as e:
-        config["codex"]["error"] = str(e)
+        config["codex"]["config_toml_error"] = str(e)
 
     try:
-        codex_auth_path = Path.home() / ".codex" / "auth.json"
-        if codex_auth_path.exists():
-            with open(codex_auth_path, "r") as f:
-                auth_data = json.load(f)
-                config["codex"]["auth_json"] = auth_data
-                if "OPENAI_API_KEY" in auth_data:
-                    config["codex"]["api_key"] = auth_data["OPENAI_API_KEY"]
+        if auth_path.exists():
+            config["codex"]["auth_json_text"] = auth_path.read_text(encoding="utf-8")
     except Exception as e:
-        config["codex"]["auth_error"] = str(e)
-
-    # Read Claude config
-    try:
-        claude_settings_path = Path.home() / ".claude" / "settings.json"
-        if claude_settings_path.exists():
-            with open(claude_settings_path, "r") as f:
-                claude_data = json.load(f)
-                config["claude"]["settings_json"] = claude_data
-                if "model" in claude_data:
-                    config["claude"]["model"] = claude_data["model"]
-    except Exception as e:
-        config["claude"]["error"] = str(e)
-
-    # Read Gemini config
-    try:
-        gemini_settings_path = Path.home() / ".gemini" / "settings.json"
-        if gemini_settings_path.exists():
-            with open(gemini_settings_path, "r") as f:
-                gemini_data = json.load(f)
-                config["gemini"]["settings_json"] = gemini_data
-    except Exception as e:
-        config["gemini"]["error"] = str(e)
-
-    # Read environment variables (provider config prefers latest .env values).
-    effective_env = _effective_config_env()
-    for var in _CONFIG_ENV_VARS:
-        val = effective_env.get(var)
-        if val:
-            config["env"][var] = val
-            if var in _SECRET_ENV_VARS:
-                config["env_masked"][var] = _mask_secret_value(val)
+        config["codex"]["auth_json_error"] = str(e)
 
     return config
 
 
 def _save_cli_config(updates: dict[str, Any]) -> dict[str, Any]:
-    """Save configuration updates for CLIs."""
-    result = {"ok": True, "updated": [], "note": "Configuration saved. Restart CLI sessions for changes to take effect."}
+    """Save raw native Codex configuration files."""
+    result = {"ok": True, "updated": [], "note": "Configuration saved. Restart Codex sessions for changes to take effect."}
     updated_items = result["updated"]
 
     def _mark_updated(name: str) -> None:
@@ -1466,150 +1175,30 @@ def _save_cli_config(updates: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(codex_updates, dict):
             result["codex_error"] = "invalid codex updates"
             codex_updates = {}
+        codex_dir = Path.home() / ".codex"
+        codex_dir.mkdir(parents=True, exist_ok=True)
 
-        # Update config.toml using simple text replacement
-        if "base_url" in codex_updates or "model" in codex_updates:
-            try:
-                codex_config_path = Path.home() / ".codex" / "config.toml"
-                if codex_config_path.exists():
-                    content = codex_config_path.read_text()
-
-                    # Update base_url
-                    if "base_url" in codex_updates and codex_updates["base_url"]:
-                        import re
-                        content = re.sub(
-                            r'(base_url\s*=\s*")[^"]*(")',
-                            r'\1' + codex_updates["base_url"] + r'\2',
-                            content
-                        )
-
-                    # Update model
-                    if "model" in codex_updates and codex_updates["model"]:
-                        import re
-                        content = re.sub(
-                            r'^(model\s*=\s*")[^"]*(")',
-                            r'\1' + codex_updates["model"] + r'\2',
-                            content,
-                            flags=re.MULTILINE
-                        )
-
-                    codex_config_path.write_text(content)
-                    _mark_updated("codex_config")
-            except Exception as e:
-                result["codex_config_error"] = str(e)
-
-        # Update auth.json
-        if "api_key" in codex_updates and codex_updates["api_key"]:
-            try:
-                codex_auth_path = Path.home() / ".codex" / "auth.json"
-                auth_data = {}
-                if codex_auth_path.exists():
-                    with open(codex_auth_path, "r") as f:
-                        auth_data = json.load(f)
-
-                auth_data["OPENAI_API_KEY"] = codex_updates["api_key"]
-                if "auth_mode" not in auth_data:
-                    auth_data["auth_mode"] = "apikey"
-
-                with open(codex_auth_path, "w") as f:
-                    json.dump(auth_data, f, indent=2)
-
-                _mark_updated("codex_auth")
-            except Exception as e:
-                result["codex_auth_error"] = str(e)
-
-        codex_env_updates: dict[str, str] = {}
-        if "yolo" in codex_updates:
-            codex_env_updates["CODEX_WEB_CODEX_YOLO"] = "1" if _normalize_bool_setting(codex_updates.get("yolo")) else "0"
-        if codex_env_updates:
-            try:
-                _update_env_file(_DOTENV, codex_env_updates)
-                _apply_env_updates(codex_env_updates)
-                _mark_updated("codex_env")
-            except Exception as e:
-                result["codex_env_error"] = str(e)
-
-    # Update Claude config
-    if "claude" in updates:
-        claude_updates = updates["claude"]
-        if not isinstance(claude_updates, dict):
-            result["claude_error"] = "invalid claude updates"
-            claude_updates = {}
-
-        # Update settings.json
-        if "model" in claude_updates:
-            try:
-                claude_settings_path = Path.home() / ".claude" / "settings.json"
-                claude_data = {}
-                if claude_settings_path.exists():
-                    with open(claude_settings_path, "r") as f:
-                        claude_data = json.load(f)
-                model = _normalize_env_value(claude_updates.get("model"))
-                if model:
-                    claude_data["model"] = model
-                else:
-                    claude_data.pop("model", None)
-                claude_settings_path.parent.mkdir(parents=True, exist_ok=True)
-
-                with open(claude_settings_path, "w") as f:
-                    json.dump(claude_data, f, indent=2)
-
-                _mark_updated("claude_settings")
-            except Exception as e:
-                result["claude_error"] = str(e)
-
-        claude_env_updates: dict[str, str] = {}
-        if "api_key" in claude_updates:
-            secret = _normalize_env_value(claude_updates.get("api_key"))
-            if secret:
-                cur_api = _normalize_env_value(os.environ.get("ANTHROPIC_API_KEY"))
-                cur_auth = _normalize_env_value(os.environ.get("ANTHROPIC_AUTH_TOKEN"))
-                use_auth_token = bool(cur_auth and (not cur_api))
-                if secret.startswith("sk-ant"):
-                    use_auth_token = False
-                if use_auth_token:
-                    claude_env_updates["ANTHROPIC_AUTH_TOKEN"] = secret
-                    claude_env_updates["ANTHROPIC_API_KEY"] = ""
-                else:
-                    claude_env_updates["ANTHROPIC_API_KEY"] = secret
-                    claude_env_updates["ANTHROPIC_AUTH_TOKEN"] = ""
+        if "config_toml_text" in codex_updates:
+            raw = codex_updates.get("config_toml_text")
+            if not isinstance(raw, str):
+                result["codex_config_error"] = "config_toml_text must be a string"
             else:
-                claude_env_updates["ANTHROPIC_API_KEY"] = ""
-                claude_env_updates["ANTHROPIC_AUTH_TOKEN"] = ""
-        if "base_url" in claude_updates:
-            claude_env_updates["ANTHROPIC_BASE_URL"] = _normalize_env_value(claude_updates.get("base_url"))
-        if "yolo" in claude_updates:
-            claude_env_updates["CODEX_WEB_CLAUDE_YOLO"] = "1" if _normalize_bool_setting(claude_updates.get("yolo")) else "0"
-        if claude_env_updates:
-            try:
-                _update_env_file(_DOTENV, claude_env_updates)
-                _apply_env_updates(claude_env_updates)
-                _mark_updated("claude_env")
-            except Exception as e:
-                result["claude_env_error"] = str(e)
+                try:
+                    (codex_dir / "config.toml").write_text(raw, encoding="utf-8")
+                    _mark_updated("codex_config")
+                except Exception as e:
+                    result["codex_config_error"] = str(e)
 
-    # Update Gemini config
-    if "gemini" in updates:
-        gemini_updates = updates["gemini"]
-        if not isinstance(gemini_updates, dict):
-            result["gemini_error"] = "invalid gemini updates"
-            gemini_updates = {}
-        gemini_env_updates: dict[str, str] = {}
-        if "api_key" in gemini_updates:
-            gemini_env_updates["GEMINI_API_KEY"] = _normalize_env_value(gemini_updates.get("api_key"))
-        if "base_url" in gemini_updates:
-            gemini_env_updates["GOOGLE_GEMINI_BASE_URL"] = _normalize_env_value(gemini_updates.get("base_url"))
-        if "model" in gemini_updates:
-            gemini_env_updates["GEMINI_MODEL"] = _normalize_env_value(gemini_updates.get("model"))
-        if "yolo" in gemini_updates:
-            gemini_env_updates["CODEX_WEB_GEMINI_YOLO"] = "1" if _normalize_bool_setting(gemini_updates.get("yolo")) else "0"
-        if gemini_env_updates:
-            try:
-                _update_env_file(_DOTENV, gemini_env_updates)
-                _apply_env_updates(gemini_env_updates)
-                _mark_updated("gemini_env")
-            except Exception as e:
-                result["gemini_env_error"] = str(e)
+        if "auth_json_text" in codex_updates:
+            raw = codex_updates.get("auth_json_text")
+            if not isinstance(raw, str):
+                result["codex_auth_error"] = "auth_json_text must be a string"
+            else:
+                try:
+                    (codex_dir / "auth.json").write_text(raw, encoding="utf-8")
+                    _mark_updated("codex_auth")
+                except Exception as e:
+                    result["codex_auth_error"] = str(e)
 
     return result
 
@@ -2201,6 +1790,8 @@ class SessionManager:
                 inferred = _infer_cli_from_log_path(log_path)
                 if isinstance(inferred, str):
                     cli = _normalize_cli_name(inferred, default=cli)
+            if cli != "codex":
+                continue
             if log_path is not None and log_path.exists():
                 if cli == "codex":
                     thread_id, log_path = _coerce_main_thread_log(thread_id=thread_id, log_path=log_path)
@@ -2407,6 +1998,7 @@ class SessionManager:
         self._prune_dead_sessions()
         self._update_meta_counters()
         files_dirty = False
+        branch_by_cwd: dict[str, str] = {}
         with self._lock:
             items: list[dict[str, Any]] = []
             for s in self._sessions.values():
@@ -2439,6 +2031,9 @@ class SessionManager:
                 if s.last_chat_ts is None and log_exists and s.log_path is not None:
                     s.last_chat_ts = float(s.log_path.stat().st_mtime)
                 updated_ts = float(s.last_chat_ts) if isinstance(s.last_chat_ts, (int, float)) else float(s.start_ts)
+                cwd_norm = _normalize_git_cwd(s.cwd)
+                if cwd_norm not in branch_by_cwd:
+                    branch_by_cwd[cwd_norm] = _git_branch_for_cwd(s.cwd) if cwd_norm else ""
                 items.append(
                     {
                         "session_id": s.session_id,
@@ -2462,6 +2057,7 @@ class SessionManager:
                         "harness_enabled": h_enabled,
                         "alias": alias,
                         "files": list(files),
+                        "git_branch": branch_by_cwd.get(cwd_norm, ""),
                         "tmux_name": s.tmux_name if isinstance(getattr(s, "tmux_name", None), str) else None,
                     }
                 )
@@ -2481,6 +2077,7 @@ class SessionManager:
                     state_busy=state_busy,
                     idle_from_log=idle_val,
                     log_path=lp,
+                    cli_name=str(it.get("cli") or ""),
                 )
             it2 = dict(it)
             it2.pop("log_exists", None)
@@ -2528,6 +2125,8 @@ class SessionManager:
             inferred = _infer_cli_from_log_path(log_path)
             if isinstance(inferred, str):
                 cli = _normalize_cli_name(inferred, default=cli)
+        if cli != "codex":
+            raise RuntimeError(f"unsupported session cli in metadata for socket {sock}")
         if log_path is not None and log_path.exists():
             if cli == "codex":
                 thread_id, log_path = _coerce_main_thread_log(thread_id=thread_id, log_path=log_path)
@@ -2828,6 +2427,8 @@ class SessionManager:
         cli: str | None = None,
     ) -> dict[str, Any]:
         cli_name = _parse_cli_name(cli, default=DEFAULT_SPAWN_CLI)
+        if cli_name != "codex":
+            raise ValueError("unsupported cli: only codex is available")
         env = dict(os.environ)
         dotenv_values: dict[str, str] = {}
         if _DOTENV.exists():
@@ -2837,63 +2438,17 @@ class SessionManager:
                 dotenv_values = {}
             for k, v in dotenv_values.items():
                 env.setdefault(k, v)
-            # Keep spawn behavior aligned with Configuration modal reads: for
-            # provider-related settings, `.env` values override inherited
-            # process env, and explicit empty values clear inherited entries.
-            for key in _CONFIG_ENV_VARS:
-                if key not in dotenv_values:
-                    continue
-                val = _normalize_env_value(dotenv_values.get(key))
-                if val:
-                    env[key] = val
-                else:
-                    env.pop(key, None)
         cli_args = list(args) if isinstance(args, list) else []
-        cli_args = _apply_provider_yolo_args(cli_name=cli_name, cli_args=cli_args, env=env)
-        if cli_name == "claude" and (not _claude_args_override_session(cli_args)):
-            # Keep "new web session" semantics stable even when another Claude
-            # session already exists in the same workspace.
-            cli_args.extend(["--session-id", str(uuid.uuid4())])
         argv = [sys.executable, "-m", "codoxear.broker", "--cwd", cwd, "--"]
         if cli_args:
             argv.extend(cli_args)
         env["CODEX_WEB_OWNER"] = "web"
         env["CODEX_WEB_CLI"] = cli_name
-        env.pop("CODEX_WEB_UNSET_ANTHROPIC_AUTH_TOKEN", None)
         use_tmux = _env_flag("CODEX_WEB_TMUX", True)
         tmux_bin = shutil.which("tmux") if use_tmux else None
         child_env_unset: list[str] = []
-        if cli_name == "claude":
-            env.setdefault("CLAUDE_HOME", str(_cli_home("claude")))
-            env.setdefault("CLAUDE_BIN", _cli_bin("claude"))
-            prefer_api_key_raw = env.get("CODEX_WEB_CLAUDE_PREFER_API_KEY")
-            prefer_api_key = (
-                True
-                if prefer_api_key_raw is None
-                else str(prefer_api_key_raw).strip().lower() not in ("0", "false", "no", "off")
-            )
-            api_key = env.get("ANTHROPIC_API_KEY")
-            auth_token = env.get("ANTHROPIC_AUTH_TOKEN")
-            has_api_key = isinstance(api_key, str) and bool(api_key.strip())
-            has_auth_token = isinstance(auth_token, str) and bool(auth_token.strip())
-            if use_tmux and tmux_bin:
-                if not has_api_key:
-                    has_api_key = _tmux_global_env_has_nonempty(tmux_bin, "ANTHROPIC_API_KEY", env)
-                if not has_auth_token:
-                    has_auth_token = _tmux_global_env_has_nonempty(tmux_bin, "ANTHROPIC_AUTH_TOKEN", env)
-            # Claude CLI can stall at auth prompts when both auth modes are set.
-            # Default behavior prefers API key for headless web-owned sessions.
-            if prefer_api_key and has_api_key and has_auth_token:
-                env.pop("ANTHROPIC_AUTH_TOKEN", None)
-                if "ANTHROPIC_AUTH_TOKEN" not in child_env_unset:
-                    child_env_unset.append("ANTHROPIC_AUTH_TOKEN")
-                env["CODEX_WEB_UNSET_ANTHROPIC_AUTH_TOKEN"] = "1"
-        elif cli_name == "gemini":
-            env.setdefault("GEMINI_HOME", str(_cli_home("gemini")))
-            env.setdefault("GEMINI_BIN", _cli_bin("gemini"))
-        else:
-            env.setdefault("CODEX_HOME", str(_cli_home("codex")))
-            env.setdefault("CODEX_BIN", _cli_bin("codex"))
+        env.setdefault("CODEX_HOME", str(_cli_home("codex")))
+        env.setdefault("CODEX_BIN", _cli_bin("codex"))
 
         if use_tmux and tmux_bin:
             tmux_name = f"codoxear-web-{uuid.uuid4().hex[:8]}"
@@ -2969,16 +2524,38 @@ class SessionManager:
             sock = s.sock_path
             cli = _normalize_cli_name(s.cli, default="codex")
         text_out = _normalize_outgoing_text_for_cli(text, cli)
-        try:
-            resp = self._sock_call(sock, {"cmd": "send", "text": text_out}, timeout_s=3.0)
-        except Exception:
-            if not _pid_alive(s.broker_pid) and not _pid_alive(s.codex_pid):
-                with self._lock:
-                    self._sessions.pop(session_id, None)
-                _unlink_quiet(sock)
-                _unlink_quiet(sock.with_suffix(".json"))
-                raise KeyError("unknown session")
-            raise
+        deadline = 0.0
+        if (
+            s.owned
+            and cli == "codex"
+            and isinstance(s.start_ts, (int, float))
+        ):
+            age = max(0.0, time.time() - float(s.start_ts))
+            remaining = max(float(SEND_STARTUP_RETRY_WINDOW_SECONDS) - age, 0.0)
+            if remaining > 0.0:
+                deadline = time.time() + remaining
+        last_exc: Exception | None = None
+        while True:
+            try:
+                resp = self._sock_call(sock, {"cmd": "send", "text": text_out}, timeout_s=3.0)
+                break
+            except Exception as e:
+                last_exc = e
+                if not _pid_alive(s.broker_pid) and not _pid_alive(s.codex_pid):
+                    with self._lock:
+                        self._sessions.pop(session_id, None)
+                    _unlink_quiet(sock)
+                    _unlink_quiet(sock.with_suffix(".json"))
+                    raise KeyError("unknown session")
+                if deadline <= 0.0 or time.time() >= deadline:
+                    raise
+                time.sleep(max(float(SEND_STARTUP_RETRY_INTERVAL_SECONDS), 0.05))
+        if last_exc is not None:
+            sys.stderr.write(
+                f"warning: send recovered after startup retry for session {session_id}: "
+                f"{type(last_exc).__name__}: {last_exc}\n"
+            )
+            sys.stderr.flush()
         with self._lock:
             s2 = self._sessions.get(session_id)
             if s2:
@@ -3073,7 +2650,6 @@ class SessionManager:
             if not s:
                 raise KeyError("unknown session")
             sock = s.sock_path
-            cli = _normalize_cli_name(getattr(s, "cli", ""), default="codex")
         try:
             resp = self._sock_call(sock, {"cmd": "tail"}, timeout_s=1.5)
         except Exception:
@@ -3089,10 +2665,7 @@ class SessionManager:
         tail = resp.get("tail")
         if not isinstance(tail, str):
             raise ValueError("invalid broker tail response")
-        cleaned = _sanitize_tail_text(tail)
-        if cli == "claude":
-            return _sanitize_claude_tail_text(cleaned)
-        return cleaned
+        return _sanitize_tail_text(tail)
 
     def inject_keys(self, session_id: str, seq: str) -> dict[str, Any]:
         with self._lock:
@@ -3204,7 +2777,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if not _require_auth(self):
                     self._unauthorized()
                     return
-                _json_response(self, 200, {"ok": True})
+                _json_response(self, 200, {"ok": True, "limits": _api_limits_payload()})
                 return
 
             if path == "/api/sessions":
@@ -3215,7 +2788,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 sessions = MANAGER.list_sessions()
                 dt_ms = (time.perf_counter() - t0) * 1000.0
                 _record_metric("api_sessions_ms", dt_ms)
-                _json_response(self, 200, {"sessions": sessions})
+                _json_response(self, 200, {"sessions": sessions, "limits": _api_limits_payload()})
                 return
 
             if path == "/api/metrics":
@@ -3405,6 +2978,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     state_busy=bool(state_busy),
                     idle_from_log=bool(idle_val),
                     log_path=s.log_path,
+                    cli_name=str(getattr(s, "cli", "") or ""),
                 )
                 queue_val = state_queue
 
@@ -3496,6 +3070,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return
 
             self.send_error(404)
+        except PayloadTooLargeError as e:
+            _json_response(self, 413, {"error": str(e), "limit_bytes": e.limit, "actual_bytes": e.actual})
         except Exception as e:
             traceback.print_exc()
             _json_response(self, 500, {"error": str(e), "trace": traceback.format_exc()})
@@ -3582,7 +3158,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     try:
                         cli = _parse_cli_name(cli_raw, default=DEFAULT_SPAWN_CLI)
                     except ValueError:
-                        _json_response(self, 400, {"error": "unsupported cli (use codex, claude, or gemini)"})
+                        _json_response(self, 400, {"error": "unsupported cli (use codex)"})
                         return
                 else:
                     _json_response(self, 400, {"error": "cli must be a string"})
@@ -3820,7 +3396,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     return
                 parts = path.split("/")
                 session_id = parts[3] if len(parts) >= 4 else ""
-                body = _read_body(self)
+                body = _read_body(self, limit=MESSAGE_BODY_MAX_BYTES)
                 body_text = body.decode("utf-8")
                 if not body_text.strip():
                     raise ValueError("empty request body")
@@ -3861,7 +3437,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     return
                 parts = path.split("/")
                 session_id = parts[3] if len(parts) >= 4 else ""
-                body = _read_body(self)
+                body = _read_body(self, limit=MESSAGE_BODY_MAX_BYTES)
                 body_text = body.decode("utf-8")
                 if not body_text.strip():
                     raise ValueError("empty request body")

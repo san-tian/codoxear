@@ -223,13 +223,22 @@ def _encode_enter() -> bytes:
     return b
 
 
+def _write_all(fd: int, data: bytes) -> None:
+    view = memoryview(data)
+    while view:
+        n = os.write(fd, view)
+        if n <= 0:
+            raise OSError("pty write returned no progress")
+        view = view[n:]
+
+
 def _inject(fd: int, *, text: str, suffix: bytes, delay_s: float = 0.2) -> None:
-    os.write(fd, text.encode("utf-8"))
+    _write_all(fd, text.encode("utf-8"))
     if not suffix:
         return
     for _i in range(3):
         time.sleep(delay_s)
-        os.write(fd, suffix)
+        _write_all(fd, suffix)
 
 
 def _set_winsize(fd: int, rows: int, cols: int) -> None:
@@ -1295,7 +1304,13 @@ class Broker:
                             fd = st.pty_master_fd
                             resp = {"queued": False, "queue_len": len(st.queue)}
                     if fd is not None:
-                        _inject(fd, text=text, suffix=seq)
+                        f.write((json.dumps(resp) + "\n").encode("utf-8"))
+                        f.flush()
+                        try:
+                            _inject(fd, text=text, suffix=seq)
+                        except Exception:
+                            traceback.print_exc()
+                        return
                 f.write((json.dumps(resp) + "\n").encode("utf-8"))
                 f.flush()
                 return

@@ -239,6 +239,9 @@
 
       const fileLaunchParams = parseFileLaunchParams();
       if (fileLaunchParams.fullscreen && document.body) document.body.classList.add("file-fullscreen");
+      const jsonBodyEncoder = typeof TextEncoder !== "undefined" ? new TextEncoder() : null;
+      let messageBodyMaxBytes = 8 * 1024 * 1024;
+      const NEW_CODEX_SESSION_READY_DELAY_MS = 900;
 
       async function api(path, { method = "GET", body } = {}) {
         const t0 = performance.now();
@@ -271,6 +274,7 @@
           throw e;
         }
         const dt = performance.now() - t0;
+        updateApiLimits(obj && obj.limits);
         const rawPath = String(path ?? "");
         if (rawPath === "/api/sessions" && method === "GET") pushPerfSample("api_sessions_ms", dt);
         else if (rawPath.includes("/messages") && method === "GET") {
@@ -318,6 +322,34 @@
         return `${val.toFixed(dec)} ${units[u]}`;
       }
 
+      function updateApiLimits(limits) {
+        if (!limits || typeof limits !== "object") return;
+        const raw = Number(limits.message_body_max_bytes);
+        if (Number.isFinite(raw) && raw > 0) messageBodyMaxBytes = raw;
+      }
+
+      function jsonBodySizeBytes(body) {
+        const raw = JSON.stringify(body);
+        if (jsonBodyEncoder) return jsonBodyEncoder.encode(raw).length;
+        try {
+          return new Blob([raw]).size;
+        } catch {
+          return raw.length;
+        }
+      }
+
+      function assertBodyWithinLimit(body, label) {
+        const limit = Number(messageBodyMaxBytes);
+        if (!Number.isFinite(limit) || limit <= 0) return;
+        const size = jsonBodySizeBytes(body);
+        if (size <= limit) return;
+        throw Object.assign(new Error(`${label} too large for web send (${fmtBytes(size)} > ${fmtBytes(limit)})`), {
+          status: 413,
+          limitBytes: limit,
+          actualBytes: size,
+        });
+      }
+
       function listFromFilesField(val) {
         if (!Array.isArray(val)) return [];
         const out = [];
@@ -346,8 +378,6 @@
 
       function normalizeCliName(raw, fallback = "codex") {
         const v = String(raw || "").trim().toLowerCase();
-        if (v === "gemini" || v === "google-gemini" || v === "gemini-cli" || v === "gemini_cli") return "gemini";
-        if (v === "claude" || v === "claude-code" || v === "claude_code") return "claude";
         if (v === "codex" || v === "openai-codex" || v === "codex-cli") return "codex";
         return fallback;
       }
@@ -357,23 +387,14 @@
       }
 
       function resumeCommandForSession(sid, session) {
-        const cli = sessionCliName(session);
-        if (cli === "gemini") return `gemini --resume ${sid}`;
-        if (cli === "claude") return `claude --resume ${sid}`;
         return `codex resume ${sid}`;
       }
 
       function cliDisplayName(cli) {
-        const v = normalizeCliName(cli, "codex");
-        if (v === "gemini") return "Gemini";
-        if (v === "claude") return "Claude";
         return "Codex";
       }
 
       function cliLogoPath(cli) {
-        const v = normalizeCliName(cli, "codex");
-        if (v === "gemini") return resolveAppUrl("/static/logos/gemini.svg");
-        if (v === "claude") return resolveAppUrl("/static/logos/claude.svg");
         return resolveAppUrl("/static/logos/codex.svg");
       }
 
@@ -467,6 +488,11 @@
         return { title: cwd, subtitle: "" };
       }
 
+      function normalizeGitBranch(branch) {
+        if (typeof branch !== "string") return "";
+        return branch.trim();
+      }
+
       function buildWorkspaces(sessions) {
         const map = new Map();
         for (const s of sessions) {
@@ -474,12 +500,14 @@
           const key = workspaceKeyFromCwd(cwd);
           let ws = map.get(key);
           if (!ws) {
-            ws = { key, cwd, sessions: [], updated_ts: 0 };
+            ws = { key, cwd, sessions: [], updated_ts: 0, git_branch: "" };
             map.set(key, ws);
           }
           ws.sessions.push(s);
           const ts = Number(s && (s.updated_ts || s.start_ts || 0));
           if (Number.isFinite(ts) && ts > ws.updated_ts) ws.updated_ts = ts;
+          const gitBranch = normalizeGitBranch(s && s.git_branch);
+          if (!ws.git_branch && gitBranch) ws.git_branch = gitBranch;
         }
         for (const ws of map.values()) {
           ws.sessions.sort((a, b) => {
@@ -1100,12 +1128,7 @@
         let sessionCardIndex = new Map(); // session_id -> session card element
 
         function normalizeOutgoingTextForCli(raw, sid = selected) {
-          const text = typeof raw === "string" ? raw : "";
-          if (!text || !sid) return text;
-          const sess = sessionIndex.get(sid);
-          if (sessionCliName(sess) !== "claude") return text;
-          // Claude CLI treats leading "!" as local shell command; escape markdown image prefix.
-          return text.replace(/^(\s*)!\[/, "$1\\![");
+          return typeof raw === "string" ? raw : "";
         }
 
         function normalizeSessionName(name) {
@@ -1124,16 +1147,26 @@
           }
           return out;
         }
-        function buildDuplicateAlias(baseName) {
-          const base = String(baseName || "").trim() || "Session";
+        function formatTimestampAlias(tsMs = Date.now()) {
+          const d = new Date(Number(tsMs) || Date.now());
+          const pad2 = (n) => String(n).padStart(2, "0");
+          const yyyy = String(d.getFullYear()).padStart(4, "0");
+          const mm = pad2(d.getMonth() + 1);
+          const dd = pad2(d.getDate());
+          const hh = pad2(d.getHours());
+          const min = pad2(d.getMinutes());
+          const ss = pad2(d.getSeconds());
+          return `${yyyy}-${mm}-${dd} ${hh}:${min}:${ss}`;
+        }
+        function buildTimestampAlias(tsMs = Date.now()) {
           const existing = collectSessionNameSet();
-          let candidate = `${base} duplicate`;
-          if (!existing.has(normalizeSessionName(candidate))) return candidate;
+          const base = formatTimestampAlias(tsMs);
+          if (!existing.has(normalizeSessionName(base))) return base;
           for (let i = 2; i < 200; i += 1) {
-            candidate = `${base} duplicate ${i}`;
+            const candidate = `${base} #${i}`;
             if (!existing.has(normalizeSessionName(candidate))) return candidate;
           }
-          return `${base} duplicate ${Date.now()}`;
+          return `${base} #${Date.now()}`;
         }
 	        let sending = false;
 	        let localEchoSeq = 0;
@@ -1300,8 +1333,13 @@
             html: iconSvg("paperclip"),
           }),
           el("div", { class: "inputWrap" }, [
-            el("textarea", { id: "msg", placeholder: "", "aria-label": "Enter your instructions here" }),
-            el("div", { class: "ph", id: "msgPh", text: "Enter your instructions here" }),
+            el("textarea", {
+              id: "msg",
+              placeholder: "",
+              title: "Enter sends · Shift+Enter inserts a newline",
+              "aria-label": "Enter your instructions here. Press Enter to send or Shift+Enter for a newline",
+            }),
+            el("div", { class: "ph", id: "msgPh", text: "Enter message · Enter sends · Shift+Enter newline" }),
           ]),
           el("input", { id: "imgInput", type: "file", accept: "image/*", style: "display:none" }),
           el("button", { class: "icon-btn primary", id: "sendBtn", type: "submit", title: "Send", "aria-label": "Send", html: iconSvg("send") }),
@@ -1563,42 +1601,9 @@
         root.appendChild(sessionToolsBackdrop);
         root.appendChild(sessionTools);
 
-        const cliChoiceBackdrop = el("div", { class: "modalBackdrop", id: "cliChoiceBackdrop" });
-        const cliChoiceTitle = el("div", { class: "title", id: "cliChoiceTitle", text: "Choose CLI" });
-        const cliChoiceCwd = el("div", { class: "muted", id: "cliChoiceCwd", text: "" });
-        const cliChoiceButtons = el("div", { class: "cliChoiceButtons" }, [
-          el("button", { class: "cliChoiceBtn", id: "cliChoiceCodex", type: "button", "data-cli": "codex" }, [
-            el("div", { class: "cliChoiceLogo" }, [
-              el("img", { src: "static/logos/codex.svg", alt: "Codex", width: "32", height: "32" }),
-            ]),
-            el("div", { class: "cliChoiceLabel", text: "Codex" }),
-          ]),
-          el("button", { class: "cliChoiceBtn", id: "cliChoiceClaude", type: "button", "data-cli": "claude" }, [
-            el("div", { class: "cliChoiceLogo" }, [
-              el("img", { src: "static/logos/claude.svg", alt: "Claude", width: "32", height: "32" }),
-            ]),
-            el("div", { class: "cliChoiceLabel", text: "Claude" }),
-          ]),
-          el("button", { class: "cliChoiceBtn", id: "cliChoiceGemini", type: "button", "data-cli": "gemini" }, [
-            el("div", { class: "cliChoiceLogo" }, [
-              el("img", { src: "static/logos/gemini.svg", alt: "Gemini", width: "32", height: "32" }),
-            ]),
-            el("div", { class: "cliChoiceLabel", text: "Gemini" }),
-          ]),
-        ]);
-        const cliChoiceCancel = el("button", { class: "cliChoiceCancel", id: "cliChoiceCancel", type: "button", text: "Cancel" });
-        const cliChoice = el("div", { class: "cliChoice", id: "cliChoice", role: "dialog", "aria-label": "Choose CLI" }, [
-          cliChoiceTitle,
-          cliChoiceCwd,
-          cliChoiceButtons,
-          cliChoiceCancel,
-        ]);
-        root.appendChild(cliChoiceBackdrop);
-        root.appendChild(cliChoice);
-
         // Config modal
         const configBackdrop = el("div", { class: "modalBackdrop", id: "configBackdrop" });
-        const configTitle = el("div", { class: "title", id: "configTitle", text: "CLI Configuration" });
+        const configTitle = el("div", { class: "title", id: "configTitle", text: "Codex Configuration" });
         const configContent = el("div", { class: "configContent", id: "configContent" });
         const configActions = el("div", { class: "configActions" }, [
           el("button", { class: "configCancel", id: "configCancel", type: "button", text: "Cancel" }),
@@ -1635,190 +1640,39 @@
         }
         function renderConfigForm(config) {
           configContent.innerHTML = "";
-          const env = config?.env || {};
-          const envMasked = config?.env_masked || {};
-
-          function readEnvBool(key, fallback = false) {
-            const raw = env[key];
-            if (raw == null || raw === "") return !!fallback;
-            const s = String(raw).trim().toLowerCase();
-            return !["0", "false", "no", "off"].includes(s);
-          }
-
-          function buildSecretField({ label, id, value, placeholder, masked }) {
-            const input = el("input", {
-              type: "password",
-              id,
-              class: "configInput",
-              value: value || "",
-              placeholder: placeholder || "",
-            });
-            const revealBtn = el("button", {
-              type: "button",
-              class: "configRevealBtn",
-              "aria-label": `Show ${label}`,
-              text: "Show",
-            });
-            revealBtn.onclick = () => {
-              const hidden = input.getAttribute("type") !== "text";
-              input.setAttribute("type", hidden ? "text" : "password");
-              revealBtn.textContent = hidden ? "Hide" : "Show";
-            };
-            const hintText = masked ? `Saved: ${masked}` : "Saved: (empty)";
-            return el("div", { class: "configField" }, [
-              el("label", { text: label, for: id }),
-              el("div", { class: "configSecretRow" }, [input, revealBtn]),
-              el("div", { class: "configHint", text: hintText }),
-            ]);
-          }
-
-          function buildToggleField({ label, id, checked, hint }) {
-            const checkbox = el("input", { type: "checkbox", id, class: "configCheckbox" });
-            checkbox.checked = !!checked;
-            const row = el("label", { class: "configToggle", for: id }, [checkbox, el("span", { text: label })]);
-            return el("div", { class: "configField" }, [
-              row,
-              el("div", { class: "configHint", text: hint || "" }),
-            ]);
-          }
-
-          // Codex section
+          const codexConfig = config?.codex || {};
           const codexSection = el("div", { class: "configSection" }, [
-            el("div", { class: "configSectionTitle", text: "Codex (OpenAI)" }),
-            buildSecretField({
-              label: "API Key",
-              id: "codexApiKey",
-              value: config.codex?.api_key || env.OPENAI_API_KEY || "",
-              placeholder: "sk-...",
-              masked: envMasked.OPENAI_API_KEY || "",
-            }),
+            el("div", { class: "configSectionTitle", text: "Codex Native Files" }),
             el("div", { class: "configField" }, [
-              el("label", { text: "Base URL", for: "codexBaseUrl" }),
-              el("input", {
-                type: "text",
-                id: "codexBaseUrl",
-                class: "configInput",
-                value: config.codex?.base_url || env.OPENAI_BASE_URL || "",
-                placeholder: "https://api.openai.com/v1"
-              }),
+              el("label", { text: codexConfig.config_toml_path || "~/.codex/config.toml", for: "codexConfigToml" }),
+              el("textarea", {
+                id: "codexConfigToml",
+                class: "configEditor",
+                spellcheck: "false",
+                placeholder: "# ~/.codex/config.toml",
+              }, []),
             ]),
             el("div", { class: "configField" }, [
-              el("label", { text: "Model", for: "codexModel" }),
-              el("input", {
-                type: "text",
-                id: "codexModel",
-                class: "configInput",
-                value: config.codex?.model || "",
-                placeholder: "gpt-4"
-              }),
+              el("label", { text: codexConfig.auth_json_path || "~/.codex/auth.json", for: "codexAuthJson" }),
+              el("textarea", {
+                id: "codexAuthJson",
+                class: "configEditor",
+                spellcheck: "false",
+                placeholder: "{\n  \"auth_mode\": \"apikey\"\n}",
+              }, []),
             ]),
-            buildToggleField({
-              label: "YOLO Mode",
-              id: "codexYolo",
-              checked: readEnvBool("CODEX_WEB_CODEX_YOLO", false),
-              hint: "Append --dangerously-bypass-approvals-and-sandbox for new Codex web sessions.",
-            }),
-          ]);
-
-          // Claude section
-          const claudeSection = el("div", { class: "configSection" }, [
-            el("div", { class: "configSectionTitle", text: "Claude (Anthropic)" }),
-            buildSecretField({
-              label: "API Key / Auth Token",
-              id: "claudeApiKey",
-              value: env.ANTHROPIC_API_KEY || env.ANTHROPIC_AUTH_TOKEN || "",
-              placeholder: "sk-ant-...",
-              masked: envMasked.ANTHROPIC_API_KEY || envMasked.ANTHROPIC_AUTH_TOKEN || "",
-            }),
-            el("div", { class: "configField" }, [
-              el("label", { text: "Base URL", for: "claudeBaseUrl" }),
-              el("input", {
-                type: "text",
-                id: "claudeBaseUrl",
-                class: "configInput",
-                value: env.ANTHROPIC_BASE_URL || "",
-                placeholder: "https://api.anthropic.com"
-              }),
-            ]),
-            el("div", { class: "configField" }, [
-              el("label", { text: "Model", for: "claudeModel" }),
-              el("input", {
-                type: "text",
-                id: "claudeModel",
-                class: "configInput",
-                value: config.claude?.model || "",
-                placeholder: "opus"
-              }),
-            ]),
-            buildToggleField({
-              label: "YOLO Mode",
-              id: "claudeYolo",
-              checked: readEnvBool("CODEX_WEB_CLAUDE_YOLO", false),
-              hint: "Append --dangerously-skip-permissions for new Claude web sessions.",
-            }),
-          ]);
-
-          // Gemini section
-          const geminiSection = el("div", { class: "configSection" }, [
-            el("div", { class: "configSectionTitle", text: "Gemini (Google)" }),
-            buildSecretField({
-              label: "API Key",
-              id: "geminiApiKey",
-              value: env.GEMINI_API_KEY || "",
-              placeholder: "AIza...",
-              masked: envMasked.GEMINI_API_KEY || "",
-            }),
-            el("div", { class: "configField" }, [
-              el("label", { text: "Base URL", for: "geminiBaseUrl" }),
-              el("input", {
-                type: "text",
-                id: "geminiBaseUrl",
-                class: "configInput",
-                value: env.GOOGLE_GEMINI_BASE_URL || "",
-                placeholder: "https://generativelanguage.googleapis.com"
-              }),
-            ]),
-            el("div", { class: "configField" }, [
-              el("label", { text: "Model", for: "geminiModel" }),
-              el("input", {
-                type: "text",
-                id: "geminiModel",
-                class: "configInput",
-                value: env.GEMINI_MODEL || "",
-                placeholder: "gemini-pro"
-              }),
-            ]),
-            buildToggleField({
-              label: "YOLO Mode",
-              id: "geminiYolo",
-              checked: readEnvBool("CODEX_WEB_GEMINI_YOLO", false),
-              hint: "Append --yolo for new Gemini web sessions.",
-            }),
+            el("div", { class: "configHint", text: "The modal edits these two files directly. Save writes the raw text back to disk." }),
           ]);
 
           configContent.appendChild(codexSection);
-          configContent.appendChild(claudeSection);
-          configContent.appendChild(geminiSection);
+          $("#codexConfigToml").value = String(codexConfig.config_toml_text || "");
+          $("#codexAuthJson").value = String(codexConfig.auth_json_text || "");
         }
         async function saveConfig() {
           const updates = {
             codex: {
-              api_key: $("#codexApiKey").value.trim(),
-              base_url: $("#codexBaseUrl").value.trim(),
-              model: $("#codexModel").value.trim(),
-              yolo: !!$("#codexYolo").checked,
-            },
-            claude: {
-              api_key: $("#claudeApiKey").value.trim(),
-              base_url: $("#claudeBaseUrl").value.trim(),
-              model: $("#claudeModel").value.trim(),
-              yolo: !!$("#claudeYolo").checked,
-            },
-            gemini: {
-              api_key: $("#geminiApiKey").value.trim(),
-              base_url: $("#geminiBaseUrl").value.trim(),
-              model: $("#geminiModel").value.trim(),
-              yolo: !!$("#geminiYolo").checked,
+              config_toml_text: $("#codexConfigToml").value,
+              auth_json_text: $("#codexAuthJson").value,
             },
           };
           try {
@@ -1837,37 +1691,6 @@
         configBackdrop.onclick = hideConfig;
         $("#configCancel").onclick = hideConfig;
         $("#configSave").onclick = saveConfig;
-
-        let cliChoiceResolve = null;
-        function showCliChoice({ title, cwd } = {}) {
-          return new Promise((resolve) => {
-            cliChoiceResolve = resolve;
-            cliChoiceTitle.textContent = title || "Choose CLI";
-            cliChoiceCwd.textContent = cwd || "";
-            cliChoiceBackdrop.style.display = "block";
-            cliChoice.style.display = "flex";
-          });
-        }
-        function hideCliChoice() {
-          cliChoiceBackdrop.style.display = "none";
-          cliChoice.style.display = "none";
-          if (cliChoiceResolve) {
-            cliChoiceResolve(null);
-            cliChoiceResolve = null;
-          }
-        }
-        cliChoiceBackdrop.onclick = hideCliChoice;
-        cliChoiceCancel.onclick = hideCliChoice;
-        for (const btn of [$("#cliChoiceCodex"), $("#cliChoiceClaude"), $("#cliChoiceGemini")]) {
-          btn.onclick = () => {
-            const cli = btn.getAttribute("data-cli");
-            if (cliChoiceResolve) {
-              cliChoiceResolve(cli);
-              cliChoiceResolve = null;
-            }
-            hideCliChoice();
-          };
-        }
 
         function setToast(text) {
           toast.textContent = text || "";
@@ -2143,18 +1966,10 @@
         }
 
         function initPageLimit() {
-          const s = selected ? sessionIndex.get(selected) : null;
-          const cli = sessionCliName(s);
-          if (cli === "claude") {
-            return isMobile() ? INIT_PAGE_LIMIT_CLAUDE_MOBILE : INIT_PAGE_LIMIT_CLAUDE_DESKTOP;
-          }
           return isMobile() ? INIT_PAGE_LIMIT_MOBILE : INIT_PAGE_LIMIT_DESKTOP;
         }
 
         function olderPageLimit() {
-          const s = selected ? sessionIndex.get(selected) : null;
-          const cli = sessionCliName(s);
-          if (cli === "claude") return OLDER_PAGE_LIMIT_CLAUDE;
           return OLDER_PAGE_LIMIT;
         }
 
@@ -2229,7 +2044,9 @@
           const q = normalizeQueueList(getQueueCache(sid)).map((x) => normalizeOutgoingTextForCli(x, sid));
           queueCacheBySession.set(sid, q);
           try {
-            const res = await api(`/api/sessions/${sid}/queue`, { method: "POST", body: { queue: q } });
+            const body = { queue: q };
+            assertBodyWithinLimit(body, "queue payload");
+            const res = await api(`/api/sessions/${sid}/queue`, { method: "POST", body });
             applyQueueResponse(sid, res);
           } catch (e) {
             setToast(`queue save error: ${e && e.message ? e.message : "unknown error"}`);
@@ -2723,8 +2540,10 @@
           const outgoing = normalizeOutgoingTextForCli(raw, sid);
           if (!outgoing || !outgoing.trim()) return false;
           try {
+            const body = { text: outgoing, front: Boolean(front) };
+            assertBodyWithinLimit(body, "message");
             setToast("queueing...");
-            const res = await api(`/api/sessions/${sid}/queue`, { method: "POST", body: { text: outgoing, front: Boolean(front) } });
+            const res = await api(`/api/sessions/${sid}/queue`, { method: "POST", body });
             const list = applyQueueResponse(sid, res);
             const count = Array.isArray(list) ? list.length : getSelectedQueueLen();
             if (sid === selected) {
@@ -2854,9 +2673,7 @@
 
         function trimRenderedRows({ fromTop }) {
           const rows = Array.from(chatInner.querySelectorAll(".msg-row")).filter((x) => !x.classList.contains("typing-row"));
-          const s = selected ? sessionIndex.get(selected) : null;
-          const cli = sessionCliName(s);
-          const windowLimit = cli === "claude" ? CHAT_DOM_WINDOW_CLAUDE : CHAT_DOM_WINDOW;
+          const windowLimit = CHAT_DOM_WINDOW;
           if (rows.length <= windowLimit) return;
           const extra = rows.length - windowLimit;
           if (fromTop) {
@@ -3490,11 +3307,8 @@
               setToast("cwd unavailable");
               return;
             }
-            const base = sessionDisplayName(s) || baseName(cwd) || "Session";
-            const alias = buildDuplicateAlias(base);
-            const cli = await showCliChoice({ title: "Choose CLI for duplicate session", cwd });
-            if (!cli) return;
-            await spawnSessionWithCwd(cwd, { alias, cli });
+            const alias = buildTimestampAlias();
+            await spawnSessionWithCwd(cwd, { alias, cli: "codex" });
           };
           actionButtons.unshift(dupBtn);
           if (delBtn) actionButtons.push(delBtn);
@@ -3532,15 +3346,31 @@
               bindTap(closeBtn, () => {
                 void closeWorkspace(ws);
               });
+              const metaRowItems = [];
+              if (ws.git_branch) {
+                metaRowItems.push(
+                  el("div", {
+                    class: "workspaceBranch",
+                    text: ws.git_branch,
+                    title: `Git branch: ${ws.git_branch}`,
+                    "aria-label": `Git branch ${ws.git_branch}`,
+                  })
+                );
+              }
+              if (title.subtitle) {
+                metaRowItems.push(el("div", { class: "workspacePath muted", text: title.subtitle, title: title.subtitle }));
+              }
               const header = el("div", { class: "workspaceHeader" }, [
                 el("div", { class: "workspaceTitleRow" }, [
-                  el("div", { class: "workspaceTitle", text: title.title, title: ws.cwd || "Unknown cwd" }),
+                  el("div", { class: "workspaceTitleMain" }, [
+                    el("div", { class: "workspaceTitle", text: title.title, title: ws.cwd || "Unknown cwd" }),
+                  ]),
                   el("div", { class: "workspaceTitleActions" }, [
                     el("div", { class: "workspaceMeta muted", text: countLabel }),
                     closeBtn,
                   ]),
                 ]),
-                title.subtitle ? el("div", { class: "workspacePath muted", text: title.subtitle, title: title.subtitle }) : null,
+                metaRowItems.length ? el("div", { class: "workspaceMetaRow" }, metaRowItems) : null,
               ].filter(Boolean));
               const { files, owners } = collectWorkspaceFiles(ws);
               const filesWrap = buildWorkspaceFiles(ws, files, owners);
@@ -4655,6 +4485,13 @@
             const raw = sendChoicePending;
             hideSendChoice();
             if (!raw) return;
+            try {
+              const outgoing = normalizeOutgoingTextForCli(raw, selected);
+              assertBodyWithinLimit({ text: outgoing }, "message");
+            } catch (e) {
+              setToast(`send error: ${e.message}`);
+              return;
+            }
             clearComposer();
             await sendText(raw);
           };
@@ -4798,12 +4635,17 @@
           }
         }
 
-        async function waitForSessionByBrokerPid(brokerPid, { alias } = {}) {
+        async function waitForSessionByBrokerPid(brokerPid, { alias, cli } = {}) {
           if (!brokerPid) return null;
           for (let i = 0; i < 60; i++) {
             const sessions = await refreshSessions();
             const found = (sessions || []).find((x) => Number(x.broker_pid || 0) === brokerPid);
             if (found) {
+              const cliName = normalizeCliName(cli || found.cli, "");
+              if (cliName === "codex" && found.owned) {
+                setToast("starting Codex session...");
+                await new Promise((r) => setTimeout(r, NEW_CODEX_SESSION_READY_DELAY_MS));
+              }
               if (alias) await applySessionAlias(found.session_id, alias);
               selectSession(found.session_id);
               return brokerPid;
@@ -4820,8 +4662,8 @@
             return null;
           }
           const cliName = normalizeCliName(cli, "");
-          if (!cliName) {
-            setToast("invalid cli (use codex, claude, or gemini)");
+          if (cliName !== "codex") {
+            setToast("invalid cli (use codex)");
             return null;
           }
           try {
@@ -4834,7 +4676,7 @@
             }
             setPreferredSpawnCli(cliName);
             setToast(`started (broker ${brokerPid})`);
-            return await waitForSessionByBrokerPid(brokerPid, { alias });
+            return await waitForSessionByBrokerPid(brokerPid, { alias, cli: cliName });
           } catch (e) {
             setToast(`start error: ${e.message}`);
             return null;
@@ -4845,9 +4687,8 @@
           const def = cur && cur.cwd && cur.cwd !== "?" ? cur.cwd : "";
           const cwd = prompt("New session cwd:", def);
           if (!cwd) return;
-          const cli = await showCliChoice({ title: "Choose CLI for new session", cwd });
-          if (!cli) return;
-          await spawnSessionWithCwd(cwd, { cli });
+          const alias = buildTimestampAlias();
+          await spawnSessionWithCwd(cwd, { alias, cli: "codex" });
         };
 
         // More menu toggle
@@ -4942,11 +4783,8 @@
             setToast("cwd unavailable");
             return;
           }
-          const base = sessionDisplayName(s) || baseName(cwd) || "Session";
-          const alias = buildDuplicateAlias(base);
-          const cli = await showCliChoice({ title: "Choose CLI for duplicate session", cwd });
-          if (!cli) return;
-          await spawnSessionWithCwd(cwd, { alias, cli });
+          const alias = buildTimestampAlias();
+          await spawnSessionWithCwd(cwd, { alias, cli: "codex" });
         };
 
 	        backdrop.onclick = () => setSidebarOpen(false);
@@ -5007,6 +4845,8 @@
 	        const textarea = $("#msg");
 	        const msgPh = $("#msgPh");
 	        const imgInput = $("#imgInput");
+        let composerImeActive = false;
+        let composerImeSuppressEnterUntil = 0;
         const attachBtn = $("#attachBtn");
         if (!attachBadgeEl) {
           attachBadgeEl = el("span", { class: "attachBadge", id: "attachBadge" });
@@ -5051,6 +4891,14 @@
             autoGrow();
             if (selected) scheduleDraftSave(selected, textarea.value);
           });
+	        textarea.addEventListener("compositionstart", () => {
+            composerImeActive = true;
+            composerImeSuppressEnterUntil = 0;
+          });
+	        textarea.addEventListener("compositionend", () => {
+            composerImeActive = false;
+            composerImeSuppressEnterUntil = Date.now() + 48;
+          });
 	        textarea.addEventListener(
 	          "focus",
 	          () => {
@@ -5069,14 +4917,22 @@
 	        textarea.addEventListener(
 	          "blur",
 	          () => {
+            composerImeSuppressEnterUntil = 0;
 	            setTimeout(updateAppHeightVar, 0);
 	          },
 	          { passive: true }
 	        );
         textarea.addEventListener("keydown", (e) => {
           if (e.key !== "Enter") return;
-          if (e.isComposing) return;
-          if (!(e.ctrlKey || e.metaKey)) return;
+          if (e.isComposing || composerImeActive) return;
+          if (e.keyCode === 229) return;
+          if (e.shiftKey) return;
+          if (Date.now() < composerImeSuppressEnterUntil) {
+            composerImeSuppressEnterUntil = 0;
+            e.preventDefault();
+            return;
+          }
+          composerImeSuppressEnterUntil = 0;
           e.preventDefault();
           form.requestSubmit();
         });
@@ -5246,6 +5102,8 @@
           const sid = selected;
           const outgoing = normalizeOutgoingTextForCli(raw, sid);
           if (!outgoing || !outgoing.trim()) return;
+          const body = { text: outgoing };
+          assertBodyWithinLimit(body, "message");
           if (sending) return;
           sending = true;
           $("#sendBtn").disabled = true;
@@ -5264,7 +5122,7 @@
           turnOpen = true;
           updateUserSummaryFromText(sid, outgoing);
           try {
-            const res = await api(`/api/sessions/${sid}/send`, { method: "POST", body: { text: outgoing } });
+            const res = await api(`/api/sessions/${sid}/send`, { method: "POST", body });
             if (res.queued) {
               setToast(`queued (queue ${res.queue_len})`);
               if (Array.isArray(res.queue)) {
@@ -5302,6 +5160,13 @@
           if (sending) return;
           if (currentRunning) {
             showSendChoice(raw);
+            return;
+          }
+          try {
+            const outgoing = normalizeOutgoingTextForCli(raw, selected);
+            assertBodyWithinLimit({ text: outgoing }, "message");
+          } catch (e2) {
+            setToast(`send error: ${e2.message}`);
             return;
           }
           clearComposer();

@@ -46,25 +46,25 @@ class TestSessionsPendingLogIdle(unittest.TestCase):
         self.assertEqual(len(out), 1)
         self.assertIs(out[0].get("busy"), False)
 
-    def test_list_sessions_stale_log_does_not_stay_busy_when_broker_idle(self) -> None:
+    def test_list_sessions_codex_recent_log_does_not_rearm_busy_when_broker_idle(self) -> None:
         mgr = _make_manager()
         with TemporaryDirectory() as td:
-            lp = Path(td) / "claude.jsonl"
-            lp.write_text('{"type":"user","message":{"content":"hello"}}\n', encoding="utf-8")
-            old_ts = time.time() - 600.0
+            lp = Path(td) / "rollout-2026-03-20T00-00-00-44444444-4444-4444-4444-444444444444.jsonl"
+            lp.write_text('{"type":"event_msg","payload":{"type":"user_message","message":"hello"}}\n', encoding="utf-8")
+            now_ts = time.time()
             lp.touch()
-            os.utime(lp, (old_ts, old_ts))
+            os.utime(lp, (now_ts, now_ts))
             s = Session(
-                session_id="broker-2",
-                thread_id="broker-2",
-                broker_pid=11,
-                codex_pid=12,
-                cli="claude",
+                session_id="broker-4",
+                thread_id="broker-4",
+                broker_pid=31,
+                codex_pid=32,
+                cli="codex",
                 owned=False,
                 start_ts=123.0,
                 cwd="/tmp",
                 log_path=lp,
-                sock_path=Path("/tmp/broker-2.sock"),
+                sock_path=Path("/tmp/broker-4.sock"),
                 busy=False,
                 queue_len=0,
             )
@@ -74,35 +74,6 @@ class TestSessionsPendingLogIdle(unittest.TestCase):
                 out = mgr.list_sessions()
             self.assertEqual(len(out), 1)
             self.assertIs(out[0].get("busy"), False)
-
-    def test_list_sessions_recent_log_keeps_busy_fallback_when_broker_idle(self) -> None:
-        mgr = _make_manager()
-        with TemporaryDirectory() as td:
-            lp = Path(td) / "claude.jsonl"
-            lp.write_text('{"type":"user","message":{"content":"hello"}}\n', encoding="utf-8")
-            now_ts = time.time()
-            lp.touch()
-            os.utime(lp, (now_ts, now_ts))
-            s = Session(
-                session_id="broker-3",
-                thread_id="broker-3",
-                broker_pid=21,
-                codex_pid=22,
-                cli="claude",
-                owned=False,
-                start_ts=123.0,
-                cwd="/tmp",
-                log_path=lp,
-                sock_path=Path("/tmp/broker-3.sock"),
-                busy=False,
-                queue_len=0,
-            )
-            mgr._sessions[s.session_id] = s
-            mgr.idle_from_log = lambda _sid: False  # type: ignore[method-assign]
-            with patch("codoxear.server.LOG_BUSY_FROM_LOG_STALE_SECONDS", 45.0):
-                out = mgr.list_sessions()
-            self.assertEqual(len(out), 1)
-            self.assertIs(out[0].get("busy"), True)
 
 
 if __name__ == "__main__":
