@@ -43,7 +43,7 @@ class TestServerSpawnCli(unittest.TestCase):
         with patch("codoxear.server._env_flag", return_value=False), patch(
             "codoxear.server._wait_or_raise", return_value=None
         ), patch("codoxear.server.subprocess.Popen", return_value=_DummyProc(5432)) as popen:
-            res = mgr.spawn_web_session(cwd="/tmp", cli="codex")
+            res = mgr.spawn_web_session(cwd="/tmp", cli="codex", transport="broker")
 
         self.assertEqual(res.get("broker_pid"), 5432)
         self.assertEqual(res.get("cli"), "codex")
@@ -59,7 +59,7 @@ class TestServerSpawnCli(unittest.TestCase):
         ), patch("codoxear.server._wait_or_raise", return_value=None), patch(
             "codoxear.server.subprocess.Popen", return_value=_DummyProc(5433)
         ) as popen:
-            mgr.spawn_web_session(cwd="/tmp", cli="codex")
+            mgr.spawn_web_session(cwd="/tmp", cli="codex", transport="broker")
 
         argv = popen.call_args.args[0]
         self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", argv)
@@ -71,7 +71,7 @@ class TestServerSpawnCli(unittest.TestCase):
         ), patch("codoxear.server._tmux_pane_pid", return_value=7777), patch(
             "codoxear.server.subprocess.run", return_value=_DummyRun(0)
         ) as run_mock:
-            res = mgr.spawn_web_session(cwd="/tmp", cli="codex")
+            res = mgr.spawn_web_session(cwd="/tmp", cli="codex", transport="broker")
 
         self.assertEqual(res.get("broker_pid"), 7777)
         tmux_cmd = run_mock.call_args.args[0]

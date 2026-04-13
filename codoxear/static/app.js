@@ -1004,6 +1004,8 @@
           return `<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6 6 18"/><path d="M6 6l12 12"/></svg>`;
         if (name === "queue")
           return `<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 7h16"/><path d="M4 12h16"/><path d="M4 17h10"/></svg>`;
+        if (name === "alert")
+          return `<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 9v4"/><path d="M12 17h.01"/><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0Z"/></svg>`;
         if (name === "duplicate")
           return `<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="8" y="8" width="11" height="11" rx="2"/><rect x="5" y="5" width="11" height="11" rx="2"/></svg>`;
         if (name === "settings")
@@ -1103,7 +1105,11 @@
         let pollKickPending = false;
 	        let pollFastUntilMs = 0;
 	        let turnOpen = false;
-	        let sessionsTimer = null;
+        let sessionsTimer = null;
+        let sessionEventSource = null;
+        let sessionEventSourceSid = "";
+        let sessionEventSeq = 0;
+        let sessionRefreshKickTimer = null;
         let updateCheckTimer = null;
         let updateCheckStartTimer = null;
         let updateCheckInFlight = false;
@@ -1126,6 +1132,12 @@
         let updateNotifiedCommit = String(localStorage.getItem("codexweb.updateNotifiedCommit") || "");
         let sessionIndex = new Map(); // session_id -> session info
         let sessionCardIndex = new Map(); // session_id -> session card element
+        let pendingRequests = [];
+        let pendingRequestSubmitBusy = false;
+        let pendingRequestSelectedId = 0;
+        let requestModalVisible = false;
+        let requestModalDismissedKey = "";
+        let requestBadgeEl = null;
 
         function normalizeOutgoingTextForCli(raw, sid = selected) {
           return typeof raw === "string" ? raw : "";
@@ -1257,6 +1269,15 @@
           html: iconSvg("more"),
         });
         sessionToolsBtn.disabled = true;
+        const requestBtn = el("button", {
+          id: "requestBtn",
+          class: "icon-btn",
+          title: "Requests",
+          "aria-label": "Requests",
+          type: "button",
+          html: iconSvg("alert"),
+        });
+        requestBtn.disabled = true;
         const newBtn = el("button", { id: "newBtn", class: "icon-btn primary-action", title: "New session", "aria-label": "New session", html: iconSvg("plus") });
         const refreshBtn = el("button", { id: "refreshBtn", class: "icon-btn", title: "Refresh", "aria-label": "Refresh", html: iconSvg("refresh") });
         const configBtn = el("button", { id: "configBtn", class: "icon-btn", title: "Configuration", "aria-label": "Configuration", html: iconSvg("settings") });
@@ -1319,6 +1340,7 @@
             fileBtn,
             tmuxAttachBtn,
             sessionToolsBtn,
+            requestBtn,
             interruptBtn,
           ]),
         ]);
@@ -1524,6 +1546,35 @@
         root.appendChild(sendChoiceBackdrop);
         root.appendChild(sendChoice);
 
+        const requestBackdrop = el("div", { class: "modalBackdrop", id: "requestBackdrop" });
+        const requestCloseBtn = el("button", {
+          id: "requestCloseBtn",
+          class: "icon-btn",
+          title: "Close",
+          "aria-label": "Close",
+          type: "button",
+          html: iconSvg("x"),
+        });
+        const requestTitle = el("div", { class: "title", id: "requestTitle", text: "Action required" });
+        const requestMeta = el("div", { class: "muted", id: "requestMeta", text: "" });
+        const requestList = el("div", { class: "requestList", id: "requestList" });
+        const requestBody = el("div", { class: "requestBody", id: "requestBody" });
+        const requestNotice = el("div", { class: "muted requestNotice", id: "requestNotice", text: "" });
+        const requestActions = el("div", { class: "requestActions", id: "requestActions" });
+        const requestModal = el("div", { class: "requestModal", id: "requestModal", role: "dialog", "aria-label": "Action required" }, [
+          el("div", { class: "requestHeader" }, [
+            requestTitle,
+            el("div", { class: "actions" }, [requestCloseBtn]),
+          ]),
+          requestMeta,
+          requestList,
+          requestBody,
+          requestNotice,
+          requestActions,
+        ]);
+        root.appendChild(requestBackdrop);
+        root.appendChild(requestModal);
+
         const queueBackdrop = el("div", { class: "modalBackdrop", id: "queueBackdrop" });
         const queueCloseBtn = el("button", {
           id: "queueCloseBtn",
@@ -1691,6 +1742,370 @@
         configBackdrop.onclick = hideConfig;
         $("#configCancel").onclick = hideConfig;
         $("#configSave").onclick = saveConfig;
+        requestBackdrop.onclick = () => setRequestModalVisible(false, { dismiss: true });
+        requestCloseBtn.onclick = () => setRequestModalVisible(false, { dismiss: true });
+
+        function requestSummaryLabel(req) {
+          const kind = String(req && req.kind || "");
+          if (kind === "command_approval") return "Command approval";
+          if (kind === "file_change_approval") return "File change approval";
+          if (kind === "permissions_approval") return "Permission request";
+          if (kind === "request_user_input") return "Input requested";
+          if (kind === "mcp_elicitation") return "MCP request";
+          return "Server request";
+        }
+
+        function codeBlock(text) {
+          return el("pre", { class: "requestCode", text: String(text || "") });
+        }
+
+        function normalizePendingRequestsList(raw) {
+          if (!Array.isArray(raw)) return [];
+          const out = [];
+          for (const item of raw) {
+            if (!item || typeof item !== "object") continue;
+            const requestId = Number(item.request_id);
+            if (!Number.isInteger(requestId)) continue;
+            out.push(item);
+          }
+          out.sort((a, b) => Number(a.request_id || 0) - Number(b.request_id || 0));
+          return out;
+        }
+
+        function pendingRequestsKeyOf(list = pendingRequests) {
+          if (!Array.isArray(list) || !list.length) return "";
+          return list.map((item) => String(item && item.request_id || "")).filter(Boolean).join(",");
+        }
+
+        function upsertPendingRequest(req) {
+          if (!req || typeof req !== "object") return;
+          const requestId = Number(req.request_id);
+          if (!Number.isInteger(requestId)) return;
+          const next = pendingRequests.slice();
+          const idx = next.findIndex((item) => Number(item && item.request_id) === requestId);
+          if (idx >= 0) next[idx] = req;
+          else next.push(req);
+          next.sort((a, b) => Number(a.request_id || 0) - Number(b.request_id || 0));
+          pendingRequests = next;
+          if (!pendingRequests.some((item) => Number(item.request_id) === Number(pendingRequestSelectedId))) {
+            pendingRequestSelectedId = pendingRequests.length ? Number(pendingRequests[0].request_id) : 0;
+          }
+          if (selected) {
+            const s = sessionIndex.get(selected);
+            if (s) s.pending_request_count = pendingRequests.length;
+          }
+          updateRequestBadge();
+          renderPendingRequestModal();
+        }
+
+        function removePendingRequestById(requestId) {
+          const id = Number(requestId);
+          if (!Number.isInteger(id)) return;
+          pendingRequests = pendingRequests.filter((item) => Number(item && item.request_id) !== id);
+          if (!pendingRequests.some((item) => Number(item.request_id) === Number(pendingRequestSelectedId))) {
+            pendingRequestSelectedId = pendingRequests.length ? Number(pendingRequests[0].request_id) : 0;
+          }
+          if (selected) {
+            const s = sessionIndex.get(selected);
+            if (s) s.pending_request_count = pendingRequests.length;
+          }
+          if (!pendingRequests.length) {
+            requestModalDismissedKey = "";
+            requestModalVisible = false;
+          }
+          updateRequestBadge();
+          renderPendingRequestModal();
+        }
+
+        function getSelectedPendingRequest() {
+          if (!pendingRequests.length) return null;
+          const found = pendingRequests.find((item) => Number(item.request_id) === Number(pendingRequestSelectedId));
+          return found || pendingRequests[0];
+        }
+
+        function updateRequestBadge() {
+          const count = pendingRequests.length;
+          if (!requestBadgeEl) return;
+          if (count > 0) {
+            requestBadgeEl.textContent = String(count);
+            requestBadgeEl.style.display = "inline-flex";
+          } else {
+            requestBadgeEl.textContent = "";
+            requestBadgeEl.style.display = "none";
+          }
+          requestBtn.classList.toggle("active", count > 0);
+          requestBtn.title = count > 0 ? `${count} pending request${count === 1 ? "" : "s"}` : "Requests";
+          requestBtn.setAttribute("aria-label", requestBtn.title);
+        }
+
+        function setRequestModalVisible(open, { dismiss = false } = {}) {
+          requestModalVisible = Boolean(open);
+          if (!requestModalVisible && dismiss) requestModalDismissedKey = pendingRequestsKeyOf();
+          renderPendingRequestModal();
+        }
+
+        function hidePendingRequestModal() {
+          requestBackdrop.style.display = "none";
+          requestModal.style.display = "none";
+          requestList.innerHTML = "";
+          requestActions.innerHTML = "";
+          requestBody.innerHTML = "";
+          requestNotice.textContent = "";
+        }
+
+        function renderPendingRequestModal() {
+          const req = getSelectedPendingRequest();
+          if (!selected || !req || !requestModalVisible) {
+            hidePendingRequestModal();
+            return;
+          }
+          requestTitle.textContent = requestSummaryLabel(req);
+          requestMeta.textContent = pendingRequests.length > 1 ? `${pendingRequests.length} requests pending` : "";
+          requestList.innerHTML = "";
+          requestBody.innerHTML = "";
+          requestActions.innerHTML = "";
+          requestNotice.textContent = "";
+
+          const params = req && typeof req.params === "object" ? req.params : {};
+          const kind = String(req.kind || "");
+          const requestId = Number(req.request_id);
+
+          for (const item of pendingRequests) {
+            const id = Number(item.request_id);
+            const btn = el("button", {
+              type: "button",
+              class: "requestListBtn" + (id === requestId ? " active" : ""),
+              text: requestSummaryLabel(item),
+              title: requestSummaryLabel(item),
+            });
+            btn.onclick = () => {
+              pendingRequestSelectedId = id;
+              renderPendingRequestModal();
+            };
+            requestList.appendChild(btn);
+          }
+
+          const addButton = (label, response, { primary = false } = {}) => {
+            const btn = el("button", { type: "button", text: label, class: primary ? "primary" : "" });
+            btn.disabled = pendingRequestSubmitBusy;
+            btn.onclick = async () => {
+              if (pendingRequestSubmitBusy) return;
+              pendingRequestSubmitBusy = true;
+              requestNotice.textContent = "Sending response...";
+              try {
+                await api(`/api/sessions/${selected}/requests/resolve`, {
+                  method: "POST",
+                  body: { request_id: requestId, response },
+                });
+                requestNotice.textContent = "";
+                await fetchPendingRequests(selected, pollGen);
+                const nextReq = getSelectedPendingRequest();
+                pendingRequestSelectedId = nextReq ? Number(nextReq.request_id) : 0;
+                kickPoll(0);
+              } catch (e) {
+                requestNotice.textContent = `request error: ${e.message}`;
+              } finally {
+                pendingRequestSubmitBusy = false;
+                renderPendingRequestModal();
+              }
+            };
+            requestActions.appendChild(btn);
+          };
+
+          if (kind === "command_approval") {
+            if (params.reason) requestBody.appendChild(el("div", { class: "requestText", text: String(params.reason) }));
+            if (params.command) requestBody.appendChild(codeBlock(params.command));
+            addButton("Allow", { decision: "accept" }, { primary: true });
+            addButton("Allow Session", { decision: "acceptForSession" });
+            addButton("Deny", { decision: "decline" });
+            addButton("Cancel", { decision: "cancel" });
+          } else if (kind === "file_change_approval") {
+            if (params.reason) requestBody.appendChild(el("div", { class: "requestText", text: String(params.reason) }));
+            if (params.grantRoot) requestBody.appendChild(codeBlock(params.grantRoot));
+            addButton("Allow", { decision: "accept" }, { primary: true });
+            addButton("Allow Session", { decision: "acceptForSession" });
+            addButton("Deny", { decision: "decline" });
+            addButton("Cancel", { decision: "cancel" });
+          } else if (kind === "permissions_approval") {
+            if (params.reason) requestBody.appendChild(el("div", { class: "requestText", text: String(params.reason) }));
+            requestBody.appendChild(codeBlock(JSON.stringify(params.permissions || {}, null, 2)));
+            addButton("Grant Once", { permissions: params.permissions || {}, scope: "turn" }, { primary: true });
+            addButton("Grant Session", { permissions: params.permissions || {}, scope: "session" });
+            addButton("Deny", { permissions: {}, scope: "turn" });
+          } else if (kind === "request_user_input") {
+            const form = el("div", { class: "requestForm" });
+            const questions = Array.isArray(params.questions) ? params.questions : [];
+            const inputs = [];
+            for (const q of questions) {
+              if (!q || typeof q !== "object") continue;
+              const qid = String(q.id || "");
+              const row = el("div", { class: "requestField" });
+              row.appendChild(el("div", { class: "requestFieldLabel", text: String(q.header || q.question || qid || "Input") }));
+              if (q.question) row.appendChild(el("div", { class: "muted requestFieldHelp", text: String(q.question) }));
+              let inputEl;
+              const opts = Array.isArray(q.options) ? q.options : [];
+              if (opts.length && !q.isOther && !q.isSecret) {
+                inputEl = el("select", { class: "requestInput" });
+                for (const opt of opts) {
+                  const label = String(opt && opt.label || "");
+                  inputEl.appendChild(el("option", { value: label, text: label }));
+                }
+              } else {
+                inputEl = el("input", { class: "requestInput", type: q.isSecret ? "password" : "text" });
+              }
+              row.appendChild(inputEl);
+              form.appendChild(row);
+              inputs.push({ qid, inputEl });
+            }
+            requestBody.appendChild(form);
+            const submitBtn = el("button", { type: "button", text: "Submit", class: "primary" });
+            submitBtn.onclick = async () => {
+              if (pendingRequestSubmitBusy) return;
+              const answers = {};
+              for (const item of inputs) {
+                const val = item.inputEl && "value" in item.inputEl ? String(item.inputEl.value || "") : "";
+                answers[item.qid] = { answers: [val] };
+              }
+              pendingRequestSubmitBusy = true;
+              requestNotice.textContent = "Sending response...";
+              try {
+                await api(`/api/sessions/${selected}/requests/resolve`, {
+                  method: "POST",
+                  body: { request_id: requestId, response: { answers } },
+                });
+                requestNotice.textContent = "";
+                await fetchPendingRequests(selected, pollGen);
+                const nextReq = getSelectedPendingRequest();
+                pendingRequestSelectedId = nextReq ? Number(nextReq.request_id) : 0;
+                kickPoll(0);
+              } catch (e) {
+                requestNotice.textContent = `request error: ${e.message}`;
+              } finally {
+                pendingRequestSubmitBusy = false;
+                renderPendingRequestModal();
+              }
+            };
+            requestActions.appendChild(submitBtn);
+          } else if (kind === "mcp_elicitation") {
+            if (params.message) requestBody.appendChild(el("div", { class: "requestText", text: String(params.message) }));
+            if (params.mode === "url" && params.url) {
+              const link = el("a", { href: String(params.url), target: "_blank", rel: "noreferrer noopener", text: String(params.url) });
+              requestBody.appendChild(link);
+              addButton("Accept", { action: "accept", content: null, _meta: null }, { primary: true });
+              addButton("Decline", { action: "decline", content: null, _meta: null });
+              addButton("Cancel", { action: "cancel", content: null, _meta: null });
+            } else {
+              const form = el("div", { class: "requestForm" });
+              const schema = params.requestedSchema && typeof params.requestedSchema === "object" ? params.requestedSchema : {};
+              const properties = schema.properties && typeof schema.properties === "object" ? schema.properties : {};
+              const entries = Object.entries(properties);
+              const inputs = [];
+              for (const [name, spec] of entries) {
+                if (!spec || typeof spec !== "object") continue;
+                const row = el("div", { class: "requestField" });
+                row.appendChild(el("div", { class: "requestFieldLabel", text: String(spec.title || name) }));
+                if (spec.description) row.appendChild(el("div", { class: "muted requestFieldHelp", text: String(spec.description) }));
+                let inputEl;
+                if (Array.isArray(spec.enum)) {
+                  inputEl = el("select", { class: "requestInput" });
+                  for (const opt of spec.enum) inputEl.appendChild(el("option", { value: String(opt), text: String(opt) }));
+                } else if (String(spec.type || "") === "boolean") {
+                  inputEl = el("input", { class: "requestCheckbox", type: "checkbox" });
+                  inputEl.checked = Boolean(spec.default);
+                } else {
+                  inputEl = el("input", {
+                    class: "requestInput",
+                    type: String(spec.type || "") === "number" || String(spec.type || "") === "integer" ? "number" : "text",
+                    value: spec.default == null ? "" : String(spec.default),
+                  });
+                }
+                row.appendChild(inputEl);
+                form.appendChild(row);
+                inputs.push({ name, spec, inputEl });
+              }
+              requestBody.appendChild(form);
+              const submitBtn = el("button", { type: "button", text: "Submit", class: "primary" });
+              submitBtn.onclick = async () => {
+                if (pendingRequestSubmitBusy) return;
+                const content = {};
+                for (const item of inputs) {
+                  if (item.inputEl.type === "checkbox") content[item.name] = Boolean(item.inputEl.checked);
+                  else if (item.inputEl.type === "number") {
+                    const raw = String(item.inputEl.value || "").trim();
+                    content[item.name] = raw === "" ? null : Number(raw);
+                  } else content[item.name] = String(item.inputEl.value || "");
+                }
+                pendingRequestSubmitBusy = true;
+                requestNotice.textContent = "Sending response...";
+                try {
+                  await api(`/api/sessions/${selected}/requests/resolve`, {
+                    method: "POST",
+                    body: { request_id: requestId, response: { action: "accept", content, _meta: null } },
+                  });
+                  requestNotice.textContent = "";
+                  await fetchPendingRequests(selected, pollGen);
+                  const nextReq = getSelectedPendingRequest();
+                  pendingRequestSelectedId = nextReq ? Number(nextReq.request_id) : 0;
+                  kickPoll(0);
+                } catch (e) {
+                  requestNotice.textContent = `request error: ${e.message}`;
+                } finally {
+                  pendingRequestSubmitBusy = false;
+                  renderPendingRequestModal();
+                }
+              };
+              requestActions.appendChild(submitBtn);
+              addButton("Decline", { action: "decline", content: null, _meta: null });
+              addButton("Cancel", { action: "cancel", content: null, _meta: null });
+            }
+          } else {
+            requestBody.appendChild(codeBlock(JSON.stringify(req, null, 2)));
+          }
+          requestBackdrop.style.display = "block";
+          requestModal.style.display = "flex";
+        }
+
+        async function fetchPendingRequests(sid = selected, gen = pollGen) {
+          if (!sid) {
+            pendingRequests = [];
+            pendingRequestSelectedId = 0;
+            updateRequestBadge();
+            hidePendingRequestModal();
+            return;
+          }
+          try {
+            const data = await api(`/api/sessions/${sid}/requests`);
+            if (gen !== pollGen || sid !== selected) return;
+            const nextList = normalizePendingRequestsList(data && data.requests);
+            const prevKey = pendingRequestsKeyOf();
+            const nextKey = pendingRequestsKeyOf(nextList);
+            pendingRequests = nextList;
+            if (!pendingRequests.some((item) => Number(item.request_id) === Number(pendingRequestSelectedId))) {
+              pendingRequestSelectedId = pendingRequests.length ? Number(pendingRequests[0].request_id) : 0;
+            }
+            if (selected) {
+              const s = sessionIndex.get(selected);
+              if (s) s.pending_request_count = pendingRequests.length;
+            }
+            updateRequestBadge();
+            if (!nextKey) {
+              requestModalDismissedKey = "";
+              requestModalVisible = false;
+            } else if (nextKey !== prevKey) {
+              requestModalDismissedKey = "";
+              requestModalVisible = true;
+            } else if (!requestModalVisible && requestModalDismissedKey !== nextKey) {
+              requestModalVisible = true;
+            }
+            renderPendingRequestModal();
+          } catch (e) {
+            if (gen !== pollGen || sid !== selected) return;
+            pendingRequests = [];
+            pendingRequestSelectedId = 0;
+            updateRequestBadge();
+            hidePendingRequestModal();
+          }
+        }
 
         function setToast(text) {
           toast.textContent = text || "";
@@ -2932,6 +3347,118 @@
           return last > seen + 0.0001;
         }
 
+        function getPendingRequestCount(s) {
+          const v = Number(s && s.pending_request_count);
+          return Number.isFinite(v) && v > 0 ? Math.trunc(v) : 0;
+        }
+
+        function applyRealtimeSessionSnapshot(sid, snapshot) {
+          if (!sid || !snapshot || typeof snapshot !== "object") return;
+          const s = sessionIndex.get(sid);
+          if (!s) return;
+          if (typeof snapshot.thread_id === "string" && snapshot.thread_id) s.thread_id = snapshot.thread_id;
+          if (typeof snapshot.cwd === "string" && snapshot.cwd) s.cwd = snapshot.cwd;
+          if (typeof snapshot.log_path === "string" && snapshot.log_path) s.log_path = snapshot.log_path;
+          if (snapshot.log_path === null) s.log_path = null;
+          if (typeof snapshot.busy === "boolean") s.busy = snapshot.busy;
+          if (Number.isFinite(Number(snapshot.queue_len))) s.queue_len = Number(snapshot.queue_len) || 0;
+          if (Number.isFinite(Number(snapshot.pending_server_requests))) {
+            s.pending_request_count = Number(snapshot.pending_server_requests) || 0;
+          }
+          if (snapshot.token && typeof snapshot.token === "object") s.token = snapshot.token;
+          if (Number.isFinite(Number(snapshot.last_chat_ts))) s.updated_ts = Number(snapshot.last_chat_ts);
+          if (Number.isFinite(Number(snapshot.last_assistant_ts))) s.last_assistant_ts = Number(snapshot.last_assistant_ts);
+
+          if (selected === sid) {
+            if (Number.isFinite(Number(s.queue_len))) setSelectedQueueLen(s.queue_len);
+            if (snapshot.token && typeof snapshot.token === "object") setContext(snapshot.token);
+            if (typeof snapshot.busy === "boolean") {
+              turnOpen = Boolean(snapshot.busy);
+              setStatus({ running: Boolean(snapshot.busy), queueLen: s.queue_len });
+              setTyping(Boolean(snapshot.busy));
+            }
+            updateRequestBadge();
+          }
+        }
+
+        function closeSessionEventStream() {
+          if (sessionEventSource) {
+            try {
+              sessionEventSource.close();
+            } catch {}
+          }
+          sessionEventSource = null;
+          sessionEventSourceSid = "";
+          sessionEventSeq = 0;
+        }
+
+        function scheduleSessionRefreshFromEvent(delayMs = 120) {
+          if (sessionRefreshKickTimer) return;
+          sessionRefreshKickTimer = setTimeout(async () => {
+            sessionRefreshKickTimer = null;
+            try {
+              await refreshSessions();
+            } catch (e) {
+              console.error("event refreshSessions failed", e);
+            }
+          }, delayMs);
+        }
+
+        function openSessionEventStream(sid) {
+          closeSessionEventStream();
+          if (!sid) return;
+          const s = sessionIndex.get(sid);
+          if (!s || String(s.transport || "") !== "app_server") return;
+          if (typeof EventSource !== "function") return;
+          const url = resolveAppUrl(`/api/sessions/${sid}/events?since=${sessionEventSeq}`);
+          const es = new EventSource(url, { withCredentials: true });
+          sessionEventSource = es;
+          sessionEventSourceSid = sid;
+          es.addEventListener("update", (ev) => {
+            if (selected !== sid || sessionEventSource !== es) return;
+            let payload = null;
+            try {
+              payload = JSON.parse(ev.data || "{}");
+            } catch {
+              payload = null;
+            }
+            if (payload && Number.isFinite(Number(payload.seq))) {
+              sessionEventSeq = Number(payload.seq) || sessionEventSeq;
+            }
+            const eventObj = payload && payload.event && typeof payload.event === "object" ? payload.event : null;
+            const snapshot = payload && payload.snapshot && typeof payload.snapshot === "object" ? payload.snapshot : null;
+            const kind = String(eventObj && eventObj.kind || "");
+            if (snapshot) applyRealtimeSessionSnapshot(sid, snapshot);
+            scheduleSessionRefreshFromEvent();
+            if (kind === "chat_event") {
+              const ev2 = eventObj && eventObj.chat_event && typeof eventObj.chat_event === "object" ? eventObj.chat_event : null;
+              if (ev2) appendEvent(ev2);
+              return;
+            }
+            if (kind === "request_pending") {
+              const req = eventObj && eventObj.request && typeof eventObj.request === "object" ? eventObj.request : null;
+              if (req) upsertPendingRequest(req);
+              else void fetchPendingRequests(sid, pollGen);
+              return;
+            }
+            if (kind === "request_resolved") {
+              if (eventObj && Number.isFinite(Number(eventObj.request_id))) {
+                removePendingRequestById(Number(eventObj.request_id));
+              } else {
+                void fetchPendingRequests(sid, pollGen);
+              }
+              return;
+            }
+            if (kind === "turn_started" || kind === "turn_completed") {
+              kickPoll(0);
+              return;
+            }
+          });
+          es.onerror = () => {
+            if (sessionEventSource !== es) return;
+          };
+        }
+
         function workspaceHasSelected(ws) {
           if (!selected) return false;
           return ws.sessions.some((s) => s && s.session_id === selected);
@@ -3110,6 +3637,7 @@
             }
             if (selected && deletedSids.includes(selected)) {
               selected = null;
+              closeSessionEventStream();
               offset = 0;
               activeLogPath = null;
               activeThreadId = null;
@@ -3196,6 +3724,8 @@
         function buildSessionCard(s) {
           const badge = el("span", { class: "badge" + (s.busy ? " busy" : ""), text: s.busy ? "busy" : "idle" });
           const q = s.queue_len ? el("span", { class: "badge queue", text: `queue ${s.queue_len}` }) : null;
+          const pendingCount = getPendingRequestCount(s);
+          const req = pendingCount ? el("span", { class: "badge request", text: pendingCount === 1 ? "needs input" : `needs input ${pendingCount}` }) : null;
           const card = el("div", { class: "session" + (selected === s.session_id ? " active" : "") });
           if (s && s.session_id) {
             const sid = String(s.session_id);
@@ -3209,6 +3739,7 @@
           const badges = [];
           badges.push(badge);
           if (q) badges.push(q);
+          if (req) badges.push(req);
           if (isSessionUnread(s)) badges.push(el("span", { class: "unreadDot", title: "Unread response" }));
           let delBtn = null;
           const renameCardBtn = el("button", {
@@ -3245,6 +3776,7 @@
                 clearUserSummaryForSession(s.session_id);
                 if (selected === s.session_id) {
                   selected = null;
+                  closeSessionEventStream();
                   offset = 0;
                   activeLogPath = null;
                   activeThreadId = null;
@@ -3388,6 +3920,7 @@
             clearQueueForSession(selected);
             clearPendingForSession(selected);
             selected = null;
+            closeSessionEventStream();
             offset = 0;
             activeLogPath = null;
             activeThreadId = null;
@@ -3660,6 +4193,7 @@
             if (e && e.status === 404) {
               clearPendingForSession(sid);
               selected = null;
+              closeSessionEventStream();
               offset = 0;
               activeLogPath = null;
               activeThreadId = null;
@@ -3668,6 +4202,8 @@
               pollTimer = null;
               pollKickPending = false;
               turnOpen = false;
+              pendingRequests = [];
+              hidePendingRequestModal();
               localStorage.removeItem("codexweb.selected");
               titleLabel.textContent = "No session selected";
               setStatus({ running: false, queueLen: 0 });
@@ -3697,6 +4233,7 @@
           const myGen = pollGen;
           try {
             await pollMessages(mySid, myGen);
+            await fetchPendingRequests(mySid, myGen);
           } finally {
             pollLoopBusy = false;
           }
@@ -3728,6 +4265,7 @@
 		        async function selectSession(id) {
 	          pollGen += 1;
 	          const myGen = pollGen;
+            closeSessionEventStream();
 	          if (pollTimer) {
 	            clearTimeout(pollTimer);
 	            pollTimer = null;
@@ -3751,6 +4289,8 @@
             setContext(null);
             setTyping(false);
             turnOpen = false;
+            pendingRequests = [];
+            hidePendingRequestModal();
 		          {
 		            const s = sessionIndex.get(sid);
                 if (s) titleLabel.textContent = sessionTitleWithId(s);
@@ -3814,6 +4354,7 @@
 			            setStatus({ running: Boolean(turnOpen || nowBusy), queueLen: data.queue_len });
 			            setContext(data.token);
 			            setTyping(Boolean(turnOpen || nowBusy));
+                  await fetchPendingRequests(sid, myGen);
 		          } catch {
                 if (hasCached) {
                   activeLogPath = typeof cached.log_path === "string" ? cached.log_path : null;
@@ -3824,16 +4365,19 @@
                   renderPendingForSelectedSession();
                   try {
                     await pollMessages(sid, myGen);
+                    await fetchPendingRequests(sid, myGen);
                   } catch {
                     // ignore and rely on next poll
                   }
                   if (pollGen !== myGen || selected !== sid) return;
                 } else {
                   await pollMessages(sid, myGen);
+                  await fetchPendingRequests(sid, myGen);
                   if (pollGen !== myGen || selected !== sid) return;
                 }
 		          }
            refreshSessions().catch((e) => console.error("refreshSessions failed", e));
+           openSessionEventStream(sid);
            kickPoll(900);
            if (isMobile()) setSidebarOpen(false);
            updateActionBtnState();
@@ -3864,6 +4408,7 @@
           renameBtn.disabled = !selected;
           duplicateBtn.disabled = !selected;
           sessionToolsBtn.disabled = !selected;
+          requestBtn.disabled = !selected;
 
           // Update tmux attach button state
           const s = selected ? sessionIndex.get(selected) : null;
@@ -4462,6 +5007,7 @@
           if (e.key !== "Escape") return;
           if (fileViewer.style.display === "flex") hideFileViewer();
           if (sendChoice.style.display === "flex") hideSendChoice();
+          if (requestModal.style.display === "flex") setRequestModalVisible(false, { dismiss: true });
           if (queueViewer.style.display === "flex") hideQueueViewer();
           if (sessionTools.style.display === "flex") hideSessionTools();
         });
@@ -4577,6 +5123,13 @@
             showQueueViewer();
           };
         }
+        requestBtn.onclick = async (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          if (!selected) return;
+          await fetchPendingRequests(selected, pollGen);
+          if (pendingRequests.length) setRequestModalVisible(true);
+        };
         sessionToolsBtn.onclick = (e) => {
           e.preventDefault();
           e.stopPropagation();
@@ -4856,6 +5409,10 @@
           queueBadgeEl = el("span", { class: "attachBadge queueBadge", id: "queueBadge" });
           queueBtn.appendChild(queueBadgeEl);
         }
+        if (!requestBadgeEl && requestBtn) {
+          requestBadgeEl = el("span", { class: "attachBadge requestBadge", id: "requestBadge" });
+          requestBtn.appendChild(requestBadgeEl);
+        }
         const setAttachCount = (n) => {
           const next = Math.max(0, Number(n) || 0);
           attachedImages = next;
@@ -4870,6 +5427,7 @@
         };
         setAttachCount(0);
         updateQueueBadge();
+        updateRequestBadge();
 
 	        function autoGrow() {
 	          const basePx = parseFloat(getComputedStyle(textarea).minHeight || "0") || 32;

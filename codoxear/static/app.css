@@ -444,6 +444,11 @@
         color: #f59e0b;
         border-color: rgba(245, 158, 11, 0.5);
       }
+      .badge.request {
+        color: #b45309;
+        border-color: rgba(217, 119, 6, 0.5);
+        background: rgba(255, 247, 237, 0.96);
+      }
       .sessionSummary.draft {
         color: #f59e0b;
       }
@@ -782,6 +787,9 @@
       }
       .queueBadge {
         background: rgba(245, 158, 11, 0.95);
+      }
+      .requestBadge {
+        background: rgba(217, 119, 6, 0.95);
       }
 
       .status-chip {
@@ -1588,6 +1596,109 @@ input[type="text"] {
         flex-direction: column;
         gap: 10px;
         box-sizing: border-box;
+      }
+      .requestModal {
+        display: none;
+        position: fixed;
+        left: 50%;
+        top: calc(50% + var(--vvTop, 0px));
+        transform: translate(-50%, -50%);
+        z-index: 80;
+        width: min(92vw, 640px);
+        max-height: calc(var(--appH, 100dvh) - 24px);
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 14px;
+        box-shadow: 0 24px 60px rgba(15, 23, 42, 0.28);
+        padding: 16px;
+        flex-direction: column;
+        gap: 12px;
+        box-sizing: border-box;
+        overflow: auto;
+      }
+      .requestHeader {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 10px;
+      }
+      .requestList {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+      }
+      .requestListBtn {
+        padding: 8px 10px;
+        border-radius: 999px;
+        border: 1px solid var(--border);
+        background: #fff;
+        color: var(--muted);
+        cursor: pointer;
+        font-size: 12px;
+        transition: all 140ms ease-out;
+      }
+      .requestListBtn.active {
+        color: var(--accent);
+        border-color: rgba(37, 99, 235, 0.38);
+        background: rgba(37, 99, 235, 0.08);
+      }
+      .requestBody {
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+      }
+      .requestText {
+        white-space: pre-wrap;
+      }
+      .requestCode {
+        margin: 0;
+        padding: 10px;
+        border-radius: 10px;
+        border: 1px solid rgba(15, 23, 42, 0.2);
+        background: #0b1220;
+        color: #e5e7eb;
+        font-size: 12px;
+        line-height: 1.45;
+        max-height: 240px;
+        overflow: auto;
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
+      .requestActions {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+      }
+      .requestActions button {
+        flex: 1 1 auto;
+      }
+      .requestNotice {
+        min-height: 18px;
+        font-size: 12px;
+      }
+      .requestForm {
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+      }
+      .requestField {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+      }
+      .requestFieldLabel {
+        font-size: 13px;
+        font-weight: 600;
+      }
+      .requestFieldHelp {
+        font-size: 12px;
+      }
+      .requestInput {
+        width: 100%;
+      }
+      .requestCheckbox {
+        width: 18px;
+        height: 18px;
       }
       .sendChoiceActions {
         display: flex;

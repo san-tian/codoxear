@@ -28,6 +28,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .codex_app_server import CodexAppServerSession
 from .cli_support import cli_bin as _cli_bin
 from .cli_support import cli_home as _cli_home
 from .cli_support import infer_cli_from_log_path as _infer_cli_from_log_path
@@ -106,6 +107,7 @@ def _strip_url_prefix(prefix: str, path: str) -> str | None:
 APP_DIR = _default_app_dir()
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 SOCK_DIR = APP_DIR / "socks"
+APP_SESSION_DIR = APP_DIR / "app_sessions"
 STATE_PATH = APP_DIR / "state.json"
 HMAC_SECRET_PATH = APP_DIR / "hmac_secret"
 UPLOAD_DIR = APP_DIR / "uploads"
@@ -1232,12 +1234,15 @@ class Session:
     chat_index_log_off: int = 0
     idle_cache_log_off: int = -1
     idle_cache_value: bool | None = None
+    transport: str = "broker"
+    pending_request_count: int = 0
 
 
 class SessionManager:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._sessions: dict[str, Session] = {}
+        self._app_sessions: dict[str, CodexAppServerSession] = {}
         self._stop = threading.Event()
         self._last_discover_ts = 0.0
         self._harness: dict[str, dict[str, Any]] = {}
@@ -1254,6 +1259,13 @@ class SessionManager:
 
     def stop(self) -> None:
         self._stop.set()
+        with self._lock:
+            app_sessions = list(self._app_sessions.values())
+        for app_session in app_sessions:
+            try:
+                app_session.close()
+            except Exception:
+                continue
 
     def _reset_log_caches(self, s: Session, *, meta_log_off: int) -> None:
         s.meta_thinking = 0
@@ -1885,6 +1897,82 @@ class SessionManager:
                         self._reset_log_caches(prev, meta_log_off=meta_log_off)
                     if s.last_assistant_ts is not None:
                         prev.last_assistant_ts = s.last_assistant_ts
+        APP_SESSION_DIR.mkdir(parents=True, exist_ok=True)
+        env = dict(os.environ)
+        if _DOTENV.exists():
+            try:
+                dotenv_values = _load_env_file(_DOTENV)
+            except Exception:
+                dotenv_values = {}
+            for k, v in dotenv_values.items():
+                env.setdefault(k, v)
+        env.setdefault("CODEX_HOME", str(_cli_home("codex")))
+        env.setdefault("CODEX_BIN", _cli_bin("codex"))
+        codex_bin = str(env.get("CODEX_BIN") or _cli_bin("codex"))
+        for meta_path in sorted(APP_SESSION_DIR.glob("*.json")):
+            try:
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            except Exception:
+                _unlink_quiet(meta_path)
+                continue
+            if not isinstance(meta, dict):
+                _unlink_quiet(meta_path)
+                continue
+            transport = str(meta.get("transport") or "")
+            if transport != "app_server":
+                continue
+            session_id = meta.get("session_id") if isinstance(meta.get("session_id"), str) else ""
+            if not session_id:
+                _unlink_quiet(meta_path)
+                continue
+            with self._lock:
+                if session_id in self._sessions:
+                    continue
+            cwd = meta.get("cwd") if isinstance(meta.get("cwd"), str) and meta.get("cwd").strip() else str(Path.cwd())
+            queue_items = _normalize_queue_list(meta.get("queue") if isinstance(meta.get("queue"), list) else [])
+            start_ts_raw = meta.get("start_ts")
+            start_ts = float(start_ts_raw) if isinstance(start_ts_raw, (int, float)) else time.time()
+            try:
+                app_session = CodexAppServerSession.resume(
+                    thread_id=session_id,
+                    cwd=cwd,
+                    env=env,
+                    codex_bin=codex_bin,
+                    queue_items=queue_items,
+                )
+            except Exception as e:
+                sys.stderr.write(
+                    f"warning: failed to resume app-server session {session_id}: {type(e).__name__}: {e}\n"
+                )
+                sys.stderr.flush()
+                _unlink_quiet(meta_path)
+                continue
+            snap = app_session.snapshot()
+            s = Session(
+                session_id=session_id,
+                thread_id=str(snap.get("thread_id") or session_id),
+                broker_pid=int(app_session.pid),
+                codex_pid=int(app_session.pid),
+                cli="codex",
+                owned=True,
+                start_ts=float(start_ts),
+                cwd=str(snap.get("cwd") or cwd),
+                log_path=snap.get("log_path") if isinstance(snap.get("log_path"), Path) else None,
+                sock_path=APP_DIR / f"app-server-{session_id}.jsonrpc",
+                busy=bool(snap.get("busy")),
+                queue_len=int(snap.get("queue_len") or 0),
+                pending_request_count=int(snap.get("pending_server_requests") or 0),
+                token=snap.get("token") if isinstance(snap.get("token"), dict) else None,
+                last_chat_ts=float(snap.get("last_chat_ts")) if isinstance(snap.get("last_chat_ts"), (int, float)) else None,
+                last_assistant_ts=(
+                    float(snap.get("last_assistant_ts")) if isinstance(snap.get("last_assistant_ts"), (int, float)) else None
+                ),
+                transport="app_server",
+            )
+            with self._lock:
+                self._sessions[session_id] = s
+                self._app_sessions[session_id] = app_session
+            self._save_app_session_meta(session_id)
         with self._lock:
             self._last_discover_ts = time.time()
 
@@ -1911,6 +1999,10 @@ class SessionManager:
             items = list(self._sessions.items())
         dead: list[tuple[str, Path]] = []
         for sid, s in items:
+            if getattr(s, "transport", "broker") == "app_server":
+                if self._refresh_app_session(sid) is None:
+                    dead.append((sid, s.sock_path))
+                continue
             if not s.sock_path.exists():
                 dead.append((sid, s.sock_path))
                 continue
@@ -1928,6 +2020,7 @@ class SessionManager:
         with self._lock:
             for sid, _sock in dead:
                 self._sessions.pop(sid, None)
+                self._app_sessions.pop(sid, None)
         for _sid, sock in dead:
             _unlink_quiet(sock)
             _unlink_quiet(sock.with_suffix(".json"))
@@ -1936,6 +2029,8 @@ class SessionManager:
         with self._lock:
             items = list(self._sessions.items())
         for sid, s in items:
+            if getattr(s, "transport", "broker") == "app_server":
+                continue
             lp = s.log_path
             if lp is None or (not lp.exists()):
                 continue
@@ -1997,6 +2092,10 @@ class SessionManager:
         self._discover_existing_if_stale()
         self._prune_dead_sessions()
         self._update_meta_counters()
+        with self._lock:
+            app_session_ids = [sid for sid, s in self._sessions.items() if getattr(s, "transport", "broker") == "app_server"]
+        for sid in app_session_ids:
+            self._refresh_app_session(sid)
         files_dirty = False
         branch_by_cwd: dict[str, str] = {}
         with self._lock:
@@ -2049,6 +2148,7 @@ class SessionManager:
                         "log_exists": log_exists,
                         "state_busy": bool(s.busy),
                         "queue_len": int(s.queue_len),
+                        "pending_request_count": int(getattr(s, "pending_request_count", 0) or 0),
                         "token": s.token,
                         "thinking": int(s.meta_thinking),
                         "tools": int(s.meta_tools),
@@ -2059,12 +2159,20 @@ class SessionManager:
                         "files": list(files),
                         "git_branch": branch_by_cwd.get(cwd_norm, ""),
                         "tmux_name": s.tmux_name if isinstance(getattr(s, "tmux_name", None), str) else None,
+                        "transport": str(getattr(s, "transport", "broker") or "broker"),
                     }
                 )
 
         out: list[dict[str, Any]] = []
         for it in items:
             sid = str(it["session_id"])
+            if str(it.get("transport") or "") == "app_server":
+                it2 = dict(it)
+                it2.pop("log_exists", None)
+                it2.pop("state_busy", None)
+                it2["busy"] = bool(it.get("state_busy"))
+                out.append(it2)
+                continue
             log_exists = bool(it.get("log_exists"))
             state_busy = bool(it.get("state_busy"))
             if not log_exists:
@@ -2099,7 +2207,13 @@ class SessionManager:
             s = self._sessions.get(session_id)
             if not s:
                 return
-            sock = s.sock_path
+            if getattr(s, "transport", "broker") == "app_server":
+                pass
+            else:
+                sock = s.sock_path
+        if s and getattr(s, "transport", "broker") == "app_server":
+            self._refresh_app_session(session_id)
+            return
         meta_path = sock.with_suffix(".json")
         if not meta_path.exists():
             raise RuntimeError(f"missing metadata sidecar for socket {sock}")
@@ -2416,8 +2530,100 @@ class SessionManager:
             s = self._sessions.get(session_id)
         if not s:
             return False
+        if getattr(s, "transport", "broker") == "app_server":
+            with self._lock:
+                app_session = self._app_sessions.pop(session_id, None)
+                self._sessions.pop(session_id, None)
+            self._delete_app_session_meta(session_id)
+            if app_session is not None:
+                app_session.close()
+            return True
         self._sock_call(s.sock_path, {"cmd": "shutdown"}, timeout_s=1.0)
         return True
+
+    def _refresh_app_session(self, session_id: str) -> Session | None:
+        with self._lock:
+            s = self._sessions.get(session_id)
+            app_session = self._app_sessions.get(session_id)
+        if not s or getattr(s, "transport", "broker") != "app_server":
+            return s
+        if app_session is None or not app_session.is_alive():
+            with self._lock:
+                self._sessions.pop(session_id, None)
+                self._app_sessions.pop(session_id, None)
+            self._delete_app_session_meta(session_id)
+            return None
+        snap = app_session.snapshot()
+        with self._lock:
+            s2 = self._sessions.get(session_id)
+            if not s2:
+                return None
+            s2.thread_id = str(snap.get("thread_id") or s2.thread_id)
+            s2.cwd = str(snap.get("cwd") or s2.cwd)
+            log_path = snap.get("log_path")
+            if isinstance(log_path, Path) or log_path is None:
+                s2.log_path = log_path
+            s2.busy = bool(snap.get("busy"))
+            s2.queue_len = int(snap.get("queue_len") or 0)
+            s2.pending_request_count = int(snap.get("pending_server_requests") or 0)
+            token = snap.get("token")
+            if isinstance(token, dict) or token is None:
+                s2.token = token
+            last_chat_ts = snap.get("last_chat_ts")
+            if isinstance(last_chat_ts, (int, float)):
+                s2.last_chat_ts = float(last_chat_ts)
+            last_assistant_ts = snap.get("last_assistant_ts")
+            if isinstance(last_assistant_ts, (int, float)):
+                s2.last_assistant_ts = float(last_assistant_ts)
+        self._save_app_session_meta(session_id)
+        with self._lock:
+            return self._sessions.get(session_id)
+
+    def _app_session_for(self, session_id: str) -> CodexAppServerSession:
+        with self._lock:
+            s = self._sessions.get(session_id)
+            app_session = self._app_sessions.get(session_id)
+        if not s or getattr(s, "transport", "broker") != "app_server" or app_session is None:
+            raise KeyError("unknown session")
+        if not app_session.is_alive():
+            with self._lock:
+                self._sessions.pop(session_id, None)
+                self._app_sessions.pop(session_id, None)
+            raise KeyError("unknown session")
+        return app_session
+
+    def _app_session_meta_path(self, session_id: str) -> Path:
+        return APP_SESSION_DIR / f"{session_id}.json"
+
+    def _save_app_session_meta(self, session_id: str) -> None:
+        with self._lock:
+            s = self._sessions.get(session_id)
+            app_session = self._app_sessions.get(session_id)
+        if not s or getattr(s, "transport", "broker") != "app_server" or app_session is None:
+            return
+        snap = app_session.snapshot()
+        APP_SESSION_DIR.mkdir(parents=True, exist_ok=True)
+        meta = {
+            "session_id": s.session_id,
+            "thread_id": s.thread_id,
+            "owner": "web" if s.owned else "terminal",
+            "cli": s.cli,
+            "transport": "app_server",
+            "app_server_pid": int(app_session.pid),
+            "cwd": s.cwd,
+            "start_ts": float(s.start_ts),
+            "log_path": str(s.log_path) if s.log_path is not None else None,
+            "queue": list(snap.get("queue") or []),
+        }
+        path = self._app_session_meta_path(session_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.parent / f".{path.name}.tmp"
+        tmp.write_text(json.dumps(meta, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+        os.replace(tmp, path)
+
+    def _delete_app_session_meta(self, session_id: str) -> None:
+        path = self._app_session_meta_path(session_id)
+        _unlink_quiet(path)
 
     def spawn_web_session(
         self,
@@ -2425,10 +2631,16 @@ class SessionManager:
         cwd: str,
         args: list[str] | None = None,
         cli: str | None = None,
+        transport: str | None = None,
     ) -> dict[str, Any]:
         cli_name = _parse_cli_name(cli, default=DEFAULT_SPAWN_CLI)
         if cli_name != "codex":
             raise ValueError("unsupported cli: only codex is available")
+        transport_name = str(transport or "").strip().lower()
+        if not transport_name:
+            transport_name = "app_server"
+        if transport_name not in ("broker", "app_server"):
+            raise ValueError("unsupported transport")
         env = dict(os.environ)
         dotenv_values: dict[str, str] = {}
         if _DOTENV.exists():
@@ -2449,6 +2661,47 @@ class SessionManager:
         child_env_unset: list[str] = []
         env.setdefault("CODEX_HOME", str(_cli_home("codex")))
         env.setdefault("CODEX_BIN", _cli_bin("codex"))
+        if transport_name == "app_server":
+            codex_bin = str(env.get("CODEX_BIN") or _cli_bin("codex"))
+            app_session = CodexAppServerSession(cwd=cwd, env=env, codex_bin=codex_bin)
+            snap = app_session.snapshot()
+            session_id = str(snap.get("thread_id") or "")
+            if not session_id:
+                app_session.close()
+                raise RuntimeError("app-server session did not report a thread id")
+            s = Session(
+                session_id=session_id,
+                thread_id=session_id,
+                broker_pid=int(app_session.pid),
+                codex_pid=int(app_session.pid),
+                cli=cli_name,
+                owned=True,
+                start_ts=time.time(),
+                cwd=str(snap.get("cwd") or cwd),
+                log_path=snap.get("log_path") if isinstance(snap.get("log_path"), Path) else None,
+                sock_path=APP_DIR / f"app-server-{session_id}.jsonrpc",
+                busy=bool(snap.get("busy")),
+                queue_len=int(snap.get("queue_len") or 0),
+                pending_request_count=int(snap.get("pending_server_requests") or 0),
+                token=snap.get("token") if isinstance(snap.get("token"), dict) else None,
+                last_chat_ts=float(snap.get("last_chat_ts")) if isinstance(snap.get("last_chat_ts"), (int, float)) else None,
+                last_assistant_ts=(
+                    float(snap.get("last_assistant_ts")) if isinstance(snap.get("last_assistant_ts"), (int, float)) else None
+                ),
+                transport="app_server",
+            )
+            with self._lock:
+                self._sessions[session_id] = s
+                self._app_sessions[session_id] = app_session
+            self._save_app_session_meta(session_id)
+            return {
+                "broker_pid": int(app_session.pid),
+                "pid": int(app_session.pid),
+                "cli": cli_name,
+                "session_id": session_id,
+                "thread_id": session_id,
+                "transport": "app_server",
+            }
 
         if use_tmux and tmux_bin:
             tmux_name = f"codoxear-web-{uuid.uuid4().hex[:8]}"
@@ -2477,7 +2730,7 @@ class SessionManager:
                 msg = msg[-4000:] if msg else ""
                 raise RuntimeError(f"tmux spawn failed (rc={proc.returncode}): {msg}")
             broker_pid = _tmux_pane_pid(tmux_bin, tmux_name, env) or 0
-            return {"broker_pid": int(broker_pid), "tmux_name": tmux_name, "cli": cli_name}
+            return {"broker_pid": int(broker_pid), "tmux_name": tmux_name, "cli": cli_name, "transport": "broker"}
         if use_tmux and not tmux_bin:
             sys.stderr.write("warning: CODEX_WEB_TMUX enabled but tmux not found; falling back to direct broker spawn.\n")
             sys.stderr.flush()
@@ -2500,7 +2753,7 @@ class SessionManager:
 
         # Prevent zombies when the broker exits.
         threading.Thread(target=proc.wait, daemon=True).start()
-        return {"broker_pid": int(proc.pid), "cli": cli_name}
+        return {"broker_pid": int(proc.pid), "cli": cli_name, "transport": "broker"}
 
     def delete_web_session(self, session_id: str) -> bool:
         with self._lock:
@@ -2521,9 +2774,15 @@ class SessionManager:
             s = self._sessions.get(session_id)
             if not s:
                 raise KeyError("unknown session")
+            transport = str(getattr(s, "transport", "broker") or "broker")
             sock = s.sock_path
             cli = _normalize_cli_name(s.cli, default="codex")
         text_out = _normalize_outgoing_text_for_cli(text, cli)
+        if transport == "app_server":
+            app_session = self._app_session_for(session_id)
+            resp = app_session.send_text(text_out)
+            self._refresh_app_session(session_id)
+            return resp
         deadline = 0.0
         if (
             s.owned
@@ -2571,7 +2830,27 @@ class SessionManager:
             s = self._sessions.get(session_id)
             if not s:
                 raise KeyError("unknown session")
+            transport = str(getattr(s, "transport", "broker") or "broker")
             sock = s.sock_path
+        if transport == "app_server":
+            app_session = self._app_session_for(session_id)
+            op = str(req.get("op") or "")
+            if op == "get":
+                resp = app_session.queue_get()
+            elif op == "set":
+                queue_raw = req.get("queue")
+                if not isinstance(queue_raw, list):
+                    raise ValueError("invalid queue payload")
+                resp = app_session.queue_set(_normalize_queue_list(queue_raw))
+            elif op == "push":
+                text = req.get("text")
+                if not isinstance(text, str):
+                    raise ValueError("invalid queue payload")
+                resp = app_session.queue_push(text, front=bool(req.get("front")))
+            else:
+                raise ValueError("invalid queue operation")
+            self._refresh_app_session(session_id)
+            return resp
         try:
             resp = self._sock_call(sock, req, timeout_s=2.5)
         except Exception:
@@ -2620,7 +2899,13 @@ class SessionManager:
             s = self._sessions.get(session_id)
             if not s:
                 raise KeyError("unknown session")
+            transport = str(getattr(s, "transport", "broker") or "broker")
             sock = s.sock_path
+        if transport == "app_server":
+            app_session = self._app_session_for(session_id)
+            resp = app_session.get_state()
+            self._refresh_app_session(session_id)
+            return resp
         try:
             resp = self._sock_call(sock, {"cmd": "state"}, timeout_s=1.5)
         except Exception:
@@ -2649,7 +2934,11 @@ class SessionManager:
             s = self._sessions.get(session_id)
             if not s:
                 raise KeyError("unknown session")
+            transport = str(getattr(s, "transport", "broker") or "broker")
             sock = s.sock_path
+        if transport == "app_server":
+            app_session = self._app_session_for(session_id)
+            return _sanitize_tail_text(app_session.get_tail())
         try:
             resp = self._sock_call(sock, {"cmd": "tail"}, timeout_s=1.5)
         except Exception:
@@ -2667,12 +2956,57 @@ class SessionManager:
             raise ValueError("invalid broker tail response")
         return _sanitize_tail_text(tail)
 
+    def get_app_server_messages(self, session_id: str, *, offset: int, init: bool, limit: int, before: int) -> dict[str, Any]:
+        app_session = self._app_session_for(session_id)
+        resp = app_session.get_messages(offset=offset, init=init, limit=limit, before=before)
+        self._refresh_app_session(session_id)
+        return resp
+
+    def get_pending_requests(self, session_id: str) -> dict[str, Any]:
+        with self._lock:
+            s = self._sessions.get(session_id)
+        if not s:
+            raise KeyError("unknown session")
+        if str(getattr(s, "transport", "broker") or "broker") != "app_server":
+            return {"requests": [], "count": 0}
+        app_session = self._app_session_for(session_id)
+        requests = app_session.list_pending_requests()
+        self._refresh_app_session(session_id)
+        return {"requests": requests, "count": len(requests)}
+
+    def resolve_pending_request(self, session_id: str, request_id: int, response: dict[str, Any]) -> dict[str, Any]:
+        app_session = self._app_session_for(session_id)
+        app_session.resolve_pending_request(int(request_id), response)
+        self._refresh_app_session(session_id)
+        return {"ok": True}
+
+    def wait_for_session_event(self, session_id: str, *, after_seq: int, timeout_s: float) -> dict[str, Any]:
+        app_session = self._app_session_for(session_id)
+        item = app_session.wait_for_event(after_seq=after_seq, timeout_s=timeout_s)
+        snap = app_session.snapshot()
+        snap_json = dict(snap)
+        log_path = snap_json.get("log_path")
+        if isinstance(log_path, Path):
+            snap_json["log_path"] = str(log_path)
+        self._refresh_app_session(session_id)
+        if item is None:
+            return {"ok": False}
+        return {"ok": True, **item, "snapshot": snap_json}
+
     def inject_keys(self, session_id: str, seq: str) -> dict[str, Any]:
         with self._lock:
             s = self._sessions.get(session_id)
             if not s:
                 raise KeyError("unknown session")
+            transport = str(getattr(s, "transport", "broker") or "broker")
             sock = s.sock_path
+        if transport == "app_server":
+            if seq != "\\x1b":
+                raise ValueError("raw key injection is unsupported for app-server sessions")
+            app_session = self._app_session_for(session_id)
+            resp = app_session.interrupt()
+            self._refresh_app_session(session_id)
+            return resp
         try:
             resp = self._sock_call(sock, {"cmd": "keys", "seq": seq}, timeout_s=2.0)
         except Exception:
@@ -2890,6 +3224,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         raise ValueError("invalid before")
                     before = int(before_q[0])
                 before = max(0, before)
+                transport = str(getattr(s, "transport", "broker") or "broker")
+                if transport == "app_server":
+                    limit_q = qs.get("limit")
+                    if limit_q is None:
+                        limit = 80
+                    else:
+                        if not limit_q:
+                            raise ValueError("invalid limit")
+                        limit = int(limit_q[0])
+                    limit = max(20, min(200, limit))
+                    data = MANAGER.get_app_server_messages(session_id, offset=offset, init=init, limit=limit, before=before)
+                    _json_response(self, 200, data)
+                    dt_total_ms = (time.perf_counter() - t0_total) * 1000.0
+                    _record_metric("api_messages_init_ms" if init else "api_messages_poll_ms", dt_total_ms)
+                    return
                 if s.log_path is None or (not s.log_path.exists()):
                     state = MANAGER.get_state(session_id)
                     if not isinstance(state, dict):
@@ -3030,6 +3379,69 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 _json_response(self, 200, resp)
                 return
 
+            if path.startswith("/api/sessions/") and path.endswith("/requests"):
+                if not _require_auth(self):
+                    self._unauthorized()
+                    return
+                parts = path.split("/")
+                session_id = parts[3] if len(parts) >= 4 else ""
+                try:
+                    resp = MANAGER.get_pending_requests(session_id)
+                except KeyError:
+                    _json_response(self, 404, {"error": "unknown session"})
+                    return
+                _json_response(self, 200, resp)
+                return
+
+            if path.startswith("/api/sessions/") and path.endswith("/events"):
+                if not _require_auth(self):
+                    self._unauthorized()
+                    return
+                parts = path.split("/")
+                session_id = parts[3] if len(parts) >= 4 else ""
+                qs = urllib.parse.parse_qs(u.query)
+                since_raw = qs.get("since")
+                since = 0
+                if since_raw:
+                    since = int(since_raw[0] or "0")
+                try:
+                    sref = MANAGER.get_session(session_id)
+                    if not sref:
+                        raise KeyError("unknown session")
+                    if str(getattr(sref, "transport", "broker") or "broker") != "app_server":
+                        _json_response(self, 400, {"error": "event stream only supported for app_server sessions"})
+                        return
+                except KeyError:
+                    _json_response(self, 404, {"error": "unknown session"})
+                    return
+
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Connection", "keep-alive")
+                self.end_headers()
+                cur = int(since)
+                try:
+                    while True:
+                        item = MANAGER.wait_for_session_event(session_id, after_seq=cur, timeout_s=25.0)
+                        if not item.get("ok"):
+                            self.wfile.write(b": keepalive\n\n")
+                            self.wfile.flush()
+                            continue
+                        cur = int(item.get("seq") or cur)
+                        payload = json.dumps({"seq": cur, "event": item.get("event")}, ensure_ascii=False)
+                        self.wfile.write(f"event: update\ndata: {payload}\n\n".encode("utf-8"))
+                        self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    return
+                except KeyError:
+                    try:
+                        self.wfile.write(b"event: close\ndata: {}\n\n")
+                        self.wfile.flush()
+                    except Exception:
+                        pass
+                    return
+
             if path.startswith("/api/sessions/") and path.endswith("/tail"):
                 if not _require_auth(self):
                     self._unauthorized()
@@ -3163,7 +3575,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 else:
                     _json_response(self, 400, {"error": "cli must be a string"})
                     return
-                res = MANAGER.spawn_web_session(cwd=cwd, args=args_list, cli=cli)
+                transport_raw = obj.get("transport")
+                if transport_raw is None:
+                    transport = None
+                elif isinstance(transport_raw, str):
+                    transport = transport_raw
+                else:
+                    _json_response(self, 400, {"error": "transport must be a string"})
+                    return
+                res = MANAGER.spawn_web_session(cwd=cwd, args=args_list, cli=cli, transport=transport)
                 _json_response(self, 200, {"ok": True, **res})
                 return
 
@@ -3431,6 +3851,35 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 _json_response(self, 200, resp)
                 return
 
+            if path.startswith("/api/sessions/") and path.endswith("/requests/resolve"):
+                if not _require_auth(self):
+                    self._unauthorized()
+                    return
+                parts = path.split("/")
+                session_id = parts[3] if len(parts) >= 4 else ""
+                body = _read_body(self)
+                body_text = body.decode("utf-8")
+                if not body_text.strip():
+                    raise ValueError("empty request body")
+                obj = json.loads(body_text)
+                if not isinstance(obj, dict):
+                    raise ValueError("invalid json body (expected object)")
+                request_id = obj.get("request_id")
+                response = obj.get("response")
+                if not isinstance(request_id, int):
+                    _json_response(self, 400, {"error": "request_id must be an integer"})
+                    return
+                if not isinstance(response, dict):
+                    _json_response(self, 400, {"error": "response must be an object"})
+                    return
+                try:
+                    resp = MANAGER.resolve_pending_request(session_id, request_id, response)
+                except KeyError:
+                    _json_response(self, 404, {"error": "unknown session or request"})
+                    return
+                _json_response(self, 200, resp)
+                return
+
             if path.startswith("/api/sessions/") and path.endswith("/send"):
                 if not _require_auth(self):
                     self._unauthorized()
@@ -3565,7 +4014,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 # Bracketed paste: inject the image path; Codex TUI attaches if it exists and is an image.
                 seq = f"\x1b[200~{str(out_path)}\x1b[201~"
                 try:
-                    resp = MANAGER.inject_keys(session_id, seq)
+                    sref = MANAGER.get_session(session_id)
+                    if not sref:
+                        raise KeyError("unknown session")
+                    if str(getattr(sref, "transport", "broker") or "broker") == "app_server":
+                        app_session = MANAGER._app_session_for(session_id)
+                        resp = app_session.send_local_image(str(out_path))
+                        MANAGER._refresh_app_session(session_id)
+                    else:
+                        resp = MANAGER.inject_keys(session_id, seq)
                 except KeyError:
                     _json_response(self, 404, {"error": "unknown session"})
                     return
