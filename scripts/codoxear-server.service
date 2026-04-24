@@ -1,0 +1,14 @@
+[Unit]
+Description=Codoxear server (dev)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/code/codoxear
+ExecStart=/usr/bin/python3 -m codoxear.server
+Restart=always
+RestartSec=2
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target

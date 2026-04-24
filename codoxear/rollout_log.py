@@ -593,6 +593,9 @@ def _extract_chat_events(
                 continue
             if pt == "token_count":
                 continue
+            if pt == "task_complete":
+                turn_end = True
+                continue
 
         if typ == "response_item":
             p = obj.get("payload")
@@ -790,11 +793,12 @@ def _has_assistant_output_text(obj: dict[str, Any]) -> bool:
 
 def _analyze_log_chunk(
     objs: list[dict[str, Any]],
-) -> tuple[int, int, int, float | None, dict[str, Any] | None, list[dict[str, Any]]]:
+) -> tuple[int, int, int, float | None, float | None, dict[str, Any] | None, list[dict[str, Any]]]:
     d_th = 0
     d_tools = 0
     d_sys = 0
     last_chat_ts: float | None = None
+    last_assistant_ts: float | None = None
     token_update = _extract_token_update(objs)
     chat_events, _meta, _flags, _diag = _extract_chat_events(objs)
 
@@ -842,7 +846,7 @@ def _analyze_log_chunk(
             if pt == "message" and p.get("role") in ("developer", "system"):
                 d_sys += 1
 
-    return d_th, d_tools, d_sys, last_chat_ts, token_update, chat_events
+    return d_th, d_tools, d_sys, last_chat_ts, last_assistant_ts, token_update, chat_events
 
 
 def _last_conversation_ts_from_tail(
@@ -858,6 +862,41 @@ def _last_conversation_ts_from_tail(
         if ts is not None:
             return ts
     return None
+
+
+def _last_assistant_ts_from_tail(
+    path: Path,
+    *,
+    max_scan_bytes: int,
+) -> float | None:
+    scan = 256 * 1024
+    while True:
+        objs = _read_jsonl_tail(path, scan)
+        last_assistant: float | None = None
+        for obj in objs:
+            typ = obj.get("type")
+            if typ == "event_msg":
+                p = obj.get("payload")
+                if not isinstance(p, dict):
+                    raise ValueError("invalid event_msg payload")
+                pt = p.get("type")
+                if pt == "agent_message":
+                    msg = p.get("message")
+                    if isinstance(msg, str) and msg.strip():
+                        ts = _event_ts(obj)
+                        if ts is not None:
+                            last_assistant = float(ts)
+                    continue
+            if typ == "response_item" and _has_assistant_output_text(obj):
+                ts = _event_ts(obj)
+                if ts is not None:
+                    last_assistant = float(ts)
+                continue
+        if last_assistant is not None:
+            return float(last_assistant)
+        if scan >= max_scan_bytes:
+            return None
+        scan *= 2
 
 
 def _compute_idle_from_log(path: Path, max_scan_bytes: int = 8 * 1024 * 1024) -> bool | None:

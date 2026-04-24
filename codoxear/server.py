@@ -174,9 +174,11 @@ QUEUE_SWEEP_SECONDS = float(os.environ.get("CODEX_WEB_QUEUE_SWEEP_SECONDS", "1.0
 VOICE_PUSH_SWEEP_SECONDS = float(os.environ.get("CODEX_WEB_VOICE_PUSH_SWEEP_SECONDS", "1.0"))
 QUEUE_IDLE_GRACE_SECONDS = float(os.environ.get("CODEX_WEB_QUEUE_IDLE_GRACE_SECONDS", "10.0"))
 HARNESS_MAX_SCAN_BYTES = int(os.environ.get("CODEX_WEB_HARNESS_MAX_SCAN_BYTES", str(8 * 1024 * 1024)))
+CHAT_INIT_MAX_SCAN_BYTES = int(os.environ.get("CODEX_WEB_CHAT_INIT_MAX_SCAN_BYTES", str(128 * 1024 * 1024)))
 DISCOVER_MIN_INTERVAL_SECONDS = float(os.environ.get("CODEX_WEB_DISCOVER_MIN_INTERVAL_SECONDS", "1.0"))
 METRICS_WINDOW = int(os.environ.get("CODEX_WEB_METRICS_WINDOW", "256"))
 FILE_READ_MAX_BYTES = int(os.environ.get("CODEX_WEB_FILE_READ_MAX_BYTES", str(2 * 1024 * 1024)))
+FILE_WRITE_MAX_BYTES = int(os.environ.get("CODEX_WEB_FILE_WRITE_MAX_BYTES", str(FILE_READ_MAX_BYTES)))
 FILE_HISTORY_MAX = int(os.environ.get("CODEX_WEB_FILE_HISTORY_MAX", "20"))
 FILE_SEARCH_LIMIT = int(os.environ.get("CODEX_WEB_FILE_SEARCH_LIMIT", "120"))
 FILE_SEARCH_TIMEOUT_SECONDS = float(os.environ.get("CODEX_WEB_FILE_SEARCH_TIMEOUT_SECONDS", "0.75"))
@@ -593,6 +595,9 @@ def _json_response(handler: http.server.BaseHTTPRequestHandler, status: int, obj
     handler.send_response(status)
     handler.send_header("Content-Type", "application/json; charset=utf-8")
     handler.send_header("Content-Length", str(len(body)))
+    handler.send_header("Cache-Control", "no-store")
+    handler.send_header("Pragma", "no-cache")
+    handler.send_header("Expires", "0")
     handler.end_headers()
     handler.wfile.write(body)
 
@@ -2187,7 +2192,7 @@ def _has_assistant_output_text(obj: dict[str, Any]) -> bool:
 
 def _analyze_log_chunk(
     objs: list[dict[str, Any]],
-) -> tuple[int, int, int, float | None, dict[str, Any] | None, list[dict[str, Any]]]:
+) -> tuple[int, int, int, float | None, float | None, dict[str, Any] | None, list[dict[str, Any]]]:
     return _rollout_log._analyze_log_chunk(objs)
 
 
@@ -2211,6 +2216,14 @@ def _last_chat_role_ts_from_tail(
     return _rollout_log._last_chat_role_ts_from_tail(path, max_scan_bytes=max_scan_bytes)
 
 
+def _last_assistant_ts_from_tail(
+    path: Path,
+    *,
+    max_scan_bytes: int,
+) -> float | None:
+    return _rollout_log._last_assistant_ts_from_tail(path, max_scan_bytes=max_scan_bytes)
+
+
 @dataclass
 class Session:
     session_id: str
@@ -2228,6 +2241,7 @@ class Session:
     token: dict[str, Any] | None = None
     last_turn_id: str | None = None
     last_chat_ts: float | None = None
+    last_assistant_ts: float | None = None
     last_chat_history_scanned: bool = False
     meta_thinking: int = 0
     meta_tools: int = 0
@@ -3445,6 +3459,15 @@ class SessionManager:
                 meta_log_off = int(log_path.stat().st_size)
             else:
                 meta_log_off = 0
+            prev: Session | None
+            with self._lock:
+                prev = self._sessions.get(session_id)
+            last_assistant_ts: float | None = None
+            if log_path is not None and log_path.exists():
+                if prev and prev.log_path == log_path and prev.last_assistant_ts is not None:
+                    last_assistant_ts = prev.last_assistant_ts
+                else:
+                    last_assistant_ts = _last_assistant_ts_from_tail(log_path, max_scan_bytes=CHAT_INIT_MAX_SCAN_BYTES)
 
             s = Session(
                 session_id=session_id,
@@ -3461,6 +3484,7 @@ class SessionManager:
                 busy=bool(resp.get("busy")),
                 queue_len=int(resp.get("queue_len")),
                 token=(resp.get("token") if isinstance(resp.get("token"), (dict, type(None))) else None),
+                last_assistant_ts=last_assistant_ts,
                 meta_thinking=0,
                 meta_tools=0,
                 meta_system=0,
@@ -3576,18 +3600,23 @@ class SessionManager:
             total_tools = 0
             total_sys = 0
             latest_chat_ts: float | None = None
+            latest_assistant_ts: float | None = None
             latest_token: dict[str, Any] | None = None
             loops = 0
             while off < sz and loops < 16:
                 objs, new_off = _read_jsonl_from_offset(lp, off, max_bytes=256 * 1024)
                 if new_off <= off:
                     break
-                d_th, d_tools, d_sys, chunk_chat_ts, token_update, _chat_events = _analyze_log_chunk(objs)
+                d_th, d_tools, d_sys, chunk_chat_ts, chunk_assistant_ts, token_update, _chat_events = _analyze_log_chunk(objs)
                 total_th += d_th
                 total_tools += d_tools
                 total_sys += d_sys
                 if chunk_chat_ts is not None:
                     latest_chat_ts = chunk_chat_ts if latest_chat_ts is None else max(latest_chat_ts, chunk_chat_ts)
+                if chunk_assistant_ts is not None:
+                    latest_assistant_ts = (
+                        chunk_assistant_ts if latest_assistant_ts is None else max(latest_assistant_ts, chunk_assistant_ts)
+                    )
                 if token_update is not None:
                     latest_token = token_update
                 off = new_off
@@ -3605,6 +3634,10 @@ class SessionManager:
                     s2.last_chat_history_scanned = False
                 if latest_chat_ts is not None:
                     s2.last_chat_ts = latest_chat_ts if s2.last_chat_ts is None else max(s2.last_chat_ts, latest_chat_ts)
+                if latest_assistant_ts is not None:
+                    s2.last_assistant_ts = (
+                        latest_assistant_ts if s2.last_assistant_ts is None else max(s2.last_assistant_ts, latest_assistant_ts)
+                    )
                 if latest_token is not None:
                     s2.token = latest_token
                 if s2.busy:
@@ -3741,6 +3774,7 @@ class SessionManager:
                         "thinking": int(s.meta_thinking),
                         "tools": int(s.meta_tools),
                         "system": int(s.meta_system),
+                        "last_assistant_ts": (float(s.last_assistant_ts) if isinstance(s.last_assistant_ts, (int, float)) else None),
                         "harness_enabled": h_enabled,
                         "harness_cooldown_minutes": h_cooldown_minutes,
                         "harness_remaining_injections": h_remaining_injections,
@@ -6133,6 +6167,31 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     _json_response(self, 400, {"error": str(e)})
                     return
                 _json_response(self, 200, {"ok": True, "alias": alias, **sidebar_meta})
+                return
+
+            if path.startswith("/api/sessions/") and path.endswith("/rename"):
+                if not _require_auth(self):
+                    self._unauthorized()
+                    return
+                parts = path.split("/")
+                session_id = parts[3] if len(parts) >= 4 else ""
+                body = _read_body(self)
+                body_text = body.decode("utf-8")
+                if not body_text.strip():
+                    raise ValueError("empty request body")
+                obj = json.loads(body_text)
+                if not isinstance(obj, dict):
+                    raise ValueError("invalid json body (expected object)")
+                name = obj.get("name")
+                if not isinstance(name, str):
+                    _json_response(self, 400, {"error": "name required"})
+                    return
+                try:
+                    alias = MANAGER.alias_set(session_id, name)
+                except KeyError:
+                    _json_response(self, 404, {"error": "unknown session"})
+                    return
+                _json_response(self, 200, {"ok": True, "alias": alias})
                 return
 
             if path.startswith("/api/sessions/") and path.endswith("/rename"):

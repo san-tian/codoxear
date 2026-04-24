@@ -82,6 +82,23 @@
         for (const c of children) n.appendChild(c);
         return n;
       };
+      let lastTapAt = 0;
+      function bindTap(el, handler) {
+        if (!el) return;
+        const onTap = (e) => {
+          if (e && e.preventDefault) e.preventDefault();
+          if (e && e.stopPropagation) e.stopPropagation();
+          handler(e);
+        };
+        el.addEventListener("touchend", (e) => {
+          lastTapAt = Date.now();
+          onTap(e);
+        });
+        el.addEventListener("click", (e) => {
+          if (Date.now() - lastTapAt < 500) return;
+          onTap(e);
+        });
+      }
 
       const perfWindow = 200;
       const perfSamples = new Map();
@@ -208,6 +225,8 @@
           return String(ts);
         }
       }
+
+      const FILE_AUTO_REFRESH_MS = 4000;
 
       function fmtBytes(n) {
         const v = Number(n);
@@ -441,6 +460,107 @@
         if (!s || typeof s !== "object") return "No session selected";
         const name = sessionDisplayName(s);
         return name || "No session selected";
+      }
+
+      function sessionSortName(s) {
+        const raw = sessionDisplayName(s);
+        return raw ? raw.toLocaleLowerCase() : "";
+      }
+
+      function isUploadPathLine(line, sid) {
+        if (!line || line[0] !== "/") return false;
+        if (!line.includes("/.local/share/codoxear/uploads/")) return false;
+        if (sid && !line.includes(`/uploads/${sid}/`)) return false;
+        return /\.(png|jpe?g|webp|gif|bmp|heic|heif)$/i.test(line);
+      }
+
+      function stripUploadPathLines(text, sid) {
+        const raw = String(text ?? "");
+        if (!raw) return { text: raw, removed: false };
+        const lines = raw.split(/\r?\n/);
+        const out = [];
+        let removed = false;
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (trimmed && isUploadPathLine(trimmed, sid)) {
+            removed = true;
+            continue;
+          }
+          out.push(line);
+        }
+        if (!removed) return { text: raw, removed: false };
+        let joined = out.join("\n");
+        joined = joined.replace(/\n{3,}/g, "\n\n");
+        return { text: joined, removed: true };
+      }
+
+      function sanitizeUserText(text, sid) {
+        const raw = typeof text === "string" ? text : "";
+        if (!raw) return { text: raw, dropped: false };
+        const { text: stripped, removed } = stripUploadPathLines(raw, sid);
+        if (!removed) return { text: raw, dropped: false };
+        if (!stripped.trim()) return { text: "", dropped: true };
+        return { text: stripped, dropped: false };
+      }
+
+      function sanitizeUserEvent(ev, sid) {
+        if (!ev || ev.role !== "user" || typeof ev.text !== "string") return ev;
+        const res = sanitizeUserText(ev.text, sid);
+        if (res.dropped) return null;
+        if (res.text !== ev.text) return { ...ev, text: res.text };
+        return ev;
+      }
+
+      const UNKNOWN_WORKSPACE_KEY = "__unknown_cwd__";
+
+      function normalizeCwd(value) {
+        if (typeof value !== "string") return "";
+        const trimmed = value.trim();
+        if (!trimmed || trimmed === "?") return "";
+        if (trimmed.length > 1) return trimmed.replace(/\/+$/, "");
+        return trimmed;
+      }
+
+      function workspaceKeyFromCwd(cwd) {
+        return cwd ? `cwd:${cwd}` : UNKNOWN_WORKSPACE_KEY;
+      }
+
+      function workspaceTitleParts(cwd) {
+        if (!cwd) return { title: "Unknown cwd", subtitle: "" };
+        const base = baseName(cwd);
+        if (base && base !== cwd) return { title: base, subtitle: cwd };
+        return { title: cwd, subtitle: "" };
+      }
+
+      function buildWorkspaces(sessions) {
+        const map = new Map();
+        for (const s of sessions) {
+          const cwd = normalizeCwd(s && s.cwd);
+          const key = workspaceKeyFromCwd(cwd);
+          let ws = map.get(key);
+          if (!ws) {
+            ws = { key, cwd, sessions: [], updated_ts: 0 };
+            map.set(key, ws);
+          }
+          ws.sessions.push(s);
+          const ts = Number(s && (s.updated_ts || s.start_ts || 0));
+          if (Number.isFinite(ts) && ts > ws.updated_ts) ws.updated_ts = ts;
+        }
+        for (const ws of map.values()) {
+          ws.sessions.sort((a, b) => {
+            const na = sessionSortName(a);
+            const nb = sessionSortName(b);
+            const cmp = na.localeCompare(nb, undefined, { numeric: true, sensitivity: "base" });
+            if (cmp) return cmp;
+            const at = Number(a && (a.updated_ts || a.start_ts || 0));
+            const bt = Number(b && (b.updated_ts || b.start_ts || 0));
+            if (Number.isFinite(at) && Number.isFinite(bt) && at !== bt) return bt - at;
+            const aid = a && a.session_id ? String(a.session_id) : "";
+            const bid = b && b.session_id ? String(b.session_id) : "";
+            return aid.localeCompare(bid, undefined, { numeric: true, sensitivity: "base" });
+          });
+        }
+        return Array.from(map.values()).sort((a, b) => (b.updated_ts || 0) - (a.updated_ts || 0));
       }
 
       function escapeHtml(s) {
@@ -845,7 +965,7 @@
             return { type: "ul", indent, text: t.slice(2).trimStart() };
           }
           const mOl = t.match(/^(\d+)\.\s+(.*)$/);
-          if (mOl) return { type: "ol", indent, text: (mOl[2] || "").trimStart() };
+          if (mOl) return { type: "ol", indent, text: (mOl[2] || "").trimStart(), num: Number(mOl[1]) };
           return null;
         };
 
@@ -854,6 +974,7 @@
           if (!head) throw new Error("parseList called on non-list line");
           const baseIndent = head.indent;
           const listType = head.type;
+          const listStart = listType === "ol" && Number.isFinite(head.num) ? head.num : null;
           const items = [];
 
           let i = start;
@@ -872,12 +993,17 @@
             items.push({ text: info.text, child: null });
             i += 1;
           }
-          return { node: { type: listType, items }, next: i };
+          return { node: { type: listType, items, start: listStart }, next: i };
         };
 
         const renderList = (node) => {
           const out = [];
-          out.push(node.type === "ol" ? "<ol>" : "<ul>");
+          if (node.type === "ol") {
+            const startAttr = Number.isFinite(node.start) && node.start > 1 ? ` start="${node.start}"` : "";
+            out.push(`<ol${startAttr}>`);
+          } else {
+            out.push("<ul>");
+          }
           for (const it of node.items) {
             out.push("<li>");
             out.push(renderInlineMd(it.text || "", options));
@@ -985,8 +1111,13 @@
         const out = [];
         for (const c of chunks) {
           if (c.type === "code") {
-            const langAttr = c.lang ? ` data-lang="${escapeHtml(c.lang)}"` : "";
-            out.push(`<pre><code${langAttr}>${escapeHtml(c.value)}</code></pre>`);
+            const lang = String(c.lang || "").trim().toLowerCase();
+            if (lang === "mermaid" || lang === "mmd") {
+              out.push(`<div class="mermaid">${escapeHtml(c.value)}</div>`);
+            } else {
+              const langAttr = c.lang ? ` data-lang="${escapeHtml(c.lang)}"` : "";
+              out.push(`<pre><code${langAttr}>${escapeHtml(c.value)}</code></pre>`);
+            }
             continue;
           }
           const blocks = c.value.split(/\n{2,}/);
@@ -2380,6 +2511,451 @@
           }
         }
 
+        function draftStorageKey(sid) {
+          return `codexweb.draft.${sid}`;
+        }
+
+        function loadDraftFromStorage(sid) {
+          if (!sid) return "";
+          if (draftBySession.has(sid)) return draftBySession.get(sid) || "";
+          let raw = "";
+          try {
+            raw = localStorage.getItem(draftStorageKey(sid)) || "";
+          } catch {
+            raw = "";
+          }
+          draftBySession.set(sid, raw);
+          return raw;
+        }
+
+        function saveDraftToStorage(sid, text) {
+          if (!sid) return;
+          const val = String(text || "");
+          draftBySession.set(sid, val);
+          try {
+            if (val) localStorage.setItem(draftStorageKey(sid), val);
+            else localStorage.removeItem(draftStorageKey(sid));
+          } catch {
+            // ignore quota or storage errors
+          }
+        }
+
+        function scheduleDraftSave(sid, text) {
+          if (!sid) return;
+          const prev = draftSaveTimers.get(sid);
+          if (prev) clearTimeout(prev);
+          const t = setTimeout(() => {
+            draftSaveTimers.delete(sid);
+            saveDraftToStorage(sid, text);
+          }, 250);
+          draftSaveTimers.set(sid, t);
+        }
+
+        function clearDraftForSession(sid) {
+          if (!sid) return;
+          const prev = draftSaveTimers.get(sid);
+          if (prev) clearTimeout(prev);
+          draftSaveTimers.delete(sid);
+          draftBySession.delete(sid);
+          try {
+            localStorage.removeItem(draftStorageKey(sid));
+          } catch {
+            // ignore
+          }
+        }
+
+        function seenAssistantStorageKey(sid) {
+          return `codexweb.seen.assistant.${sid}`;
+        }
+
+        function loadSeenAssistantTs(sid) {
+          if (!sid) return 0;
+          if (seenAssistantBySession.has(sid)) return seenAssistantBySession.get(sid) || 0;
+          let raw = "";
+          try {
+            raw = localStorage.getItem(seenAssistantStorageKey(sid)) || "";
+          } catch {
+            raw = "";
+          }
+          const val = Number(raw);
+          const out = Number.isFinite(val) ? val : 0;
+          seenAssistantBySession.set(sid, out);
+          return out;
+        }
+
+        function saveSeenAssistantTs(sid, ts) {
+          if (!sid) return;
+          const val = Number(ts);
+          if (!Number.isFinite(val) || val <= 0) return;
+          seenAssistantBySession.set(sid, val);
+          try {
+            localStorage.setItem(seenAssistantStorageKey(sid), String(val));
+          } catch {
+            // ignore storage issues
+          }
+        }
+
+        function markAssistantSeen(sid, ts) {
+          if (!sid) return;
+          const val = Number(ts);
+          if (!Number.isFinite(val) || val <= 0) return;
+          const cur = loadSeenAssistantTs(sid);
+          if (val > cur) saveSeenAssistantTs(sid, val);
+        }
+
+        function clearSeenAssistantForSession(sid) {
+          if (!sid) return;
+          seenAssistantBySession.delete(sid);
+          try {
+            localStorage.removeItem(seenAssistantStorageKey(sid));
+          } catch {
+            // ignore
+          }
+        }
+
+        function lastLineStorageKey(sid) {
+          return `codexweb.lastline.${sid}`;
+        }
+
+        function loadLastLineFromStorage(sid) {
+          if (!sid) return "";
+          if (lastLineBySession.has(sid)) return lastLineBySession.get(sid) || "";
+          let raw = "";
+          try {
+            raw = localStorage.getItem(lastLineStorageKey(sid)) || "";
+          } catch {
+            raw = "";
+          }
+          lastLineBySession.set(sid, raw);
+          return raw;
+        }
+
+        function saveLastLineToStorage(sid, text) {
+          if (!sid) return;
+          const val = String(text || "");
+          lastLineBySession.set(sid, val);
+          try {
+            if (val) localStorage.setItem(lastLineStorageKey(sid), val);
+            else localStorage.removeItem(lastLineStorageKey(sid));
+          } catch {
+            // ignore storage issues
+          }
+        }
+
+        function scheduleLastLineSave(sid, text) {
+          if (!sid) return;
+          const prev = lastLineSaveTimers.get(sid);
+          if (prev) clearTimeout(prev);
+          const t = setTimeout(() => {
+            lastLineSaveTimers.delete(sid);
+            saveLastLineToStorage(sid, text);
+          }, 200);
+          lastLineSaveTimers.set(sid, t);
+        }
+
+        function clearLastLineForSession(sid) {
+          if (!sid) return;
+          const prev = lastLineSaveTimers.get(sid);
+          if (prev) clearTimeout(prev);
+          lastLineSaveTimers.delete(sid);
+          lastLineBySession.delete(sid);
+          try {
+            localStorage.removeItem(lastLineStorageKey(sid));
+          } catch {
+            // ignore
+          }
+        }
+
+        function userSummaryStorageKey(sid) {
+          return `codexweb.summary.user.${sid}`;
+        }
+
+        function loadUserSummaryFromStorage(sid) {
+          if (!sid) return "";
+          if (userSummaryBySession.has(sid)) return userSummaryBySession.get(sid) || "";
+          let raw = "";
+          try {
+            raw = localStorage.getItem(userSummaryStorageKey(sid)) || "";
+          } catch {
+            raw = "";
+          }
+          userSummaryBySession.set(sid, raw);
+          return raw;
+        }
+
+        function saveUserSummaryToStorage(sid, text) {
+          if (!sid) return;
+          const val = String(text || "");
+          userSummaryBySession.set(sid, val);
+          try {
+            if (val) localStorage.setItem(userSummaryStorageKey(sid), val);
+            else localStorage.removeItem(userSummaryStorageKey(sid));
+          } catch {
+            // ignore storage issues
+          }
+        }
+
+        function scheduleUserSummarySave(sid, text) {
+          if (!sid) return;
+          const prev = userSummarySaveTimers.get(sid);
+          if (prev) clearTimeout(prev);
+          const t = setTimeout(() => {
+            userSummarySaveTimers.delete(sid);
+            saveUserSummaryToStorage(sid, text);
+          }, 200);
+          userSummarySaveTimers.set(sid, t);
+        }
+
+        function clearUserSummaryForSession(sid) {
+          if (!sid) return;
+          const prev = userSummarySaveTimers.get(sid);
+          if (prev) clearTimeout(prev);
+          userSummarySaveTimers.delete(sid);
+          userSummaryBySession.delete(sid);
+          try {
+            localStorage.removeItem(userSummaryStorageKey(sid));
+          } catch {
+            // ignore
+          }
+        }
+
+        function formatUserSummaryText(text, sid) {
+          const res = sanitizeUserText(text, sid);
+          if (res.dropped) return "";
+          let t = res.text.replace(/\s+/g, " ").trim();
+          if (!t) return "";
+          const maxLen = 220;
+          if (t.length > maxLen) {
+            t = t.slice(0, Math.max(0, maxLen - 3)) + "...";
+          }
+          return t;
+        }
+
+        function updateUserSummaryFromEvent(ev, sid) {
+          if (!sid || !ev || ev.pending || ev.role !== "user") return;
+          const line = formatUserSummaryText(ev.text, sid);
+          if (!line) return;
+          scheduleUserSummarySave(sid, line);
+        }
+
+        function updateUserSummaryFromText(sid, text) {
+          if (!sid) return;
+          const line = formatUserSummaryText(text, sid);
+          if (!line) return;
+          scheduleUserSummarySave(sid, line);
+        }
+
+        function updateUserSummaryFromEvents(events, sid) {
+          if (!sid || !Array.isArray(events) || !events.length) return;
+          let best = null;
+          let bestTs = -1;
+          for (const ev of events) {
+            if (!ev || ev.role !== "user") continue;
+            if (ev.pending) continue;
+            const ts = typeof ev.ts === "number" && Number.isFinite(ev.ts) ? ev.ts : null;
+            if (ts !== null) {
+              if (ts > bestTs) {
+                bestTs = ts;
+                best = ev;
+              }
+            } else {
+              best = ev;
+            }
+          }
+          if (!best) return;
+          const line = formatUserSummaryText(best.text, sid);
+          if (!line) return;
+          saveUserSummaryToStorage(sid, line);
+        }
+
+        function formatLastLine(ev, sid) {
+          if (!ev || typeof ev.text !== "string") return "";
+          let text = ev.text;
+          if (ev.role === "user") {
+            const res = sanitizeUserText(text, sid);
+            if (res.dropped) return "";
+            text = res.text;
+          }
+          text = text.replace(/\s+/g, " ").trim();
+          if (!text) return "";
+          const prefix = ev.role === "user" ? "You: " : "Assistant: ";
+          const maxLen = 280;
+          if (text.length > maxLen) {
+            text = text.slice(0, Math.max(0, maxLen - 3)) + "...";
+          }
+          return prefix + text;
+        }
+
+        function updateLastLineForEvent(ev, sid) {
+          if (!sid || !ev || ev.pending) return;
+          if (ev.role !== "user" && ev.role !== "assistant") return;
+          const line = formatLastLine(ev, sid);
+          if (!line) return;
+          scheduleLastLineSave(sid, line);
+          if (sid === selected) setLastLine(line);
+        }
+
+        function updateLastLineFromEvents(events, sid) {
+          if (!sid || !Array.isArray(events) || !events.length) return;
+          let best = null;
+          let bestTs = -1;
+          for (const ev of events) {
+            if (!ev || ev.role !== "user" && ev.role !== "assistant") continue;
+            if (ev.pending) continue;
+            const ts = typeof ev.ts === "number" && Number.isFinite(ev.ts) ? ev.ts : null;
+            if (ts !== null) {
+              if (ts > bestTs) {
+                bestTs = ts;
+                best = ev;
+              }
+            } else if (best === null) {
+              best = ev;
+            } else {
+              best = ev;
+            }
+          }
+          if (!best) return;
+          const line = formatLastLine(best, sid);
+          if (!line) return;
+          saveLastLineToStorage(sid, line);
+          if (sid === selected) setLastLine(line);
+        }
+
+        function cacheStorageKey(sid) {
+          return `codexweb.cache.v4.${sid}`;
+        }
+
+        function normalizeCacheEvent(ev) {
+          if (!ev || (ev.role !== "user" && ev.role !== "assistant")) return null;
+          if (typeof ev.text !== "string" || !ev.text.trim()) return null;
+          const out = { role: ev.role, text: ev.text };
+          if (typeof ev.ts === "number" && Number.isFinite(ev.ts)) out.ts = ev.ts;
+          return out;
+        }
+
+        function loadCacheFromStorage(sid) {
+          if (!sid || cacheLoaded.has(sid)) return;
+          cacheLoaded.add(sid);
+          try {
+            const raw = localStorage.getItem(cacheStorageKey(sid));
+            if (!raw) return;
+            const obj = JSON.parse(raw);
+            if (!obj || typeof obj !== "object") return;
+            const eventsIn = Array.isArray(obj.events) ? obj.events : [];
+            const events = [];
+            for (const ev of eventsIn) {
+              const norm = normalizeCacheEvent(ev);
+              if (norm) events.push(norm);
+            }
+            if (!events.length) return;
+            if (events.length > CACHE_LIMIT) events.splice(0, events.length - CACHE_LIMIT);
+            const cache = {
+              log_path: typeof obj.log_path === "string" ? obj.log_path : null,
+              offset: Number(obj.offset) || 0,
+              older_before: Number(obj.older_before) || 0,
+              has_older: Boolean(obj.has_older),
+              events,
+            };
+            cacheBySession.set(sid, cache);
+          } catch {
+            // ignore corrupted cache
+          }
+        }
+
+        function getCache(sid) {
+          if (!sid) return null;
+          loadCacheFromStorage(sid);
+          return cacheBySession.get(sid) || null;
+        }
+
+        function saveCacheNow(sid) {
+          if (!sid) return;
+          const cache = cacheBySession.get(sid);
+          if (!cache) {
+            localStorage.removeItem(cacheStorageKey(sid));
+            return;
+          }
+          const payload = {
+            log_path: cache.log_path || null,
+            offset: Number(cache.offset) || 0,
+            older_before: Number(cache.older_before) || 0,
+            has_older: Boolean(cache.has_older),
+            events: Array.isArray(cache.events) ? cache.events : [],
+          };
+          try {
+            localStorage.setItem(cacheStorageKey(sid), JSON.stringify(payload));
+          } catch {
+            // ignore quota issues
+          }
+        }
+
+        function scheduleCacheSave(sid) {
+          if (!sid) return;
+          const existing = cacheSaveTimers.get(sid);
+          if (existing) clearTimeout(existing);
+          const t = setTimeout(() => {
+            cacheSaveTimers.delete(sid);
+            saveCacheNow(sid);
+          }, 400);
+          cacheSaveTimers.set(sid, t);
+        }
+
+        function setCacheMeta(sid, { logPath, offset: off, olderBefore, hasOlder } = {}) {
+          if (!sid) return;
+          const cache =
+            getCache(sid) || { log_path: null, offset: 0, older_before: 0, has_older: false, events: [] };
+          if (logPath !== undefined) cache.log_path = logPath || null;
+          if (typeof off === "number" && Number.isFinite(off)) cache.offset = off;
+          if (typeof olderBefore === "number" && Number.isFinite(olderBefore)) cache.older_before = olderBefore;
+          if (typeof hasOlder === "boolean") cache.has_older = hasOlder;
+          cacheBySession.set(sid, cache);
+          scheduleCacheSave(sid);
+        }
+
+        function replaceCacheEvents(sid, events) {
+          if (!sid) return;
+          const cache =
+            getCache(sid) || { log_path: null, offset: 0, older_before: 0, has_older: false, events: [] };
+          const out = [];
+          for (const ev of events || []) {
+            const norm = normalizeCacheEvent(ev);
+            if (norm) out.push(norm);
+          }
+          if (out.length > CACHE_LIMIT) out.splice(0, out.length - CACHE_LIMIT);
+          cache.events = out;
+          cacheBySession.set(sid, cache);
+          scheduleCacheSave(sid);
+        }
+
+        function appendCacheEvents(sid, events) {
+          if (!sid || !events || !events.length) return;
+          const cache =
+            getCache(sid) || { log_path: null, offset: 0, older_before: 0, has_older: false, events: [] };
+          const list = Array.isArray(cache.events) ? cache.events : [];
+          for (const ev of events) {
+            const norm = normalizeCacheEvent(ev);
+            if (norm) list.push(norm);
+          }
+          if (list.length > CACHE_LIMIT) list.splice(0, list.length - CACHE_LIMIT);
+          cache.events = list;
+          cacheBySession.set(sid, cache);
+          scheduleCacheSave(sid);
+        }
+
+        function clearCache(sid) {
+          if (!sid) return;
+          cacheBySession.delete(sid);
+          cacheLoaded.delete(sid);
+          cacheSaveTimers.delete(sid);
+          localStorage.removeItem(cacheStorageKey(sid));
+        }
+
+        function queueEditorActive() {
+          if (queueViewer.style.display !== "flex") return false;
+          const active = document.activeElement;
+          return Boolean(active && active.classList && active.classList.contains("queueText"));
+        }
+
         function updateQueueBadge() {
           if (!queueBadgeEl) return;
           if (!selected) {
@@ -2662,6 +3238,62 @@
           return recentEventKeySet.has(key);
         }
 
+        function eventKey(ev) {
+          if (!ev || (ev.role !== "user" && ev.role !== "assistant")) return "";
+          const text = typeof ev.text === "string" ? ev.text : "";
+          const ts = typeof ev.ts === "number" && Number.isFinite(ev.ts) ? ev.ts : 0;
+          return `${ev.role}|${ts}|${text}`;
+        }
+
+        function eventSig(ev) {
+          if (!ev || (ev.role !== "user" && ev.role !== "assistant")) return "";
+          const raw = typeof ev.text === "string" ? ev.text : "";
+          const text = normalizeTextForPendingMatch(raw);
+          return `${ev.role}|${text}`;
+        }
+
+        function eventTs(ev) {
+          return typeof ev.ts === "number" && Number.isFinite(ev.ts) ? ev.ts : null;
+        }
+
+        function markEventSeen(ev) {
+          const key = eventKey(ev);
+          if (!key) return;
+          if (recentEventKeySet.has(key)) return;
+          recentEventKeySet.add(key);
+          recentEventKeys.push(key);
+          if (recentEventKeys.length > RECENT_EVENT_KEYS_MAX) {
+            const drop = recentEventKeys.splice(0, recentEventKeys.length - RECENT_EVENT_KEYS_MAX);
+            for (const k of drop) recentEventKeySet.delete(k);
+          }
+          const sig = eventSig(ev);
+          const ts = eventTs(ev);
+          if (sig && typeof ts === "number") {
+            recentEventSigTs.set(sig, ts);
+            recentEventSigOrder.push({ sig, ts });
+            if (recentEventSigOrder.length > RECENT_EVENT_SIG_MAX) {
+              const drop = recentEventSigOrder.splice(0, recentEventSigOrder.length - RECENT_EVENT_SIG_MAX);
+              for (const item of drop) {
+                if (recentEventSigTs.get(item.sig) === item.ts) {
+                  recentEventSigTs.delete(item.sig);
+                }
+              }
+            }
+          }
+        }
+
+        function isDuplicateEvent(ev) {
+          const key = eventKey(ev);
+          if (!key) return false;
+          if (recentEventKeySet.has(key)) return true;
+          const sig = eventSig(ev);
+          const ts = eventTs(ev);
+          if (!sig || typeof ts !== "number") return false;
+          const last = recentEventSigTs.get(sig);
+          if (typeof last !== "number") return false;
+          return Math.abs(ts - last) * 1000 <= RECENT_EVENT_SIG_WINDOW_MS;
+        }
+
         function pendingMatchKey(s) {
           // Codex log serialization can trim trailing whitespace/newlines; match on a slightly
           // normalized key to avoid duplicating the optimistic local echo bubble.
@@ -2704,7 +3336,10 @@
           pendingEl.removeAttribute("data-pending");
 
           const mdEl = pendingEl.querySelector(".md");
-          if (mdEl && typeof ev.text === "string") mdEl.innerHTML = mdToHtmlCached(ev.text);
+          if (mdEl && typeof ev.text === "string") {
+            mdEl.innerHTML = mdToHtmlCached(ev.text);
+            renderMermaidIn(mdEl);
+          }
 
           const row = pendingEl.closest(".msg-row");
           if (row && typeof ev.ts === "number" && Number.isFinite(ev.ts)) row.dataset.ts = String(ev.ts);
@@ -3081,8 +3716,11 @@
         function appendEvent(ev) {
           if (!ev || (ev.role !== "user" && ev.role !== "assistant")) return;
           if (consumePendingUserIfMatches(ev)) return;
-          if (isDuplicateEvent(ev)) return;
+          if (!ev.pending && isDuplicateEvent(ev)) return;
 
+          if (!ev.pending && selected) {
+            lastActivityBySession.set(selected, performance.now());
+          }
           const stick = autoScroll || isNearBottom();
           const ts = typeof ev.ts === "number" && Number.isFinite(ev.ts) ? ev.ts : ev.pending ? Date.now() / 1000 : null;
            const { row } = safeMakeRow(ev, { ts, pending: Boolean(ev.pending) });
@@ -3132,7 +3770,9 @@
           const msgs = [];
           for (const ev of allEvents) {
             if (!ev || (ev.role !== "user" && ev.role !== "assistant")) continue;
-            msgs.push(ev);
+            const clean = sanitizeUserEvent(ev, selected);
+            if (!clean) continue;
+            msgs.push(clean);
           }
           if (!msgs.length) return;
           autoScroll = false;
@@ -8108,6 +8748,19 @@ importScripts(${JSON.stringify(base + "/base/worker/workerMain.js")});
           renderLogin(renderApp);
         };
 
+        duplicateBtn.onclick = async () => {
+          if (!selected) return;
+          const s = sessionIndex.get(selected);
+          const cwd = s && s.cwd && s.cwd !== "?" ? s.cwd : "";
+          if (!cwd) {
+            setToast("cwd unavailable");
+            return;
+          }
+          const base = sessionDisplayName(s) || baseName(cwd) || "Session";
+          const alias = buildDuplicateAlias(base);
+          await spawnSessionWithCwd(cwd, { alias });
+        };
+
         toggleSidebarBtn.onclick = () => {
           if (isMobile()) {
             setSidebarOpen(!document.body.classList.contains("sidebar-open"));
@@ -8264,6 +8917,14 @@ importScripts(${JSON.stringify(base + "/base/worker/workerMain.js")});
         attachBtn.title = attachHint;
         attachBtn.setAttribute("aria-label", attachHint);
         updateQueueBadge();
+
+        function setLastLine(text) {
+          const t = String(text || "").trim();
+          const elLine = $("#lastLine");
+          if (!elLine) return;
+          elLine.textContent = t;
+          elLine.style.display = t ? "block" : "none";
+        }
 	        function autoGrow() {
 	          const basePx = parseFloat(getComputedStyle(textarea).minHeight || "0") || 32;
 	          const maxPx = 180;
@@ -8327,6 +8988,36 @@ importScripts(${JSON.stringify(base + "/base/worker/workerMain.js")});
           e.preventDefault();
           form.requestSubmit();
         });
+        textarea.addEventListener("paste", (e) => {
+          const cd = e.clipboardData;
+          if (!cd) return;
+          let f = null;
+          if (cd.files && cd.files.length) {
+            f = cd.files[0];
+          } else if (cd.items && cd.items.length) {
+            for (const item of cd.items) {
+              if (!item || item.kind !== "file") continue;
+              const file = item.getAsFile();
+              if (!file) continue;
+              f = file;
+              break;
+            }
+          }
+          if (!f) return;
+          const t = String(f.type || "").toLowerCase();
+          const name = String(f.name || "").toLowerCase();
+          const isImg =
+            t.startsWith("image/") ||
+            name.endsWith(".png") ||
+            name.endsWith(".jpg") ||
+            name.endsWith(".jpeg") ||
+            name.endsWith(".webp") ||
+            name.endsWith(".heic") ||
+            name.endsWith(".heif");
+          if (!isImg) return;
+          e.preventDefault();
+          void handleImageFile(f);
+        });
         window.addEventListener("resize", () => {
           if (autoScroll) requestAnimationFrame(() => scrollToBottom());
         });
@@ -8336,9 +9027,8 @@ importScripts(${JSON.stringify(base + "/base/worker/workerMain.js")});
 	          imgInput.value = "";
 	          imgInput.click();
 	        };
-		        imgInput.addEventListener("change", async () => {
+		        async function handleImageFile(f) {
 		          if (!selected) return;
-		          const f = imgInput.files && imgInput.files[0];
 		          if (!f) return;
 		          if (sending) return;
 		          try {
@@ -8445,11 +9135,19 @@ importScripts(${JSON.stringify(base + "/base/worker/workerMain.js")});
 		          } catch (e) {
 	            setToast(`attach error: ${e.message}`);
 	          }
-	        });
+		        }
+		        imgInput.addEventListener("change", async () => {
+		          const f = imgInput.files && imgInput.files[0];
+		          await handleImageFile(f);
+		          imgInput.value = "";
+		        });
 
         function clearComposer() {
-          $("#msg").value = "";
+          const ta = $("#msg");
+          if (!ta) return;
+          ta.value = "";
           autoGrow();
+          if (selected) saveDraftToStorage(selected, "");
         }
 
         async function sendText(raw, { sid = null } = {}) {
@@ -8460,6 +9158,9 @@ importScripts(${JSON.stringify(base + "/base/worker/workerMain.js")});
           sending = true;
           $("#sendBtn").disabled = true;
           setToast("sending...");
+          if (deferred && selected) {
+            markDeferGate(selected);
+          }
 
           const localId = ++localEchoSeq;
           const t0 = Date.now() / 1000;
@@ -8497,7 +9198,6 @@ importScripts(${JSON.stringify(base + "/base/worker/workerMain.js")});
         form.onsubmit = async (e) => {
           e.preventDefault();
           if (!selected) return;
-          const raw = $("#msg").value;
           if (!raw || !raw.trim()) return;
           if (sending) return;
           if (currentRunning) {
