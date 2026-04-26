@@ -126,6 +126,8 @@ tailscale serve status
 - Headless Linux: start Codex or Pi inside `tmux`, then attach from your phone or a laptop browser. This avoids using a mobile terminal emulator for TUI interaction (for example Termius).
 - Web-owned sessions: start a new Codex or Pi session from the Codoxear UI, use it from mobile, and kill it from the UI when finished.
 - Web-owned tmux sessions: start a new Codex or Pi session from the Codoxear UI with `Create in tmux` enabled to run it inside tmux session `codoxear` for shell-side observability.
+- When a tmux-backed session is selected, the top bar shows a tmux button that copies the exact `tmux attach-session ...` command for reconnecting to that session from a terminal.
+- The Nova preview shell also exposes a `Copy tmux attach` button for tmux-backed sessions, using the same `tmux attach-session ...` command shape.
 
 ## Session ownership
 
@@ -178,6 +180,42 @@ Set these in `.env` (or in the process environment):
 - `CODEX_WEB_COOKIE_TTL_SECONDS` (default `2592000`, 30 days)
 - `CODEX_WEB_COOKIE_SECURE` (default `0`; set to `1` behind HTTPS)
 - `CODEX_WEB_HARNESS_SWEEP_SECONDS` (default `2.5`)
+
+## Replatforming preview
+
+This repository now also contains an in-progress replatforming spike:
+
+- `frontend/` — `Preact + TypeScript + Vite + Pretext`
+- `backend-rs/` — `Rust + Axum + SSE`
+
+These do not replace the existing Python server yet. They are the new shell and API spine for the next generation UI.
+
+Current route split:
+
+- `/` and `/nova/` — redirect to `/nova-preview/`, so the replatformed shell is the active browser entry
+- `/nova-preview/` — new `Preact + Pretext` shell, now wired to the real Python `/api/*` endpoints for sessions, transcript polling, diagnostics, queue, harness, interrupt, file viewing, new-session creation, voice settings, and desktop notification polling
+- `/api/v1/*` — still reserved for the Rust preview backend
+
+Frontend dev:
+
+```sh
+cd frontend
+npm install
+npm run dev
+```
+
+Rust backend dev:
+
+```sh
+cd backend-rs
+cargo run
+```
+
+The Nova preview frontend uses same-origin `/api` by default in production. For standalone local dev against a different server, set `VITE_CODOXEAR_API_BASE=http://127.0.0.1:13780`.
+
+The local deploy helper `./scripts/codoxear-local` now runs two processes:
+- public Python web entry on `:8743` redirecting `/` and `/nova/` to `/nova-preview/`, serving the custom Nova preview at `/nova-preview/`, and proxying `/api/v1` to Rust
+- Rust Nova preview API on `127.0.0.1:8787`
 - `CODEX_WEB_QUEUE_SWEEP_SECONDS` (default `1.0`)
 - `CODEX_WEB_QUEUE_IDLE_GRACE_SECONDS` (default `10.0`)
 - `CODEX_WEB_DISCOVER_MIN_INTERVAL_SECONDS` (default `1.0`)

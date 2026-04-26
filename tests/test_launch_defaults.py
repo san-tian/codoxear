@@ -1,3 +1,4 @@
+import os
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -9,6 +10,21 @@ from codoxear.server import _normalize_requested_service_tier
 from codoxear.server import _read_codex_launch_defaults
 from codoxear.server import _read_new_session_defaults
 from codoxear.server import _read_pi_launch_defaults
+
+
+CODEX_LAUNCH_DEFAULT_ENV_KEYS = (
+    "CODEX_WEB_DEFAULT_MODEL_PROVIDER",
+    "CODEX_WEB_DEFAULT_PREFERRED_AUTH_METHOD",
+    "CODEX_WEB_DEFAULT_MODEL",
+    "CODEX_WEB_DEFAULT_REASONING_EFFORT",
+    "CODEX_WEB_DEFAULT_SERVICE_TIER",
+)
+
+
+def _codex_launch_default_env(**values: str):
+    env = {key: "" for key in CODEX_LAUNCH_DEFAULT_ENV_KEYS}
+    env.update(values)
+    return patch.dict(os.environ, env)
 
 
 class TestLaunchDefaults(unittest.TestCase):
@@ -37,7 +53,7 @@ name = "Right"
                 encoding="utf-8",
             )
 
-            with patch("codoxear.server.CODEX_CONFIG_PATH", config_path), patch("codoxear.server.MODELS_CACHE_PATH", models_cache_path):
+            with patch("codoxear.server.CODEX_CONFIG_PATH", config_path), patch("codoxear.server.MODELS_CACHE_PATH", models_cache_path), _codex_launch_default_env():
                 defaults = _read_codex_launch_defaults()
 
         self.assertEqual(defaults["model_provider"], "crs")
@@ -52,7 +68,7 @@ name = "Right"
         with TemporaryDirectory() as td:
             config_path = Path(td) / "missing-config.toml"
             models_cache_path = Path(td) / "missing-models.json"
-            with patch("codoxear.server.CODEX_CONFIG_PATH", config_path), patch("codoxear.server.MODELS_CACHE_PATH", models_cache_path):
+            with patch("codoxear.server.CODEX_CONFIG_PATH", config_path), patch("codoxear.server.MODELS_CACHE_PATH", models_cache_path), _codex_launch_default_env():
                 defaults = _read_codex_launch_defaults()
 
         self.assertEqual(defaults["model_provider"], "openai")
@@ -89,7 +105,7 @@ preferred_auth_method = "chatgpt"
             )
             models_cache_path.write_text('{"models":[]}', encoding="utf-8")
 
-            with patch("codoxear.server.CODEX_CONFIG_PATH", config_path), patch("codoxear.server.MODELS_CACHE_PATH", models_cache_path):
+            with patch("codoxear.server.CODEX_CONFIG_PATH", config_path), patch("codoxear.server.MODELS_CACHE_PATH", models_cache_path), _codex_launch_default_env():
                 defaults = _read_codex_launch_defaults()
 
         self.assertEqual(defaults["provider_choice"], "chatgpt")
@@ -113,10 +129,69 @@ base_url = "https://example.com/v1"
             )
             models_cache_path.write_text('{"models":[]}', encoding="utf-8")
 
-            with patch("codoxear.server.CODEX_CONFIG_PATH", config_path), patch("codoxear.server.MODELS_CACHE_PATH", models_cache_path):
+            with patch("codoxear.server.CODEX_CONFIG_PATH", config_path), patch("codoxear.server.MODELS_CACHE_PATH", models_cache_path), _codex_launch_default_env():
                 defaults = _read_codex_launch_defaults()
 
         self.assertEqual(defaults["model_providers"], ["chatgpt", "openai-api", "crs", "custom"])
+
+    def test_read_codex_launch_defaults_applies_web_env_overrides(self) -> None:
+        with TemporaryDirectory() as td:
+            config_path = Path(td) / "config.toml"
+            models_cache_path = Path(td) / "models.json"
+            config_path.write_text(
+                """
+model = "gpt-5.4"
+model_provider = "yesteam"
+preferred_auth_method = "apikey"
+service_tier = "flex"
+
+[model_providers.yesteam]
+base_url = "https://example.invalid/yesteam"
+
+[model_providers.crs]
+base_url = "https://example.invalid/crs"
+""".strip()
+                + "\n",
+                encoding="utf-8",
+            )
+            models_cache_path.write_text(
+                '{"models":[{"slug":"gpt-5.4","default_reasoning_level":"medium","priority":1}]}',
+                encoding="utf-8",
+            )
+
+            with patch("codoxear.server.CODEX_CONFIG_PATH", config_path), patch("codoxear.server.MODELS_CACHE_PATH", models_cache_path), _codex_launch_default_env(
+                CODEX_WEB_DEFAULT_MODEL_PROVIDER="crs",
+                CODEX_WEB_DEFAULT_MODEL="gpt-5.5",
+                CODEX_WEB_DEFAULT_REASONING_EFFORT="high",
+                CODEX_WEB_DEFAULT_SERVICE_TIER="fast",
+            ):
+                defaults = _read_codex_launch_defaults()
+
+        self.assertEqual(defaults["model_provider"], "crs")
+        self.assertEqual(defaults["provider_choice"], "crs")
+        self.assertEqual(defaults["model"], "gpt-5.5")
+        self.assertEqual(defaults["reasoning_effort"], "high")
+        self.assertEqual(defaults["service_tier"], "fast")
+
+    def test_read_codex_launch_defaults_rejects_unknown_web_env_provider(self) -> None:
+        with TemporaryDirectory() as td:
+            config_path = Path(td) / "config.toml"
+            models_cache_path = Path(td) / "models.json"
+            config_path.write_text(
+                """
+[model_providers.crs]
+base_url = "https://example.invalid/crs"
+""".strip()
+                + "\n",
+                encoding="utf-8",
+            )
+            models_cache_path.write_text('{"models":[]}', encoding="utf-8")
+
+            with patch("codoxear.server.CODEX_CONFIG_PATH", config_path), patch("codoxear.server.MODELS_CACHE_PATH", models_cache_path), _codex_launch_default_env(
+                CODEX_WEB_DEFAULT_MODEL_PROVIDER="missing"
+            ):
+                with self.assertRaisesRegex(ValueError, "model_provider must be one of crs, openai"):
+                    _read_codex_launch_defaults()
 
     def test_read_pi_launch_defaults_reads_provider_model_and_thinking(self) -> None:
         with TemporaryDirectory() as td:

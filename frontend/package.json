@@ -1,0 +1,24 @@
+{
+  "name": "codoxear-frontend",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@chenglou/pretext": "^0.0.6",
+    "@preact/signals": "^2.9.0",
+    "preact": "^10.29.1"
+  },
+  "devDependencies": {
+    "@preact/preset-vite": "^2.10.5",
+    "@types/babel__core": "^7.20.5",
+    "@types/node": "^25.6.0",
+    "typescript": "^6.0.3",
+    "vite": "^8.0.10"
+  }
+}

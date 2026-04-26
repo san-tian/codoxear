@@ -138,6 +138,24 @@ class TestBrokerProcRolloutDiscovery(unittest.TestCase):
             found = proc_find_open_rollout_log(proc_root=proc_root, root_pid=100, cwd="/x")
             self.assertIsNone(found)
 
+    def test_proc_uses_unique_open_main_log_when_cwd_was_changed_by_shell(self) -> None:
+        with TemporaryDirectory() as td:
+            root = Path(td)
+            proc_root = root / "proc"
+            logs = root / "logs"
+            logs.mkdir(parents=True, exist_ok=True)
+
+            want = logs / "rollout-2026-02-04T00-00-02-11111111-1111-1111-1111-111111111111.jsonl"
+            _write_jsonl(want, [{"type": "session_meta", "payload": {"id": "want", "cwd": "/shell-rc-cwd", "source": "cli"}}])
+
+            _ensure_proc_pid(proc_root, "100")
+            _ensure_proc_pid(proc_root, "101")
+            (proc_root / "100" / "task" / "100" / "children").write_text("101\n", encoding="utf-8")
+            _link_fd(proc_root, "101", "3", want, flags_octal="0100001")
+
+            found = proc_find_open_rollout_log(proc_root=proc_root, root_pid=100, cwd="/requested-cwd")
+            self.assertEqual(found, want)
+
     def test_proc_ignores_explicitly_ignored_paths(self) -> None:
         with TemporaryDirectory() as td:
             root = Path(td)

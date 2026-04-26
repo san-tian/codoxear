@@ -20,3 +20,9 @@ root-repo/
 codex-homes/
 socks/
 generated_imgs/
+
+.tmp/
+
+frontend/*.tsbuildinfo
+frontend/vite.config.js
+frontend/vite.config.d.ts

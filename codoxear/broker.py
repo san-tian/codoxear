@@ -287,7 +287,7 @@ def _exec_agent(*, cwd: str, agent_args: list[str]) -> None:
 def _exec_agent_via_login_shell(*, cwd: str, agent_args: list[str]) -> None:
     q = shlex.quote
     argv = [AGENT_BIN, *agent_args]
-    cmd = "exec " + " ".join(q(x) for x in argv)
+    cmd = f"cd {q(cwd)}; exec " + " ".join(q(x) for x in argv)
     shell_argv = _shell_argv_for_command(cmd)
     os.chdir(cwd)
     os.execvpe(shell_argv[0], shell_argv, os.environ)

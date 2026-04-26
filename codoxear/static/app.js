@@ -1482,9 +1482,17 @@
         const LIVE_AUDIO_STALL_GRACE_MS = 12000;
         const LIVE_AUDIO_RESTART_THROTTLE_MS = 4000;
         let swRegistration = null;
-         const recentEventKeys = [];
-         const recentEventKeySet = new Set();
-         const RECENT_EVENT_KEYS_MAX = 320;
+        const TOOL_EVENT_TYPES = new Set(["tool", "tool_result", "ask_user"]);
+        const SHOW_TOOL_CALLS_KEY = "codoxear.showToolCalls";
+        const recentEventKeys = [];
+        const recentEventKeySet = new Set();
+        const RECENT_EVENT_KEYS_MAX = 320;
+        const recentEventSigTs = new Map();
+        const recentEventSigOrder = [];
+        const RECENT_EVENT_SIG_MAX = 240;
+        const RECENT_EVENT_SIG_WINDOW_MS = 250;
+        let showToolCalls = localStorage.getItem(SHOW_TOOL_CALLS_KEY) === "1";
+        let transcriptEvents = [];
                  let clickLoadT0 = 0;
                  let clickMetricPending = false;
               let harnessMenuOpen = false;
@@ -1565,6 +1573,23 @@
           html: iconSvg("file"),
         });
         fileBtn.disabled = true;
+        const tmuxAttachBtn = el("button", {
+          id: "tmuxAttachBtn",
+          class: "icon-btn",
+          title: "Copy tmux attach command",
+          "aria-label": "Copy tmux attach command",
+          type: "button",
+          html: iconSvg("tmux"),
+        });
+        tmuxAttachBtn.disabled = true;
+        const toolToggleBtn = el("button", {
+          id: "toolToggleBtn",
+          class: "icon-btn",
+          title: "Show tool calls",
+          "aria-label": "Show tool calls",
+          type: "button",
+          html: iconSvg("terminal"),
+        });
         const harnessMenu = el("div", { id: "harnessMenu", class: "harnessMenu", role: "dialog", "aria-label": "Harness mode settings" }, [
           el("div", { class: "row" }, [
             el("label", {}, [
@@ -1594,6 +1619,8 @@
         const topbar = el("div", { class: "topbar" }, [
           el("div", { class: "pill" }, [toggleSidebarBtn, titleWrap]),
           el("div", { class: "actions topActions" }, [
+            toolToggleBtn,
+            tmuxAttachBtn,
             fileBtn,
             diagBtn,
             interruptBtn,
@@ -2325,6 +2352,29 @@
           copyTextViaSelection(text);
         }
 
+        function shellSingleQuote(s) {
+          return `'${String(s || "").replace(/'/g, `'\\''`)}'`;
+        }
+
+        function tmuxAttachCommandForSession(s) {
+          if (!s || s.transport !== "tmux") return "";
+          const tmuxSession = typeof s.tmux_session === "string" ? s.tmux_session.trim() : "";
+          if (!tmuxSession) return "";
+          const tmuxWindow = typeof s.tmux_window === "string" ? s.tmux_window.trim() : "";
+          const attachCmd = `tmux attach-session -t ${shellSingleQuote(tmuxSession)}`;
+          if (!tmuxWindow) return attachCmd;
+          return `${attachCmd} \\; select-window -t ${shellSingleQuote(`${tmuxSession}:${tmuxWindow}`)}`;
+        }
+
+        function updateTmuxAttachButtonState() {
+          const s = selected ? sessionIndex.get(selected) : null;
+          const cmd = tmuxAttachCommandForSession(s);
+          tmuxAttachBtn.disabled = !cmd;
+          tmuxAttachBtn.classList.toggle("active", Boolean(cmd));
+          tmuxAttachBtn.title = cmd ? "Copy tmux attach command" : "No tmux attach command for this session";
+          tmuxAttachBtn.setAttribute("aria-label", tmuxAttachBtn.title);
+        }
+
         let currentQueueLen = 0;
         function setStatus({ running, queueLen }) {
           const q = Math.max(0, Number(queueLen) || 0);
@@ -2392,8 +2442,11 @@
           invalidateOlderLoad();
           autoScroll = true;
           sending = false;
+          transcriptEvents = [];
           recentEventKeys.length = 0;
           recentEventKeySet.clear();
+          recentEventSigTs.clear();
+          recentEventSigOrder.length = 0;
           liveCursor = null;
           historyCursor = null;
           hasOlder = false;
@@ -2432,14 +2485,51 @@
           return OLDER_PAGE_LIMIT;
         }
 
+        function isToolEvent(ev) {
+          return Boolean(ev && typeof ev.type === "string" && TOOL_EVENT_TYPES.has(ev.type));
+        }
+
+        function shouldRenderEvent(ev) {
+          if (!ev) return false;
+          if (ev.role === "user" || ev.role === "assistant") return true;
+          return isToolEvent(ev) ? showToolCalls : false;
+        }
+
         function normalizeTailEvent(ev) {
-          if (!ev || (ev.role !== "user" && ev.role !== "assistant")) return null;
-          if (typeof ev.text !== "string" || !ev.text.trim()) return null;
-          const out = { role: ev.role, text: ev.text };
+          if (!ev || typeof ev !== "object") return null;
+          if (ev.role === "user" || ev.role === "assistant") {
+            if (typeof ev.text !== "string" || !ev.text.trim()) return null;
+            const out = { role: ev.role, text: ev.text };
+            if (typeof ev.ts === "number" && Number.isFinite(ev.ts)) out.ts = ev.ts;
+            if (ev.pending) out.pending = true;
+            if (typeof ev.localId === "string" && ev.localId) out.localId = ev.localId;
+            if (typeof ev.message_class === "string") out.message_class = ev.message_class;
+            if (typeof ev.message_id === "string") out.message_id = ev.message_id;
+            if (typeof ev.notification_text === "string") out.notification_text = ev.notification_text;
+            return out;
+          }
+          if (!isToolEvent(ev)) return null;
+          const out = { type: ev.type };
           if (typeof ev.ts === "number" && Number.isFinite(ev.ts)) out.ts = ev.ts;
-          if (typeof ev.message_class === "string") out.message_class = ev.message_class;
-          if (typeof ev.message_id === "string") out.message_id = ev.message_id;
-          if (typeof ev.notification_text === "string") out.notification_text = ev.notification_text;
+          if (typeof ev.name === "string" && ev.name.trim()) out.name = ev.name;
+          if (typeof ev.text === "string" && ev.text.trim()) out.text = ev.text;
+          if (typeof ev.tool_call_id === "string" && ev.tool_call_id) out.tool_call_id = ev.tool_call_id;
+          if (typeof ev.question === "string") out.question = ev.question;
+          if (typeof ev.context === "string") out.context = ev.context;
+          if (Array.isArray(ev.options)) out.options = ev.options.filter((item) => typeof item === "string");
+          if (Array.isArray(ev.questions)) out.questions = ev.questions;
+          if (typeof ev.header === "string" && ev.header) out.header = ev.header;
+          if (typeof ev.answer === "string" || Array.isArray(ev.answer)) out.answer = ev.answer;
+          if (typeof ev.allow_freeform === "boolean") out.allow_freeform = ev.allow_freeform;
+          if (typeof ev.allow_multiple === "boolean") out.allow_multiple = ev.allow_multiple;
+          if (typeof ev.resolved === "boolean") out.resolved = ev.resolved;
+          if (typeof ev.cancelled === "boolean") out.cancelled = ev.cancelled;
+          if (typeof ev.was_custom === "boolean") out.was_custom = ev.was_custom;
+          if (typeof ev.timeout_ms === "number" && Number.isFinite(ev.timeout_ms)) out.timeout_ms = ev.timeout_ms;
+          if (typeof ev.is_error === "boolean") out.is_error = ev.is_error;
+          if (out.type === "tool" && !out.name) out.name = "tool";
+          if (out.type === "tool_result" && !out.name) out.name = "tool";
+          if (out.type === "ask_user" && typeof out.question !== "string") out.question = "";
           return out;
         }
 
@@ -2821,135 +2911,6 @@
           if (sid === selected) setLastLine(line);
         }
 
-        function cacheStorageKey(sid) {
-          return `codexweb.cache.v4.${sid}`;
-        }
-
-        function normalizeCacheEvent(ev) {
-          if (!ev || (ev.role !== "user" && ev.role !== "assistant")) return null;
-          if (typeof ev.text !== "string" || !ev.text.trim()) return null;
-          const out = { role: ev.role, text: ev.text };
-          if (typeof ev.ts === "number" && Number.isFinite(ev.ts)) out.ts = ev.ts;
-          return out;
-        }
-
-        function loadCacheFromStorage(sid) {
-          if (!sid || cacheLoaded.has(sid)) return;
-          cacheLoaded.add(sid);
-          try {
-            const raw = localStorage.getItem(cacheStorageKey(sid));
-            if (!raw) return;
-            const obj = JSON.parse(raw);
-            if (!obj || typeof obj !== "object") return;
-            const eventsIn = Array.isArray(obj.events) ? obj.events : [];
-            const events = [];
-            for (const ev of eventsIn) {
-              const norm = normalizeCacheEvent(ev);
-              if (norm) events.push(norm);
-            }
-            if (!events.length) return;
-            if (events.length > CACHE_LIMIT) events.splice(0, events.length - CACHE_LIMIT);
-            const cache = {
-              log_path: typeof obj.log_path === "string" ? obj.log_path : null,
-              offset: Number(obj.offset) || 0,
-              older_before: Number(obj.older_before) || 0,
-              has_older: Boolean(obj.has_older),
-              events,
-            };
-            cacheBySession.set(sid, cache);
-          } catch {
-            // ignore corrupted cache
-          }
-        }
-
-        function getCache(sid) {
-          if (!sid) return null;
-          loadCacheFromStorage(sid);
-          return cacheBySession.get(sid) || null;
-        }
-
-        function saveCacheNow(sid) {
-          if (!sid) return;
-          const cache = cacheBySession.get(sid);
-          if (!cache) {
-            localStorage.removeItem(cacheStorageKey(sid));
-            return;
-          }
-          const payload = {
-            log_path: cache.log_path || null,
-            offset: Number(cache.offset) || 0,
-            older_before: Number(cache.older_before) || 0,
-            has_older: Boolean(cache.has_older),
-            events: Array.isArray(cache.events) ? cache.events : [],
-          };
-          try {
-            localStorage.setItem(cacheStorageKey(sid), JSON.stringify(payload));
-          } catch {
-            // ignore quota issues
-          }
-        }
-
-        function scheduleCacheSave(sid) {
-          if (!sid) return;
-          const existing = cacheSaveTimers.get(sid);
-          if (existing) clearTimeout(existing);
-          const t = setTimeout(() => {
-            cacheSaveTimers.delete(sid);
-            saveCacheNow(sid);
-          }, 400);
-          cacheSaveTimers.set(sid, t);
-        }
-
-        function setCacheMeta(sid, { logPath, offset: off, olderBefore, hasOlder } = {}) {
-          if (!sid) return;
-          const cache =
-            getCache(sid) || { log_path: null, offset: 0, older_before: 0, has_older: false, events: [] };
-          if (logPath !== undefined) cache.log_path = logPath || null;
-          if (typeof off === "number" && Number.isFinite(off)) cache.offset = off;
-          if (typeof olderBefore === "number" && Number.isFinite(olderBefore)) cache.older_before = olderBefore;
-          if (typeof hasOlder === "boolean") cache.has_older = hasOlder;
-          cacheBySession.set(sid, cache);
-          scheduleCacheSave(sid);
-        }
-
-        function replaceCacheEvents(sid, events) {
-          if (!sid) return;
-          const cache =
-            getCache(sid) || { log_path: null, offset: 0, older_before: 0, has_older: false, events: [] };
-          const out = [];
-          for (const ev of events || []) {
-            const norm = normalizeCacheEvent(ev);
-            if (norm) out.push(norm);
-          }
-          if (out.length > CACHE_LIMIT) out.splice(0, out.length - CACHE_LIMIT);
-          cache.events = out;
-          cacheBySession.set(sid, cache);
-          scheduleCacheSave(sid);
-        }
-
-        function appendCacheEvents(sid, events) {
-          if (!sid || !events || !events.length) return;
-          const cache =
-            getCache(sid) || { log_path: null, offset: 0, older_before: 0, has_older: false, events: [] };
-          const list = Array.isArray(cache.events) ? cache.events : [];
-          for (const ev of events) {
-            const norm = normalizeCacheEvent(ev);
-            if (norm) list.push(norm);
-          }
-          if (list.length > CACHE_LIMIT) list.splice(0, list.length - CACHE_LIMIT);
-          cache.events = list;
-          cacheBySession.set(sid, cache);
-          scheduleCacheSave(sid);
-        }
-
-        function clearCache(sid) {
-          if (!sid) return;
-          cacheBySession.delete(sid);
-          cacheLoaded.delete(sid);
-          cacheSaveTimers.delete(sid);
-          localStorage.removeItem(cacheStorageKey(sid));
-        }
-
         function queueEditorActive() {
           if (queueViewer.style.display !== "flex") return false;
           const active = document.activeElement;
@@ -3065,7 +3026,7 @@
           let lastDay = null;
 
           for (const row of rows) {
-            const role = row.classList.contains("user") ? "user" : "assistant";
+            const role = row.dataset.groupRole || (row.classList.contains("user") ? "user" : row.classList.contains("assistant") ? "assistant" : "tool");
             const ts = Number(row.dataset.ts || "0");
             const day = ts ? ymd(new Date(ts * 1000)) : null;
 
@@ -3131,17 +3092,124 @@
           for (const row of rows.slice(0, removable)) row.remove();
         }
 
+        function toolLabel(name) {
+          const raw = typeof name === "string" ? name.trim() : "";
+          if (!raw) return "Tool";
+          return raw.replace(/[_-]+/g, " ");
+        }
+
+        function askUserAnswerText(answer) {
+          if (Array.isArray(answer)) return answer.filter((item) => typeof item === "string" && item).join(", ");
+          return typeof answer === "string" ? answer : "";
+        }
+
+        function toolCopyText(ev) {
+          if (!ev || typeof ev !== "object") return "";
+          if (typeof ev.text === "string" && ev.text) return ev.text;
+          if (ev.type === "ask_user") {
+            const parts = [];
+            if (typeof ev.question === "string" && ev.question) parts.push(ev.question);
+            const answer = askUserAnswerText(ev.answer);
+            if (answer) parts.push(`Answer: ${answer}`);
+            return parts.join("\n");
+          }
+          return "";
+        }
+
+        function appendRowTimestamp(bubble, ts) {
+          if (typeof ts === "number" && Number.isFinite(ts)) {
+            bubble.appendChild(el("div", { class: "ts", text: time24(new Date(ts * 1000)) }));
+          }
+        }
+
+        function addCopyButton(shell, text) {
+          if (typeof text !== "string" || !text.length) return;
+          const copyBtn = el("button", {
+            class: "icon-btn msg-copy-btn",
+            type: "button",
+            title: "Copy raw markdown",
+            "aria-label": "Copy raw markdown",
+            html: iconSvg("copy"),
+          });
+          copyBtn.onclick = async (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            try {
+              await copyToClipboard(text);
+              copyBtn.classList.add("copied");
+              setTimeout(() => copyBtn.classList.remove("copied"), 1200);
+              setToast("Copied markdown");
+            } catch (err) {
+              setToast(`copy failed: ${err && err.message ? err.message : "unknown error"}`);
+            }
+          };
+          shell.appendChild(copyBtn);
+        }
+
         function makeRow(ev, { ts, pending }) {
-          const role = ev.role === "user" ? "user" : "assistant";
-          const row = el("div", { class: `msg-row ${role}` });
+          const isChat = ev.role === "user" || ev.role === "assistant";
+          const role = ev.role === "user" ? "user" : ev.role === "assistant" ? "assistant" : "tool";
+          const type = isChat ? role : ev.type;
+          const row = el("div", { class: `msg-row ${role}${type ? ` ${type}` : ""}` });
           row.dataset.role = role;
+          row.dataset.groupRole = isChat ? role : "tool";
+          if (type) row.dataset.type = type;
           if (typeof ts === "number" && Number.isFinite(ts)) row.dataset.ts = String(ts);
 
-          const bubble = el("div", { class: role === "user" ? "msg user" : "msg assistant" });
-          const md = el("div", { class: "md", html: mdToHtmlCached(ev.text) });
-          bubble.appendChild(md);
-          void upgradeCandidateFileRefs(md);
-          if (typeof ts === "number" && Number.isFinite(ts)) bubble.appendChild(el("div", { class: "ts", text: time24(new Date(ts * 1000)) }));
+          let bubble = null;
+          if (isChat) {
+            bubble = el("div", { class: role === "user" ? "msg user" : "msg assistant" });
+            const md = el("div", { class: "md", html: mdToHtmlCached(ev.text) });
+            bubble.appendChild(md);
+            void upgradeCandidateFileRefs(md);
+            appendRowTimestamp(bubble, ts);
+          } else if (ev.type === "tool" || ev.type === "tool_result") {
+            bubble = el("div", { class: `msg tool-card ${ev.type === "tool_result" ? "tool-result-card" : "tool-call-card"}` });
+            const header = el("div", { class: "toolCardHeader" }, [
+              el("span", { class: "toolCardBadge", text: ev.type === "tool_result" ? "Result" : "Tool" }),
+              el("span", { class: "toolCardName", text: toolLabel(ev.name) }),
+            ]);
+            bubble.appendChild(header);
+            if (typeof ev.text === "string" && ev.text) {
+              const md = el("div", { class: "md toolMd", html: mdToHtmlCached(ev.text) });
+              bubble.appendChild(md);
+              void upgradeCandidateFileRefs(md);
+            }
+            if (ev.is_error) {
+              bubble.appendChild(el("div", { class: "toolCardMeta toolError", text: "Error" }));
+            }
+            appendRowTimestamp(bubble, ts);
+          } else if (ev.type === "ask_user") {
+            bubble = el("div", { class: "msg tool-card askUserCard" });
+            const header = el("div", { class: "toolCardHeader" }, [
+              el("span", { class: "toolCardBadge", text: ev.resolved ? "Answered" : "Ask" }),
+              el("span", { class: "toolCardName", text: "User input" }),
+            ]);
+            bubble.appendChild(header);
+            if (typeof ev.context === "string" && ev.context) {
+              bubble.appendChild(el("div", { class: "toolCardMeta", text: ev.context }));
+            }
+            bubble.appendChild(el("div", { class: "askUserQuestion", text: typeof ev.question === "string" && ev.question ? ev.question : "User input requested" }));
+            if (Array.isArray(ev.options) && ev.options.length) {
+              const optionsWrap = el("div", { class: "toolOptionList" });
+              for (const option of ev.options) {
+                if (typeof option !== "string" || !option) continue;
+                optionsWrap.appendChild(el("span", { class: "toolOptionChip", text: option }));
+              }
+              bubble.appendChild(optionsWrap);
+            }
+            const answer = askUserAnswerText(ev.answer);
+            if (answer) {
+              bubble.appendChild(el("div", { class: "askUserAnswer", html: `<strong>Answer:</strong> ${escapeHtml(answer)}` }));
+            } else if (ev.cancelled) {
+              bubble.appendChild(el("div", { class: "toolCardMeta toolError", text: "Cancelled" }));
+            }
+            appendRowTimestamp(bubble, ts);
+          } else {
+            bubble = el("div", { class: "msg assistant" });
+            bubble.appendChild(el("div", { class: "md", text: typeof ev.text === "string" ? ev.text : "" }));
+            appendRowTimestamp(bubble, ts);
+          }
 
           if (pending) {
             bubble.style.opacity = "0.72";
@@ -3149,31 +3217,9 @@
             if (ev.localId) bubble.setAttribute("data-local-id", String(ev.localId));
           }
 
-          const shell = el("div", { class: `msg-shell ${role}` });
+          const shell = el("div", { class: `msg-shell ${row.dataset.groupRole || role}` });
           shell.appendChild(bubble);
-          if (typeof ev.text === "string" && ev.text.length) {
-            const copyBtn = el("button", {
-              class: "icon-btn msg-copy-btn",
-              type: "button",
-              title: "Copy raw markdown",
-              "aria-label": "Copy raw markdown",
-              html: iconSvg("copy"),
-            });
-            copyBtn.onclick = async (e) => {
-              e.preventDefault();
-              e.stopPropagation();
-              try {
-                await copyToClipboard(ev.text);
-                copyBtn.classList.add("copied");
-                setTimeout(() => copyBtn.classList.remove("copied"), 1200);
-                setToast("Copied markdown");
-              } catch (err) {
-                setToast(`copy failed: ${err && err.message ? err.message : "unknown error"}`);
-              }
-            };
-            shell.appendChild(copyBtn);
-          }
-
+          addCopyButton(shell, isChat ? ev.text : toolCopyText(ev));
           row.appendChild(shell);
           return { row, bubble };
         }
@@ -3183,15 +3229,20 @@
             return makeRow(ev, opts);
           } catch (err) {
             console.error("makeRow failed", err);
-            const role = ev && ev.role === "user" ? "user" : "assistant";
+            const role = ev && ev.role === "user" ? "user" : ev && ev.role === "assistant" ? "assistant" : "tool";
             const ts = opts && typeof opts.ts === "number" && Number.isFinite(opts.ts) ? opts.ts : null;
             const pending = Boolean(opts && opts.pending);
             const row = el("div", { class: `msg-row ${role}` });
             row.dataset.role = role;
+            row.dataset.groupRole = role === "tool" ? "tool" : role;
             if (ts !== null) row.dataset.ts = String(ts);
-            const bubble = el("div", { class: role === "user" ? "msg user" : "msg assistant" });
+            const bubble = el("div", { class: role === "user" ? "msg user" : role === "assistant" ? "msg assistant" : "msg tool-card" });
             const md = el("div", { class: "md" });
-            md.textContent = typeof ev?.text === "string" ? ev.text : String(ev?.text ?? "");
+            md.textContent = typeof ev?.text === "string"
+              ? ev.text
+              : typeof ev?.question === "string" && ev.question
+                ? ev.question
+                : String(ev?.text ?? "");
             bubble.appendChild(md);
             if (ts !== null) bubble.appendChild(el("div", { class: "ts", text: time24(new Date(ts * 1000)) }));
             if (pending) {
@@ -3212,37 +3263,18 @@
       }
 
       function eventKey(ev) {
-        if (!ev || (ev.role !== "user" && ev.role !== "assistant")) return "";
-        const ts = typeof ev.ts === "number" && Number.isFinite(ev.ts) ? ev.ts : null;
-        if (ts === null) return "";
-        const tsMs = Math.round(ts * 1000);
-        const text = typeof ev.text === "string" ? pendingMatchKey(ev.text) : "";
-        return `${ev.role}|${tsMs}|${text}`;
-      }
-
-        function markEventSeen(ev) {
-          const key = eventKey(ev);
-          if (!key) return;
-          if (recentEventKeySet.has(key)) return;
-          recentEventKeySet.add(key);
-          recentEventKeys.push(key);
-          if (recentEventKeys.length > RECENT_EVENT_KEYS_MAX) {
-            const drop = recentEventKeys.splice(0, recentEventKeys.length - RECENT_EVENT_KEYS_MAX);
-            for (const k of drop) recentEventKeySet.delete(k);
-          }
-        }
-
-        function isDuplicateEvent(ev) {
-          const key = eventKey(ev);
-          if (!key) return false;
-          return recentEventKeySet.has(key);
-        }
-
-        function eventKey(ev) {
-          if (!ev || (ev.role !== "user" && ev.role !== "assistant")) return "";
-          const text = typeof ev.text === "string" ? ev.text : "";
-          const ts = typeof ev.ts === "number" && Number.isFinite(ev.ts) ? ev.ts : 0;
-          return `${ev.role}|${ts}|${text}`;
+        if (!ev) return "";
+        const kind = ev.role === "user" || ev.role === "assistant" ? ev.role : typeof ev.type === "string" ? ev.type : "";
+        if (!kind) return "";
+        const ts = typeof ev.ts === "number" && Number.isFinite(ev.ts) ? Math.round(ev.ts * 1000) : -1;
+        const parts = [kind, String(ts)];
+        if (typeof ev.name === "string" && ev.name) parts.push(ev.name);
+        if (typeof ev.tool_call_id === "string" && ev.tool_call_id) parts.push(ev.tool_call_id);
+        if (typeof ev.question === "string" && ev.question) parts.push(ev.question);
+        if (typeof ev.text === "string" && ev.text) parts.push(pendingMatchKey(ev.text));
+        const answer = askUserAnswerText(ev.answer);
+        if (answer) parts.push(answer);
+        return parts.join("|");
         }
 
         function eventSig(ev) {
@@ -3714,22 +3746,42 @@
         }
 
         function appendEvent(ev) {
-          if (!ev || (ev.role !== "user" && ev.role !== "assistant")) return;
-          if (consumePendingUserIfMatches(ev)) return;
-          if (!ev.pending && isDuplicateEvent(ev)) return;
-
-          if (!ev.pending && selected) {
+          const norm = normalizeTailEvent(ev);
+          if (!norm) return;
+          if (norm.pending) {
+            const ts = typeof norm.ts === "number" && Number.isFinite(norm.ts) ? norm.ts : Date.now() / 1000;
+            const { row } = safeMakeRow(norm, { ts, pending: true });
+            const anchor = typingRow && typingRow.isConnected ? typingRow : bottomSentinel;
+            chatInner.insertBefore(row, anchor);
+            rebuildDecorations({ preserveScroll: false });
+            if (autoScroll || isNearBottom()) requestAnimationFrame(() => scrollToBottom());
+            syncJumpButton();
+            return;
+          }
+          if (consumePendingUserIfMatches(norm)) {
+            transcriptEvents.push(norm);
+            markEventSeen(norm);
+            return;
+          }
+          if (!norm.pending && isDuplicateEvent(norm)) return;
+          transcriptEvents.push(norm);
+          if (!shouldRenderEvent(norm)) {
+            if (selected) lastActivityBySession.set(selected, performance.now());
+            markEventSeen(norm);
+            return;
+          }
+          if (!norm.pending && selected) {
             lastActivityBySession.set(selected, performance.now());
           }
           const stick = autoScroll || isNearBottom();
-          const ts = typeof ev.ts === "number" && Number.isFinite(ev.ts) ? ev.ts : ev.pending ? Date.now() / 1000 : null;
-           const { row } = safeMakeRow(ev, { ts, pending: Boolean(ev.pending) });
-	          const anchor = typingRow && typingRow.isConnected ? typingRow : bottomSentinel;
-	          chatInner.insertBefore(row, anchor);
-            trimRenderedRows({ fromTop: true });
+          const ts = typeof norm.ts === "number" && Number.isFinite(norm.ts) ? norm.ts : norm.pending ? Date.now() / 1000 : null;
+          const { row } = safeMakeRow(norm, { ts, pending: Boolean(norm.pending) });
+          const anchor = typingRow && typingRow.isConnected ? typingRow : bottomSentinel;
+          chatInner.insertBefore(row, anchor);
+          trimRenderedRows({ fromTop: true });
           rebuildDecorations({ preserveScroll: false });
-            if (!ev.pending) markClickFirstPaint();
-          markEventSeen(ev);
+          if (!norm.pending) markClickFirstPaint();
+          markEventSeen(norm);
 
           if (stick) {
             requestAnimationFrame(() => scrollToBottom());
@@ -3738,27 +3790,31 @@
         }
 
         function renderTranscript(events, { preserveScroll = false } = {}) {
-          const msgs = [];
+          const all = [];
           const seen = new Set();
           for (const ev of events || []) {
-            if (!ev || (ev.role !== "user" && ev.role !== "assistant")) continue;
-            if (consumePendingUserIfMatches(ev)) continue;
-            const k = eventKey(ev);
+            const norm = normalizeTailEvent(ev);
+            if (!norm) continue;
+            const k = eventKey(norm);
             if (k && seen.has(k)) continue;
             if (k) seen.add(k);
-            msgs.push(ev);
+            all.push(norm);
           }
+          transcriptEvents = all.slice();
           clearTranscriptDom();
-          if (!msgs.length) {
+          if (!all.length) {
             restorePendingUserRowsForSession(selected);
             return;
           }
           recentEventKeys.length = 0;
           recentEventKeySet.clear();
+          recentEventSigTs.clear();
+          recentEventSigOrder.length = 0;
           const frag = document.createDocumentFragment();
-          for (const ev of msgs) {
-            const ts = typeof ev.ts === "number" && Number.isFinite(ev.ts) ? ev.ts : null;
+          for (const ev of all) {
             markEventSeen(ev);
+            if (!shouldRenderEvent(ev)) continue;
+            const ts = typeof ev.ts === "number" && Number.isFinite(ev.ts) ? ev.ts : null;
             frag.appendChild(safeMakeRow(ev, { ts, pending: false }).row);
           }
           chatInner.insertBefore(frag, bottomSentinel);
@@ -3769,15 +3825,19 @@
         function prependOlderEvents(allEvents, { preserveViewport = false } = {}) {
           const msgs = [];
           for (const ev of allEvents) {
-            if (!ev || (ev.role !== "user" && ev.role !== "assistant")) continue;
-            const clean = sanitizeUserEvent(ev, selected);
+            const norm = normalizeTailEvent(ev);
+            if (!norm) continue;
+            const clean = norm.role === "user" ? sanitizeUserEvent(norm, selected) : norm;
             if (!clean) continue;
             msgs.push(clean);
           }
           if (!msgs.length) return;
+          transcriptEvents = msgs.concat(transcriptEvents);
           autoScroll = false;
           const frag = document.createDocumentFragment();
           for (const ev of msgs) {
+            markEventSeen(ev);
+            if (!shouldRenderEvent(ev)) continue;
             const ts = typeof ev.ts === "number" && Number.isFinite(ev.ts) ? ev.ts : null;
             frag.appendChild(safeMakeRow(ev, { ts, pending: false }).row);
           }
@@ -3864,6 +3924,25 @@
             scrollToBottom();
             requestAnimationFrame(() => scrollToBottom());
           });
+        }
+
+        function syncToolToggleButton() {
+          if (!toolToggleBtn) return;
+          toolToggleBtn.classList.toggle("active", showToolCalls);
+          toolToggleBtn.title = showToolCalls ? "Hide tool calls" : "Show tool calls";
+          toolToggleBtn.setAttribute("aria-label", toolToggleBtn.title);
+        }
+
+        function setShowToolCalls(next) {
+          showToolCalls = Boolean(next);
+          try {
+            if (showToolCalls) localStorage.setItem(SHOW_TOOL_CALLS_KEY, "1");
+            else localStorage.removeItem(SHOW_TOOL_CALLS_KEY);
+          } catch {
+            // ignore storage issues
+          }
+          syncToolToggleButton();
+          renderTranscript(transcriptEvents, { preserveScroll: true });
         }
 
         function applyCachedTail(sessionId, cache, sessionMeta) {
@@ -4167,6 +4246,7 @@
           }
           fileBtn.disabled = !selected;
           diagBtn.disabled = !selected;
+          updateTmuxAttachButtonState();
         }
            async function loadHarnessCfgForSelected() {
              if (!selected) return;
@@ -4265,6 +4345,28 @@
 			          e.stopPropagation();
 		          toggleHarnessMenu();
 		        };
+		        tmuxAttachBtn.onclick = async (e) => {
+		          e.preventDefault();
+		          e.stopPropagation();
+		          const s = selected ? sessionIndex.get(selected) : null;
+		          const cmd = tmuxAttachCommandForSession(s);
+		          if (!cmd) {
+		            setToast("tmux unavailable for this session");
+		            return;
+		          }
+		          try {
+		            await copyToClipboard(cmd);
+		            setToast("Copied tmux attach command");
+		          } catch (err) {
+		            setToast(`copy failed: ${err && err.message ? err.message : "unknown error"}`);
+		          }
+		        };
+		        toolToggleBtn.onclick = (e) => {
+		          e.preventDefault();
+		          e.stopPropagation();
+		          setShowToolCalls(!showToolCalls);
+		        };
+		        syncToolToggleButton();
 		        harnessMenu.onclick = (e) => e.stopPropagation();
 		        if (window.__codexwebHarnessGlobalHandlers) {
 		          const h = window.__codexwebHarnessGlobalHandlers;
@@ -8746,19 +8848,6 @@ importScripts(${JSON.stringify(base + "/base/worker/workerMain.js")});
         $("#logoutBtnSide").onclick = async () => {
           await api("/api/logout", { method: "POST" });
           renderLogin(renderApp);
-        };
-
-        duplicateBtn.onclick = async () => {
-          if (!selected) return;
-          const s = sessionIndex.get(selected);
-          const cwd = s && s.cwd && s.cwd !== "?" ? s.cwd : "";
-          if (!cwd) {
-            setToast("cwd unavailable");
-            return;
-          }
-          const base = sessionDisplayName(s) || baseName(cwd) || "Session";
-          const alias = buildDuplicateAlias(base);
-          await spawnSessionWithCwd(cwd, { alias });
         };
 
         toggleSidebarBtn.onclick = () => {

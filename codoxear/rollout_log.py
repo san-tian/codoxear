@@ -22,6 +22,7 @@ from .voice_push import ClassifiedAssistantMessage
 
 
 _OAI_MEM_CITATION_TAIL_RE = re.compile(r"\s*<oai-mem-citation>\s*.*?</oai-mem-citation>\s*\Z", re.DOTALL)
+_ASK_USER_TOOL_NAMES = {"ask_user", "AskUserQuestion"}
 
 
 @dataclass(frozen=True)
@@ -130,6 +131,249 @@ def _text_message_id(*, message_class: str, text: str, ts: float | None) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def _non_empty_string(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    return value or None
+
+
+def _coerce_tool_arguments(args: Any) -> dict[str, Any]:
+    if isinstance(args, str):
+        try:
+            args = json.loads(args)
+        except (TypeError, ValueError):
+            args = {}
+    return args if isinstance(args, dict) else {}
+
+
+def _tool_text_from_content(content: Any) -> str | None:
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            block_type = item.get("type")
+            text = item.get("text")
+            if block_type in ("text", "output_text", "input_text") and isinstance(text, str) and text:
+                parts.append(text)
+        if parts:
+            return "".join(parts)
+    if isinstance(content, str) and content.strip():
+        return content
+    return None
+
+
+def _tool_result_text(payload: dict[str, Any]) -> str | None:
+    for key in ("content", "output", "text", "result"):
+        value = payload.get(key)
+        text = _tool_text_from_content(value)
+        if text:
+            return text
+        if isinstance(value, (dict, list)) and value:
+            return json.dumps(value, ensure_ascii=False, sort_keys=True)
+    return None
+
+
+def _tool_call_summary(name: str, args: dict[str, Any]) -> str | None:
+    if name in _ASK_USER_TOOL_NAMES:
+        question = _non_empty_string(args.get("question"))
+        if question is not None:
+            return question
+        questions = args.get("questions")
+        if isinstance(questions, list):
+            for item in questions:
+                if not isinstance(item, dict):
+                    continue
+                question = _non_empty_string(item.get("question"))
+                if question is not None:
+                    return question
+        return None
+    for key in ("command", "query", "prompt", "path", "file_path", "url", "subject"):
+        value = _non_empty_string(args.get(key))
+        if value is not None:
+            return value
+    return None
+
+
+def _normalized_bool_arg(
+    args: dict[str, Any], *keys: str, default: bool = False
+) -> bool:
+    for key in keys:
+        if key in args:
+            return bool(args.get(key))
+    return default
+
+
+def _normalize_ask_user_questions(questions: Any) -> list[dict[str, Any]]:
+    if not isinstance(questions, list):
+        return []
+    normalized_questions: list[dict[str, Any]] = []
+    for item in questions:
+        if not isinstance(item, dict):
+            continue
+        question = item.get("question") if isinstance(item.get("question"), str) else ""
+        header = item.get("header") if isinstance(item.get("header"), str) else ""
+        options = item.get("options") if isinstance(item.get("options"), list) else []
+        if not question:
+            continue
+        normalized_questions.append(
+            {
+                "header": header,
+                "question": question,
+                "options": [option for option in options],
+                "multiSelect": _normalized_bool_arg(
+                    item,
+                    "allow_multiple",
+                    "allowMultiple",
+                    "multiSelect",
+                ),
+            }
+        )
+    return normalized_questions
+
+
+def _normalize_ask_user_args(args: Any) -> dict[str, Any]:
+    normalized = _coerce_tool_arguments(args)
+    question = (
+        normalized.get("question")
+        if isinstance(normalized.get("question"), str)
+        else ""
+    )
+    context = (
+        normalized.get("context")
+        if isinstance(normalized.get("context"), str)
+        else ""
+    )
+    options = normalized.get("options")
+    allow_freeform = _normalized_bool_arg(
+        normalized, "allow_freeform", "allowFreeform", default=True
+    )
+    allow_multiple = _normalized_bool_arg(normalized, "allow_multiple", "allowMultiple")
+    timeout_ms = next(
+        (
+            normalized.get(key)
+            for key in ("timeout_ms", "timeoutMs", "timeout")
+            if isinstance(normalized.get(key), int)
+        ),
+        None,
+    )
+
+    normalized_questions = _normalize_ask_user_questions(normalized.get("questions"))
+    header = ""
+    if normalized_questions:
+        first = normalized_questions[0]
+        question = first.get("question") if isinstance(first.get("question"), str) else question
+        header = first.get("header") if isinstance(first.get("header"), str) else ""
+        if not context and header:
+            context = header
+        first_options = first.get("options")
+        if isinstance(first_options, list):
+            options = first_options
+        allow_freeform = _normalized_bool_arg(
+            first, "allow_freeform", "allowFreeform", default=allow_freeform
+        )
+        allow_multiple = _normalized_bool_arg(
+            first,
+            "allow_multiple",
+            "allowMultiple",
+            "multiSelect",
+            default=allow_multiple,
+        )
+        timeout_ms = next(
+            (
+                first.get(key)
+                for key in ("timeout_ms", "timeoutMs", "timeout")
+                if isinstance(first.get(key), int)
+            ),
+            timeout_ms,
+        )
+
+    result = {
+        "question": question,
+        "context": context,
+        "options": list(options) if isinstance(options, list) else [],
+        "allow_freeform": allow_freeform,
+        "allow_multiple": allow_multiple,
+        "timeout_ms": timeout_ms,
+    }
+    if header:
+        result["header"] = header
+    if normalized_questions:
+        result["questions"] = normalized_questions
+    return result
+
+
+def _ask_user_event(
+    args: Any, *, call_id: str | None, ts: float, resolved: bool = False
+) -> dict[str, Any]:
+    return {
+        "type": "ask_user",
+        "tool_call_id": call_id,
+        **_normalize_ask_user_args(args),
+        "resolved": resolved,
+        "ts": float(ts),
+    }
+
+
+def _normalize_ask_user_answer(
+    answer: Any, *, allow_multiple: bool
+) -> str | list[str] | None:
+    if isinstance(answer, str):
+        return answer
+    if allow_multiple and isinstance(answer, list):
+        normalized = [item for item in answer if isinstance(item, str)]
+        return normalized or None
+    return None
+
+
+def _normalize_ask_user_result(
+    details: dict[str, Any],
+    *,
+    allow_multiple: bool,
+    question: str = "",
+    content_text: str = "",
+) -> tuple[str | list[str] | None, bool]:
+    answers = details.get("answers")
+    if isinstance(answers, dict) and question:
+        answer = _normalize_ask_user_answer(
+            answers.get(question), allow_multiple=allow_multiple
+        )
+        if answer is not None:
+            return answer, False
+
+    answer = _normalize_ask_user_answer(
+        details.get("answer"), allow_multiple=allow_multiple
+    )
+    was_custom = bool(details.get("wasCustom"))
+    if answer is not None:
+        return answer, was_custom
+
+    response = details.get("response")
+    if isinstance(response, dict):
+        kind = response.get("kind") if isinstance(response.get("kind"), str) else ""
+        selections = response.get("selections")
+        if isinstance(selections, list):
+            normalized = [item for item in selections if isinstance(item, str) and item]
+            if normalized:
+                if allow_multiple or len(normalized) > 1:
+                    return normalized, was_custom or kind == "custom"
+                return normalized[0], was_custom or kind == "custom"
+        value = response.get("value")
+        if isinstance(value, str) and value:
+            return value, was_custom or kind == "custom"
+        comment = response.get("comment")
+        if isinstance(comment, str) and comment.strip():
+            return comment.strip(), True
+
+    if question and isinstance(content_text, str) and content_text.strip():
+        match = re.search(rf'"{re.escape(question)}"\s*=\s*"([^"]+)"', content_text)
+        if match:
+            return match.group(1), was_custom
+
+    return None, was_custom
+
+
 def _single_chat_event(obj: dict[str, Any]) -> dict[str, Any] | None:
     typ = obj.get("type")
     if typ == "message":
@@ -154,6 +398,65 @@ def _single_chat_event(obj: dict[str, Any]) -> dict[str, Any] | None:
             if ets is not None:
                 eva["ts"] = ets
             return eva
+        payload = obj.get("message")
+        if not isinstance(payload, dict):
+            return None
+        role = payload.get("role")
+        ets = _event_ts(obj)
+        if role == "assistant":
+            content = payload.get("content")
+            if not isinstance(content, list):
+                return None
+            for item in content:
+                if not isinstance(item, dict) or item.get("type") != "toolCall":
+                    continue
+                name = _non_empty_string(item.get("name")) or "tool"
+                call_id = _non_empty_string(item.get("id"))
+                args = _coerce_tool_arguments(item.get("arguments"))
+                if name in _ASK_USER_TOOL_NAMES:
+                    if ets is None:
+                        return None
+                    return _ask_user_event(args, call_id=call_id, ts=ets, resolved=False)
+                ev: dict[str, Any] = {"type": "tool", "name": name}
+                if ets is not None:
+                    ev["ts"] = ets
+                if call_id is not None:
+                    ev["tool_call_id"] = call_id
+                summary = _tool_call_summary(name, args)
+                if summary is not None:
+                    ev["text"] = summary
+                return ev
+        if role == "toolResult":
+            name = _non_empty_string(payload.get("toolName")) or "tool"
+            call_id = _non_empty_string(payload.get("toolCallId"))
+            text = _tool_result_text(payload)
+            if name in _ASK_USER_TOOL_NAMES and ets is not None:
+                details = payload.get("details")
+                details = details if isinstance(details, dict) else {}
+                event = _ask_user_event({}, call_id=call_id, ts=ets, resolved=True)
+                answer, was_custom = _normalize_ask_user_result(
+                    details,
+                    allow_multiple=bool(event.get("allow_multiple")),
+                    question=str(event.get("question") or ""),
+                    content_text=text or "",
+                )
+                if answer is not None:
+                    event["answer"] = answer
+                event["cancelled"] = bool(details.get("cancelled"))
+                event["was_custom"] = was_custom
+                return event
+            if text is None and payload.get("isError") is not True:
+                return None
+            ev = {"type": "tool_result", "name": name}
+            if ets is not None:
+                ev["ts"] = ets
+            if call_id is not None:
+                ev["tool_call_id"] = call_id
+            if text is not None:
+                ev["text"] = text
+            if payload.get("isError") is True:
+                ev["is_error"] = True
+            return ev
         return None
 
     if typ == "event_msg":
@@ -175,7 +478,78 @@ def _single_chat_event(obj: dict[str, Any]) -> dict[str, Any] | None:
         p = obj.get("payload")
         if not isinstance(p, dict):
             raise ValueError("invalid response_item payload")
-        if p.get("type") != "message" or p.get("role") != "assistant":
+        ets = _event_ts(obj)
+        pt = p.get("type")
+        if pt == "function_call":
+            name = _non_empty_string(p.get("name")) or "tool"
+            call_id = _non_empty_string(p.get("call_id"))
+            args = _coerce_tool_arguments(p.get("arguments"))
+            if name in _ASK_USER_TOOL_NAMES:
+                if ets is None:
+                    return None
+                return _ask_user_event(args, call_id=call_id, ts=ets, resolved=False)
+            ev: dict[str, Any] = {"type": "tool", "name": name}
+            if ets is not None:
+                ev["ts"] = ets
+            if call_id is not None:
+                ev["tool_call_id"] = call_id
+            summary = _tool_call_summary(name, args)
+            if summary is not None:
+                ev["text"] = summary
+            return ev
+        if pt in ("custom_tool_call", "web_search_call", "local_shell_call"):
+            raw_name = p.get("name")
+            if pt == "web_search_call":
+                name = "web_search"
+            elif pt == "local_shell_call":
+                name = "local_shell"
+            else:
+                name = _non_empty_string(raw_name) or "tool"
+            call_id = _non_empty_string(p.get("call_id"))
+            args = _coerce_tool_arguments(p.get("arguments"))
+            if not args:
+                args = p
+            ev = {"type": "tool", "name": name}
+            if ets is not None:
+                ev["ts"] = ets
+            if call_id is not None:
+                ev["tool_call_id"] = call_id
+            summary = _tool_call_summary(name, args)
+            if summary is not None:
+                ev["text"] = summary
+            return ev
+        if pt in ("function_call_output", "custom_tool_call_output"):
+            call_id = _non_empty_string(p.get("call_id"))
+            name = _non_empty_string(p.get("name")) or "tool"
+            text = _tool_result_text(p)
+            if name in _ASK_USER_TOOL_NAMES and ets is not None:
+                details = p.get("details")
+                details = details if isinstance(details, dict) else {}
+                event = _ask_user_event({}, call_id=call_id, ts=ets, resolved=True)
+                answer, was_custom = _normalize_ask_user_result(
+                    details,
+                    allow_multiple=bool(event.get("allow_multiple")),
+                    question=str(event.get("question") or ""),
+                    content_text=text or "",
+                )
+                if answer is not None:
+                    event["answer"] = answer
+                event["cancelled"] = bool(details.get("cancelled"))
+                event["was_custom"] = was_custom
+                return event
+            if text is None and p.get("is_error") is not True:
+                return None
+            ev = {"type": "tool_result", "name": name}
+            if ets is not None:
+                ev["ts"] = ets
+            if call_id is not None:
+                ev["tool_call_id"] = call_id
+            if text is not None:
+                ev["text"] = text
+            if p.get("is_error") is True:
+                ev["is_error"] = True
+            return ev
+        if pt != "message" or p.get("role") != "assistant":
             return None
         content = p.get("content")
         if not isinstance(content, list):
@@ -511,6 +885,8 @@ def _extract_chat_events(
     turn_aborted = False
     tool_names: set[str] = set()
     last_tool: str | None = None
+    known_tool_names: dict[str, str] = {}
+    pending_ask_user_calls: dict[str, dict[str, Any]] = {}
     def event_ts(o: dict[str, Any]) -> float | None:
         ts = o.get("ts")
         if isinstance(ts, (int, float)):
@@ -551,6 +927,73 @@ def _extract_chat_events(
                 total_tools += tool_count
                 tool_names.add("pi_tool")
                 last_tool = "pi_tool"
+            payload = obj.get("message")
+            if isinstance(payload, dict) and payload.get("role") == "assistant":
+                content = payload.get("content")
+                if isinstance(content, list):
+                    ets = event_ts(obj)
+                    for item in content:
+                        if not isinstance(item, dict) or item.get("type") != "toolCall":
+                            continue
+                        name = _non_empty_string(item.get("name")) or "tool"
+                        call_id = _non_empty_string(item.get("id"))
+                        args = _coerce_tool_arguments(item.get("arguments"))
+                        tool_names.add("pi_tool")
+                        if call_id is not None:
+                            known_tool_names[call_id] = name
+                        if ets is None:
+                            continue
+                        if name in _ASK_USER_TOOL_NAMES:
+                            event = _ask_user_event(args, call_id=call_id, ts=ets, resolved=False)
+                            events.append(event)
+                            if call_id is not None:
+                                pending_ask_user_calls[call_id] = dict(event)
+                            continue
+                        event = {"type": "tool", "name": name, "ts": ets}
+                        if call_id is not None:
+                            event["tool_call_id"] = call_id
+                        summary = _tool_call_summary(name, args)
+                        if summary is not None:
+                            event["text"] = summary
+                        events.append(event)
+            elif isinstance(payload, dict) and payload.get("role") == "toolResult":
+                total_tools += 1
+                tool_names.add("pi_tool")
+                last_tool = "pi_tool"
+                ets = event_ts(obj)
+                call_id = _non_empty_string(payload.get("toolCallId"))
+                name = _non_empty_string(payload.get("toolName")) or (
+                    known_tool_names.get(call_id) if call_id is not None else None
+                ) or "tool"
+                details = payload.get("details")
+                details = details if isinstance(details, dict) else {}
+                text = _tool_result_text(payload)
+                if ets is not None and (name in _ASK_USER_TOOL_NAMES or (call_id is not None and call_id in pending_ask_user_calls)):
+                    base = dict(pending_ask_user_calls.get(call_id, _ask_user_event({}, call_id=call_id, ts=ets, resolved=True)))
+                    base["resolved"] = True
+                    base["ts"] = ets
+                    answer, was_custom = _normalize_ask_user_result(
+                        details,
+                        allow_multiple=bool(base.get("allow_multiple")),
+                        question=str(base.get("question") or ""),
+                        content_text=text or "",
+                    )
+                    if answer is not None:
+                        base["answer"] = answer
+                    base["cancelled"] = bool(details.get("cancelled"))
+                    base["was_custom"] = was_custom
+                    events.append(base)
+                elif text is not None or payload.get("isError") is True:
+                    event = {"type": "tool_result", "name": name}
+                    if ets is not None:
+                        event["ts"] = ets
+                    if call_id is not None:
+                        event["tool_call_id"] = call_id
+                    if text is not None:
+                        event["text"] = text
+                    if payload.get("isError") is True:
+                        event["is_error"] = True
+                    events.append(event)
             if isinstance(assistant_text, str) and assistant_text:
                 ets = event_ts(obj)
                 message_class = "final_response" if pi_assistant_is_final_turn_end(obj) else "narration"
@@ -637,19 +1080,92 @@ def _extract_chat_events(
                 continue
             if pt == "function_call":
                 nm = p.get("name")
+                call_id = _non_empty_string(p.get("call_id"))
+                args = _coerce_tool_arguments(p.get("arguments"))
                 if isinstance(nm, str) and nm:
                     tool_names.add(nm)
                     last_tool = nm
+                    if call_id is not None:
+                        known_tool_names[call_id] = nm
                 total_tools += 1
+                ets = event_ts(obj)
+                if isinstance(nm, str) and nm and ets is not None:
+                    if nm in _ASK_USER_TOOL_NAMES:
+                        event = _ask_user_event(args, call_id=call_id, ts=ets, resolved=False)
+                        events.append(event)
+                        if call_id is not None:
+                            pending_ask_user_calls[call_id] = dict(event)
+                    else:
+                        event = {"type": "tool", "name": nm, "ts": ets}
+                        if call_id is not None:
+                            event["tool_call_id"] = call_id
+                        summary = _tool_call_summary(nm, args)
+                        if summary is not None:
+                            event["text"] = summary
+                        events.append(event)
                 continue
-            if pt in (
-                "function_call_output",
-                "custom_tool_call",
-                "custom_tool_call_output",
-                "web_search_call",
-                "local_shell_call",
-            ):
+            if pt in ("custom_tool_call", "web_search_call", "local_shell_call"):
                 total_tools += 1
+                if pt == "web_search_call":
+                    name = "web_search"
+                elif pt == "local_shell_call":
+                    name = "local_shell"
+                else:
+                    name = _non_empty_string(p.get("name")) or "tool"
+                call_id = _non_empty_string(p.get("call_id"))
+                if call_id is not None:
+                    known_tool_names[call_id] = name
+                tool_names.add(name)
+                last_tool = name
+                ets = event_ts(obj)
+                if ets is not None:
+                    args = _coerce_tool_arguments(p.get("arguments"))
+                    if not args:
+                        args = p
+                    event = {"type": "tool", "name": name, "ts": ets}
+                    if call_id is not None:
+                        event["tool_call_id"] = call_id
+                    summary = _tool_call_summary(name, args)
+                    if summary is not None:
+                        event["text"] = summary
+                    events.append(event)
+                continue
+            if pt in ("function_call_output", "custom_tool_call_output"):
+                total_tools += 1
+                call_id = _non_empty_string(p.get("call_id"))
+                name = _non_empty_string(p.get("name")) or (
+                    known_tool_names.get(call_id) if call_id is not None else None
+                ) or "tool"
+                tool_names.add(name)
+                last_tool = name
+                ets = event_ts(obj)
+                text = _tool_result_text(p)
+                details = p.get("details")
+                details = details if isinstance(details, dict) else {}
+                if ets is not None and (name in _ASK_USER_TOOL_NAMES or (call_id is not None and call_id in pending_ask_user_calls)):
+                    base = dict(pending_ask_user_calls.get(call_id, _ask_user_event({}, call_id=call_id, ts=ets, resolved=True)))
+                    base["resolved"] = True
+                    base["ts"] = ets
+                    answer, was_custom = _normalize_ask_user_result(
+                        details,
+                        allow_multiple=bool(base.get("allow_multiple")),
+                        question=str(base.get("question") or ""),
+                        content_text=text or "",
+                    )
+                    if answer is not None:
+                        base["answer"] = answer
+                    base["cancelled"] = bool(details.get("cancelled"))
+                    base["was_custom"] = was_custom
+                    events.append(base)
+                elif ets is not None and (text is not None or p.get("is_error") is True):
+                    event = {"type": "tool_result", "name": name, "ts": ets}
+                    if call_id is not None:
+                        event["tool_call_id"] = call_id
+                    if text is not None:
+                        event["text"] = text
+                    if p.get("is_error") is True:
+                        event["is_error"] = True
+                    events.append(event)
                 continue
 
     return (

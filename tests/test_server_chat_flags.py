@@ -89,6 +89,82 @@ class TestServerChatFlags(unittest.TestCase):
         self.assertEqual(events[0]["message_class"], "final_response")
         self.assertIsInstance(events[0]["message_id"], str)
 
+    def test_function_call_emits_visible_tool_event(self) -> None:
+        events, meta, _flags, diag = _extract_chat_events(
+            [
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "name": "bash",
+                        "call_id": "tool-1",
+                        "arguments": {"command": "pwd"},
+                    },
+                    "ts": 10.0,
+                }
+            ]
+        )
+        self.assertEqual(meta["tool"], 1)
+        self.assertEqual(diag["last_tool"], "bash")
+        self.assertEqual(events[0]["type"], "tool")
+        self.assertEqual(events[0]["name"], "bash")
+        self.assertEqual(events[0]["tool_call_id"], "tool-1")
+        self.assertEqual(events[0]["text"], "pwd")
+
+    def test_pi_ask_user_call_and_result_are_normalized(self) -> None:
+        events, meta, _flags, diag = _extract_chat_events(
+            [
+                {
+                    "type": "message",
+                    "timestamp": "2026-04-24T10:00:00Z",
+                    "message": {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "toolCall",
+                                "id": "ask-4",
+                                "name": "AskUserQuestion",
+                                "arguments": {
+                                    "questions": [
+                                        {
+                                            "header": "Testing",
+                                            "question": "How should we test this?",
+                                            "options": ["Single", "Freeform", "Multiple"],
+                                        }
+                                    ]
+                                },
+                            }
+                        ],
+                    },
+                },
+                {
+                    "type": "message",
+                    "timestamp": "2026-04-24T10:00:01Z",
+                    "message": {
+                        "role": "toolResult",
+                        "toolCallId": "ask-4",
+                        "toolName": "AskUserQuestion",
+                        "isError": False,
+                        "details": {
+                            "answer": "Single",
+                            "wasCustom": False,
+                        },
+                    },
+                },
+            ]
+        )
+        self.assertEqual(meta["tool"], 2)
+        self.assertEqual(diag["last_tool"], "pi_tool")
+        self.assertEqual(events[0]["type"], "ask_user")
+        self.assertFalse(events[0]["resolved"])
+        self.assertEqual(events[0]["question"], "How should we test this?")
+        self.assertEqual(events[0]["context"], "Testing")
+        self.assertEqual(events[0]["options"], ["Single", "Freeform", "Multiple"])
+        self.assertEqual(events[1]["type"], "ask_user")
+        self.assertTrue(events[1]["resolved"])
+        self.assertEqual(events[1]["answer"], "Single")
+        self.assertFalse(events[1]["was_custom"])
+
     def test_pi_message_sets_turn_end_for_final_text(self) -> None:
         events, meta, flags, diag = _extract_chat_events(
             [

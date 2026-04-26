@@ -1,0 +1,16 @@
+[package]
+name = "codoxear-backend-rs"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+axum = { version = "0.7.9", features = ["macros", "json"] }
+futures-util = "0.3.30"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+tokio = { version = "1.36.0", features = ["full"] }
+tokio-stream = { version = "0.1.15", features = ["sync"] }
+tower = { version = "0.5.2", features = ["util"] }
+tower-http = { version = "0.5.2", features = ["cors", "trace"] }
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }

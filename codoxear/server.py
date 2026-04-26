@@ -26,6 +26,7 @@ import time
 import tomllib
 import traceback
 import urllib.parse
+import urllib.request
 import zlib
 from dataclasses import dataclass
 from pathlib import Path
@@ -43,6 +44,7 @@ from .util import find_session_log_for_session_id as _find_session_log_for_sessi
 from .util import is_subagent_session_meta as _is_subagent_session_meta
 from .util import iter_session_logs as _iter_session_logs_impl
 from .util import now as _now
+from .util import proc_find_open_rollout_log as _proc_find_open_rollout_log_impl
 from .util import read_jsonl_from_offset as _read_jsonl_from_offset_impl
 from .util import read_session_meta_payload as _read_session_meta_payload_impl
 from .util import subagent_parent_thread_id as _subagent_parent_thread_id
@@ -115,7 +117,9 @@ def _strip_url_prefix(prefix: str, path: str) -> str | None:
 
 
 APP_DIR = _default_app_dir()
+PROC_ROOT = Path("/proc")
 STATIC_DIR = Path(__file__).resolve().parent / "static"
+NOVA_DIST_DIR = Path(__file__).resolve().parents[1] / "frontend" / "dist"
 STATIC_ASSET_VERSION_PLACEHOLDER = "__CODOXEAR_ASSET_VERSION__"
 STATIC_ATTACH_MAX_BYTES_PLACEHOLDER = "__CODOXEAR_ATTACH_MAX_BYTES__"
 STATIC_ASSET_VERSION_FILES = ("app.js", "app.css")
@@ -167,6 +171,9 @@ SUPPORTED_PI_REASONING_EFFORTS = ("off", "minimal", "low", "medium", "high", "xh
 
 DEFAULT_HOST = os.environ.get("CODEX_WEB_HOST", "::")
 DEFAULT_PORT = int(os.environ.get("CODEX_WEB_PORT", "8743"))
+NOVA_ENABLED = os.environ.get("CODEX_WEB_NOVA", "0") == "1"
+NOVA_API_BASE = os.environ.get("CODEX_WEB_NOVA_API_BASE", "http://127.0.0.1:8787").rstrip("/")
+NOVA_LEGACY_BASE = os.environ.get("CODEX_WEB_NOVA_LEGACY_BASE", "http://127.0.0.1:8744").rstrip("/")
 HARNESS_DEFAULT_IDLE_MINUTES = 5
 HARNESS_DEFAULT_MAX_INJECTIONS = 10
 HARNESS_SWEEP_SECONDS = float(os.environ.get("CODEX_WEB_HARNESS_SWEEP_SECONDS", "2.5"))
@@ -1701,6 +1708,22 @@ def _read_jsonl_from_offset(path: Path, offset: int, max_bytes: int = 2 * 1024 *
 def _discover_log_for_session_id(session_id: str, *, agent_backend: str = "codex") -> Path | None:
     return _find_session_log_for_session_id(session_id, agent_backend=agent_backend)
 
+
+def _discover_open_log_for_process(*, root_pid: int, cwd: str, agent_backend: str) -> Path | None:
+    if root_pid <= 0:
+        return None
+    try:
+        lp = _proc_find_open_rollout_log_impl(
+            proc_root=PROC_ROOT,
+            root_pid=root_pid,
+            agent_backend=normalize_agent_backend(agent_backend),
+            cwd=cwd,
+        )
+    except Exception:
+        return None
+    return lp if lp is not None and lp.exists() else None
+
+
 def _session_id_from_rollout_path(log_path: Path) -> str | None:
     name = log_path.name
     m = _SESSION_ID_RE.findall(name)
@@ -1801,6 +1824,41 @@ def _provider_choice_for_settings(*, model_provider: str | None, preferred_auth_
     return provider
 
 
+def _apply_codex_launch_default_env_overrides(defaults: dict[str, Any]) -> None:
+    provider_choices = defaults.get("model_providers")
+    if not isinstance(provider_choices, list):
+        provider_choices = ["chatgpt", "openai-api"]
+    allowed_providers = {"openai", *[str(p) for p in provider_choices if p not in {"chatgpt", "openai-api"}]}
+
+    model_provider = _normalize_requested_model_provider(
+        os.environ.get("CODEX_WEB_DEFAULT_MODEL_PROVIDER"),
+        allowed=allowed_providers,
+    )
+    if model_provider is not None:
+        defaults["model_provider"] = model_provider
+
+    preferred_auth_method = _normalize_requested_preferred_auth_method(os.environ.get("CODEX_WEB_DEFAULT_PREFERRED_AUTH_METHOD"))
+    if preferred_auth_method is not None:
+        defaults["preferred_auth_method"] = preferred_auth_method
+
+    model = _normalize_requested_model(os.environ.get("CODEX_WEB_DEFAULT_MODEL"))
+    if model is not None:
+        defaults["model"] = model
+
+    reasoning_effort = _normalize_requested_reasoning_effort(os.environ.get("CODEX_WEB_DEFAULT_REASONING_EFFORT"))
+    if reasoning_effort is not None:
+        defaults["reasoning_effort"] = reasoning_effort
+
+    service_tier = _normalize_requested_service_tier(os.environ.get("CODEX_WEB_DEFAULT_SERVICE_TIER"))
+    if service_tier is not None:
+        defaults["service_tier"] = service_tier
+
+    defaults["provider_choice"] = _provider_choice_for_settings(
+        model_provider=defaults.get("model_provider"),
+        preferred_auth_method=defaults.get("preferred_auth_method"),
+    )
+
+
 def _new_queue_item_id() -> str:
     return f"queue-{secrets.token_hex(8)}"
 
@@ -1879,9 +1937,11 @@ def _read_codex_launch_defaults() -> dict[str, Any]:
     }
     if configured_effort is not None:
         defaults["reasoning_effort"] = configured_effort
+        _apply_codex_launch_default_env_overrides(defaults)
         return defaults
     if not MODELS_CACHE_PATH.exists():
         defaults["reasoning_effort"] = None
+        _apply_codex_launch_default_env_overrides(defaults)
         return defaults
     cache = json.loads(MODELS_CACHE_PATH.read_text(encoding="utf-8"))
     models = cache.get("models") if isinstance(cache, dict) else None
@@ -1890,6 +1950,7 @@ def _read_codex_launch_defaults() -> dict[str, Any]:
     rows: list[dict[str, Any]] = [row for row in models if isinstance(row, dict)]
     if not rows:
         defaults["reasoning_effort"] = None
+        _apply_codex_launch_default_env_overrides(defaults)
         return defaults
     if configured_model is not None:
         for row in rows:
@@ -1899,6 +1960,7 @@ def _read_codex_launch_defaults() -> dict[str, Any]:
             }
             if configured_model in names:
                 defaults["reasoning_effort"] = _display_reasoning_effort(row.get("default_reasoning_level"))
+                _apply_codex_launch_default_env_overrides(defaults)
                 return defaults
     ranked = sorted(
         rows,
@@ -1908,6 +1970,7 @@ def _read_codex_launch_defaults() -> dict[str, Any]:
         ),
     )
     defaults["reasoning_effort"] = _display_reasoning_effort(ranked[0].get("default_reasoning_level"))
+    _apply_codex_launch_default_env_overrides(defaults)
     return defaults
 
 
@@ -2611,7 +2674,7 @@ class SessionManager:
         self._save_sidebar_meta()
         return alias, {"priority_offset": offset, "snooze_until": snooze_until_clean, "dependency_session_id": dependency_clean}
 
-    def _clear_deleted_session_state(self, session_id: str) -> None:
+    def _clear_deleted_session_state(self, session_id: str, *, cwd: str | None = None) -> None:
         changed_sidebar = False
         changed_harness = False
         changed_files = False
@@ -2638,7 +2701,10 @@ class SessionManager:
                 changed_harness = True
             files = getattr(self, "_files", None)
             if isinstance(files, dict):
-                for key in [f"sid:{session_id}", session_id]:
+                keys = [f"sid:{session_id}", session_id]
+                if cwd:
+                    keys.append(f"cwd:{cwd}")
+                for key in keys:
                     if key in files:
                         files.pop(key, None)
                         changed_files = True
@@ -3428,6 +3494,8 @@ class SessionManager:
             cwd = cwd_raw
             if self._remember_recent_cwd(cwd, ts=meta.get("updated_ts", meta.get("start_ts"))):
                 recent_cwd_dirty = True
+            if log_path is None and _pid_alive(codex_pid):
+                log_path = _discover_open_log_for_process(root_pid=codex_pid, cwd=cwd, agent_backend=agent_backend)
 
             start_ts_raw = meta.get("start_ts")
             if not isinstance(start_ts_raw, (int, float)):
@@ -3567,18 +3635,20 @@ class SessionManager:
             if ok:
                 continue
             if err is not None and _sock_error_definitely_stale(err):
-                dead.append((sid, s.sock_path))
+                if _pid_alive(s.broker_pid) or _pid_alive(s.codex_pid):
+                    continue
+                dead.append((sid, s.sock_path, s.cwd))
                 continue
             if _pid_alive(s.broker_pid) or _pid_alive(s.codex_pid):
                 continue
-            dead.append((sid, s.sock_path))
+            dead.append((sid, s.sock_path, s.cwd))
         if not dead:
             return
         with self._lock:
-            for sid, _sock in dead:
+            for sid, _sock, _cwd in dead:
                 self._sessions.pop(sid, None)
-        for sid, sock in dead:
-            self._clear_deleted_session_state(sid)
+        for sid, sock, cwd in dead:
+            self._clear_deleted_session_state(sid, cwd=cwd)
             _unlink_quiet(sock)
             _unlink_quiet(sock.with_suffix(".json"))
 
@@ -3808,7 +3878,6 @@ class SessionManager:
             sid = str(it["session_id"])
             agent_backend = normalize_agent_backend(it.get("agent_backend"), default="codex")
             log_exists = bool(it.get("log_exists"))
-            state_busy = bool(it.get("state_busy"))
             if not log_exists:
                 busy_out = False
             else:
@@ -3816,9 +3885,7 @@ class SessionManager:
                 if agent_backend == "pi":
                     busy_out = not idle_val
                 else:
-                    # When a log exists, unify semantics with /messages:
-                    # busy if broker says busy OR log-derived idle is false.
-                    busy_out = state_busy or (not idle_val)
+                    busy_out = not idle_val
             it2 = dict(it)
             it2.pop("log_exists", None)
             it2.pop("state_busy", None)
@@ -3878,11 +3945,15 @@ class SessionManager:
         if log_path is not None and log_path.exists():
             if agent_backend == "codex":
                 thread_id, log_path = _coerce_main_thread_log(thread_id=thread_id, log_path=log_path)
+        else:
+            log_path = None
 
         cwd_raw = meta.get("cwd")
         if not isinstance(cwd_raw, str) or (not cwd_raw.strip()):
             raise ValueError(f"invalid cwd in metadata for socket {sock}")
         cwd = cwd_raw
+        if log_path is None and _pid_alive(s.codex_pid):
+            log_path = _discover_open_log_for_process(root_pid=s.codex_pid, cwd=cwd, agent_backend=agent_backend)
         resume_session_id = _clean_optional_text(meta.get("resume_session_id"))
         model_provider, preferred_auth_method, model, reasoning_effort = self._session_run_settings(
             meta=meta,
@@ -3944,7 +4015,7 @@ class SessionManager:
         return out
 
     def mark_log_delta(self, session_id: str, *, objs: list[dict[str, Any]], new_off: int) -> None:
-        _th, _tools, _sys, last_ts, token_update, _chat_events = _analyze_log_chunk(objs)
+        _th, _tools, _sys, last_ts, _last_assistant_ts, token_update, _chat_events = _analyze_log_chunk(objs)
         model = None
         reasoning_effort = None
         for obj in reversed(objs):
@@ -4245,7 +4316,7 @@ class SessionManager:
         ok = self.kill_session(session_id)
         if ok:
             self.files_clear(session_id)
-            self._clear_deleted_session_state(session_id)
+            self._clear_deleted_session_state(session_id, cwd=s.cwd)
         return ok
 
     def send(self, session_id: str, text: str) -> dict[str, Any]:
@@ -4260,7 +4331,7 @@ class SessionManager:
             if not _pid_alive(s.broker_pid) and not _pid_alive(s.codex_pid):
                 with self._lock:
                     self._sessions.pop(session_id, None)
-                self._clear_deleted_session_state(session_id)
+                self._clear_deleted_session_state(session_id, cwd=s.cwd)
                 _unlink_quiet(sock)
                 _unlink_quiet(sock.with_suffix(".json"))
                 raise KeyError("unknown session")
@@ -4311,7 +4382,7 @@ class SessionManager:
             if not _pid_alive(s.broker_pid) and not _pid_alive(s.codex_pid):
                 with self._lock:
                     self._sessions.pop(session_id, None)
-                self._clear_deleted_session_state(session_id)
+                self._clear_deleted_session_state(session_id, cwd=s.cwd)
                 _unlink_quiet(sock)
                 _unlink_quiet(sock.with_suffix(".json"))
                 raise KeyError("unknown session")
@@ -4407,26 +4478,55 @@ def _read_static_bytes(path: Path) -> bytes:
     return data
 
 
+def _content_type_for_path(path: Path) -> str:
+    if path.suffix == ".html":
+        return "text/html; charset=utf-8"
+    if path.suffix == ".js":
+        return "text/javascript; charset=utf-8"
+    if path.suffix == ".css":
+        return "text/css; charset=utf-8"
+    if path.suffix == ".webmanifest":
+        return "application/manifest+json; charset=utf-8"
+    if path.suffix == ".png":
+        return "image/png"
+    if path.suffix in (".jpg", ".jpeg"):
+        return "image/jpeg"
+    if path.suffix == ".webp":
+        return "image/webp"
+    if path.suffix == ".svg":
+        return "image/svg+xml; charset=utf-8"
+    if path.suffix == ".ico":
+        return "image/x-icon"
+    return "application/octet-stream"
+
+
 def _message_runtime_snapshot(
     session_id: str,
     s: Session,
     *,
     token_update: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], bool, int, dict[str, Any] | None]:
-    state = MANAGER.get_state(session_id)
+    try:
+        state = MANAGER.get_state(session_id)
+    except Exception as e:
+        if (not _sock_error_definitely_stale(e)) or ((not _pid_alive(s.broker_pid)) and (not _pid_alive(s.codex_pid))):
+            raise
+        queue_len = MANAGER._queue_len(session_id)
+        state = {"busy": bool(s.busy), "queue_len": int(queue_len)}
+        if isinstance(s.token, dict):
+            state["token"] = s.token
     if not isinstance(state, dict):
         raise ValueError("invalid broker state response")
     if "busy" not in state:
         raise ValueError("missing busy from broker state response")
     if "queue_len" not in state:
         raise ValueError("missing queue_len from broker state response")
-    state_busy = bool(state.get("busy"))
     if s.log_path is not None and s.log_path.exists():
         idle_val = MANAGER.idle_from_log(session_id)
         if s.agent_backend == "pi":
             busy_val = not bool(idle_val)
         else:
-            busy_val = state_busy or (not bool(idle_val))
+            busy_val = not bool(idle_val)
     else:
         busy_val = False
     queue_val = MANAGER._queue_len(session_id)
@@ -4453,28 +4553,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_error(404)
             return
         data = _read_static_bytes(path)
-        if path.suffix == ".html":
-            ctype = "text/html; charset=utf-8"
-        elif path.suffix == ".js":
-            ctype = "text/javascript; charset=utf-8"
-        elif path.suffix == ".css":
-            ctype = "text/css; charset=utf-8"
-        elif path.suffix == ".webmanifest":
-            ctype = "application/manifest+json; charset=utf-8"
-        elif path.suffix == ".png":
-            ctype = "image/png"
-        elif path.suffix in (".jpg", ".jpeg"):
-            ctype = "image/jpeg"
-        elif path.suffix == ".webp":
-            ctype = "image/webp"
-        elif path.suffix == ".svg":
-            ctype = "image/svg+xml; charset=utf-8"
-        elif path.suffix == ".ico":
-            ctype = "image/x-icon"
-        else:
-            ctype = "application/octet-stream"
         self.send_response(200)
-        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Type", _content_type_for_path(path))
         self.send_header("Content-Length", str(len(data)))
         # UI is used for interactive debugging; serve assets without caching so changes
         # (including inline JS) show up immediately on refresh.
@@ -4483,6 +4563,119 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_header("Expires", "0")
         self.end_headers()
         self.wfile.write(data)
+
+    def _send_nova_static(self, rel: str) -> None:
+        path = (NOVA_DIST_DIR / rel.lstrip("/")).resolve()
+        if not str(path).startswith(str(NOVA_DIST_DIR.resolve())):
+            self.send_error(404)
+            return
+        if not path.exists() or not path.is_file():
+            self.send_error(404)
+            return
+        data = path.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", _content_type_for_path(path))
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Pragma", "no-cache")
+        self.send_header("Expires", "0")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _proxy_request(self, *, target_base: str, request_path: str, body: bytes | None = None, require_auth: bool = False, stream: bool = False) -> None:
+        if require_auth and not _require_auth(self):
+            self._unauthorized()
+            return
+        url = target_base + request_path
+        req = urllib.request.Request(url, data=body, method=self.command)
+        for key, value in self.headers.items():
+            lowered = key.lower()
+            if lowered in {"host", "content-length", "connection"}:
+                continue
+            req.add_header(key, value)
+        try:
+            with urllib.request.urlopen(req, timeout=600) as upstream:
+                status = int(getattr(upstream, "status", 200))
+                self.send_response(status)
+                for key, value in upstream.headers.items():
+                    lowered = key.lower()
+                    if lowered in {"transfer-encoding", "connection", "server", "date"}:
+                        continue
+                    self.send_header(key, value)
+                self.end_headers()
+                while True:
+                    chunk = upstream.read(64 * 1024)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    if stream:
+                        self.wfile.flush()
+        except urllib.error.HTTPError as e:
+            data = e.read()
+            self.send_response(int(e.code))
+            for key, value in e.headers.items():
+                lowered = key.lower()
+                if lowered in {"transfer-encoding", "connection", "server", "date"}:
+                    continue
+                self.send_header(key, value)
+            if data and not e.headers.get("Content-Length"):
+                self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            if data:
+                self.wfile.write(data)
+        except Exception as e:
+            _json_response(self, 502, {"error": f"proxy error: {e}"})
+
+    def _handle_nova_get(self, path: str, u: urllib.parse.ParseResult) -> bool:
+        if not NOVA_ENABLED:
+            return False
+        request_path = path + (("?" + u.query) if u.query else "")
+        if path == "/nova-preview" or path == "/nova-preview/" or (
+            path.startswith("/nova-preview/")
+            and not path.startswith("/nova-preview/assets/")
+            and "." not in path.rsplit("/", 1)[-1]
+        ):
+            self._send_nova_static("index.html")
+            return True
+        if path.startswith("/nova-preview/assets/"):
+            self._send_nova_static(path[len("/nova-preview/") :])
+            return True
+        if path == "/api/v1/events/stream":
+            self._proxy_request(target_base=NOVA_API_BASE, request_path=request_path, require_auth=True, stream=True)
+            return True
+        if path.startswith("/api/v1/"):
+            self._proxy_request(target_base=NOVA_API_BASE, request_path=request_path, require_auth=True)
+            return True
+        if path == "/legacy" or path.startswith("/legacy/"):
+            rewritten = path[len("/legacy") :] or "/"
+            request_path = rewritten + (("?" + u.query) if u.query else "")
+            self._proxy_request(target_base=NOVA_LEGACY_BASE, request_path=request_path, require_auth=True)
+            return True
+        return False
+
+    def _handle_nova_post(self, path: str, u: urllib.parse.ParseResult, body: bytes) -> bool:
+        if not NOVA_ENABLED:
+            return False
+        request_path = path + (("?" + u.query) if u.query else "")
+        if path.startswith("/api/v1/"):
+            self._proxy_request(target_base=NOVA_API_BASE, request_path=request_path, body=body, require_auth=True)
+            return True
+        if path == "/legacy" or path.startswith("/legacy/"):
+            rewritten = path[len("/legacy") :] or "/"
+            request_path = rewritten + (("?" + u.query) if u.query else "")
+            self._proxy_request(target_base=NOVA_LEGACY_BASE, request_path=request_path, body=body, require_auth=True)
+            return True
+        return False
+
+    def _strip_alt_shell_prefix(self, path: str) -> str:
+        if not NOVA_ENABLED:
+            return path
+        for prefix in ("/nova", "/legacy"):
+            if path == prefix:
+                return "/"
+            if path.startswith(prefix + "/"):
+                return path[len(prefix) :]
+        return path
 
     def _unauthorized(self) -> None:
         _json_response(self, 401, {"error": "unauthorized"})
@@ -4505,6 +4698,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self.send_error(404)
                     return
                 path = stripped
+            request_path = path
+            if NOVA_ENABLED and (request_path == "/" or request_path == "/nova" or request_path.startswith("/nova/")):
+                if request_path.startswith("/nova/"):
+                    loc = "/nova-preview/" + request_path[len("/nova/") :]
+                else:
+                    loc = "/nova-preview/"
+                if u.query:
+                    loc = loc + "?" + u.query
+                self.send_response(308)
+                self.send_header("Location", loc)
+                self.end_headers()
+                return
+            path = self._strip_alt_shell_prefix(path)
+            if self._handle_nova_get(path, u):
+                return
             if path == "/favicon.ico":
                 self._send_static("favicon.png")
                 return
@@ -4736,7 +4944,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     if s.agent_backend == "pi":
                         busy_val = not bool(idle_val)
                     else:
-                        busy_val = broker_busy or (not bool(idle_val))
+                        busy_val = not bool(idle_val)
                 _json_response(
                     self,
                     200,
@@ -5590,6 +5798,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self.send_error(404)
                     return
                 path = stripped
+            if NOVA_ENABLED and path.startswith("/api/v1/"):
+                body = _read_body(self)
+                if self._handle_nova_post(path, u, body):
+                    return
+            path = self._strip_alt_shell_prefix(path)
 
             if path == "/api/login":
                 body = _read_body(self)

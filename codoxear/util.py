@@ -500,6 +500,7 @@ def proc_find_open_rollout_log(
     except Exception:
         pass
     matches: list[Path] = []
+    unique_open_main: list[Path] = []
     for p in cands:
         try:
             rp = p.resolve()
@@ -512,12 +513,15 @@ def proc_find_open_rollout_log(
             continue
         if backend_name == "codex" and is_subagent_session_meta(payload):
             continue
+        unique_open_main.append(p)
         if cwd is not None:
             pcwd = payload.get("cwd")
             if not (isinstance(pcwd, str) and pcwd == cwd):
                 continue
         matches.append(p)
     if len(matches) != 1:
+        if cwd is not None and not matches and len(unique_open_main) == 1:
+            return unique_open_main[0]
         return None
     return matches[0]
 

@@ -845,6 +845,9 @@
       .msg-row.assistant {
         justify-content: flex-start;
       }
+      .msg-row.tool {
+        justify-content: center;
+      }
       .msg-shell {
         position: relative;
         display: inline-flex;
@@ -871,8 +874,89 @@
       .msg.assistant {
         background: var(--bubble-assistant);
       }
+      .msg.tool-card {
+        width: min(640px, 100%);
+        max-width: 100%;
+        background: linear-gradient(180deg, rgba(255, 255, 255, 0.98), rgba(248, 250, 252, 0.96));
+        border-color: rgba(148, 163, 184, 0.34);
+      }
+      .tool-result-card {
+        background: linear-gradient(180deg, rgba(248, 250, 252, 0.98), rgba(241, 245, 249, 0.96));
+      }
+      .askUserCard {
+        background: linear-gradient(180deg, rgba(239, 246, 255, 0.96), rgba(248, 250, 252, 0.98));
+        border-color: rgba(59, 130, 246, 0.24);
+      }
       .msg-shell .msg {
         max-width: 100%;
+      }
+      .toolCardHeader {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin-bottom: 8px;
+        min-width: 0;
+      }
+      .toolCardBadge {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-height: 22px;
+        padding: 0 8px;
+        border-radius: 999px;
+        background: rgba(15, 23, 42, 0.08);
+        color: rgba(15, 23, 42, 0.72);
+        font-size: 11px;
+        font-weight: 700;
+        letter-spacing: 0.02em;
+        text-transform: uppercase;
+      }
+      .toolCardName {
+        min-width: 0;
+        font-size: 13px;
+        font-weight: 600;
+        color: rgba(15, 23, 42, 0.88);
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .toolCardMeta {
+        margin-bottom: 8px;
+        font-size: 12px;
+        color: var(--muted);
+      }
+      .toolError {
+        color: #b91c1c;
+      }
+      .toolMd {
+        margin-top: 2px;
+      }
+      .askUserQuestion {
+        font-size: 14px;
+        font-weight: 600;
+        color: rgba(15, 23, 42, 0.92);
+      }
+      .askUserAnswer {
+        margin-top: 10px;
+        font-size: 13px;
+        color: rgba(15, 23, 42, 0.86);
+      }
+      .toolOptionList {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+        margin-top: 10px;
+      }
+      .toolOptionChip {
+        display: inline-flex;
+        align-items: center;
+        min-height: 24px;
+        padding: 0 9px;
+        border-radius: 999px;
+        background: rgba(37, 99, 235, 0.08);
+        color: rgba(29, 78, 216, 0.92);
+        font-size: 12px;
+        line-height: 1.1;
       }
       .msg-copy-btn {
         position: absolute;

@@ -6,6 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from codoxear import broker as broker_mod
 from codoxear.broker import Broker
 from codoxear.broker import State
 from codoxear.agent_backend import get_agent_backend
@@ -52,6 +53,18 @@ class _FakeThread:
 
 
 class TestBrokerFailClosed(unittest.TestCase):
+    def test_login_shell_agent_launch_reasserts_requested_cwd_after_shell_rc(self) -> None:
+        with patch("codoxear.broker._user_shell", return_value="/bin/bash"), patch("codoxear.broker.os.chdir") as chdir, patch(
+            "codoxear.broker.os.execvpe"
+        ) as execvpe:
+            broker_mod._exec_agent_via_login_shell(cwd="/tmp/work dir", agent_args=["--model", "gpt-5.4"])
+
+        chdir.assert_called_once_with("/tmp/work dir")
+        shell_argv = execvpe.call_args.args[1]
+        self.assertEqual(shell_argv[:4], ["/bin/bash", "-l", "-i", "-c"])
+        self.assertIn("cd '/tmp/work dir'; exec", shell_argv[4])
+        self.assertIn("--model gpt-5.4", shell_argv[4])
+
     def test_pi_broker_injects_explicit_session_path_for_new_sessions(self) -> None:
         fake_stdin = SimpleNamespace(isatty=lambda: False, fileno=lambda: 9)
         with tempfile.TemporaryDirectory() as td, patch("codoxear.broker.sys.stdin", fake_stdin), patch.dict(
