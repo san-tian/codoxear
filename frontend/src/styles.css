@@ -171,8 +171,10 @@ button:disabled {
 }
 
 .workspaceGroup {
+  position: relative;
   display: grid;
   gap: 6px;
+  transition: opacity 140ms ease, transform 140ms ease;
 }
 
 .workspaceGroup[draggable="true"],
@@ -183,6 +185,39 @@ button:disabled {
 .workspaceGroup.is-dragging,
 .workspace.is-dragging {
   opacity: 0.52;
+  transform: scale(0.985);
+}
+
+.workspaceGroup.is-drop-before,
+.workspaceGroup.is-drop-after,
+.workspace.is-drop-before,
+.workspace.is-drop-after {
+  transform: translateY(-1px);
+}
+
+.workspaceGroup.is-drop-before::before,
+.workspaceGroup.is-drop-after::after,
+.workspace.is-drop-before::before,
+.workspace.is-drop-after::after {
+  content: "";
+  position: absolute;
+  left: 4px;
+  right: 4px;
+  height: 3px;
+  border-radius: 999px;
+  background: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft), 0 8px 22px rgba(37, 99, 235, 0.24);
+  pointer-events: none;
+}
+
+.workspaceGroup.is-drop-before::before,
+.workspace.is-drop-before::before {
+  top: -6px;
+}
+
+.workspaceGroup.is-drop-after::after,
+.workspace.is-drop-after::after {
+  bottom: -6px;
 }
 
 .sessionContextMenu {
@@ -228,6 +263,13 @@ button:disabled {
   border: 1px solid transparent;
   border-radius: 10px;
   background: rgba(248, 250, 252, 0.86);
+  transition: border-color 140ms ease, background 140ms ease, box-shadow 140ms ease, transform 140ms ease;
+}
+
+.workspaceGroup.is-drop-before .workspaceGroupHeader,
+.workspaceGroup.is-drop-after .workspaceGroupHeader {
+  border-color: rgba(37, 99, 235, 0.32);
+  box-shadow: 0 8px 24px rgba(37, 99, 235, 0.1);
 }
 
 .workspaceGroup.active .workspaceGroupHeader {
@@ -279,6 +321,7 @@ button:disabled {
 }
 
 .workspace {
+  position: relative;
   width: 100%;
   display: flex;
   flex-direction: column;
@@ -288,6 +331,13 @@ button:disabled {
   border: 1px solid var(--border);
   border-radius: 12px;
   background: rgba(255, 255, 255, 0.96);
+  transition: border-color 140ms ease, background 140ms ease, box-shadow 140ms ease, opacity 140ms ease, transform 140ms ease;
+}
+
+.workspace.is-drop-before,
+.workspace.is-drop-after {
+  border-color: rgba(37, 99, 235, 0.34);
+  box-shadow: 0 8px 24px rgba(37, 99, 235, 0.1);
 }
 
 .workspace.active {

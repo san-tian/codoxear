@@ -48,6 +48,10 @@ type ThemeMode = "dark" | "light";
 type SidebarSessionOrder = Record<string, string[]>;
 type SidebarDragEvent = JSX.TargetedDragEvent<HTMLElement>;
 type SidebarContextMenuEvent = JSX.TargetedMouseEvent<HTMLElement>;
+type SidebarDropPosition = "before" | "after";
+type SidebarDropIndicator =
+  | { kind: "workspace"; key: string; position: SidebarDropPosition }
+  | { kind: "session"; key: string; position: SidebarDropPosition };
 
 const EMPTY_VOICE_SETTINGS: VoiceSettingsResponse = {
   ok: true,
@@ -138,14 +142,20 @@ function applyStoredOrder<T>(items: T[], order: string[], keyForItem: (item: T) 
   return out;
 }
 
-function moveOrderedKey(keys: string[], source: string, target: string) {
+function moveOrderedKey(keys: string[], source: string, target: string, position: SidebarDropPosition = "before") {
   const next = keys.slice();
   const from = next.indexOf(source);
   const to = next.indexOf(target);
   if (from < 0 || to < 0 || from === to) return next;
   const [item] = next.splice(from, 1);
-  next.splice(to, 0, item);
+  const targetIndex = next.indexOf(target);
+  next.splice(position === "after" ? targetIndex + 1 : targetIndex, 0, item);
   return next;
+}
+
+function dropPositionFromEvent(event: SidebarDragEvent): SidebarDropPosition {
+  const rect = event.currentTarget.getBoundingClientRect();
+  return event.clientY > rect.top + rect.height / 2 ? "after" : "before";
 }
 
 function copyTextViaSelection(text: string) {
@@ -636,6 +646,7 @@ export function App() {
   const [sessionOrderByWorkspace, setSessionOrderByWorkspace] = useState<SidebarSessionOrder>(() => readStoredSessionOrder());
   const [draggingWorkspaceKey, setDraggingWorkspaceKey] = useState("");
   const [draggingSession, setDraggingSession] = useState<{ workspaceKey: string; sessionId: string } | null>(null);
+  const [sidebarDropIndicator, setSidebarDropIndicator] = useState<SidebarDropIndicator | null>(null);
   const [showFilesPanel, setShowFilesPanel] = useState(false);
   const [showDetailsPanel, setShowDetailsPanel] = useState(false);
   const [newSessionOpen, setNewSessionOpen] = useState(false);
@@ -824,22 +835,50 @@ export function App() {
 
   function handleWorkspaceDragStart(event: SidebarDragEvent, workspaceKey: string) {
     setDraggingWorkspaceKey(workspaceKey);
+    setSidebarDropIndicator(null);
     event.dataTransfer!.effectAllowed = "move";
     event.dataTransfer!.setData("text/plain", workspaceKey);
   }
 
-  function handleWorkspaceDrop(event: SidebarDragEvent, targetWorkspaceKey: string) {
+  function handleWorkspaceDragOver(event: SidebarDragEvent, targetWorkspaceKey: string) {
+    if (!draggingWorkspaceKey) return;
+    if (draggingWorkspaceKey === targetWorkspaceKey) {
+      setSidebarDropIndicator(null);
+      return;
+    }
     event.preventDefault();
+    setSidebarDropIndicator({ kind: "workspace", key: targetWorkspaceKey, position: dropPositionFromEvent(event) });
+  }
+
+  function handleWorkspaceDrop(event: SidebarDragEvent, targetWorkspaceKey: string) {
     if (!draggingWorkspaceKey || draggingWorkspaceKey === targetWorkspaceKey) return;
-    setWorkspaceOrder(moveOrderedKey(workspaceGroups.map((group) => group.key), draggingWorkspaceKey, targetWorkspaceKey));
+    event.preventDefault();
+    const position =
+      sidebarDropIndicator?.kind === "workspace" && sidebarDropIndicator.key === targetWorkspaceKey
+        ? sidebarDropIndicator.position
+        : dropPositionFromEvent(event);
+    setWorkspaceOrder(moveOrderedKey(workspaceGroups.map((group) => group.key), draggingWorkspaceKey, targetWorkspaceKey, position));
     setDraggingWorkspaceKey("");
+    setSidebarDropIndicator(null);
   }
 
   function handleSessionDragStart(event: SidebarDragEvent, workspaceKey: string, sessionId: string) {
     event.stopPropagation();
     setDraggingSession({ workspaceKey, sessionId });
+    setSidebarDropIndicator(null);
     event.dataTransfer!.effectAllowed = "move";
     event.dataTransfer!.setData("text/plain", sessionId);
+  }
+
+  function handleSessionDragOver(event: SidebarDragEvent, workspaceKey: string, targetSessionId: string) {
+    if (!draggingSession || draggingSession.workspaceKey !== workspaceKey) return;
+    if (draggingSession.sessionId === targetSessionId) {
+      setSidebarDropIndicator(null);
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    setSidebarDropIndicator({ kind: "session", key: targetSessionId, position: dropPositionFromEvent(event) });
   }
 
   function handleSessionDrop(event: SidebarDragEvent, workspaceKey: string, targetSessionId: string) {
@@ -849,9 +888,14 @@ export function App() {
     if (draggingSession.workspaceKey !== workspaceKey || draggingSession.sessionId === targetSessionId) return;
     const group = workspaceGroups.find((item) => item.key === workspaceKey);
     if (!group) return;
-    const nextOrder = moveOrderedKey(group.sessions.map((session) => session.session_id), draggingSession.sessionId, targetSessionId);
+    const position =
+      sidebarDropIndicator?.kind === "session" && sidebarDropIndicator.key === targetSessionId
+        ? sidebarDropIndicator.position
+        : dropPositionFromEvent(event);
+    const nextOrder = moveOrderedKey(group.sessions.map((session) => session.session_id), draggingSession.sessionId, targetSessionId, position);
     setSessionOrderByWorkspace((current) => ({ ...current, [workspaceKey]: nextOrder }));
     setDraggingSession(null);
+    setSidebarDropIndicator(null);
   }
 
   function openSessionContextMenu(event: SidebarContextMenuEvent, session: SessionSummary) {
@@ -1930,15 +1974,20 @@ export function App() {
             {workspaceGroups.map((group) => {
               const hasSelected = group.sessions.some((session) => session.session_id === selectedSessionId);
               const collapsed = Boolean(collapsedWorkspaces[group.key] && !hasSelected);
+              const groupDropClass =
+                sidebarDropIndicator?.kind === "workspace" && sidebarDropIndicator.key === group.key ? ` is-drop-${sidebarDropIndicator.position}` : "";
               return (
                 <section
                   key={group.key}
-                  className={`workspaceGroup${hasSelected ? " active" : ""}${draggingWorkspaceKey === group.key ? " is-dragging" : ""}`}
+                  className={`workspaceGroup${hasSelected ? " active" : ""}${draggingWorkspaceKey === group.key ? " is-dragging" : ""}${groupDropClass}`}
                   draggable
                   onDragStart={(event) => handleWorkspaceDragStart(event, group.key)}
-                  onDragOver={(event) => event.preventDefault()}
+                  onDragOver={(event) => handleWorkspaceDragOver(event, group.key)}
                   onDrop={(event) => handleWorkspaceDrop(event, group.key)}
-                  onDragEnd={() => setDraggingWorkspaceKey("")}
+                  onDragEnd={() => {
+                    setDraggingWorkspaceKey("");
+                    setSidebarDropIndicator(null);
+                  }}
                 >
                   <button className="workspaceGroupHeader" type="button" onClick={() => toggleWorkspaceGroup(group.key)} aria-expanded={!collapsed}>
                     <span className="workspaceDisclosure">{collapsed ? "▸" : "▾"}</span>
@@ -1954,36 +2003,41 @@ export function App() {
                   </button>
                   {!collapsed ? (
                     <div className="workspaceSessions">
-                      {group.sessions.map((session) => (
-                        <button
-                          key={session.session_id}
-                          className={`workspace${selectedSessionId === session.session_id ? " active" : ""}${draggingSession?.sessionId === session.session_id ? " is-dragging" : ""}`}
-                          draggable
-                          onDragStart={(event) => handleSessionDragStart(event, group.key, session.session_id)}
-                          onDragOver={(event) => {
-                            if (!draggingSession) return;
-                            event.preventDefault();
-                            event.stopPropagation();
-                          }}
-                          onDrop={(event) => handleSessionDrop(event, group.key, session.session_id)}
-                          onDragEnd={() => setDraggingSession(null)}
-                          onContextMenu={(event) => openSessionContextMenu(event, session)}
-                          onClick={() => selectSession(session.session_id)}
-                        >
-                          <div className="workspaceHeader">
-                            <div className="workspaceTitleRow">
-                              <div className="workspaceTitle">{sessionDisplayName(session)}</div>
-                              <div className={`status-dot ${session.busy || sessionIsStarting(session) ? "running" : "idle"}`} />
+                      {group.sessions.map((session) => {
+                        const sessionDropClass =
+                          sidebarDropIndicator?.kind === "session" && sidebarDropIndicator.key === session.session_id
+                            ? ` is-drop-${sidebarDropIndicator.position}`
+                            : "";
+                        return (
+                          <button
+                            key={session.session_id}
+                            className={`workspace${selectedSessionId === session.session_id ? " active" : ""}${draggingSession?.sessionId === session.session_id ? " is-dragging" : ""}${sessionDropClass}`}
+                            draggable
+                            onDragStart={(event) => handleSessionDragStart(event, group.key, session.session_id)}
+                            onDragOver={(event) => handleSessionDragOver(event, group.key, session.session_id)}
+                            onDrop={(event) => handleSessionDrop(event, group.key, session.session_id)}
+                            onDragEnd={() => {
+                              setDraggingSession(null);
+                              setSidebarDropIndicator(null);
+                            }}
+                            onContextMenu={(event) => openSessionContextMenu(event, session)}
+                            onClick={() => selectSession(session.session_id)}
+                          >
+                            <div className="workspaceHeader">
+                              <div className="workspaceTitleRow">
+                                <div className="workspaceTitle">{sessionDisplayName(session)}</div>
+                                <div className={`status-dot ${session.busy || sessionIsStarting(session) ? "running" : "idle"}`} />
+                              </div>
+                              <div className="workspacePath">{session.git_branch ? session.git_branch : String(session.agent_backend || "codex").toUpperCase()}</div>
+                              <div className="workspaceMeta">
+                                {String(session.agent_backend || "codex").toUpperCase()} · {sessionStatusText(session)} ·{" "}
+                                {relativeAge(session.updated_ts)}
+                              </div>
                             </div>
-                            <div className="workspacePath">{session.git_branch ? session.git_branch : String(session.agent_backend || "codex").toUpperCase()}</div>
-                            <div className="workspaceMeta">
-                              {String(session.agent_backend || "codex").toUpperCase()} · {sessionStatusText(session)} ·{" "}
-                              {relativeAge(session.updated_ts)}
-                            </div>
-                          </div>
-                          <div className="lastLine">{sessionLastLines[session.session_id] || session.session_id}</div>
-                        </button>
-                      ))}
+                            <div className="lastLine">{sessionLastLines[session.session_id] || session.session_id}</div>
+                          </button>
+                        );
+                      })}
                     </div>
                   ) : null}
                 </section>
