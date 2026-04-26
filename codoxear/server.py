@@ -1974,6 +1974,20 @@ def _read_codex_launch_defaults() -> dict[str, Any]:
     return defaults
 
 
+def _read_codex_config_for_settings() -> dict[str, Any]:
+    text = CODEX_CONFIG_PATH.read_text(encoding="utf-8") if CODEX_CONFIG_PATH.exists() else ""
+    return {"path": str(CODEX_CONFIG_PATH), "exists": CODEX_CONFIG_PATH.exists(), "text": text}
+
+
+def _write_codex_config_for_settings(text: str) -> dict[str, Any]:
+    tomllib.loads(text)
+    CODEX_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = CODEX_CONFIG_PATH.with_name(f"{CODEX_CONFIG_PATH.name}.tmp")
+    tmp_path.write_text(text, encoding="utf-8")
+    tmp_path.replace(CODEX_CONFIG_PATH)
+    return _read_codex_config_for_settings()
+
+
 def _read_pi_launch_defaults() -> dict[str, Any]:
     configured_provider: str | None = None
     configured_model: str | None = None
@@ -4752,6 +4766,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 _json_response(self, 200, {"ok": True, **MANAGER._voice_push.settings_snapshot()})
                 return
 
+            if path == "/api/settings/codex_config":
+                if not _require_auth(self):
+                    self._unauthorized()
+                    return
+                _json_response(self, 200, {"ok": True, **_read_codex_config_for_settings()})
+                return
+
             if path == "/api/notifications/subscription":
                 if not _require_auth(self):
                     self._unauthorized()
@@ -5851,6 +5872,29 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 try:
                     payload = MANAGER._voice_push.set_settings(obj)
                 except ValueError as e:
+                    _json_response(self, 400, {"error": str(e)})
+                    return
+                _json_response(self, 200, {"ok": True, **payload})
+                return
+
+            if path == "/api/settings/codex_config":
+                if not _require_auth(self):
+                    self._unauthorized()
+                    return
+                body = _read_body(self)
+                body_text = body.decode("utf-8")
+                if not body_text.strip():
+                    raise ValueError("empty request body")
+                obj = json.loads(body_text)
+                if not isinstance(obj, dict):
+                    raise ValueError("invalid json body (expected object)")
+                text = obj.get("text")
+                if not isinstance(text, str):
+                    _json_response(self, 400, {"error": "text required"})
+                    return
+                try:
+                    payload = _write_codex_config_for_settings(text)
+                except tomllib.TOMLDecodeError as e:
                     _json_response(self, 400, {"error": str(e)})
                     return
                 _json_response(self, 200, {"ok": True, **payload})

@@ -111,6 +111,96 @@ class TestServerChatFlags(unittest.TestCase):
         self.assertEqual(events[0]["tool_call_id"], "tool-1")
         self.assertEqual(events[0]["text"], "pwd")
 
+    def test_exec_command_function_call_uses_cmd_argument_as_visible_text(self) -> None:
+        events, meta, _flags, diag = _extract_chat_events(
+            [
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "name": "exec_command",
+                        "call_id": "tool-2",
+                        "arguments": {"cmd": "rtk git status --short"},
+                    },
+                    "ts": 10.0,
+                }
+            ]
+        )
+        self.assertEqual(meta["tool"], 1)
+        self.assertEqual(diag["last_tool"], "exec_command")
+        self.assertEqual(events[0]["type"], "tool")
+        self.assertEqual(events[0]["name"], "exec_command")
+        self.assertEqual(events[0]["tool_call_id"], "tool-2")
+        self.assertEqual(events[0]["text"], "rtk git status --short")
+
+    def test_update_plan_function_call_emits_extension_progress(self) -> None:
+        events, meta, _flags, diag = _extract_chat_events(
+            [
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "name": "update_plan",
+                        "call_id": "plan-1",
+                        "arguments": {
+                            "plan": [
+                                {"step": "Inspect logs", "status": "completed"},
+                                {"step": "Render progress", "status": "in_progress"},
+                            ]
+                        },
+                    },
+                    "ts": 10.0,
+                }
+            ]
+        )
+        self.assertEqual(meta["tool"], 1)
+        self.assertEqual(diag["last_tool"], "update_plan")
+        self.assertEqual(events[0]["type"], "extension")
+        self.assertEqual(events[0]["extension_kind"], "progress")
+        self.assertEqual(events[0]["title"], "Todo")
+        self.assertEqual(events[0]["status"], "running")
+        self.assertEqual(events[0]["summary"], "1/2 completed")
+        self.assertEqual(events[0]["progress_current"], 1)
+        self.assertEqual(events[0]["progress_total"], 2)
+        self.assertEqual(events[0]["items"][1]["label"], "Render progress")
+
+    def test_codoxear_display_protocol_emits_extension_event(self) -> None:
+        events, meta, _flags, diag = _extract_chat_events(
+            [
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "name": "ralph_loop",
+                        "call_id": "ralph-1",
+                        "arguments": {
+                            "codoxear_display": {
+                                "version": 1,
+                                "kind": "progress",
+                                "source": "ralph-loop",
+                                "title": "Ralph loop",
+                                "status": "running",
+                                "summary": "Iteration 2",
+                                "progress": {"current": 2, "total": 5, "label": "iterations"},
+                                "items": [
+                                    {"label": "Patch parser", "status": "completed"},
+                                    {"label": "Run checks", "status": "pending"},
+                                ],
+                            }
+                        },
+                    },
+                    "ts": 10.0,
+                }
+            ]
+        )
+        self.assertEqual(meta["tool"], 1)
+        self.assertEqual(diag["last_tool"], "ralph_loop")
+        self.assertEqual(events[0]["type"], "extension")
+        self.assertEqual(events[0]["source"], "ralph-loop")
+        self.assertEqual(events[0]["title"], "Ralph loop")
+        self.assertEqual(events[0]["progress_label"], "iterations")
+        self.assertEqual(events[0]["items"][0]["status"], "completed")
+
     def test_pi_ask_user_call_and_result_are_normalized(self) -> None:
         events, meta, _flags, diag = _extract_chat_events(
             [

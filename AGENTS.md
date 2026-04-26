@@ -1,34 +1,25 @@
-# codoxear
+# Codoxear Agent Entry
 
-> CWD: `/vePFS-Mindverse/user/intern/ccss/codoxear`
+> Canonical memory: `/vePFS-Mindverse/user/intern/ccss/docs/Projects/codoxear-nova/AGENTS.md`
+> Source CWD: `/vePFS-Mindverse/user/intern/ccss/codoxear`
 
-## Canonical Memory
+## Startup
 
-- Project memory entry: `/vePFS-Mindverse/user/intern/ccss/docs/Projects/codoxear-yiwenlu66/AGENTS.md`
-- Work records: `/vePFS-Mindverse/user/intern/ccss/docs/Projects/codoxear-yiwenlu66/Records/WORK_RECORDS.md`
-- Shared memory root: `/vePFS-Mindverse/user/intern/ccss/docs/AGENTS.md`
+- Read the canonical memory file first.
+- Then read `Records/WORK_RECORDS.md` and every Feature whose hook keywords match the task.
+- Treat `/vePFS-Mindverse/user/intern/ccss/docs/Projects/codoxear-nova/` as the canonical project memory source.
+- Do not create or maintain a repo-local canonical `memory/docs/` tree.
+- Prefix shell commands with `rtk`, per `/root/.codex/RTK.md`.
 
-## Purpose
+## Quick Commands
 
-Local clone of `https://github.com/yiwenlu66/codoxear.git`, used to serve the Codoxear Web UI on this machine through the existing `127.0.0.1:13780 -> 127.0.0.1:8743` port forwarder.
-
-## Standard startup (this host)
-
-- Runtime config: `.env` (gitignored), currently binds backend to `0.0.0.0:8743` with password auth.
-- External/local entry: `http://127.0.0.1:13780/` (forwarded to backend `8743`).
-- Daemon helper: `./scripts/codoxear-local start|stop|restart|status|logs`.
-- Python env: `.venv/`; install/update with `.venv/bin/python -m pip install -e . pytest`.
-- Frontend build: `cd frontend && npm run build`.
-- Rust release build: `cd backend-rs && cargo build --release`.
-
-## Structure at a glance
-
-- `README.md` — usage, configuration, and route split.
-- `codoxear/` — Python package, server, broker, rollout parsing, voice push, static assets.
-- `frontend/` — Nova preview frontend (`Preact + TypeScript + Vite + Pretext`).
-- `backend-rs/` — Nova preview Rust backend (`Axum + SSE`).
-- `scripts/` — local daemon/dev/resume helpers.
-- `tests/` — Python tests.
+- Install/update: `.venv/bin/python -m pip install -e . pytest`
+- Dev server: `./scripts/codoxear-server-dev`
+- Local daemon: `./scripts/codoxear-local start|stop|restart|status|logs`
+- Python tests: `.venv/bin/python -m pytest -q`
+- Frontend build: `cd frontend && npm run build`
+- Rust tests: `cd backend-rs && cargo test`
+- Rust release build: `cd backend-rs && cargo build --release`
 
 ## Default Workflow
 
@@ -50,19 +41,3 @@ Local clone of `https://github.com/yiwenlu66/codoxear.git`, used to serve the Co
 - Self-review done, risks noted
 - Tests run, or explicit reason for skipping
 - Relevant `Features/<feature>.md`, `AGENTS.md` Feature Index/Documentation Index (if docs added/renamed), and `Records/WORK_RECORDS.md` updated
-
-## Feature Index
-
-| Feature | When to read (hook keywords) |
-|-------|------------------------------|
-| `Features/server-and-api.md` | server.py, api, routes, auth, session endpoint, queue, harness, diagnostics, file read, inject_file, nova route |
-| `Features/session-and-broker.md` | broker, sessiond, pty, socket, send, enqueue, interrupt, tmux, resume, ownership, Codex, Pi |
-| `Features/ui.md` | static/app.js, static/app.css, legacy UI, /nova, browser, button, composer, mobile, tmux attach |
-| `Features/replatforming.md` | replatforming, frontend, pretext, preact, vite, rust, axum, sse, transcript, backend-rs, nova-preview |
-| `Features/voice-push.md` | voice_push, TTS, notification, web push, VAPID, service-worker, narration, mobile push, audio stream |
-| `Features/rollout-log-parsing.md` | rollout_log, JSONL, messages, transcript, idle, token usage, tool call, ask_user, pi_log |
-
-## Documentation Index
-
-- `/vePFS-Mindverse/user/intern/ccss/docs/Projects/codoxear-yiwenlu66/AGENTS.md` — canonical project memory entry and full Documentation Index.
-- `/vePFS-Mindverse/user/intern/ccss/docs/Projects/codoxear-yiwenlu66/Records/WORK_RECORDS.md` — newest-first work record index.

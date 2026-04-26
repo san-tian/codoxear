@@ -1,8 +1,18 @@
+import type { JSX } from "preact";
 import { useEffect, useMemo, useRef, useState } from "preact/hooks";
 import { api } from "./lib/api";
-import { PretextParagraph } from "./lib/pretext";
+import {
+  TranscriptEventRow,
+  coalesceAdjacentAssistantEvents,
+  eventTextPreview,
+  isCollapsibleEvent,
+  mergeTranscriptEvents,
+  normalizeEvents,
+  previewFromEvents,
+} from "./lib/transcript";
 import type {
   ChangedFilesResponse,
+  CodexConfigResponse,
   DiagnosticsResponse,
   FileEntry,
   FileReadResponse,
@@ -11,7 +21,6 @@ import type {
   NotificationSubscriptionsResponse,
   QueueResponse,
   QueueItem,
-  RawChatEvent,
   ResumeCandidate,
   SessionSummary,
   UiTranscriptEvent,
@@ -28,7 +37,40 @@ const ATTACH_UPLOAD_MAX_BYTES = 16 * 1024 * 1024;
 const SELECTED_SESSION_KEY = "codoxear.nova.selected";
 const SHOW_TOOL_CALLS_KEY = "codoxear.showToolCalls";
 const DESKTOP_NOTIFICATIONS_KEY = "codoxear.desktopNotificationsEnabled";
+const BUSY_SUBMIT_MODE_KEY = "codoxear.nova.busySubmitMode";
+const THEME_MODE_KEY = "codoxear.nova.theme";
+const SIDEBAR_WORKSPACE_ORDER_KEY = "codoxear.nova.sidebar.workspaceOrder";
+const SIDEBAR_SESSION_ORDER_KEY = "codoxear.nova.sidebar.sessionOrder";
 const CHAT_BOTTOM_FOLLOW_THRESHOLD_PX = 96;
+
+type BusySubmitMode = "queue" | "interrupt";
+type ThemeMode = "dark" | "light";
+type SidebarSessionOrder = Record<string, string[]>;
+type SidebarDragEvent = JSX.TargetedDragEvent<HTMLElement>;
+type SidebarContextMenuEvent = JSX.TargetedMouseEvent<HTMLElement>;
+
+const EMPTY_VOICE_SETTINGS: VoiceSettingsResponse = {
+  ok: true,
+  tts_enabled_for_narration: false,
+  tts_enabled_for_final_response: true,
+  tts_base_url: "",
+  tts_api_key: "",
+  summarization_model: "",
+  tts_model: "",
+  audio: {
+    queue_depth: 0,
+    active_listener_count: 0,
+    stream_url: "",
+    segment_count: 0,
+    last_error: "",
+    media_sequence: 0,
+  },
+  notifications: {
+    enabled_devices: 0,
+    total_devices: 0,
+    vapid_public_key: "",
+  },
+};
 
 function readLocalStorage(key: string) {
   try {
@@ -45,6 +87,65 @@ function writeLocalStorage(key: string, value: string | null) {
   } catch {
     // ignore storage failures
   }
+}
+
+function readBusySubmitMode(): BusySubmitMode {
+  return readLocalStorage(BUSY_SUBMIT_MODE_KEY) === "interrupt" ? "interrupt" : "queue";
+}
+
+function readThemeMode(): ThemeMode {
+  return readLocalStorage(THEME_MODE_KEY) === "light" ? "light" : "dark";
+}
+
+function readStoredStringList(key: string) {
+  try {
+    const parsed = JSON.parse(readLocalStorage(key) || "[]");
+    return Array.isArray(parsed) ? parsed.filter((value): value is string => typeof value === "string" && !!value) : [];
+  } catch {
+    return [];
+  }
+}
+
+function readStoredSessionOrder(): SidebarSessionOrder {
+  try {
+    const parsed = JSON.parse(readLocalStorage(SIDEBAR_SESSION_ORDER_KEY) || "{}");
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+    const out: SidebarSessionOrder = {};
+    Object.entries(parsed).forEach(([key, value]) => {
+      if (Array.isArray(value)) out[key] = value.filter((item): item is string => typeof item === "string" && !!item);
+    });
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+function applyStoredOrder<T>(items: T[], order: string[], keyForItem: (item: T) => string) {
+  if (!order.length) return items;
+  const byKey = new Map(items.map((item) => [keyForItem(item), item]));
+  const used = new Set<string>();
+  const out: T[] = [];
+  order.forEach((key) => {
+    const item = byKey.get(key);
+    if (!item || used.has(key)) return;
+    used.add(key);
+    out.push(item);
+  });
+  items.forEach((item) => {
+    const key = keyForItem(item);
+    if (!used.has(key)) out.push(item);
+  });
+  return out;
+}
+
+function moveOrderedKey(keys: string[], source: string, target: string) {
+  const next = keys.slice();
+  const from = next.indexOf(source);
+  const to = next.indexOf(target);
+  if (from < 0 || to < 0 || from === to) return next;
+  const [item] = next.splice(from, 1);
+  next.splice(to, 0, item);
+  return next;
 }
 
 function copyTextViaSelection(text: string) {
@@ -208,196 +309,19 @@ function relativeAge(ts: number) {
   return `${Math.max(1, Math.floor(delta / 86400))}d ago`;
 }
 
-function formatTime(ts: number | null) {
-  if (!(typeof ts === "number" && Number.isFinite(ts) && ts > 0)) return "";
-  return new Date(ts * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
-}
-
 function shellSingleQuote(text: string) {
   return `'${text.replace(/'/g, `'\\''`)}'`;
 }
 
-function tmuxAttachCommandForSession(session: SessionSummary | null) {
+  function tmuxAttachCommandForSession(session: SessionSummary | null) {
   if (!session || session.transport !== "tmux" || !session.tmux_session) return "";
   const attachCommand = `tmux attach-session -t ${shellSingleQuote(session.tmux_session)}`;
   if (!session.tmux_window) return attachCommand;
   return `${attachCommand} \\; select-window -t ${shellSingleQuote(`${session.tmux_session}:${session.tmux_window}`)}`;
 }
 
-function eventTextPreview(event: UiTranscriptEvent) {
-  const body = String(event.body || "").trim();
-  if (!body) return isCollapsibleEvent(event.kind) ? "" : event.title || "";
-  const preview = body.replace(/\s+/g, " ").slice(0, 160);
-  if (!isCollapsibleEvent(event.kind) || !event.title) return preview;
-  return stripRepeatedTitlePrefix(preview, event.title);
-}
-
-function stripRepeatedTitlePrefix(preview: string, title: string) {
-  const normalizedTitle = title.trim();
-  if (!preview || !normalizedTitle) return preview;
-  const lowerPreview = preview.toLocaleLowerCase();
-  const lowerTitle = normalizedTitle.toLocaleLowerCase();
-  if (lowerPreview === lowerTitle) return "";
-  const separators = [":", "-", "—", "–", "·", "|"];
-  for (const separator of separators) {
-    const prefix = `${lowerTitle}${separator}`;
-    if (lowerPreview.startsWith(prefix)) return preview.slice(normalizedTitle.length + separator.length).trimStart();
-  }
-  if (lowerPreview.startsWith(`${lowerTitle} `)) return preview.slice(normalizedTitle.length).trimStart();
-  return preview;
-}
-
-function describeAskUser(
-  raw: {
-    question?: string;
-    context?: string;
-    options?: string[];
-    questions?: Array<Record<string, unknown>>;
-    answer?: string | string[];
-  },
-) {
-  const parts: string[] = [];
-  if (typeof raw.question === "string" && raw.question.trim()) parts.push(raw.question.trim());
-  if (typeof raw.context === "string" && raw.context.trim()) parts.push(raw.context.trim());
-  if (Array.isArray(raw.options) && raw.options.length) {
-    parts.push(`Options: ${raw.options.filter(Boolean).join(" · ")}`);
-  }
-  if (Array.isArray(raw.questions) && raw.questions.length) {
-    parts.push(`Questions: ${raw.questions.length}`);
-  }
-  if (Array.isArray(raw.answer) && raw.answer.length) {
-    parts.push(`Answer: ${raw.answer.join(", ")}`);
-  } else if (typeof raw.answer === "string" && raw.answer.trim()) {
-    parts.push(`Answer: ${raw.answer.trim()}`);
-  }
-  return parts.join("\n\n");
-}
-
-function normalizeEvent(raw: RawChatEvent, index: number, knownToolTitles: Map<string, string>): UiTranscriptEvent | null {
-  if ("role" in raw) {
-    if (typeof raw.text !== "string" || !raw.text.trim()) return null;
-    const ts = typeof raw.ts === "number" && Number.isFinite(raw.ts) ? raw.ts : null;
-    const id = raw.message_id || raw.localId || `${raw.role}-${ts ?? "na"}-${index}`;
-    return {
-      id,
-      kind: raw.role,
-      ts,
-      title: raw.role === "user" ? "User" : "Assistant",
-      body: raw.text,
-      meta: String(raw.message_class || ""),
-    };
-  }
-  const ts = typeof raw.ts === "number" && Number.isFinite(raw.ts) ? raw.ts : null;
-  if (raw.type === "ask_user") {
-    return {
-      id: raw.tool_call_id || `ask-${ts ?? "na"}-${index}`,
-      kind: "ask_user",
-      ts,
-      title: raw.header || "Ask user",
-      body: describeAskUser(raw),
-      meta: [
-        raw.allow_multiple ? "multiple" : "",
-        raw.allow_freeform ? "freeform" : "",
-        raw.resolved ? "resolved" : "",
-        raw.cancelled ? "cancelled" : "",
-      ]
-        .filter(Boolean)
-        .join(" · "),
-    };
-  }
-  const rawName = typeof raw.name === "string" && raw.name.trim() ? raw.name.trim() : "";
-  const knownName = raw.tool_call_id ? knownToolTitles.get(raw.tool_call_id) || "" : "";
-  const toolTitle = raw.type === "tool_result" ? knownName || (rawName === "tool" ? "" : rawName) : rawName;
-  return {
-    id: raw.tool_call_id || `${raw.type}-${raw.name || "tool"}-${ts ?? "na"}-${index}`,
-    kind: raw.type,
-    ts,
-    title: toolTitle || (raw.type === "tool_result" ? "Tool result" : "Tool call"),
-    body: String(raw.text || ""),
-    meta: [raw.tool_call_id || "", raw.is_error ? "error" : ""].filter(Boolean).join(" · "),
-  };
-}
-
-function normalizeEvents(events: RawChatEvent[]) {
-  const out: UiTranscriptEvent[] = [];
-  const knownToolTitles = new Map<string, string>();
-  events.forEach((event) => {
-    if ("role" in event || event.type !== "tool" || !event.tool_call_id) return;
-    if (typeof event.name === "string" && event.name.trim()) knownToolTitles.set(event.tool_call_id, event.name.trim());
-  });
-  events.forEach((event, index) => {
-    const normalized = normalizeEvent(event, index, knownToolTitles);
-    if (normalized) out.push(normalized);
-  });
-  return out;
-}
-
-function coalesceAdjacentAssistantEvents(events: UiTranscriptEvent[]) {
-  const out: UiTranscriptEvent[] = [];
-  for (const event of events) {
-    const previous = out[out.length - 1];
-    if (previous && previous.kind === "assistant" && event.kind === "assistant") {
-      const metaParts = [previous.meta, event.meta].filter((value, index, arr) => value && arr.indexOf(value) === index);
-      out[out.length - 1] = {
-        ...previous,
-        id: `${previous.id}+${event.id}`,
-        ts: previous.ts ?? event.ts,
-        body: [previous.body, event.body].filter((value) => value.trim()).join("\n\n"),
-        meta: metaParts.join(" · "),
-      };
-      continue;
-    }
-    out.push(event);
-  }
-  return out;
-}
-
-function shouldShowMessageSide(events: UiTranscriptEvent[], index: number) {
-  const event = events[index];
-  if (!event || event.kind !== "assistant") return true;
-  for (let cursor = index - 1; cursor >= 0; cursor -= 1) {
-    const previous = events[cursor];
-    if (previous.kind === "user") return true;
-    if (previous.kind === "assistant") return false;
-  }
-  return true;
-}
-
-function isAssistantNarration(event: UiTranscriptEvent) {
-  return event.kind === "assistant" && event.meta.trim() === "narration";
-}
-
-function shouldShowMessageFooter(events: UiTranscriptEvent[], index: number, collapsible: boolean) {
-  const event = events[index];
-  if (!event || collapsible || (!event.meta && !event.ts)) return false;
-  if (!isAssistantNarration(event)) return true;
-  for (let cursor = index + 1; cursor < events.length; cursor += 1) {
-    const next = events[cursor];
-    if (next.kind === "user") return true;
-    if (isAssistantNarration(next)) return false;
-  }
-  return true;
-}
-
-function mergeTranscriptEvents(current: UiTranscriptEvent[], incoming: UiTranscriptEvent[]) {
-  if (!incoming.length) return current;
-  const incomingIds = new Set(incoming.map((event) => event.id));
-  const incomingUserBodies = new Set(
-    incoming.filter((event) => event.kind === "user").map((event) => event.body.trim()).filter(Boolean),
-  );
-  return current
-    .filter((event) => !incomingIds.has(event.id))
-    .filter((event) => !(event.id.startsWith("local-user-") && incomingUserBodies.has(event.body.trim())))
-    .concat(incoming);
-}
-
-function previewFromEvents(events: UiTranscriptEvent[]) {
-  for (let index = events.length - 1; index >= 0; index -= 1) {
-    const event = events[index];
-    if (event.kind !== "user") continue;
-    return eventTextPreview(event);
-  }
-  return "";
+function sessionById(items: SessionSummary[], sessionId: string) {
+  return items.find((session) => session.session_id === sessionId) || null;
 }
 
 function isNearScrollBottom(element: HTMLElement) {
@@ -435,14 +359,6 @@ function icon(name: string) {
         <svg {...common}>
           <path d="M3.5 6.5H6L9.5 4v8L6 9.5H3.5Z" />
           <path d="M11.5 6a3 3 0 0 1 0 4" />
-        </svg>
-      );
-    case "help":
-      return (
-        <svg {...common}>
-          <circle cx="8" cy="8" r="5.5" />
-          <path d="M6.8 6.4A1.6 1.6 0 1 1 8.9 8c-.6.3-.9.7-.9 1.3" />
-          <path d="M8 11.8h.01" />
         </svg>
       );
     case "settings":
@@ -636,25 +552,6 @@ function normalizeQueueItems(response: QueueResponse) {
   return [];
 }
 
-function eventClassName(kind: UiTranscriptEvent["kind"]) {
-  switch (kind) {
-    case "user":
-      return "event-user";
-    case "assistant":
-      return "event-assistant";
-    case "tool":
-      return "event-tool";
-    case "tool_result":
-      return "event-result";
-    case "ask_user":
-      return "event-question";
-  }
-}
-
-function isCollapsibleEvent(kind: UiTranscriptEvent["kind"]) {
-  return kind === "tool" || kind === "tool_result" || kind === "ask_user";
-}
-
 function renderTokenSummary(token: Record<string, unknown> | null | undefined) {
   if (!token || typeof token !== "object") return "";
   const contextWindow = Number(token.context_window);
@@ -730,9 +627,15 @@ export function App() {
   const [loadingOlder, setLoadingOlder] = useState(false);
   const [errorText, setErrorText] = useState("");
   const [composerText, setComposerText] = useState("");
+  const [busySubmitMode, setBusySubmitMode] = useState<BusySubmitMode>(() => readBusySubmitMode());
   const [toastText, setToastText] = useState("");
   const [loginPassword, setLoginPassword] = useState("");
   const [showTools, setShowTools] = useState(() => readLocalStorage(SHOW_TOOL_CALLS_KEY) !== "0");
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [workspaceOrder, setWorkspaceOrder] = useState<string[]>(() => readStoredStringList(SIDEBAR_WORKSPACE_ORDER_KEY));
+  const [sessionOrderByWorkspace, setSessionOrderByWorkspace] = useState<SidebarSessionOrder>(() => readStoredSessionOrder());
+  const [draggingWorkspaceKey, setDraggingWorkspaceKey] = useState("");
+  const [draggingSession, setDraggingSession] = useState<{ workspaceKey: string; sessionId: string } | null>(null);
   const [showFilesPanel, setShowFilesPanel] = useState(false);
   const [showDetailsPanel, setShowDetailsPanel] = useState(false);
   const [newSessionOpen, setNewSessionOpen] = useState(false);
@@ -753,21 +656,27 @@ export function App() {
   const [newSessionWorktreeBranch, setNewSessionWorktreeBranch] = useState("");
   const [newSessionError, setNewSessionError] = useState("");
   const [renameOpen, setRenameOpen] = useState(false);
+  const [renameSessionId, setRenameSessionId] = useState("");
   const [renameName, setRenameName] = useState("");
   const [renameBusy, setRenameBusy] = useState(false);
   const [renameError, setRenameError] = useState("");
+  const [sessionContextMenu, setSessionContextMenu] = useState<{ sessionId: string; x: number; y: number } | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [themeMode, setThemeMode] = useState<ThemeMode>(() => readThemeMode());
   const [voiceSettings, setVoiceSettings] = useState<VoiceSettingsResponse | null>(null);
+  const [codexConfig, setCodexConfig] = useState<CodexConfigResponse | null>(null);
   const [voiceSettingsLoading, setVoiceSettingsLoading] = useState(false);
   const [voiceSettingsSaving, setVoiceSettingsSaving] = useState(false);
+  const [codexConfigSaving, setCodexConfigSaving] = useState(false);
+  const [settingsLoadError, setSettingsLoadError] = useState("");
   const [voiceBaseUrl, setVoiceBaseUrl] = useState("");
   const [voiceApiKey, setVoiceApiKey] = useState("");
   const [voiceNarrationEnabled, setVoiceNarrationEnabled] = useState(false);
+  const [codexConfigText, setCodexConfigText] = useState("");
   const [notificationSnapshot, setNotificationSnapshot] = useState<NotificationSubscriptionsResponse | null>(null);
   const [desktopNotificationsEnabled, setDesktopNotificationsEnabled] = useState(() => readLocalStorage(DESKTOP_NOTIFICATIONS_KEY) === "1");
   const [mobilePushEnabled, setMobilePushEnabled] = useState(false);
   const [mobilePushEndpoint, setMobilePushEndpoint] = useState("");
-  const [helpOpen, setHelpOpen] = useState(false);
   const [attachedFiles, setAttachedFiles] = useState(0);
   const [attachBusy, setAttachBusy] = useState(false);
   const [diagnostics, setDiagnostics] = useState<DiagnosticsResponse | null>(null);
@@ -809,6 +718,14 @@ export function App() {
     () => sessions.find((session) => session.session_id === selectedSessionId) || null,
     [sessions, selectedSessionId],
   );
+  const contextMenuSession = useMemo(
+    () => sessions.find((session) => session.session_id === sessionContextMenu?.sessionId) || null,
+    [sessionContextMenu, sessions],
+  );
+  const renameTargetSession = useMemo(
+    () => sessionById(sessions, renameSessionId) || selectedSession,
+    [renameSessionId, selectedSession, sessions],
+  );
   const workspaceGroups = useMemo(() => {
     const groups = new Map<
       string,
@@ -823,14 +740,18 @@ export function App() {
       group.updatedTs = Math.max(group.updatedTs, Number(session.updated_ts || session.start_ts || 0));
       groups.set(key, group);
     }
-    return Array.from(groups.values()).sort((left, right) => {
+    const fallbackSortedGroups = Array.from(groups.values()).sort((left, right) => {
       const leftSelected = left.sessions.some((session) => session.session_id === selectedSessionId) ? 1 : 0;
       const rightSelected = right.sessions.some((session) => session.session_id === selectedSessionId) ? 1 : 0;
       if (leftSelected !== rightSelected) return rightSelected - leftSelected;
       if (left.updatedTs !== right.updatedTs) return right.updatedTs - left.updatedTs;
       return workspaceTitle(left.cwd).localeCompare(workspaceTitle(right.cwd));
     });
-  }, [selectedSessionId, sessions]);
+    return applyStoredOrder(fallbackSortedGroups, workspaceOrder, (group) => group.key).map((group) => ({
+      ...group,
+      sessions: applyStoredOrder(group.sessions, sessionOrderByWorkspace[group.key] || [], (session) => session.session_id),
+    }));
+  }, [selectedSessionId, sessionOrderByWorkspace, sessions, workspaceOrder]);
   const currentNewSessionDefaults = useMemo(
     () => defaultsForBackend(newSessionDefaults, newSessionBackend),
     [newSessionDefaults, newSessionBackend],
@@ -844,7 +765,12 @@ export function App() {
     [currentNewSessionDefaults],
   );
   const visibleTranscript = useMemo(
-    () => coalesceAdjacentAssistantEvents(showTools ? transcript : transcript.filter((event) => event.kind === "user" || event.kind === "assistant")),
+    () =>
+      coalesceAdjacentAssistantEvents(
+        showTools
+          ? transcript
+          : transcript.filter((event) => event.kind === "user" || event.kind === "assistant" || event.kind === "extension"),
+      ),
     [showTools, transcript],
   );
   const visibleFileEntries = useMemo(
@@ -852,6 +778,7 @@ export function App() {
     [fileEntries, fileSearchEntries, fileSearchQuery],
   );
   const tmuxCommand = useMemo(() => tmuxAttachCommandForSession(selectedSession), [selectedSession]);
+  const queuePreviewItems = useMemo(() => queueItems.slice(0, 3), [queueItems]);
   const awaitingAssistantReply = useMemo(() => {
     if (!selectedSession || queueLen) return false;
     let latestUserTs = 0;
@@ -864,6 +791,9 @@ export function App() {
     }
     return latestUserTs > latestAssistantTs;
   }, [queueLen, selectedSession, transcript]);
+  const composerSessionBusy = Boolean(awaitingAssistantReply || busy || selectedSession?.busy);
+  const displayedVoiceSettings = voiceSettings || EMPTY_VOICE_SETTINGS;
+  const settingsInitialLoading = voiceSettingsLoading && !voiceSettings && !codexConfig;
   const topSessionStatus = useMemo(() => {
     if (!selectedSession) return "No session";
     if (closingSession) return "closing";
@@ -875,12 +805,64 @@ export function App() {
   }, [awaitingAssistantReply, busy, closingSession, queueLen, selectedSession, sending]);
   const topSessionStatusClass = topSessionStatus === "working" || topSessionStatus === "starting" ? "status-chip working" : "status-chip";
 
-  function toggleTranscriptEvent(eventId: string) {
-    setCollapsedEvents((current) => ({ ...current, [eventId]: current[eventId] === false }));
+  function askUserDefaultsOpen(event: UiTranscriptEvent) {
+    return event.kind === "ask_user" && !event.askResolved && !event.askAnswer && !event.askCancelled;
+  }
+
+  function transcriptEventCollapsed(event: UiTranscriptEvent, collapsedState = collapsedEvents) {
+    if (!isCollapsibleEvent(event.kind)) return false;
+    return askUserDefaultsOpen(event) ? collapsedState[event.id] === true : collapsedState[event.id] !== false;
+  }
+
+  function toggleTranscriptEvent(event: UiTranscriptEvent) {
+    setCollapsedEvents((current) => ({ ...current, [event.id]: !transcriptEventCollapsed(event, current) }));
   }
 
   function toggleWorkspaceGroup(workspaceKey: string) {
     setCollapsedWorkspaces((current) => ({ ...current, [workspaceKey]: !current[workspaceKey] }));
+  }
+
+  function handleWorkspaceDragStart(event: SidebarDragEvent, workspaceKey: string) {
+    setDraggingWorkspaceKey(workspaceKey);
+    event.dataTransfer!.effectAllowed = "move";
+    event.dataTransfer!.setData("text/plain", workspaceKey);
+  }
+
+  function handleWorkspaceDrop(event: SidebarDragEvent, targetWorkspaceKey: string) {
+    event.preventDefault();
+    if (!draggingWorkspaceKey || draggingWorkspaceKey === targetWorkspaceKey) return;
+    setWorkspaceOrder(moveOrderedKey(workspaceGroups.map((group) => group.key), draggingWorkspaceKey, targetWorkspaceKey));
+    setDraggingWorkspaceKey("");
+  }
+
+  function handleSessionDragStart(event: SidebarDragEvent, workspaceKey: string, sessionId: string) {
+    event.stopPropagation();
+    setDraggingSession({ workspaceKey, sessionId });
+    event.dataTransfer!.effectAllowed = "move";
+    event.dataTransfer!.setData("text/plain", sessionId);
+  }
+
+  function handleSessionDrop(event: SidebarDragEvent, workspaceKey: string, targetSessionId: string) {
+    if (!draggingSession) return;
+    event.preventDefault();
+    event.stopPropagation();
+    if (draggingSession.workspaceKey !== workspaceKey || draggingSession.sessionId === targetSessionId) return;
+    const group = workspaceGroups.find((item) => item.key === workspaceKey);
+    if (!group) return;
+    const nextOrder = moveOrderedKey(group.sessions.map((session) => session.session_id), draggingSession.sessionId, targetSessionId);
+    setSessionOrderByWorkspace((current) => ({ ...current, [workspaceKey]: nextOrder }));
+    setDraggingSession(null);
+  }
+
+  function openSessionContextMenu(event: SidebarContextMenuEvent, session: SessionSummary) {
+    event.preventDefault();
+    event.stopPropagation();
+    setSessionContextMenu({ sessionId: session.session_id, x: event.clientX, y: event.clientY });
+  }
+
+  function focusSidebarSession(sessionId: string) {
+    setSessionContextMenu(null);
+    if (selectedSessionRef.current !== sessionId) selectSession(sessionId);
   }
 
   function pushToast(text: string) {
@@ -1163,6 +1145,7 @@ export function App() {
       if (selectedSessionRef.current !== sessionId) return;
       const items = normalizeQueueItems(response);
       setQueueItems(items);
+      setQueueLen(items.length);
       setQueueDrafts(Object.fromEntries(items.map((item) => [item.id, item.text])));
     } catch (error) {
       setErrorText(error instanceof Error ? error.message : "Unable to load queue");
@@ -1266,7 +1249,8 @@ export function App() {
     const sessionId = selectedSessionRef.current;
     const text = composerText.trim();
     if (!text || !sessionId) return;
-    const shouldQueue = Boolean(busy || selectedSession?.busy);
+    const shouldQueue = composerSessionBusy && busySubmitMode === "queue";
+    const shouldInterrupt = composerSessionBusy && busySubmitMode === "interrupt";
     let localEvent: UiTranscriptEvent | null = null;
     setComposerText("");
     setSending(true);
@@ -1288,13 +1272,15 @@ export function App() {
         const response = await api.enqueueMessage(sessionId, text);
         setQueueLen(Number(response.queue_len || queueLen + 1));
         pushToast(`Queued${response.queue_len ? ` (${response.queue_len})` : ""}`);
+        void loadQueue(sessionId);
         await refreshSessions();
       } else {
+        if (shouldInterrupt) await api.interrupt(sessionId);
         await api.sendMessage(sessionId, text);
         if (localEvent) {
           setTranscript((current) => current.map((event) => (event.id === localEvent.id ? { ...event, meta: "sent" } : event)));
         }
-        pushToast("Sent");
+        pushToast(shouldInterrupt ? "Interrupted and sent" : "Sent");
       }
       fastPollUntilRef.current = Date.now() + 5000;
       schedulePoll(0);
@@ -1310,10 +1296,26 @@ export function App() {
     }
   }
 
-  async function handleCloseSession() {
+  async function handleAskUserRespond(event: UiTranscriptEvent, text: string) {
     const sessionId = selectedSessionRef.current;
+    if (!sessionId) throw new Error("No session selected");
+    await api.sendMessage(sessionId, text);
+    fastPollUntilRef.current = Date.now() + 5000;
+    schedulePoll(0);
+    pushToast(event.askQuestion ? "Answer sent" : "Response sent");
+  }
+
+  function handleComposerKeyDown(event: KeyboardEvent) {
+    if (event.key !== "Enter" || event.shiftKey || event.isComposing) return;
+    event.preventDefault();
+    void handleSend();
+  }
+
+  async function handleCloseSession(targetSession = selectedSession) {
+    const sessionId = targetSession?.session_id || selectedSessionRef.current;
     if (!sessionId || closingSession) return;
-    if (!window.confirm(`Close ${sessionDisplayName(selectedSession)}?`)) return;
+    if (!window.confirm(`Close ${sessionDisplayName(targetSession || selectedSession)}?`)) return;
+    setSessionContextMenu(null);
     setClosingSession(true);
     try {
       await api.deleteSession(sessionId);
@@ -1334,8 +1336,7 @@ export function App() {
     if (!selectedSessionRef.current) return;
     const text = composerText.trim();
     if (!text) {
-      setQueueOpen(true);
-      void loadQueue(selectedSessionRef.current);
+      openQueueModal();
       return;
     }
     try {
@@ -1350,13 +1351,21 @@ export function App() {
     }
   }
 
-  async function handleInterrupt() {
+  function openQueueModal() {
     if (!selectedSessionRef.current) return;
+    setQueueOpen(true);
+    void loadQueue(selectedSessionRef.current);
+  }
+
+  async function handleInterrupt(targetSession = selectedSession) {
+    const sessionId = targetSession?.session_id || selectedSessionRef.current;
+    if (!sessionId) return;
+    setSessionContextMenu(null);
     try {
-      await api.interrupt(selectedSessionRef.current);
+      await api.interrupt(sessionId);
       fastPollUntilRef.current = Date.now() + 4000;
       pushToast("Interrupt sent");
-      schedulePoll(0);
+      if (selectedSessionRef.current === sessionId) schedulePoll(0);
     } catch (error) {
       setErrorText(error instanceof Error ? error.message : "Unable to interrupt session");
     }
@@ -1384,15 +1393,17 @@ export function App() {
     setTranscript([]);
   }
 
-  function openRenameDialog() {
-    if (!selectedSession) return;
-    setRenameName(String(selectedSession.alias || sessionDisplayName(selectedSession) || ""));
+  function openRenameDialog(targetSession = selectedSession) {
+    if (!targetSession) return;
+    setRenameSessionId(targetSession.session_id);
+    setRenameName(String(targetSession.alias || sessionDisplayName(targetSession) || ""));
     setRenameError("");
+    setSessionContextMenu(null);
     setRenameOpen(true);
   }
 
   async function handleRenameSession() {
-    const sessionId = selectedSessionRef.current;
+    const sessionId = renameSessionId || selectedSessionRef.current;
     if (!sessionId) return;
     setRenameBusy(true);
     try {
@@ -1403,6 +1414,7 @@ export function App() {
       );
       await refreshSessions({ preserveSelection: true });
       setRenameOpen(false);
+      setRenameSessionId("");
       pushToast(name ? "Session renamed" : "Session name cleared");
     } catch (error) {
       setRenameError(error instanceof Error ? error.message : "Unable to rename session");
@@ -1514,19 +1526,58 @@ export function App() {
 
   async function loadVoiceAndNotifications() {
     setVoiceSettingsLoading(true);
+    setSettingsLoadError("");
     try {
-      const [voice, notifications] = await Promise.all([api.fetchVoiceSettings(), api.fetchNotificationSubscriptions()]);
-      setVoiceSettings(voice);
-      setVoiceBaseUrl(String(voice.tts_base_url || ""));
-      setVoiceApiKey(String(voice.tts_api_key || ""));
-      setVoiceNarrationEnabled(Boolean(voice.tts_enabled_for_narration));
-      setNotificationSnapshot(notifications);
-      await syncMobilePushState(notifications, voice.notifications.vapid_public_key);
-      setErrorText("");
-    } catch (error) {
-      setErrorText(error instanceof Error ? error.message : "Unable to load settings");
+      const [voiceResult, notificationsResult, configResult] = await Promise.allSettled([
+        api.fetchVoiceSettings(),
+        api.fetchNotificationSubscriptions(),
+        api.fetchCodexConfig(),
+      ]);
+      const errors: string[] = [];
+      let loadedVoice: VoiceSettingsResponse | null = null;
+      let loadedNotifications: NotificationSubscriptionsResponse | null = null;
+
+      if (voiceResult.status === "fulfilled") {
+        loadedVoice = voiceResult.value;
+        setVoiceSettings(loadedVoice);
+        setVoiceBaseUrl(String(loadedVoice.tts_base_url || ""));
+        setVoiceApiKey(String(loadedVoice.tts_api_key || ""));
+        setVoiceNarrationEnabled(Boolean(loadedVoice.tts_enabled_for_narration));
+      } else {
+        errors.push(voiceResult.reason instanceof Error ? voiceResult.reason.message : "Unable to load voice settings");
+      }
+
+      if (notificationsResult.status === "fulfilled") {
+        loadedNotifications = notificationsResult.value;
+        setNotificationSnapshot(loadedNotifications);
+      } else {
+        errors.push(notificationsResult.reason instanceof Error ? notificationsResult.reason.message : "Unable to load notification settings");
+      }
+
+      if (configResult.status === "fulfilled") {
+        setCodexConfig(configResult.value);
+        setCodexConfigText(String(configResult.value.text || ""));
+      } else {
+        errors.push(configResult.reason instanceof Error ? configResult.reason.message : "Unable to load config.toml");
+      }
+
+      if (loadedVoice && loadedNotifications) {
+        void syncMobilePushState(loadedNotifications, loadedVoice.notifications.vapid_public_key);
+      }
+      setSettingsLoadError(errors.join(" · "));
+      setErrorText(errors.length ? errors[0] : "");
     } finally {
       setVoiceSettingsLoading(false);
+    }
+  }
+
+  async function reloadCodexConfig() {
+    try {
+      const config = await api.fetchCodexConfig();
+      setCodexConfig(config);
+      setCodexConfigText(String(config.text || ""));
+    } catch (error) {
+      setErrorText(error instanceof Error ? error.message : "Unable to reload config.toml");
     }
   }
 
@@ -1545,6 +1596,20 @@ export function App() {
       setErrorText(error instanceof Error ? error.message : "Unable to save voice settings");
     } finally {
       setVoiceSettingsSaving(false);
+    }
+  }
+
+  async function saveCodexConfig() {
+    setCodexConfigSaving(true);
+    try {
+      const saved = await api.saveCodexConfig(codexConfigText);
+      setCodexConfig(saved);
+      setCodexConfigText(String(saved.text || ""));
+      pushToast("config.toml saved");
+    } catch (error) {
+      setErrorText(error instanceof Error ? error.message : "Unable to save config.toml");
+    } finally {
+      setCodexConfigSaving(false);
     }
   }
 
@@ -1674,8 +1739,34 @@ export function App() {
   }, [showTools]);
 
   useEffect(() => {
+    writeLocalStorage(BUSY_SUBMIT_MODE_KEY, busySubmitMode);
+  }, [busySubmitMode]);
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = themeMode;
+    writeLocalStorage(THEME_MODE_KEY, themeMode === "light" ? "light" : null);
+  }, [themeMode]);
+
+  useEffect(() => {
+    writeLocalStorage(SIDEBAR_WORKSPACE_ORDER_KEY, JSON.stringify(workspaceOrder));
+  }, [workspaceOrder]);
+
+  useEffect(() => {
+    writeLocalStorage(SIDEBAR_SESSION_ORDER_KEY, JSON.stringify(sessionOrderByWorkspace));
+  }, [sessionOrderByWorkspace]);
+
+  useEffect(() => {
     writeLocalStorage(DESKTOP_NOTIFICATIONS_KEY, desktopNotificationsEnabled ? "1" : null);
   }, [desktopNotificationsEnabled]);
+
+  useEffect(() => {
+    if (!selectedSessionId || queueLen <= 0) {
+      setQueueItems([]);
+      setQueueDrafts({});
+      return;
+    }
+    void loadQueue(selectedSessionId);
+  }, [selectedSessionId, queueLen]);
 
   useEffect(() => {
     let cancelled = false;
@@ -1797,7 +1888,7 @@ export function App() {
 
   return (
     <>
-      <div className={`app${showFilesPanel || showDetailsPanel ? " withRail" : ""}`}>
+      <div className={`app${showFilesPanel || showDetailsPanel ? " withRail" : ""}${sidebarCollapsed ? " sidebarCollapsed" : ""}`} onClick={() => setSessionContextMenu(null)}>
         <aside className="sidebar">
           <header>
             <div className="title">
@@ -1840,7 +1931,15 @@ export function App() {
               const hasSelected = group.sessions.some((session) => session.session_id === selectedSessionId);
               const collapsed = Boolean(collapsedWorkspaces[group.key] && !hasSelected);
               return (
-                <section key={group.key} className={`workspaceGroup${hasSelected ? " active" : ""}`}>
+                <section
+                  key={group.key}
+                  className={`workspaceGroup${hasSelected ? " active" : ""}${draggingWorkspaceKey === group.key ? " is-dragging" : ""}`}
+                  draggable
+                  onDragStart={(event) => handleWorkspaceDragStart(event, group.key)}
+                  onDragOver={(event) => event.preventDefault()}
+                  onDrop={(event) => handleWorkspaceDrop(event, group.key)}
+                  onDragEnd={() => setDraggingWorkspaceKey("")}
+                >
                   <button className="workspaceGroupHeader" type="button" onClick={() => toggleWorkspaceGroup(group.key)} aria-expanded={!collapsed}>
                     <span className="workspaceDisclosure">{collapsed ? "▸" : "▾"}</span>
                     <span className="workspaceGroupText">
@@ -1858,7 +1957,17 @@ export function App() {
                       {group.sessions.map((session) => (
                         <button
                           key={session.session_id}
-                          className={`workspace${selectedSessionId === session.session_id ? " active" : ""}`}
+                          className={`workspace${selectedSessionId === session.session_id ? " active" : ""}${draggingSession?.sessionId === session.session_id ? " is-dragging" : ""}`}
+                          draggable
+                          onDragStart={(event) => handleSessionDragStart(event, group.key, session.session_id)}
+                          onDragOver={(event) => {
+                            if (!draggingSession) return;
+                            event.preventDefault();
+                            event.stopPropagation();
+                          }}
+                          onDrop={(event) => handleSessionDrop(event, group.key, session.session_id)}
+                          onDragEnd={() => setDraggingSession(null)}
+                          onContextMenu={(event) => openSessionContextMenu(event, session)}
                           onClick={() => selectSession(session.session_id)}
                         >
                           <div className="workspaceHeader">
@@ -1882,10 +1991,6 @@ export function App() {
             })}
           </div>
           <footer>
-            <button type="button" onClick={() => setHelpOpen(true)}>
-              {icon("help")}
-              Help
-            </button>
             <button type="button" onClick={() => setSettingsOpen(true)}>
               {icon("settings")}
               Settings
@@ -1900,7 +2005,13 @@ export function App() {
         <div className="main">
           <div className="topbar">
             <div className="pill">
-              <button className="icon-btn" type="button" title="Sidebar structure now follows the legacy station" disabled>
+              <button
+                className="icon-btn"
+                type="button"
+                title={sidebarCollapsed ? "Show sidebar" : "Hide sidebar"}
+                aria-pressed={sidebarCollapsed}
+                onClick={() => setSidebarCollapsed((current) => !current)}
+              >
                 {icon("menu")}
               </button>
               <div className="titleWrap">
@@ -1995,63 +2106,17 @@ export function App() {
                     </button>
                   ) : null}
                   {visibleTranscript.map((event, index) => {
-                    const collapsible = isCollapsibleEvent(event.kind);
-                    const collapsed = Boolean(collapsible && collapsedEvents[event.id] !== false);
-                    const showMessageSide = shouldShowMessageSide(visibleTranscript, index);
-                    const showMessageFooter = shouldShowMessageFooter(visibleTranscript, index, collapsible);
+                    const collapsed = transcriptEventCollapsed(event);
                     return (
-                      <article
+                      <TranscriptEventRow
                         key={event.id}
-                        className={`msg ${eventClassName(event.kind)}${collapsible ? " is-collapsible" : ""}${collapsed ? " is-collapsed" : ""}`}
-                        role={collapsible ? "button" : undefined}
-                        tabIndex={collapsible ? 0 : undefined}
-                        aria-expanded={collapsible ? !collapsed : undefined}
-                        onClick={collapsible ? () => toggleTranscriptEvent(event.id) : undefined}
-                        onKeyDown={
-                          collapsible
-                            ? (keyEvent) => {
-                                if (keyEvent.key === "Enter" || keyEvent.key === " ") {
-                                  keyEvent.preventDefault();
-                                  toggleTranscriptEvent(event.id);
-                                }
-                              }
-                            : undefined
-                        }
-                      >
-                        <div className={`message-side${showMessageSide && !collapsible ? "" : " is-hidden"}`}>
-                          {showMessageSide && !collapsible ? (
-                            <>
-                              <span className="message-kind">{event.title || event.kind.replace("_", " ")}</span>
-                            </>
-                          ) : null}
-                        </div>
-                        <div className="message-main">
-                          {collapsed ? (
-                            <div className="message-inline">
-                              <span className="message-kind">{event.title || event.kind.replace("_", " ")}</span>
-                              <span className="message-fold" aria-label="Show details" title="Show details" />
-                              <span className="message-summary">{eventTextPreview(event) || "No details"}</span>
-                            </div>
-                          ) : (
-                            <>
-                              {collapsible ? (
-                                <div className="message-inline is-open">
-                                  <span className="message-kind">{event.title || event.kind.replace("_", " ")}</span>
-                                  <span className="message-fold is-open" aria-label="Hide details" title="Hide details" />
-                                </div>
-                              ) : null}
-                              {event.body ? <PretextParagraph text={event.body} className="message-body" /> : null}
-                              {collapsible && event.meta ? <div className="message-meta">{event.meta}</div> : null}
-                              {showMessageFooter ? (
-                                <div className="message-footer">
-                                  {event.meta ? <span className="message-meta">{event.meta}</span> : null}
-                                  {event.ts ? <span className="message-time">{formatTime(event.ts)}</span> : null}
-                                </div>
-                              ) : null}
-                            </>
-                          )}
-                        </div>
-                      </article>
+                        event={event}
+                        events={visibleTranscript}
+                        index={index}
+                        collapsed={collapsed}
+                        onToggle={toggleTranscriptEvent}
+                        onAskUserRespond={handleAskUserRespond}
+                      />
                     );
                   })}
                   {!visibleTranscript.length ? <div className="emptyState">No transcript yet for this session.</div> : null}
@@ -2160,6 +2225,24 @@ export function App() {
           </div>
 
           <div className="composer">
+            {queueLen > 0 ? (
+              <button className="queuePreview" type="button" onClick={() => openQueueModal()}>
+                <span className="queuePreviewHeader">
+                  <span>Queued messages</span>
+                  <span>{queueLoading ? "loading" : `${queueLen}`}</span>
+                </span>
+                <span className="queuePreviewList">
+                  {queuePreviewItems.map((item, index) => (
+                    <span className="queuePreviewItem" key={item.id}>
+                      <span>{index + 1}</span>
+                      <span>{item.text}</span>
+                    </span>
+                  ))}
+                  {!queuePreviewItems.length ? <span className="queuePreviewEmpty">Loading queued messages...</span> : null}
+                  {queueLen > queuePreviewItems.length ? <span className="queuePreviewMore">+{queueLen - queuePreviewItems.length} more</span> : null}
+                </span>
+              </button>
+            ) : null}
             <form
               onSubmit={(event) => {
                 event.preventDefault();
@@ -2183,20 +2266,98 @@ export function App() {
                   ref={composerInputRef}
                   value={composerText}
                   onInput={(event) => setComposerText((event.currentTarget as HTMLTextAreaElement).value)}
+                  onKeyDown={handleComposerKeyDown}
                   aria-label="Enter your instructions here"
                 />
                 {!composerText ? <div className="ph">Enter your instructions here</div> : null}
               </div>
+              {composerSessionBusy ? (
+                <div className="composerMode" role="group" aria-label="Busy send mode">
+                  <button
+                    className={`modeBtn${busySubmitMode === "queue" ? " active" : ""}`}
+                    type="button"
+                    aria-pressed={busySubmitMode === "queue"}
+                    title="Queue while session is working"
+                    onClick={() => setBusySubmitMode("queue")}
+                  >
+                    {icon("queue")}
+                    <span>Queue</span>
+                  </button>
+                  <button
+                    className={`modeBtn${busySubmitMode === "interrupt" ? " active" : ""}`}
+                    type="button"
+                    aria-pressed={busySubmitMode === "interrupt"}
+                    title="Interrupt current work before sending"
+                    onClick={() => setBusySubmitMode("interrupt")}
+                  >
+                    {icon("stop")}
+                    <span>Interrupt</span>
+                  </button>
+                </div>
+              ) : null}
               <button className="icon-btn" type="button" title="Queued messages" onClick={() => void handleQueueAction()}>
                 {icon("queue")}
               </button>
-              <button className="icon-btn primary" type="submit" title={sending ? "Sending…" : "Send"} disabled={sending || !selectedSessionId}>
+              <button
+                className="icon-btn primary"
+                type="submit"
+                title={sending ? "Sending…" : composerSessionBusy && busySubmitMode === "queue" ? "Queue" : composerSessionBusy ? "Interrupt and send" : "Send"}
+                disabled={sending || !selectedSessionId}
+              >
                 {icon("send")}
               </button>
             </form>
           </div>
         </div>
       </div>
+
+      {sessionContextMenu && contextMenuSession ? (
+        <div
+          className="sessionContextMenu"
+          style={{ left: `${sessionContextMenu.x}px`, top: `${sessionContextMenu.y}px` }}
+          onClick={(event) => event.stopPropagation()}
+          onContextMenu={(event) => event.preventDefault()}
+        >
+          <button type="button" onClick={() => openRenameDialog(contextMenuSession)}>
+            Rename
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              focusSidebarSession(contextMenuSession.session_id);
+              setShowDetailsPanel(true);
+            }}
+          >
+            Details
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              focusSidebarSession(contextMenuSession.session_id);
+              setShowFilesPanel(true);
+            }}
+          >
+            Files
+          </button>
+          <button type="button" onClick={() => void handleInterrupt(contextMenuSession)}>
+            Interrupt
+          </button>
+          <button
+            type="button"
+            disabled={!tmuxAttachCommandForSession(contextMenuSession)}
+            onClick={async () => {
+              await copyToClipboard(tmuxAttachCommandForSession(contextMenuSession));
+              setSessionContextMenu(null);
+              pushToast("tmux command copied");
+            }}
+          >
+            Copy tmux command
+          </button>
+          <button className="dangerText" type="button" onClick={() => void handleCloseSession(contextMenuSession)}>
+            Close session
+          </button>
+        </div>
+      ) : null}
 
       {newSessionOpen ? (
         <div className="modalBackdrop" onClick={() => setNewSessionOpen(false)}>
@@ -2360,7 +2521,7 @@ export function App() {
                 <input
                   value={renameName}
                   onInput={(event) => setRenameName((event.currentTarget as HTMLInputElement).value)}
-                  placeholder={selectedSession ? sessionDisplayName(selectedSession) : "Session name"}
+                  placeholder={renameTargetSession ? sessionDisplayName(renameTargetSession) : "Session name"}
                   autoFocus
                 />
               </label>
@@ -2378,41 +2539,6 @@ export function App() {
         </div>
       ) : null}
 
-      {helpOpen ? (
-        <div className="modalBackdrop" onClick={() => setHelpOpen(false)}>
-          <div className="modalCard" onClick={(event) => event.stopPropagation()}>
-            <div className="modalHeader">
-              <div>Help</div>
-              <button className="icon-btn" type="button" onClick={() => setHelpOpen(false)}>
-                {icon("info")}
-              </button>
-            </div>
-            <div className="helpGrid">
-              <section>
-                <div className="detailSectionHeader">Sending</div>
-                <p>Use Send for an immediate prompt. Use the queue button to enqueue text or edit queued messages while a session is busy.</p>
-              </section>
-              <section>
-                <div className="detailSectionHeader">Attachments</div>
-                <p>The paperclip uploads a file to the selected session and injects an attachment line into the tmux/broker input.</p>
-              </section>
-              <section>
-                <div className="detailSectionHeader">Tool Calls</div>
-                <p>The wrench button toggles tool, tool result, and ask-user events without hiding normal user or assistant messages.</p>
-              </section>
-              <section>
-                <div className="detailSectionHeader">Harness</div>
-                <p>Harness mode automatically injects a configured request after idle periods until the remaining injection budget reaches zero.</p>
-              </section>
-              <section>
-                <div className="detailSectionHeader">Notifications</div>
-                <p>Desktop notifications poll the server feed in this browser. Mobile push uses the service worker and server-side web-push subscription.</p>
-              </section>
-            </div>
-          </div>
-        </div>
-      ) : null}
-
       {settingsOpen ? (
         <div className="modalBackdrop" onClick={() => setSettingsOpen(false)}>
           <div className="modalCard" onClick={(event) => event.stopPropagation()}>
@@ -2422,10 +2548,27 @@ export function App() {
                 {icon("info")}
               </button>
             </div>
-            {voiceSettingsLoading || !voiceSettings ? (
+            {settingsInitialLoading ? (
               <div className="muted">Loading settings…</div>
             ) : (
               <div className="formGrid">
+                {settingsLoadError ? (
+                  <div className="error-inline">
+                    {settingsLoadError}
+                    <button className="secondaryBtn inlineRetry" type="button" onClick={() => void loadVoiceAndNotifications()}>
+                      Retry
+                    </button>
+                  </div>
+                ) : null}
+                <div className="detailSectionHeader">Appearance</div>
+                <div className="themePicker" role="group" aria-label="Theme">
+                  <button className={`themeChoice${themeMode === "dark" ? " active" : ""}`} type="button" onClick={() => setThemeMode("dark")}>
+                    Dark
+                  </button>
+                  <button className={`themeChoice${themeMode === "light" ? " active" : ""}`} type="button" onClick={() => setThemeMode("light")}>
+                    Light
+                  </button>
+                </div>
                 <div className="detailSectionHeader">Voice</div>
                 <label className="field">
                   <span>TTS base URL</span>
@@ -2449,7 +2592,7 @@ export function App() {
                   <span>Narration announcements</span>
                 </label>
                 <div className="muted">
-                  Stream: {voiceSettings.audio.stream_url} · listeners {voiceSettings.audio.active_listener_count} · queued {voiceSettings.audio.queue_depth}
+                  Stream: {displayedVoiceSettings.audio.stream_url || "-"} · listeners {displayedVoiceSettings.audio.active_listener_count} · queued {displayedVoiceSettings.audio.queue_depth}
                 </div>
                 <div className="detailSectionHeader">Notifications</div>
                 <label className="toggleRow">
@@ -2471,7 +2614,7 @@ export function App() {
                   <span>Desktop notifications</span>
                 </label>
                 <div className="muted">
-                  Server subscriptions: {notificationSnapshot?.subscriptions.length || 0} · enabled devices {voiceSettings.notifications.enabled_devices}
+                  Server subscriptions: {notificationSnapshot?.subscriptions.length || 0} · enabled devices {displayedVoiceSettings.notifications.enabled_devices}
                 </div>
                 <label className="toggleRow">
                   <input
@@ -2491,6 +2634,20 @@ export function App() {
                 </label>
                 <div className="muted">
                   Current push endpoint: {mobilePushEndpoint ? "registered" : "not registered"}
+                </div>
+                <div className="detailSectionHeader">Codex config.toml</div>
+                <div className="settingsPath">{codexConfig?.path || "config.toml"}</div>
+                <label className="field">
+                  <span>config.toml</span>
+                  <textarea className="configTextarea" value={codexConfigText} onInput={(event) => setCodexConfigText((event.currentTarget as HTMLTextAreaElement).value)} spellcheck={false} />
+                </label>
+                <div className="configActions">
+                  <button className="secondaryBtn" type="button" onClick={() => void reloadCodexConfig()}>
+                    Reload
+                  </button>
+                  <button className="secondaryBtn" type="button" disabled={codexConfigSaving} onClick={() => void saveCodexConfig()}>
+                    {codexConfigSaving ? "Saving…" : "Save config.toml"}
+                  </button>
                 </div>
                 <div className="modalActions">
                   <button className="secondaryBtn" type="button" onClick={() => setSettingsOpen(false)}>

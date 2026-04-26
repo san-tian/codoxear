@@ -1,5 +1,6 @@
 import type {
   ChangedFilesResponse,
+  CodexConfigResponse,
   DiagnosticsResponse,
   FileReadResponse,
   FileSearchResponse,
@@ -189,6 +190,15 @@ export const api = {
     return readJson<VoiceSettingsResponse>("/api/settings/voice", {
       method: "POST",
       body: JSON.stringify(payload),
+    });
+  },
+  fetchCodexConfig(): Promise<CodexConfigResponse> {
+    return readJson<CodexConfigResponse>("/api/settings/codex_config");
+  },
+  saveCodexConfig(text: string): Promise<CodexConfigResponse> {
+    return readJson<CodexConfigResponse>("/api/settings/codex_config", {
+      method: "POST",
+      body: JSON.stringify({ text }),
     });
   },
   fetchNotificationSubscriptions(): Promise<NotificationSubscriptionsResponse> {

@@ -23,6 +23,8 @@ from .voice_push import ClassifiedAssistantMessage
 
 _OAI_MEM_CITATION_TAIL_RE = re.compile(r"\s*<oai-mem-citation>\s*.*?</oai-mem-citation>\s*\Z", re.DOTALL)
 _ASK_USER_TOOL_NAMES = {"ask_user", "AskUserQuestion"}
+_EXTENSION_DISPLAY_KEY = "codoxear_display"
+_EXTENSION_DISPLAY_TOOL_NAMES = {"codoxear_display", "codoxear.display"}
 
 
 @dataclass(frozen=True)
@@ -189,11 +191,144 @@ def _tool_call_summary(name: str, args: dict[str, Any]) -> str | None:
                 if question is not None:
                     return question
         return None
-    for key in ("command", "query", "prompt", "path", "file_path", "url", "subject"):
+    for key in ("cmd", "command", "query", "prompt", "path", "file_path", "url", "subject"):
         value = _non_empty_string(args.get(key))
         if value is not None:
             return value
     return None
+
+
+def _extension_item(item: Any) -> dict[str, Any] | None:
+    if isinstance(item, str) and item.strip():
+        return {"label": item.strip()}
+    if not isinstance(item, dict):
+        return None
+    label = _non_empty_string(item.get("label")) or _non_empty_string(item.get("step")) or _non_empty_string(item.get("title"))
+    if label is None:
+        return None
+    out: dict[str, Any] = {"label": label}
+    status = _non_empty_string(item.get("status"))
+    detail = _non_empty_string(item.get("detail")) or _non_empty_string(item.get("summary"))
+    if status is not None:
+        out["status"] = status
+    if detail is not None:
+        out["detail"] = detail
+    return out
+
+
+def _normalize_extension_items(items: Any) -> list[dict[str, Any]]:
+    if not isinstance(items, list):
+        return []
+    return [item for item in (_extension_item(raw) for raw in items) if item is not None]
+
+
+def _number_field(value: Any) -> int | float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return value
+    return None
+
+
+def _extension_display_event(
+    payload: dict[str, Any],
+    *,
+    call_id: str | None,
+    ts: float,
+    default_source: str,
+    default_title: str,
+) -> dict[str, Any]:
+    progress = payload.get("progress")
+    progress = progress if isinstance(progress, dict) else {}
+    event: dict[str, Any] = {
+        "type": "extension",
+        "extension_kind": _non_empty_string(payload.get("kind")) or "status",
+        "source": _non_empty_string(payload.get("source")) or default_source,
+        "title": _non_empty_string(payload.get("title")) or default_title,
+        "ts": float(ts),
+    }
+    if call_id is not None:
+        event["tool_call_id"] = call_id
+    for source_key, event_key in (
+        ("status", "status"),
+        ("summary", "summary"),
+        ("text", "text"),
+    ):
+        value = _non_empty_string(payload.get(source_key))
+        if value is not None:
+            event[event_key] = value
+    current = _number_field(progress.get("current"))
+    total = _number_field(progress.get("total"))
+    if current is None:
+        current = _number_field(payload.get("progress_current"))
+    if total is None:
+        total = _number_field(payload.get("progress_total"))
+    if current is not None:
+        event["progress_current"] = current
+    if total is not None:
+        event["progress_total"] = total
+    label = _non_empty_string(progress.get("label")) or _non_empty_string(payload.get("progress_label"))
+    if label is not None:
+        event["progress_label"] = label
+    items = _normalize_extension_items(payload.get("items"))
+    if items:
+        event["items"] = items
+    return event
+
+
+def _plan_status(items: list[dict[str, Any]]) -> str:
+    statuses = [str(item.get("status") or "").strip() for item in items]
+    if any(status == "in_progress" for status in statuses):
+        return "running"
+    if statuses and all(status == "completed" for status in statuses):
+        return "completed"
+    return "pending"
+
+
+def _update_plan_event(args: dict[str, Any], *, call_id: str | None, ts: float) -> dict[str, Any] | None:
+    items = _normalize_extension_items(args.get("plan"))
+    if not items:
+        return None
+    completed = sum(1 for item in items if item.get("status") == "completed")
+    total = len(items)
+    return _extension_display_event(
+        {
+            "kind": "progress",
+            "source": "codex",
+            "title": "Todo",
+            "status": _plan_status(items),
+            "summary": f"{completed}/{total} completed",
+            "progress": {"current": completed, "total": total, "label": "items"},
+            "items": items,
+        },
+        call_id=call_id,
+        ts=ts,
+        default_source="codex",
+        default_title="Todo",
+    )
+
+
+def _extension_event_from_tool(
+    name: str,
+    args: dict[str, Any],
+    *,
+    call_id: str | None,
+    ts: float,
+) -> dict[str, Any] | None:
+    if name == "update_plan":
+        return _update_plan_event(args, call_id=call_id, ts=ts)
+    payload = args.get(_EXTENSION_DISPLAY_KEY)
+    if name in _EXTENSION_DISPLAY_TOOL_NAMES:
+        payload = args
+    if not isinstance(payload, dict):
+        return None
+    return _extension_display_event(
+        payload,
+        call_id=call_id,
+        ts=ts,
+        default_source=name,
+        default_title=name,
+    )
 
 
 def _normalized_bool_arg(
@@ -417,6 +552,10 @@ def _single_chat_event(obj: dict[str, Any]) -> dict[str, Any] | None:
                     if ets is None:
                         return None
                     return _ask_user_event(args, call_id=call_id, ts=ets, resolved=False)
+                if ets is not None:
+                    extension_event = _extension_event_from_tool(name, args, call_id=call_id, ts=ets)
+                    if extension_event is not None:
+                        return extension_event
                 ev: dict[str, Any] = {"type": "tool", "name": name}
                 if ets is not None:
                     ev["ts"] = ets
@@ -488,6 +627,10 @@ def _single_chat_event(obj: dict[str, Any]) -> dict[str, Any] | None:
                 if ets is None:
                     return None
                 return _ask_user_event(args, call_id=call_id, ts=ets, resolved=False)
+            if ets is not None:
+                extension_event = _extension_event_from_tool(name, args, call_id=call_id, ts=ets)
+                if extension_event is not None:
+                    return extension_event
             ev: dict[str, Any] = {"type": "tool", "name": name}
             if ets is not None:
                 ev["ts"] = ets
@@ -509,6 +652,10 @@ def _single_chat_event(obj: dict[str, Any]) -> dict[str, Any] | None:
             args = _coerce_tool_arguments(p.get("arguments"))
             if not args:
                 args = p
+            if ets is not None:
+                extension_event = _extension_event_from_tool(name, args, call_id=call_id, ts=ets)
+                if extension_event is not None:
+                    return extension_event
             ev = {"type": "tool", "name": name}
             if ets is not None:
                 ev["ts"] = ets
@@ -949,6 +1096,10 @@ def _extract_chat_events(
                             if call_id is not None:
                                 pending_ask_user_calls[call_id] = dict(event)
                             continue
+                        extension_event = _extension_event_from_tool(name, args, call_id=call_id, ts=ets)
+                        if extension_event is not None:
+                            events.append(extension_event)
+                            continue
                         event = {"type": "tool", "name": name, "ts": ets}
                         if call_id is not None:
                             event["tool_call_id"] = call_id
@@ -1096,6 +1247,10 @@ def _extract_chat_events(
                         if call_id is not None:
                             pending_ask_user_calls[call_id] = dict(event)
                     else:
+                        extension_event = _extension_event_from_tool(nm, args, call_id=call_id, ts=ets)
+                        if extension_event is not None:
+                            events.append(extension_event)
+                            continue
                         event = {"type": "tool", "name": nm, "ts": ets}
                         if call_id is not None:
                             event["tool_call_id"] = call_id
@@ -1122,6 +1277,10 @@ def _extract_chat_events(
                     args = _coerce_tool_arguments(p.get("arguments"))
                     if not args:
                         args = p
+                    extension_event = _extension_event_from_tool(name, args, call_id=call_id, ts=ets)
+                    if extension_event is not None:
+                        events.append(extension_event)
+                        continue
                     event = {"type": "tool", "name": name, "ts": ets}
                     if call_id is not None:
                         event["tool_call_id"] = call_id

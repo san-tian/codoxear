@@ -1,4 +1,5 @@
 import os
+import tomllib
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -8,7 +9,9 @@ from codoxear.server import _normalize_requested_model_provider
 from codoxear.server import _normalize_requested_preferred_auth_method
 from codoxear.server import _normalize_requested_service_tier
 from codoxear.server import _read_codex_launch_defaults
+from codoxear.server import _read_codex_config_for_settings
 from codoxear.server import _read_new_session_defaults
+from codoxear.server import _write_codex_config_for_settings
 from codoxear.server import _read_pi_launch_defaults
 
 
@@ -28,6 +31,27 @@ def _codex_launch_default_env(**values: str):
 
 
 class TestLaunchDefaults(unittest.TestCase):
+    def test_codex_config_settings_round_trip_raw_toml(self) -> None:
+        with TemporaryDirectory() as td:
+            config_path = Path(td) / "config.toml"
+            with patch("codoxear.server.CODEX_CONFIG_PATH", config_path):
+                missing = _read_codex_config_for_settings()
+                self.assertFalse(missing["exists"])
+                self.assertEqual(missing["text"], "")
+                saved = _write_codex_config_for_settings('model = "gpt-5.4"\n')
+                self.assertTrue(saved["exists"])
+                self.assertEqual(saved["path"], str(config_path))
+                self.assertEqual(saved["text"], 'model = "gpt-5.4"\n')
+                self.assertEqual(config_path.read_text(encoding="utf-8"), 'model = "gpt-5.4"\n')
+
+    def test_codex_config_settings_rejects_invalid_toml(self) -> None:
+        with TemporaryDirectory() as td:
+            config_path = Path(td) / "config.toml"
+            with patch("codoxear.server.CODEX_CONFIG_PATH", config_path):
+                with self.assertRaises(tomllib.TOMLDecodeError):
+                    _write_codex_config_for_settings("model = [\n")
+                self.assertFalse(config_path.exists())
+
     def test_read_codex_launch_defaults_includes_provider_list_and_service_tier(self) -> None:
         with TemporaryDirectory() as td:
             config_path = Path(td) / "config.toml"

@@ -106,8 +106,8 @@ export type RawChatEvent =
       tool_call_id?: string;
       question?: string;
       context?: string;
-      options?: string[];
-      questions?: Array<Record<string, unknown>>;
+      options?: AskUserOptionInput[];
+      questions?: AskUserQuestion[];
       header?: string;
       answer?: string | string[];
       allow_freeform?: boolean;
@@ -117,15 +117,85 @@ export type RawChatEvent =
       was_custom?: boolean;
       timeout_ms?: number;
       is_error?: boolean;
+    }
+  | {
+      type: "extension";
+      ts?: number;
+      extension_kind?: string;
+      source?: string;
+      title?: string;
+      status?: string;
+      summary?: string;
+      text?: string;
+      tool_call_id?: string;
+      progress_current?: number;
+      progress_total?: number;
+      progress_label?: string;
+      items?: TranscriptExtensionItem[];
     };
+
+export type TranscriptExtensionItem = {
+  label?: string;
+  status?: string;
+  detail?: string;
+};
+
+export type AskUserOptionInput =
+  | string
+  | {
+      label?: string;
+      value?: string;
+      title?: string;
+      description?: string;
+      preview?: string;
+    };
+
+export type AskUserQuestion = {
+  header?: string;
+  question?: string;
+  options?: AskUserOptionInput[];
+  allow_multiple?: boolean;
+  allowMultiple?: boolean;
+  multiSelect?: boolean;
+};
+
+export type AskUserOption = {
+  label: string;
+  value: string;
+  description: string;
+};
+
+export type UiAskUserQuestion = {
+  header: string;
+  question: string;
+  options: AskUserOption[];
+  allowMultiple: boolean;
+};
 
 export type UiTranscriptEvent = {
   id: string;
-  kind: "user" | "assistant" | "tool" | "tool_result" | "ask_user";
+  kind: "user" | "assistant" | "tool" | "tool_result" | "ask_user" | "extension";
   ts: number | null;
   title: string;
   body: string;
   meta: string;
+  extensionKind?: string;
+  source?: string;
+  status?: string;
+  summary?: string;
+  progressCurrent?: number;
+  progressTotal?: number;
+  progressLabel?: string;
+  items?: TranscriptExtensionItem[];
+  askQuestion?: string;
+  askContext?: string;
+  askOptions?: AskUserOption[];
+  askQuestions?: UiAskUserQuestion[];
+  askAnswer?: string | string[];
+  askAllowFreeform?: boolean;
+  askAllowMultiple?: boolean;
+  askResolved?: boolean;
+  askCancelled?: boolean;
 };
 
 export type TailResponse = {
@@ -220,6 +290,13 @@ export type VoiceSettingsResponse = {
     total_devices: number;
     vapid_public_key: string;
   };
+};
+
+export type CodexConfigResponse = {
+  ok: true;
+  path: string;
+  exists: boolean;
+  text: string;
 };
 
 export type NotificationSubscriptionsResponse = {
