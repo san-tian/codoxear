@@ -11,6 +11,10 @@ from codoxear.server import _match_session_route
 from codoxear.server import _nova_incremental_v1_path
 
 
+ROOT = Path(__file__).resolve().parents[1]
+SERVER_PY = ROOT / "codoxear" / "server.py"
+
+
 def _make_session(sid: str) -> Session:
     return Session(
         session_id=sid,
@@ -44,10 +48,14 @@ class TestServerQueuePersistence(unittest.TestCase):
         self.assertIsNone(_match_session_route("/api/sessions/s1/queue/delete", "delete"))
         self.assertEqual(_match_session_route("/api/sessions/s1/queue/delete", "queue", "delete"), "s1")
 
-    def test_nova_incremental_v1_path_only_rewrites_selected_get_routes(self) -> None:
+    def test_nova_incremental_v1_path_only_rewrites_selected_routes(self) -> None:
         self.assertEqual(
             _nova_incremental_v1_path("/api/sessions", "GET"),
-            None,
+            "/api/v1/sessions",
+        )
+        self.assertEqual(
+            _nova_incremental_v1_path("/api/sessions", "POST"),
+            "/api/v1/sessions",
         )
         self.assertEqual(
             _nova_incremental_v1_path("/api/sessions/s1/diagnostics", "GET"),
@@ -62,14 +70,107 @@ class TestServerQueuePersistence(unittest.TestCase):
             "/api/v1/sessions/s1/harness",
         )
         self.assertEqual(
+            _nova_incremental_v1_path("/api/sessions/s1/git/changed_files", "GET"),
+            "/api/v1/sessions/s1/git/changed_files",
+        )
+        self.assertEqual(
+            _nova_incremental_v1_path("/api/sessions/s1/git/diff", "GET"),
+            "/api/v1/sessions/s1/git/diff",
+        )
+        self.assertEqual(
+            _nova_incremental_v1_path("/api/sessions/s1/git/file_versions", "GET"),
+            "/api/v1/sessions/s1/git/file_versions",
+        )
+        self.assertEqual(
             _nova_incremental_v1_path("/api/sessions/s1/file/read", "GET"),
             "/api/v1/sessions/s1/file/read",
+        )
+        self.assertEqual(
+            _nova_incremental_v1_path("/api/sessions/s1/file/search", "GET"),
+            "/api/v1/sessions/s1/file/search",
         )
         self.assertEqual(
             _nova_incremental_v1_path("/api/sessions/s1/file/blob", "GET"),
             "/api/v1/sessions/s1/file/blob",
         )
-        self.assertIsNone(_nova_incremental_v1_path("/api/sessions/s1/harness", "POST"))
+        self.assertEqual(
+            _nova_incremental_v1_path("/api/sessions/s1/messages/tail", "GET"),
+            "/api/v1/sessions/s1/messages/tail",
+        )
+        self.assertEqual(
+            _nova_incremental_v1_path("/api/sessions/s1/messages/history", "GET"),
+            "/api/v1/sessions/s1/messages/history",
+        )
+        self.assertEqual(
+            _nova_incremental_v1_path("/api/sessions/s1/messages/live", "GET"),
+            "/api/v1/sessions/s1/messages/live",
+        )
+        self.assertEqual(
+            _nova_incremental_v1_path("/api/sessions/s1/rename", "POST"),
+            "/api/v1/sessions/s1/rename",
+        )
+        self.assertEqual(
+            _nova_incremental_v1_path("/api/sessions/s1/delete", "POST"),
+            "/api/v1/sessions/s1/delete",
+        )
+        self.assertEqual(
+            _nova_incremental_v1_path("/api/sessions/s1/edit", "POST"),
+            "/api/v1/sessions/s1/edit",
+        )
+        self.assertEqual(
+            _nova_incremental_v1_path("/api/sessions/s1/inject_file", "POST"),
+            "/api/v1/sessions/s1/inject_file",
+        )
+        self.assertEqual(
+            _nova_incremental_v1_path("/api/sessions/s1/inject_image", "POST"),
+            "/api/v1/sessions/s1/inject_image",
+        )
+        self.assertEqual(
+            _nova_incremental_v1_path("/api/sessions/s1/send", "POST"),
+            "/api/v1/sessions/s1/send",
+        )
+        self.assertEqual(
+            _nova_incremental_v1_path("/api/sessions/s1/interrupt", "POST"),
+            "/api/v1/sessions/s1/interrupt",
+        )
+        self.assertEqual(
+            _nova_incremental_v1_path("/api/sessions/s1/enqueue", "POST"),
+            "/api/v1/sessions/s1/enqueue",
+        )
+        self.assertEqual(
+            _nova_incremental_v1_path("/api/sessions/s1/harness", "POST"),
+            "/api/v1/sessions/s1/harness",
+        )
+        self.assertEqual(
+            _nova_incremental_v1_path("/api/sessions/s1/queue/delete", "POST"),
+            "/api/v1/sessions/s1/queue/delete",
+        )
+        self.assertEqual(
+            _nova_incremental_v1_path("/api/sessions/s1/queue/update", "POST"),
+            "/api/v1/sessions/s1/queue/update",
+        )
+        self.assertEqual(
+            _nova_incremental_v1_path("/api/sessions/s1/queue/move", "POST"),
+            "/api/v1/sessions/s1/queue/move",
+        )
+    def test_do_post_proxies_incremental_routes_before_python_fallbacks(self) -> None:
+        source = SERVER_PY.read_text(encoding="utf-8")
+        self.assertIn('incremental_v1_path = _nova_incremental_v1_path(path, self.command)', source)
+        self.assertIn('incremental_v1_path is not None', source)
+        self.assertIn('if self._handle_nova_post(path, u, body):', source)
+
+    def test_python_rename_delete_handlers_are_removed_after_cutover(self) -> None:
+        source = SERVER_PY.read_text(encoding="utf-8")
+        self.assertNotIn('res = MANAGER.spawn_web_session(', source)
+        self.assertNotIn('resume_session_id_raw = obj.get("resume_session_id")', source)
+        self.assertEqual(source.count('if path.startswith("/api/sessions/") and path.endswith("/rename"):'), 0)
+        self.assertNotIn('session_id = _match_session_route(path, "delete")', source)
+        self.assertEqual(source.count('if path.startswith("/api/sessions/") and path.endswith("/edit"):'), 0)
+        self.assertEqual(source.count('if path.startswith("/api/sessions/") and (path.endswith("/inject_file") or path.endswith("/inject_image")):'), 0)
+        self.assertNotIn('cfg = MANAGER.harness_set(', source)
+        self.assertNotIn('session_id = _match_session_route(path, "messages", "tail")', source)
+        self.assertNotIn('session_id = _match_session_route(path, "messages", "history")', source)
+        self.assertNotIn('session_id = _match_session_route(path, "messages", "live")', source)
 
     def test_save_queues_persists_transient_sending_flag_for_runtime_readers(self) -> None:
         mgr = self._mgr()

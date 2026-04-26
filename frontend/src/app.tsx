@@ -13,6 +13,7 @@ import {
 import type {
   ChangedFilesResponse,
   CodexConfigResponse,
+  CwdSuggestion,
   DiagnosticsResponse,
   FileEntry,
   FileReadResponse,
@@ -39,15 +40,28 @@ const SHOW_TOOL_CALLS_KEY = "codoxear.showToolCalls";
 const DESKTOP_NOTIFICATIONS_KEY = "codoxear.desktopNotificationsEnabled";
 const BUSY_SUBMIT_MODE_KEY = "codoxear.nova.busySubmitMode";
 const THEME_MODE_KEY = "codoxear.nova.theme";
+const SESSION_DRAFTS_KEY = "codoxear.nova.sessionDrafts";
 const SIDEBAR_WORKSPACE_ORDER_KEY = "codoxear.nova.sidebar.workspaceOrder";
 const SIDEBAR_SESSION_ORDER_KEY = "codoxear.nova.sidebar.sessionOrder";
+const SIDEBAR_WIDTH_KEY = "codoxear.nova.sidebar.width";
 const CHAT_BOTTOM_FOLLOW_THRESHOLD_PX = 96;
+const CHAT_HISTORY_TOP_THRESHOLD_PX = 16;
+const CHAT_HISTORY_JUMP_OFFSET_PX = 24;
+const SIDEBAR_MIN_WIDTH_PX = 240;
+const SIDEBAR_MAX_WIDTH_PX = 520;
+const SIDEBAR_RESIZER_WIDTH_PX = 10;
+const MAIN_MIN_WIDTH_PX = 320;
+const DETAIL_RAIL_WIDTH_PX = 360;
+const DETAIL_RAIL_STACK_BREAKPOINT_PX = 1080;
+const IMPORTANT_PRIORITY_OFFSET = 0.85;
 
 type BusySubmitMode = "queue" | "interrupt";
 type ThemeMode = "dark" | "light";
+type SessionMarkerState = "default" | "important";
 type SidebarSessionOrder = Record<string, string[]>;
 type SidebarDragEvent = JSX.TargetedDragEvent<HTMLElement>;
 type SidebarContextMenuEvent = JSX.TargetedMouseEvent<HTMLElement>;
+type SidebarPointerEvent = JSX.TargetedPointerEvent<HTMLDivElement>;
 type SidebarDropPosition = "before" | "after";
 type SidebarDropIndicator =
   | { kind: "workspace"; key: string; position: SidebarDropPosition }
@@ -101,6 +115,18 @@ function readThemeMode(): ThemeMode {
   return readLocalStorage(THEME_MODE_KEY) === "light" ? "light" : "dark";
 }
 
+function clampSidebarWidth(width: number, viewportWidth = window.innerWidth) {
+  const maxWidth = Math.max(SIDEBAR_MIN_WIDTH_PX, Math.min(SIDEBAR_MAX_WIDTH_PX, viewportWidth - MAIN_MIN_WIDTH_PX));
+  return Math.max(SIDEBAR_MIN_WIDTH_PX, Math.min(width, maxWidth));
+}
+
+function readStoredSidebarWidth() {
+  const raw = readLocalStorage(SIDEBAR_WIDTH_KEY);
+  if (!raw) return null;
+  const width = Number(raw);
+  return Number.isFinite(width) ? clampSidebarWidth(width) : null;
+}
+
 function readStoredStringList(key: string) {
   try {
     const parsed = JSON.parse(readLocalStorage(key) || "[]");
@@ -121,6 +147,20 @@ function readStoredSessionOrder(): SidebarSessionOrder {
     return out;
   } catch {
     return {};
+  }
+}
+
+function readStoredSessionDrafts() {
+  try {
+    const parsed = JSON.parse(readLocalStorage(SESSION_DRAFTS_KEY) || "{}");
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {} as Record<string, string>;
+    const out: Record<string, string> = {};
+    Object.entries(parsed).forEach(([key, value]) => {
+      if (typeof value === "string" && value) out[key] = value;
+    });
+    return out;
+  } catch {
+    return {} as Record<string, string>;
   }
 }
 
@@ -159,6 +199,19 @@ function prependOrderedKey(keys: string[], key: string) {
 
 function appendOrderedKey(keys: string[], key: string) {
   return [...keys.filter((item) => item !== key), key];
+}
+
+function insertOrderedKeyAfterAnchors(keys: string[], key: string, anchors: string[]) {
+  const next = keys.filter((item) => item !== key);
+  const anchorSet = new Set(anchors.filter(Boolean));
+  if (!anchorSet.size) return prependOrderedKey(next, key);
+  let insertAt = -1;
+  next.forEach((item, index) => {
+    if (anchorSet.has(item)) insertAt = index;
+  });
+  if (insertAt < 0) return prependOrderedKey(next, key);
+  next.splice(insertAt + 1, 0, key);
+  return next;
 }
 
 function dropPositionFromEvent(event: SidebarDragEvent): SidebarDropPosition {
@@ -259,6 +312,31 @@ function sortSessions(items: SessionSummary[]) {
   });
 }
 
+function sessionIsImportant(session: SessionSummary | null) {
+  return Boolean(session && Number(session.priority_offset || 0) >= 0.5);
+}
+
+function partitionImportantFirst<T>(items: T[], isImportant: (item: T) => boolean) {
+  const important: T[] = [];
+  const regular: T[] = [];
+  items.forEach((item) => {
+    if (isImportant(item)) important.push(item);
+    else regular.push(item);
+  });
+  return [...important, ...regular];
+}
+
+function uniqueStringsInOrder(values: string[]) {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  values.forEach((value) => {
+    if (!value || seen.has(value)) return;
+    seen.add(value);
+    out.push(value);
+  });
+  return out;
+}
+
 function sleep(ms: number) {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
@@ -281,11 +359,21 @@ function sessionIsStarting(session: SessionSummary | null) {
   return Boolean(session && session.owned && !session.log_path);
 }
 
+function sessionIsQueuedWaiting(session: SessionSummary | null) {
+  return Boolean(session && session.queue_len && !session.busy && !sessionIsStarting(session));
+}
+
 function sessionStatusText(session: SessionSummary) {
   if (session.queue_len) return `queue ${session.queue_len}`;
   if (sessionIsStarting(session)) return "starting";
   if (session.busy) return "working";
   return "idle";
+}
+
+function sessionMarkerState(session: SessionSummary | null): SessionMarkerState {
+  if (!session) return "default";
+  if (sessionIsImportant(session)) return "important";
+  return "default";
 }
 
 function workspaceKeyForSession(session: SessionSummary) {
@@ -346,6 +434,17 @@ function isNearScrollBottom(element: HTMLElement) {
   return element.scrollHeight - element.scrollTop - element.clientHeight <= CHAT_BOTTOM_FOLLOW_THRESHOLD_PX;
 }
 
+function isNearHistoryTop(element: HTMLElement) {
+  return element.scrollTop <= CHAT_HISTORY_TOP_THRESHOLD_PX;
+}
+
+function olderHistoryJumpTarget(events: UiTranscriptEvent[]) {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    if (events[index].kind === "user") return events[index].id;
+  }
+  return events[events.length - 1]?.id || "";
+}
+
 function todoStatusLabel(status: string | undefined) {
   const value = String(status || "").replace(/_/g, " ").trim();
   return value || "pending";
@@ -369,8 +468,8 @@ function isFloatingTodoProgressEvent(event: UiTranscriptEvent) {
   return title === "todo" || source === "codex";
 }
 
-function FloatingProgress(props: { event: UiTranscriptEvent }) {
-  const { event } = props;
+function FloatingProgress(props: { event: UiTranscriptEvent; collapsed: boolean; onToggle: () => void }) {
+  const { event, collapsed, onToggle } = props;
   const items = event.items || [];
   const total = event.progressTotal;
   const current = event.progressCurrent;
@@ -378,33 +477,43 @@ function FloatingProgress(props: { event: UiTranscriptEvent }) {
   const percent = hasProgress ? Math.max(0, Math.min(100, (current / total) * 100)) : 0;
   const title = event.title.trim() || "Progress";
   return (
-    <div className="floatingProgress" role="status" aria-label={title}>
+    <div className={`floatingProgress${collapsed ? " is-collapsed" : ""}`} role="status" aria-label={title}>
       <div className="floatingProgressTop">
-        <span className="floatingProgressTitle">{title}</span>
-        {event.status ? <span className={`floatingProgressStatus${todoStatusClass(event.status)}`}>{todoStatusLabel(event.status)}</span> : null}
-      </div>
-      {hasProgress ? (
-        <div className="floatingProgressBar" aria-label={`${current} of ${total} ${event.progressLabel || "items"}`}>
-          <span style={{ width: `${percent}%` }} />
+        <div className="floatingProgressHead">
+          <span className="floatingProgressTitle">{title}</span>
+          {event.status ? <span className={`floatingProgressStatus${todoStatusClass(event.status)}`}>{todoStatusLabel(event.status)}</span> : null}
         </div>
+        <button className="floatingProgressToggle" type="button" aria-expanded={!collapsed} title={collapsed ? "Expand progress" : "Collapse progress"} onClick={onToggle}>
+          {icon(collapsed ? "down" : "up")}
+          <span>{collapsed ? "Expand" : "Collapse"}</span>
+        </button>
+      </div>
+      {!collapsed ? (
+        <>
+          {hasProgress ? (
+            <div className="floatingProgressBar" aria-label={`${current} of ${total} ${event.progressLabel || "items"}`}>
+              <span style={{ width: `${percent}%` }} />
+            </div>
+          ) : null}
+          <ol className="floatingProgressItems">
+            {items.slice(0, 4).map((item, index) => (
+              <li className={`floatingProgressItem${todoStatusClass(item.status)}`} key={`${item.label || "item"}-${index}`}>
+                <span className="floatingProgressMark" />
+                <span className="floatingProgressItemLabel">{item.label || "Untitled item"}</span>
+              </li>
+            ))}
+            {items.length > 4 ? <li className="floatingProgressMore">+{items.length - 4} more</li> : null}
+          </ol>
+        </>
       ) : null}
-      <ol className="floatingProgressItems">
-        {items.slice(0, 4).map((item, index) => (
-          <li className={`floatingProgressItem${todoStatusClass(item.status)}`} key={`${item.label || "item"}-${index}`}>
-            <span className="floatingProgressMark" />
-            <span className="floatingProgressItemLabel">{item.label || "Untitled item"}</span>
-          </li>
-        ))}
-        {items.length > 4 ? <li className="floatingProgressMore">+{items.length - 4} more</li> : null}
-      </ol>
     </div>
   );
 }
 
-function WorkingIndicator(props: { label: string }) {
-  const { label } = props;
+function WorkingIndicator(props: { label: string; tone?: "working" | "waiting" }) {
+  const { label, tone = "working" } = props;
   return (
-    <article className="msg event-working workingRow" role="status" aria-live="polite" aria-label={label}>
+    <article className={`msg event-working workingRow${tone === "waiting" ? " is-waiting" : ""}`} role="status" aria-live="polite" aria-label={label}>
       <div className="message-side is-hidden" />
       <div className="message-main">
         <div className="workingIndicator">
@@ -510,6 +619,12 @@ function icon(name: string) {
         <svg {...common}>
           <path d="M9.8 3.2 12.8 6.2" />
           <path d="M11.6 2.4a1.2 1.2 0 0 1 1.7 1.7L6 11.4 3.2 12.8 4.6 10Z" />
+        </svg>
+      );
+    case "star":
+      return (
+        <svg {...common}>
+          <path d="m8 2.6 1.5 3 3.3.5-2.4 2.3.6 3.3L8 10.1 5 11.7l.6-3.3-2.4-2.3 3.3-.5Z" />
         </svg>
       );
     case "file":
@@ -644,16 +759,28 @@ function normalizeQueueItems(response: QueueResponse) {
   return [];
 }
 
-function renderTokenSummary(token: Record<string, unknown> | null | undefined) {
-  if (!token || typeof token !== "object") return "";
+function formatTokenCount(value: number) {
+  return Math.round(value).toLocaleString();
+}
+
+function renderTokenSummary(token: Record<string, unknown> | null | undefined): { label: string; title: string } | null {
+  if (!token || typeof token !== "object") return null;
   const contextWindow = Number(token.context_window);
   const tokensInContext = Number(token.tokens_in_context);
   const percentRemaining = Number(token.percent_remaining);
+  const baselineTokens = Number(token.baseline_tokens);
+  const asOf = typeof token.as_of === "string" && token.as_of.trim() ? token.as_of.trim() : null;
   if (Number.isFinite(contextWindow) && Number.isFinite(tokensInContext) && contextWindow > 0) {
-    if (Number.isFinite(percentRemaining)) return `${tokensInContext}/${contextWindow} (${Math.round(percentRemaining)}% left)`;
-    return `${tokensInContext}/${contextWindow}`;
+    const percentNote = Number.isFinite(percentRemaining)
+      ? ` ${Math.round(percentRemaining)}% remaining excludes a reserved ${Number.isFinite(baselineTokens) ? formatTokenCount(baselineTokens) : "baseline"}-token buffer.`
+      : "";
+    const asOfNote = asOf ? ` Last update: ${asOf}.` : "";
+    return {
+      label: `Ctx est ${formatTokenCount(tokensInContext)}/${formatTokenCount(contextWindow)}`,
+      title: `Usage comes from the latest token update. Context window size may be inferred from model metadata for some backends.${percentNote}${asOfNote}`,
+    };
   }
-  return "";
+  return null;
 }
 
 function LoadingScreen({ text }: { text: string }) {
@@ -708,22 +835,27 @@ export function App() {
   const [selectedSessionId, setSelectedSessionId] = useState("");
   const [transcript, setTranscript] = useState<UiTranscriptEvent[]>([]);
   const [collapsedEvents, setCollapsedEvents] = useState<Record<string, boolean>>({});
+  const [collapsedFloatingProgressEvents, setCollapsedFloatingProgressEvents] = useState<Record<string, boolean>>({});
   const [busy, setBusy] = useState(false);
   const [sending, setSending] = useState(false);
   const [closingSession, setClosingSession] = useState(false);
+  const [sessionMarkerBusyId, setSessionMarkerBusyId] = useState("");
   const [queueLen, setQueueLen] = useState(0);
-  const [tokenSummary, setTokenSummary] = useState("");
+  const [tokenSummary, setTokenSummary] = useState<{ label: string; title: string } | null>(null);
   const [liveCursor, setLiveCursor] = useState<string | null>(null);
   const [historyCursor, setHistoryCursor] = useState<string | null>(null);
   const [hasOlder, setHasOlder] = useState(false);
+  const [historyTopBoundaryReached, setHistoryTopBoundaryReached] = useState(true);
   const [loadingOlder, setLoadingOlder] = useState(false);
   const [errorText, setErrorText] = useState("");
-  const [composerText, setComposerText] = useState("");
+  const [sessionDrafts, setSessionDrafts] = useState<Record<string, string>>(() => readStoredSessionDrafts());
   const [busySubmitMode, setBusySubmitMode] = useState<BusySubmitMode>(() => readBusySubmitMode());
   const [toastText, setToastText] = useState("");
   const [loginPassword, setLoginPassword] = useState("");
   const [showTools, setShowTools] = useState(() => readLocalStorage(SHOW_TOOL_CALLS_KEY) !== "0");
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [sidebarWidth, setSidebarWidth] = useState<number | null>(() => readStoredSidebarWidth());
+  const [sidebarResizing, setSidebarResizing] = useState(false);
   const [workspaceOrder, setWorkspaceOrder] = useState<string[]>(() => readStoredStringList(SIDEBAR_WORKSPACE_ORDER_KEY));
   const [sessionOrderByWorkspace, setSessionOrderByWorkspace] = useState<SidebarSessionOrder>(() => readStoredSessionOrder());
   const [draggingWorkspaceKey, setDraggingWorkspaceKey] = useState("");
@@ -738,6 +870,11 @@ export function App() {
   const [tmuxAvailable, setTmuxAvailable] = useState(false);
   const [newSessionBackend, setNewSessionBackend] = useState<"codex" | "pi">("codex");
   const [newSessionCwd, setNewSessionCwd] = useState("");
+  const [newSessionCwdSuggestions, setNewSessionCwdSuggestions] = useState<CwdSuggestion[]>([]);
+  const [newSessionCwdSuggestionsOpen, setNewSessionCwdSuggestionsOpen] = useState(false);
+  const [newSessionCwdSuggestionIndex, setNewSessionCwdSuggestionIndex] = useState(-1);
+  const [newSessionCwdSuggestionError, setNewSessionCwdSuggestionError] = useState("");
+  const [newSessionCwdSuggestionsLoading, setNewSessionCwdSuggestionsLoading] = useState(false);
   const [newSessionProvider, setNewSessionProvider] = useState("");
   const [newSessionModel, setNewSessionModel] = useState("");
   const [newSessionReasoning, setNewSessionReasoning] = useState("high");
@@ -804,9 +941,15 @@ export function App() {
   const shownNotificationIdsRef = useRef<Set<string>>(new Set());
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const composerInputRef = useRef<HTMLTextAreaElement | null>(null);
+  const appRef = useRef<HTMLDivElement | null>(null);
+  const sidebarRef = useRef<HTMLElement | null>(null);
+  const newSessionCwdInputRef = useRef<HTMLInputElement | null>(null);
   const chatScrollRef = useRef<HTMLDivElement | null>(null);
   const stickToBottomRef = useRef(true);
   const lastAutoScrollKeyRef = useRef("");
+  const newSessionCwdRequestRef = useRef(0);
+  const sidebarResizeStartXRef = useRef(0);
+  const sidebarResizeStartWidthRef = useRef(0);
 
   const selectedSession = useMemo(
     () => sessions.find((session) => session.session_id === selectedSessionId) || null,
@@ -841,11 +984,16 @@ export function App() {
       if (left.updatedTs !== right.updatedTs) return right.updatedTs - left.updatedTs;
       return workspaceTitle(left.cwd).localeCompare(workspaceTitle(right.cwd));
     });
-    return applyStoredOrder(fallbackSortedGroups, workspaceOrder, (group) => group.key).map((group) => ({
+    const orderedGroups = applyStoredOrder(fallbackSortedGroups, workspaceOrder, (group) => group.key).map((group) => ({
       ...group,
-      sessions: applyStoredOrder(group.sessions, sessionOrderByWorkspace[group.key] || [], (session) => session.session_id),
+      sessions: partitionImportantFirst(
+        applyStoredOrder(group.sessions, sessionOrderByWorkspace[group.key] || [], (session) => session.session_id),
+        (session) => sessionIsImportant(session),
+      ),
     }));
+    return partitionImportantFirst(orderedGroups, (group) => group.sessions.some((session) => sessionIsImportant(session)));
   }, [selectedSessionId, sessionOrderByWorkspace, sessions, workspaceOrder]);
+  const groupedSessions = workspaceGroups;
   const currentNewSessionDefaults = useMemo(
     () => defaultsForBackend(newSessionDefaults, newSessionBackend),
     [newSessionDefaults, newSessionBackend],
@@ -858,6 +1006,7 @@ export function App() {
     () => (currentNewSessionDefaults?.reasoning_efforts || []).slice(),
     [currentNewSessionDefaults],
   );
+  const newSessionCwdSuggestionChoices = useMemo(() => newSessionCwdSuggestions.slice(0, 12), [newSessionCwdSuggestions]);
   const visibleTranscript = useMemo(
     () =>
       coalesceAdjacentAssistantEvents(
@@ -874,6 +1023,7 @@ export function App() {
     }
     return null;
   }, [visibleTranscript]);
+  const floatingProgressCollapsed = Boolean(floatingProgressEvent && collapsedFloatingProgressEvents[floatingProgressEvent.id]);
   const visibleFileEntries = useMemo(
     () => (fileSearchQuery.trim() ? fileSearchEntries : fileEntries),
     [fileEntries, fileSearchEntries, fileSearchQuery],
@@ -895,21 +1045,57 @@ export function App() {
   const composerSessionBusy = Boolean(awaitingAssistantReply || busy || selectedSession?.busy);
   const displayedVoiceSettings = voiceSettings || EMPTY_VOICE_SETTINGS;
   const settingsInitialLoading = voiceSettingsLoading && !voiceSettings && !codexConfig;
+  const queuedWaitingStatus = Boolean(selectedSession && queueLen && !closingSession && !sending && sessionIsQueuedWaiting(selectedSession) && !(awaitingAssistantReply || busy || selectedSession.busy));
   const topSessionStatus = useMemo(() => {
     if (!selectedSession) return "No session";
     if (closingSession) return "closing";
     if (sending) return "sending";
-    if (queueLen) return `queue ${queueLen}`;
     if (awaitingAssistantReply || busy || selectedSession.busy) return "working";
+    if (queueLen) return `queue ${queueLen}`;
     if (sessionIsStarting(selectedSession)) return "starting";
     return "idle";
   }, [awaitingAssistantReply, busy, closingSession, queueLen, selectedSession, sending]);
-  const topSessionStatusClass = topSessionStatus === "working" || topSessionStatus === "starting" ? "status-chip working" : "status-chip";
+  const topSessionStatusClass =
+    topSessionStatus === "working" || topSessionStatus === "starting"
+      ? "status-chip working"
+      : queuedWaitingStatus
+        ? "status-chip waiting"
+        : "status-chip";
   const workingIndicatorLabel =
-    topSessionStatus === "sending" ? "Sending" : topSessionStatus === "starting" ? "Starting" : topSessionStatus === "working" ? "Working" : "";
+    topSessionStatus === "sending" ? "Sending" : topSessionStatus === "starting" ? "Starting" : topSessionStatus === "working" ? "Working" : queuedWaitingStatus ? "Waiting" : "";
+  const workingIndicatorTone = queuedWaitingStatus ? "waiting" : "working";
+  const composerText = selectedSessionId ? sessionDrafts[selectedSessionId] || "" : "";
+  const appStyle = useMemo(
+    () => (sidebarWidth == null ? undefined : ({ "--sidebar-w": `${sidebarWidth}px` } as JSX.CSSProperties)),
+    [sidebarWidth],
+  );
+
+  function sidebarRailWidth(viewportWidth = window.innerWidth) {
+    return showFilesPanel || showDetailsPanel ? (viewportWidth > DETAIL_RAIL_STACK_BREAKPOINT_PX ? DETAIL_RAIL_WIDTH_PX : 0) : 0;
+  }
+
+  function currentSidebarLayoutWidth(viewportWidth = window.innerWidth) {
+    const shellWidth = appRef.current?.getBoundingClientRect().width || viewportWidth;
+    return Math.max(shellWidth - SIDEBAR_RESIZER_WIDTH_PX - sidebarRailWidth(shellWidth), SIDEBAR_MIN_WIDTH_PX + MAIN_MIN_WIDTH_PX);
+  }
 
   function askUserDefaultsOpen(event: UiTranscriptEvent) {
     return event.kind === "ask_user" && !event.askResolved && !event.askAnswer && !event.askCancelled;
+  }
+
+  function setSessionDraft(sessionId: string, text: string) {
+    if (!sessionId) return;
+    setSessionDrafts((current) => {
+      const existing = current[sessionId] || "";
+      if (text) {
+        if (existing === text) return current;
+        return { ...current, [sessionId]: text };
+      }
+      if (!(sessionId in current)) return current;
+      const next = { ...current };
+      delete next[sessionId];
+      return next;
+    });
   }
 
   function transcriptEventCollapsed(event: UiTranscriptEvent, collapsedState = collapsedEvents) {
@@ -921,8 +1107,30 @@ export function App() {
     setCollapsedEvents((current) => ({ ...current, [event.id]: !transcriptEventCollapsed(event, current) }));
   }
 
+  function toggleFloatingProgress(eventId: string) {
+    setCollapsedFloatingProgressEvents((current) => {
+      if (current[eventId]) {
+        const next = { ...current };
+        delete next[eventId];
+        return next;
+      }
+      return { ...current, [eventId]: true };
+    });
+  }
+
   function toggleWorkspaceGroup(workspaceKey: string) {
     setCollapsedWorkspaces((current) => ({ ...current, [workspaceKey]: !current[workspaceKey] }));
+  }
+
+  function handleSidebarResizeStart(event: SidebarPointerEvent) {
+    event.preventDefault();
+    if (sidebarCollapsed) return;
+    sidebarResizeStartXRef.current = event.clientX;
+    sidebarResizeStartWidthRef.current = clampSidebarWidth(
+      sidebarRef.current?.getBoundingClientRect().width || sidebarWidth || 320,
+      currentSidebarLayoutWidth(),
+    );
+    setSidebarResizing(true);
   }
 
   function handleWorkspaceDragStart(event: SidebarDragEvent, workspaceKey: string) {
@@ -1052,8 +1260,25 @@ export function App() {
 
   function updateChatScrollFollowState() {
     const element = chatScrollRef.current;
-    if (!element) return;
+    if (!element) {
+      setHistoryTopBoundaryReached(true);
+      return;
+    }
     stickToBottomRef.current = isNearScrollBottom(element);
+    setHistoryTopBoundaryReached(isNearHistoryTop(element));
+  }
+
+  function scrollChatEventIntoView(eventId: string, offsetPx = CHAT_HISTORY_JUMP_OFFSET_PX) {
+    const element = chatScrollRef.current;
+    if (!element || !eventId) return;
+    const target = Array.from(element.querySelectorAll<HTMLElement>("[data-event-id]")).find((node) => node.dataset.eventId === eventId);
+    if (!target) return;
+    const elementTop = element.getBoundingClientRect().top;
+    const targetTop = target.getBoundingClientRect().top;
+    const nextTop = Math.max(0, element.scrollTop + (targetTop - elementTop) - offsetPx);
+    element.scrollTo({ top: nextTop });
+    stickToBottomRef.current = isNearScrollBottom(element);
+    setHistoryTopBoundaryReached(isNearHistoryTop(element));
   }
 
   function applyRuntime(data: {
@@ -1065,10 +1290,14 @@ export function App() {
     token?: Record<string, unknown> | null;
   }) {
     liveCursorRef.current = data.live_cursor ?? null;
-    historyCursorRef.current = data.history_cursor ?? null;
     setLiveCursor(liveCursorRef.current);
-    setHistoryCursor(historyCursorRef.current);
-    setHasOlder(Boolean(data.has_older));
+    if (Object.prototype.hasOwnProperty.call(data, "history_cursor")) {
+      historyCursorRef.current = data.history_cursor ?? null;
+      setHistoryCursor(historyCursorRef.current);
+    }
+    if (Object.prototype.hasOwnProperty.call(data, "has_older")) {
+      setHasOlder(Boolean(data.has_older));
+    }
     setBusy(Boolean(data.busy));
     setQueueLen(Number.isFinite(Number(data.queue_len)) ? Number(data.queue_len) : 0);
     setTokenSummary(renderTokenSummary(data.token));
@@ -1183,12 +1412,18 @@ export function App() {
       const data = await api.fetchHistory(selectedSessionId, historyCursorRef.current, OLDER_PAGE_LIMIT);
       if (selectedSessionRef.current !== selectedSessionId) return;
       const older = normalizeEvents(data.events || []);
+      const jumpTargetId = olderHistoryJumpTarget(older);
       setTranscript((current) => mergeTranscriptEvents(older, current));
       historyCursorRef.current = data.history_cursor ?? null;
       setHistoryCursor(historyCursorRef.current);
       setHasOlder(Boolean(data.has_older));
       setBusy(Boolean(data.busy));
       setQueueLen(Number.isFinite(Number(data.queue_len)) ? Number(data.queue_len) : 0);
+      if (jumpTargetId) {
+        window.requestAnimationFrame(() => {
+          scrollChatEventIntoView(jumpTargetId);
+        });
+      }
     } catch (error) {
       const status = error && typeof error === "object" && "status" in error ? Number((error as { status?: number }).status) : 0;
       if (status === 409) {
@@ -1409,7 +1644,7 @@ export function App() {
     const shouldQueue = composerSessionBusy && busySubmitMode === "queue";
     const shouldInterrupt = composerSessionBusy && busySubmitMode === "interrupt";
     let localEvent: UiTranscriptEvent | null = null;
-    setComposerText("");
+    setSessionDraft(sessionId, "");
     setSending(true);
     setErrorText("");
     if (!shouldQueue) {
@@ -1442,7 +1677,7 @@ export function App() {
       fastPollUntilRef.current = Date.now() + 5000;
       schedulePoll(0);
     } catch (error) {
-      setComposerText(text);
+      setSessionDraft(sessionId, text);
       if (localEvent) {
         setTranscript((current) => current.map((event) => (event.id === localEvent.id ? { ...event, meta: "send failed" } : event)));
       }
@@ -1476,6 +1711,7 @@ export function App() {
     setClosingSession(true);
     try {
       await api.deleteSession(sessionId);
+      setSessionDraft(sessionId, "");
       pushToast("Session closed");
       if (selectedSessionRef.current === sessionId) {
         selectSession("");
@@ -1490,19 +1726,20 @@ export function App() {
   }
 
   async function handleQueueAction() {
-    if (!selectedSessionRef.current) return;
+    const sessionId = selectedSessionRef.current;
+    if (!sessionId) return;
     const text = composerText.trim();
     if (!text) {
       openQueueModal();
       return;
     }
     try {
-      await api.enqueueMessage(selectedSessionRef.current, text);
-      setComposerText("");
+      await api.enqueueMessage(sessionId, text);
+      setSessionDraft(sessionId, "");
       pushToast("Queued");
       await refreshSessions();
       setQueueOpen(true);
-      await loadQueue(selectedSessionRef.current);
+      await loadQueue(sessionId);
     } catch (error) {
       setErrorText(error instanceof Error ? error.message : "Unable to queue message");
     }
@@ -1559,6 +1796,74 @@ export function App() {
     setRenameOpen(true);
   }
 
+  async function handleSessionMarker(session: SessionSummary, nextState: SessionMarkerState) {
+    if (!session || sessionMarkerBusyId === session.session_id) return;
+    const priorityOffset = nextState === "important" ? IMPORTANT_PRIORITY_OFFSET : 0;
+    const workspaceKey = workspaceKeyForSession(session);
+    const currentWorkspace = groupedSessions.find((group) => group.key === workspaceKey) || null;
+    const workspaceHadImportantBefore = currentWorkspace ? currentWorkspace.sessions.some((item) => sessionIsImportant(item)) : false;
+    const starredWorkspaceKeys = groupedSessions
+      .filter((group) => group.key !== workspaceKey && group.sessions.some((item) => sessionIsImportant(item)))
+      .map((group) => group.key);
+    const starredSessionIds = currentWorkspace
+      ? currentWorkspace.sessions.filter((item) => item.session_id !== session.session_id && sessionIsImportant(item)).map((item) => item.session_id)
+      : [];
+    setSessionContextMenu(null);
+    setSessionMarkerBusyId(session.session_id);
+    try {
+      const result = await api.editSession(session.session_id, {
+        name: String(session.alias || ""),
+        priority_offset: priorityOffset,
+        snooze_until: null,
+        dependency_session_id: null,
+      });
+      const nextSessions = sessions.map((item) =>
+        item.session_id === session.session_id
+          ? {
+              ...item,
+              alias: String(result.alias || ""),
+              priority_offset: Number(result.priority_offset || 0),
+              snooze_until: result.snooze_until ?? null,
+              dependency_session_id: result.dependency_session_id ?? null,
+              blocked: false,
+              snoozed: false,
+            }
+          : item,
+      );
+      const nextWorkspaceKeys = uniqueStringsInOrder(nextSessions.map((item) => workspaceKeyForSession(item)));
+      const nextImportantWorkspaceKeySet = new Set(
+        nextSessions.filter((item) => sessionIsImportant(item)).map((item) => workspaceKeyForSession(item)),
+      );
+      setSessions(nextSessions);
+      if (nextState === "important") {
+        if (!workspaceHadImportantBefore) {
+          setWorkspaceOrder((current) => insertOrderedKeyAfterAnchors(current, workspaceKey, starredWorkspaceKeys));
+        }
+        setSessionOrderByWorkspace((current) => ({
+          ...current,
+          [workspaceKey]: insertOrderedKeyAfterAnchors(
+            currentWorkspace?.sessions.map((item) => item.session_id) || current[workspaceKey] || [session.session_id],
+            session.session_id,
+            starredSessionIds,
+          ),
+        }));
+      }
+      setWorkspaceOrder((current) => {
+        const normalized = uniqueStringsInOrder([
+          ...current.filter((key) => nextWorkspaceKeys.includes(key)),
+          ...nextWorkspaceKeys,
+        ]);
+        return partitionImportantFirst(normalized, (key) => nextImportantWorkspaceKeySet.has(key));
+      });
+      await refreshSessions({ preserveSelection: true });
+      pushToast(nextState === "important" ? "Starred session" : "Session star cleared");
+    } catch (error) {
+      setErrorText(error instanceof Error ? error.message : "Unable to update session marker");
+    } finally {
+      setSessionMarkerBusyId("");
+    }
+  }
+
   async function handleRenameSession() {
     const sessionId = renameSessionId || selectedSessionRef.current;
     if (!sessionId) return;
@@ -1603,9 +1908,74 @@ export function App() {
     }
   }
 
+  async function loadCwdSuggestions(query: string) {
+    const requestId = newSessionCwdRequestRef.current + 1;
+    newSessionCwdRequestRef.current = requestId;
+    setNewSessionCwdSuggestionsLoading(true);
+    try {
+      const data = await api.fetchCwdSuggestions(query, 12);
+      if (requestId !== newSessionCwdRequestRef.current) return;
+      const suggestions = Array.isArray(data.suggestions)
+        ? data.suggestions.filter(
+            (item): item is CwdSuggestion =>
+              Boolean(item) && typeof item.value === "string" && item.value.trim().length > 0 && typeof item.label === "string",
+          )
+        : [];
+      setNewSessionCwdSuggestions(suggestions);
+      setNewSessionCwdSuggestionIndex(suggestions.length ? 0 : -1);
+      setNewSessionCwdSuggestionError("");
+    } catch (error) {
+      if (requestId !== newSessionCwdRequestRef.current) return;
+      setNewSessionCwdSuggestions([]);
+      setNewSessionCwdSuggestionIndex(-1);
+      setNewSessionCwdSuggestionError(error instanceof Error ? error.message : "Unable to load folders");
+    } finally {
+      if (requestId === newSessionCwdRequestRef.current) setNewSessionCwdSuggestionsLoading(false);
+    }
+  }
+
+  function applyNewSessionCwdSuggestion(suggestion: CwdSuggestion) {
+    setNewSessionCwd(suggestion.value);
+    setNewSessionCwdSuggestionsOpen(true);
+    setNewSessionCwdSuggestionIndex(0);
+    window.setTimeout(() => newSessionCwdInputRef.current?.focus(), 0);
+  }
+
+  function handleNewSessionCwdKeyDown(event: KeyboardEvent) {
+    if (!newSessionCwdSuggestionChoices.length) {
+      if (event.key === "Escape") setNewSessionCwdSuggestionsOpen(false);
+      return;
+    }
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      setNewSessionCwdSuggestionsOpen(true);
+      setNewSessionCwdSuggestionIndex((current) => (current + 1) % newSessionCwdSuggestionChoices.length);
+      return;
+    }
+    if (event.key === "ArrowUp") {
+      event.preventDefault();
+      setNewSessionCwdSuggestionsOpen(true);
+      setNewSessionCwdSuggestionIndex((current) => (current <= 0 ? newSessionCwdSuggestionChoices.length - 1 : current - 1));
+      return;
+    }
+    if ((event.key === "Enter" || event.key === "Tab") && newSessionCwdSuggestionsOpen && newSessionCwdSuggestionIndex >= 0) {
+      event.preventDefault();
+      applyNewSessionCwdSuggestion(newSessionCwdSuggestionChoices[newSessionCwdSuggestionIndex]);
+      return;
+    }
+    if (event.key === "Escape") {
+      event.preventDefault();
+      setNewSessionCwdSuggestionsOpen(false);
+    }
+  }
+
   function openNewSessionDialog() {
     const defaults = defaultsForBackend(newSessionDefaults, newSessionBackend) || defaultsForBackend(newSessionDefaults, "codex");
     setNewSessionCwd(selectedSession?.cwd || recentCwds[0] || "");
+    setNewSessionCwdSuggestions([]);
+    setNewSessionCwdSuggestionsOpen(true);
+    setNewSessionCwdSuggestionIndex(-1);
+    setNewSessionCwdSuggestionError("");
     setNewSessionProvider(String(defaults?.provider_choice || ""));
     setNewSessionModel(String(defaults?.model || ""));
     setNewSessionReasoning(String(defaults?.reasoning_effort || "high"));
@@ -1945,8 +2315,46 @@ export function App() {
   }, [sessionOrderByWorkspace]);
 
   useEffect(() => {
+    writeLocalStorage(SESSION_DRAFTS_KEY, Object.keys(sessionDrafts).length ? JSON.stringify(sessionDrafts) : null);
+  }, [sessionDrafts]);
+
+  useEffect(() => {
+    writeLocalStorage(SIDEBAR_WIDTH_KEY, sidebarWidth == null ? null : String(Math.round(sidebarWidth)));
+  }, [sidebarWidth]);
+
+  useEffect(() => {
     writeLocalStorage(DESKTOP_NOTIFICATIONS_KEY, desktopNotificationsEnabled ? "1" : null);
   }, [desktopNotificationsEnabled]);
+
+  useEffect(() => {
+    if (!sidebarResizing) return;
+    const onPointerMove = (event: PointerEvent) => {
+      const delta = event.clientX - sidebarResizeStartXRef.current;
+      setSidebarWidth(clampSidebarWidth(sidebarResizeStartWidthRef.current + delta, currentSidebarLayoutWidth()));
+    };
+    const onPointerUp = () => setSidebarResizing(false);
+    const { style } = document.body;
+    const prevCursor = style.cursor;
+    const prevUserSelect = style.userSelect;
+    style.cursor = "col-resize";
+    style.userSelect = "none";
+    window.addEventListener("pointermove", onPointerMove);
+    window.addEventListener("pointerup", onPointerUp);
+    return () => {
+      window.removeEventListener("pointermove", onPointerMove);
+      window.removeEventListener("pointerup", onPointerUp);
+      style.cursor = prevCursor;
+      style.userSelect = prevUserSelect;
+    };
+  }, [sidebarResizing]);
+
+  useEffect(() => {
+    if (sidebarWidth == null) return;
+    const onResize = () => setSidebarWidth((current) => (current == null ? null : clampSidebarWidth(current, currentSidebarLayoutWidth())));
+    onResize();
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, [showDetailsPanel, showFilesPanel, sidebarWidth]);
 
   useEffect(() => {
     if (!selectedSessionId || queueLen <= 0) {
@@ -2009,8 +2417,18 @@ export function App() {
       if (!element) return;
       element.scrollTop = element.scrollHeight;
       stickToBottomRef.current = true;
+      setHistoryTopBoundaryReached(isNearHistoryTop(element));
     });
   }, [selectedSessionId, visibleTranscript, workingIndicatorLabel]);
+
+  useEffect(() => {
+    const raf = window.requestAnimationFrame(() => {
+      updateChatScrollFollowState();
+    });
+    return () => {
+      window.cancelAnimationFrame(raf);
+    };
+  }, [selectedSessionId, hasOlder, visibleTranscript.length, loadingOlder, workingIndicatorLabel]);
 
   useEffect(() => {
     if (authState !== "ready") return;
@@ -2031,6 +2449,14 @@ export function App() {
     if (!showFilesPanel || !selectedSessionId) return;
     void loadFiles(selectedSessionId);
   }, [showFilesPanel, selectedSessionId, sessions]);
+
+  useEffect(() => {
+    if (!newSessionOpen) return;
+    const timer = window.setTimeout(() => {
+      void loadCwdSuggestions(newSessionCwd);
+    }, 120);
+    return () => window.clearTimeout(timer);
+  }, [newSessionOpen, newSessionCwd]);
 
   useEffect(() => {
     if (!newSessionOpen) return;
@@ -2078,8 +2504,13 @@ export function App() {
 
   return (
     <>
-      <div className={`app${showFilesPanel || showDetailsPanel ? " withRail" : ""}${sidebarCollapsed ? " sidebarCollapsed" : ""}`} onClick={() => setSessionContextMenu(null)}>
-        <aside className="sidebar">
+      <div
+        ref={appRef}
+        className={`app${showFilesPanel || showDetailsPanel ? " withRail" : ""}${sidebarCollapsed ? " sidebarCollapsed" : ""}${sidebarResizing ? " sidebarResizing" : ""}`}
+        style={appStyle}
+        onClick={() => setSessionContextMenu(null)}
+      >
+        <aside className="sidebar" ref={sidebarRef}>
           <header>
             <div className="title">
               <span className="sidebarLogoDot" />
@@ -2150,14 +2581,18 @@ export function App() {
                   {!collapsed ? (
                     <div className="workspaceSessions">
                       {group.sessions.map((session) => {
+                        const markerState = sessionMarkerState(session);
+                        const importantMarked = markerState === "important";
+                        const hasDraft = Boolean((sessionDrafts[session.session_id] || "").trim());
+                        const markerBusy = sessionMarkerBusyId === session.session_id;
                         const sessionDropClass =
                           sidebarDropIndicator?.kind === "session" && sidebarDropIndicator.key === session.session_id
                             ? ` is-drop-${sidebarDropIndicator.position}`
                             : "";
                         return (
-                          <button
+                          <div
                             key={session.session_id}
-                            className={`workspace${selectedSessionId === session.session_id ? " active" : ""}${draggingSession?.sessionId === session.session_id ? " is-dragging" : ""}${sessionDropClass}`}
+                            className={`workspace${selectedSessionId === session.session_id ? " active" : ""}${draggingSession?.sessionId === session.session_id ? " is-dragging" : ""}${importantMarked ? " is-important" : ""}${sessionDropClass}`}
                             draggable
                             onDragStart={(event) => handleSessionDragStart(event, group.key, session.session_id)}
                             onDragOver={(event) => handleSessionDragOver(event, group.key, session.session_id)}
@@ -2167,21 +2602,40 @@ export function App() {
                               setSidebarDropIndicator(null);
                             }}
                             onContextMenu={(event) => openSessionContextMenu(event, session)}
-                            onClick={() => selectSession(session.session_id)}
                           >
-                            <div className="workspaceHeader">
-                              <div className="workspaceTitleRow">
-                                <div className="workspaceTitle">{sessionDisplayName(session)}</div>
-                                <div className={`status-dot ${session.busy || sessionIsStarting(session) ? "running" : "idle"}`} />
+                            <button className="workspaceSelect" type="button" onClick={() => selectSession(session.session_id)}>
+                              <div className="workspaceHeader">
+                                <div className="workspaceTitleRow">
+                                  <div className="workspaceTitle">{sessionDisplayName(session)}</div>
+                                  {hasDraft ? <span className="workspaceDraftMark" title="Draft saved" aria-label="Draft saved" /> : null}
+                                  <div className={`status-dot ${sessionIsQueuedWaiting(session) ? "waiting" : session.busy || sessionIsStarting(session) ? "running" : "idle"}`} />
+                                </div>
+                                <div className="workspacePath">{session.git_branch ? session.git_branch : String(session.agent_backend || "codex").toUpperCase()}</div>
+                                <div className="workspaceMeta">
+                                  {String(session.agent_backend || "codex").toUpperCase()} · {sessionStatusText(session)} ·{" "}
+                                  {relativeAge(session.updated_ts)}
+                                </div>
                               </div>
-                              <div className="workspacePath">{session.git_branch ? session.git_branch : String(session.agent_backend || "codex").toUpperCase()}</div>
-                              <div className="workspaceMeta">
-                                {String(session.agent_backend || "codex").toUpperCase()} · {sessionStatusText(session)} ·{" "}
-                                {relativeAge(session.updated_ts)}
-                              </div>
+                              <div className="lastLine">{sessionLastLines[session.session_id] || session.session_id}</div>
+                            </button>
+                            <div className="workspaceMarkers">
+                              <button
+                                className={`workspaceMarkerBtn${importantMarked ? " active" : ""}`}
+                                type="button"
+                                title={importantMarked ? "Clear star" : "Star session"}
+                                aria-pressed={importantMarked}
+                                disabled={markerBusy}
+                                draggable={false}
+                                onPointerDown={(event) => event.stopPropagation()}
+                                onClick={(event) => {
+                                  event.stopPropagation();
+                                  void handleSessionMarker(session, importantMarked ? "default" : "important");
+                                }}
+                              >
+                                {icon("star")}
+                              </button>
                             </div>
-                            <div className="lastLine">{sessionLastLines[session.session_id] || session.session_id}</div>
-                          </button>
+                          </div>
                         );
                       })}
                     </div>
@@ -2202,6 +2656,14 @@ export function App() {
           </footer>
         </aside>
 
+        <div
+          className="sidebarResizer"
+          role="separator"
+          aria-orientation="vertical"
+          aria-label="Resize sidebar"
+          onPointerDown={handleSidebarResizeStart}
+        />
+
         <div className="main">
           <div className="topbar">
             <div className="pill">
@@ -2220,7 +2682,7 @@ export function App() {
                   <div className="topMeta">
                     <span className="status-chip">{selectedSession ? baseName(selectedSession.cwd) : "No workspace"}</span>
                     <span className={topSessionStatusClass}>{topSessionStatus}</span>
-                    {tokenSummary ? <span className="status-chip">{tokenSummary}</span> : null}
+                    {tokenSummary ? <span className="status-chip" title={tokenSummary.title}>{tokenSummary.label}</span> : null}
                   </div>
                 </div>
               </div>
@@ -2301,7 +2763,7 @@ export function App() {
               <div className="chatWrap">
                 <div className="chat" ref={chatScrollRef} onScroll={updateChatScrollFollowState}>
                   <div className="chatInner">
-                    {hasOlder ? (
+                    {hasOlder && historyTopBoundaryReached ? (
                       <button className="olderBtn" type="button" disabled={loadingOlder} onClick={() => void loadOlder()}>
                         {loadingOlder ? "Loading older messages…" : "Load older messages"}
                       </button>
@@ -2320,12 +2782,12 @@ export function App() {
                         />
                       );
                     })}
-                    {workingIndicatorLabel ? <WorkingIndicator label={workingIndicatorLabel} /> : null}
+                    {workingIndicatorLabel ? <WorkingIndicator label={workingIndicatorLabel} tone={workingIndicatorTone} /> : null}
                     {!visibleTranscript.length && !workingIndicatorLabel ? <div className="emptyState">No transcript yet for this session.</div> : null}
                   </div>
                 </div>
               </div>
-              {floatingProgressEvent ? <FloatingProgress event={floatingProgressEvent} /> : null}
+              {floatingProgressEvent ? <FloatingProgress event={floatingProgressEvent} collapsed={floatingProgressCollapsed} onToggle={() => toggleFloatingProgress(floatingProgressEvent.id)} /> : null}
             </div>
 
             {showFilesPanel || showDetailsPanel ? (
@@ -2468,7 +2930,7 @@ export function App() {
                 <textarea
                   ref={composerInputRef}
                   value={composerText}
-                  onInput={(event) => setComposerText((event.currentTarget as HTMLTextAreaElement).value)}
+                  onInput={(event) => setSessionDraft(selectedSessionId, (event.currentTarget as HTMLTextAreaElement).value)}
                   onKeyDown={handleComposerKeyDown}
                   aria-label="Enter your instructions here"
                 />
@@ -2520,7 +2982,14 @@ export function App() {
           style={{ left: `${sessionContextMenu.x}px`, top: `${sessionContextMenu.y}px` }}
           onClick={(event) => event.stopPropagation()}
           onContextMenu={(event) => event.preventDefault()}
-        >
+      >
+          <button
+            type="button"
+            disabled={sessionMarkerBusyId === contextMenuSession.session_id}
+            onClick={() => void handleSessionMarker(contextMenuSession, sessionMarkerState(contextMenuSession) === "important" ? "default" : "important")}
+          >
+            {sessionMarkerState(contextMenuSession) === "important" ? "Clear star" : "Star session"}
+          </button>
           <button type="button" onClick={() => openRenameDialog(contextMenuSession)}>
             Rename
           </button>
@@ -2593,17 +3062,64 @@ export function App() {
               </div>
               <label className="field">
                 <span>CWD</span>
-                <input
-                  list="recent-cwds"
-                  value={newSessionCwd}
-                  onInput={(event) => setNewSessionCwd((event.currentTarget as HTMLInputElement).value)}
-                  placeholder="/path/to/workspace"
-                />
-                <datalist id="recent-cwds">
-                  {recentCwds.map((cwd) => (
-                    <option key={cwd} value={cwd} />
-                  ))}
-                </datalist>
+                <div
+                  className="cwdAutocomplete"
+                  onFocusCapture={() => setNewSessionCwdSuggestionsOpen(true)}
+                  onBlurCapture={(event) => {
+                    const next = event.relatedTarget;
+                    if (next instanceof Node && event.currentTarget.contains(next)) return;
+                    setNewSessionCwdSuggestionsOpen(false);
+                  }}
+                >
+                  <input
+                    ref={newSessionCwdInputRef}
+                    value={newSessionCwd}
+                    onInput={(event) => {
+                      setNewSessionCwd((event.currentTarget as HTMLInputElement).value);
+                      setNewSessionCwdSuggestionsOpen(true);
+                    }}
+                    onKeyDown={handleNewSessionCwdKeyDown}
+                    placeholder="/path/to/workspace"
+                    role="combobox"
+                    aria-autocomplete="list"
+                    aria-expanded={newSessionCwdSuggestionsOpen}
+                    aria-controls="new-session-cwd-suggestions"
+                    aria-activedescendant={
+                      newSessionCwdSuggestionsOpen && newSessionCwdSuggestionIndex >= 0
+                        ? `new-session-cwd-option-${newSessionCwdSuggestionIndex}`
+                        : undefined
+                    }
+                    autoComplete="off"
+                  />
+                  {newSessionCwdSuggestionsOpen &&
+                  (newSessionCwdSuggestionsLoading || Boolean(newSessionCwdSuggestionError) || newSessionCwdSuggestionChoices.length || Boolean(newSessionCwd.trim())) ? (
+                    <div className="cwdSuggestions" id="new-session-cwd-suggestions" role="listbox">
+                      {newSessionCwdSuggestionChoices.map((suggestion, index) => (
+                        <button
+                          key={`${suggestion.kind}-${suggestion.value}`}
+                          id={`new-session-cwd-option-${index}`}
+                          className={`cwdSuggestion${index === newSessionCwdSuggestionIndex ? " active" : ""}`}
+                          type="button"
+                          role="option"
+                          aria-selected={index === newSessionCwdSuggestionIndex}
+                          onMouseEnter={() => setNewSessionCwdSuggestionIndex(index)}
+                          onClick={() => applyNewSessionCwdSuggestion(suggestion)}
+                        >
+                          <span className="cwdSuggestionRow">
+                            <span className="cwdSuggestionLabel">{suggestion.label}</span>
+                            {suggestion.kind === "recent" ? <span className="cwdSuggestionBadge">Recent</span> : null}
+                          </span>
+                          <span className="cwdSuggestionPath">{suggestion.value}</span>
+                        </button>
+                      ))}
+                      {!newSessionCwdSuggestionsLoading && !newSessionCwdSuggestionError && !newSessionCwdSuggestionChoices.length ? (
+                        <div className="cwdSuggestionHint">No matching folders.</div>
+                      ) : null}
+                      {newSessionCwdSuggestionsLoading ? <div className="cwdSuggestionHint">Looking up folders…</div> : null}
+                      {newSessionCwdSuggestionError ? <div className="cwdSuggestionHint is-error">{newSessionCwdSuggestionError}</div> : null}
+                    </div>
+                  ) : null}
+                </div>
               </label>
               <div className="field">
                 <span>Resume existing</span>
@@ -2622,7 +3138,7 @@ export function App() {
                       type="button"
                       onClick={() => setNewSessionResumeSelection(candidate)}
                     >
-                      {(candidate.alias || candidate.first_user_message || candidate.session_id).trim()}
+                      {(candidate.alias || candidate.last_user_message || candidate.session_id).trim()}
                     </button>
                   ))}
                   {!newSessionResumeCandidates.length ? <div className="muted">No matching sessions for this cwd.</div> : null}
@@ -2718,7 +3234,13 @@ export function App() {
                 {icon("info")}
               </button>
             </div>
-            <div className="formGrid">
+            <form
+              className="formGrid"
+              onSubmit={(event) => {
+                event.preventDefault();
+                void handleRenameSession();
+              }}
+            >
               <label className="field">
                 <span>Name</span>
                 <input
@@ -2733,11 +3255,11 @@ export function App() {
                 <button className="secondaryBtn" type="button" onClick={() => setRenameOpen(false)}>
                   Cancel
                 </button>
-                <button className="primary" type="button" disabled={renameBusy} onClick={() => void handleRenameSession()}>
+                <button className="primary" type="submit" disabled={renameBusy}>
                   {renameBusy ? "Saving..." : "Save"}
                 </button>
               </div>
-            </div>
+            </form>
           </div>
         </div>
       ) : null}

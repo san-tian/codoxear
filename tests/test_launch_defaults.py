@@ -8,6 +8,7 @@ from unittest.mock import patch
 from codoxear.server import _normalize_requested_model_provider
 from codoxear.server import _normalize_requested_preferred_auth_method
 from codoxear.server import _normalize_requested_service_tier
+from codoxear.server import _list_directory_suggestions
 from codoxear.server import _read_codex_launch_defaults
 from codoxear.server import _read_codex_config_for_settings
 from codoxear.server import _read_new_session_defaults
@@ -32,6 +33,39 @@ def _codex_launch_default_env(**values: str):
 
 
 class TestLaunchDefaults(unittest.TestCase):
+    def test_list_directory_suggestions_returns_children_for_existing_directory(self) -> None:
+        with TemporaryDirectory() as td:
+            workspace = Path(td) / "workspace"
+            alpha = workspace / "alpha"
+            beta = workspace / "beta"
+            workspace.mkdir()
+            alpha.mkdir()
+            beta.mkdir()
+            (workspace / "notes.txt").write_text("ignore", encoding="utf-8")
+
+            payload = _list_directory_suggestions(str(workspace), limit=8)
+
+        self.assertEqual(payload["query"], str(workspace))
+        self.assertEqual(
+            [row["value"] for row in payload["suggestions"]],
+            [str(alpha.resolve()), str(beta.resolve())],
+        )
+        self.assertEqual({row["kind"] for row in payload["suggestions"]}, {"directory"})
+
+    def test_list_directory_suggestions_matches_partial_leaf_name(self) -> None:
+        with TemporaryDirectory() as td:
+            workspace = Path(td) / "workspace"
+            frontend = workspace / "frontend"
+            docs = workspace / "docs"
+            workspace.mkdir()
+            frontend.mkdir()
+            docs.mkdir()
+
+            payload = _list_directory_suggestions(str(workspace / "fr"), limit=8)
+
+        self.assertEqual([row["value"] for row in payload["suggestions"]], [str(frontend.resolve())])
+        self.assertEqual(payload["suggestions"][0]["label"], "frontend")
+
     def test_codex_config_settings_round_trip_raw_toml(self) -> None:
         with TemporaryDirectory() as td:
             config_path = Path(td) / "config.toml"

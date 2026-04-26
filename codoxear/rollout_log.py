@@ -331,6 +331,45 @@ def _extension_event_from_tool(
     )
 
 
+def _extension_payload_from_result(name: str, payload: dict[str, Any]) -> dict[str, Any] | None:
+    candidates: list[Any] = [
+        payload.get(_EXTENSION_DISPLAY_KEY),
+        payload.get("structuredContent"),
+        payload.get("structured_content"),
+        payload.get("details"),
+        payload.get("result"),
+        payload.get("output"),
+    ]
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        nested = candidate.get(_EXTENSION_DISPLAY_KEY)
+        if isinstance(nested, dict):
+            return nested
+        if name in _EXTENSION_DISPLAY_TOOL_NAMES:
+            return candidate
+    return None
+
+
+def _extension_event_from_tool_result(
+    name: str,
+    payload: dict[str, Any],
+    *,
+    call_id: str | None,
+    ts: float,
+) -> dict[str, Any] | None:
+    extension_payload = _extension_payload_from_result(name, payload)
+    if not isinstance(extension_payload, dict):
+        return None
+    return _extension_display_event(
+        extension_payload,
+        call_id=call_id,
+        ts=ts,
+        default_source=name,
+        default_title=name,
+    )
+
+
 def _normalized_bool_arg(
     args: dict[str, Any], *keys: str, default: bool = False
 ) -> bool:
@@ -569,6 +608,15 @@ def _single_chat_event(obj: dict[str, Any]) -> dict[str, Any] | None:
             name = _non_empty_string(payload.get("toolName")) or "tool"
             call_id = _non_empty_string(payload.get("toolCallId"))
             text = _tool_result_text(payload)
+            if ets is not None:
+                extension_event = _extension_event_from_tool_result(
+                    name,
+                    payload,
+                    call_id=call_id,
+                    ts=ets,
+                )
+                if extension_event is not None:
+                    return extension_event
             if name in _ASK_USER_TOOL_NAMES and ets is not None:
                 details = payload.get("details")
                 details = details if isinstance(details, dict) else {}
@@ -669,6 +717,15 @@ def _single_chat_event(obj: dict[str, Any]) -> dict[str, Any] | None:
             call_id = _non_empty_string(p.get("call_id"))
             name = _non_empty_string(p.get("name")) or "tool"
             text = _tool_result_text(p)
+            if ets is not None:
+                extension_event = _extension_event_from_tool_result(
+                    name,
+                    p,
+                    call_id=call_id,
+                    ts=ets,
+                )
+                if extension_event is not None:
+                    return extension_event
             if name in _ASK_USER_TOOL_NAMES and ets is not None:
                 details = p.get("details")
                 details = details if isinstance(details, dict) else {}
@@ -1119,6 +1176,16 @@ def _extract_chat_events(
                 details = payload.get("details")
                 details = details if isinstance(details, dict) else {}
                 text = _tool_result_text(payload)
+                if ets is not None:
+                    extension_event = _extension_event_from_tool_result(
+                        name,
+                        payload,
+                        call_id=call_id,
+                        ts=ets,
+                    )
+                    if extension_event is not None:
+                        events.append(extension_event)
+                        continue
                 if ets is not None and (name in _ASK_USER_TOOL_NAMES or (call_id is not None and call_id in pending_ask_user_calls)):
                     base = dict(pending_ask_user_calls.get(call_id, _ask_user_event({}, call_id=call_id, ts=ets, resolved=True)))
                     base["resolved"] = True
@@ -1301,6 +1368,16 @@ def _extract_chat_events(
                 text = _tool_result_text(p)
                 details = p.get("details")
                 details = details if isinstance(details, dict) else {}
+                if ets is not None:
+                    extension_event = _extension_event_from_tool_result(
+                        name,
+                        p,
+                        call_id=call_id,
+                        ts=ets,
+                    )
+                    if extension_event is not None:
+                        events.append(extension_event)
+                        continue
                 if ets is not None and (name in _ASK_USER_TOOL_NAMES or (call_id is not None and call_id in pending_ask_user_calls)):
                     base = dict(pending_ask_user_calls.get(call_id, _ask_user_event({}, call_id=call_id, ts=ets, resolved=True)))
                     base["resolved"] = True

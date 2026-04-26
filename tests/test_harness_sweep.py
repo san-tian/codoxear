@@ -37,6 +37,31 @@ def _make_session(*, sid: str, thread_id: str, log_path: Path) -> Session:
 
 
 class TestHarnessSweep(unittest.TestCase):
+    def test_reloads_persisted_harness_state_before_sweep(self) -> None:
+        with TemporaryDirectory() as td:
+            p = Path(td) / "rollout.jsonl"
+            harness_path = Path(td) / "harness.json"
+            p.write_text("{}", encoding="utf-8")
+            harness_path.write_text(
+                '{"sid-a":{"enabled":true,"request":"Reloaded","cooldown_minutes":5,"remaining_injections":10}}',
+                encoding="utf-8",
+            )
+
+            mgr = _make_manager()
+            mgr._sessions["sid-a"] = _make_session(sid="sid-a", thread_id="thread-1", log_path=p)
+            mgr._harness["sid-a"] = {"enabled": False, "request": "Stale", "cooldown_minutes": 5, "remaining_injections": 10}
+
+            sent: list[tuple[str, str]] = []
+            mgr.get_state = lambda sid: {"busy": False, "queue_len": 0}  # type: ignore[method-assign]
+            mgr.send = lambda sid, text: (sent.append((sid, text)) or {"ok": True})  # type: ignore[method-assign]
+
+            with patch("codoxear.server.HARNESS_PATH", harness_path), patch("codoxear.server.time.time", return_value=1000.0), patch(
+                "codoxear.server._last_chat_role_ts_from_tail", return_value=("assistant", 600.0)
+            ), patch("codoxear.server.HARNESS_PROMPT_PREFIX", "PFX"):
+                mgr._harness_sweep()
+
+            self.assertEqual(sent, [("sid-a", "PFX\n\n---\n\nAdditional request from user: Reloaded\n")])
+
     def test_dedupes_injection_for_same_thread(self) -> None:
         with TemporaryDirectory() as td:
             p = Path(td) / "rollout.jsonl"

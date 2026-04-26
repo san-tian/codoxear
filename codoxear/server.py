@@ -107,16 +107,39 @@ def _match_session_route(path: str, *suffix: str) -> str | None:
 
 
 def _nova_incremental_v1_path(path: str, method: str) -> str | None:
-    if str(method).upper() != "GET":
+    method_upper = str(method).upper()
+    if method_upper == "GET":
+        if path == "/api/sessions":
+            return "/api/v1/sessions"
+        for suffix in (
+            ("diagnostics",),
+            ("queue",),
+            ("harness",),
+            ("git", "changed_files"),
+            ("git", "diff"),
+            ("git", "file_versions"),
+            ("file", "read"),
+            ("file", "search"),
+            ("file", "blob"),
+            ("messages", "tail"),
+            ("messages", "history"),
+            ("messages", "live"),
+        ):
+            session_id = _match_session_route(path, *suffix)
+            if session_id is None:
+                continue
+            quoted_sid = urllib.parse.quote(session_id, safe="")
+            return f"/api/v1/sessions/{quoted_sid}/{'/'.join(suffix)}"
         return None
-    if path == "/api/sessions":
-        return None
-    for suffix in (("diagnostics",), ("queue",), ("harness",), ("file", "read"), ("file", "blob")):
-        session_id = _match_session_route(path, *suffix)
-        if session_id is None:
-            continue
-        quoted_sid = urllib.parse.quote(session_id, safe="")
-        return f"/api/v1/sessions/{quoted_sid}/{'/'.join(suffix)}"
+    if method_upper == "POST":
+        if path == "/api/sessions":
+            return "/api/v1/sessions"
+        for suffix in (("rename",), ("delete",), ("edit",), ("send",), ("interrupt",), ("enqueue",), ("harness",), ("inject_file",), ("inject_image",), ("queue", "delete"), ("queue", "update"), ("queue", "move")):
+            session_id = _match_session_route(path, *suffix)
+            if session_id is None:
+                continue
+            quoted_sid = urllib.parse.quote(session_id, safe="")
+            return f"/api/v1/sessions/{quoted_sid}/{'/'.join(suffix)}"
     return None
 
 
@@ -167,7 +190,7 @@ COOKIE_SECURE = os.environ.get("CODEX_WEB_COOKIE_SECURE", "0") == "1"
 URL_PREFIX = _normalize_url_prefix(os.environ.get("CODEX_WEB_URL_PREFIX"))
 COOKIE_PATH = (URL_PREFIX + "/") if URL_PREFIX else "/"
 TMUX_SESSION_NAME = (os.environ.get("CODEX_WEB_TMUX_SESSION") or "codoxear").strip() or "codoxear"
-TMUX_META_WAIT_SECONDS = 3.0
+TMUX_META_WAIT_SECONDS = 10.0
 
 _CODEX_HOME_ENV = os.environ.get("CODEX_HOME")
 if _CODEX_HOME_ENV is None or (not _CODEX_HOME_ENV.strip()):
@@ -409,8 +432,8 @@ def _tmux_available() -> bool:
 
 
 def _wait_for_spawned_broker_meta(spawn_nonce: str, *, timeout_s: float = TMUX_META_WAIT_SECONDS) -> dict[str, Any]:
-    deadline = time.time() + max(timeout_s, 0.0)
-    while time.time() <= deadline:
+    deadline = time.monotonic() + max(timeout_s, 0.0)
+    while time.monotonic() <= deadline:
         for meta_path in sorted(SOCK_DIR.glob("*.json")):
             try:
                 meta = json.loads(meta_path.read_text(encoding="utf-8"))
@@ -426,6 +449,27 @@ def _wait_for_spawned_broker_meta(spawn_nonce: str, *, timeout_s: float = TMUX_M
             return meta
         time.sleep(0.05)
     raise RuntimeError(f"tmux launch did not publish broker metadata within {timeout_s:.1f}s")
+
+
+def _tmux_capture_pane_tail(tmux_bin: str, pane_id: str, *, lines: int = 80) -> str:
+    pane = str(pane_id or "").strip()
+    if not pane:
+        return ""
+    proc = subprocess.run(
+        [tmux_bin, "capture-pane", "-p", "-t", pane, "-S", f"-{max(1, int(lines))}"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        return ""
+    text = (proc.stdout or "").strip()
+    if not text:
+        return ""
+    lines_out = [line.rstrip() for line in text.splitlines() if line.strip()]
+    if not lines_out:
+        return ""
+    return "\n".join(lines_out[-12:])[-4000:]
 
 
 def _pid_alive(pid: int) -> bool:
@@ -1128,6 +1172,111 @@ def _resolve_dir_target(raw: str, *, field_name: str) -> Path:
     if path.exists() and not path.is_dir():
         raise ValueError(f"{field_name} is not a directory: {path}")
     return path
+
+
+def _iter_matching_directories(base_dir: Path, *, prefix: str, limit: int) -> list[Path]:
+    wanted = prefix.casefold().strip()
+    rows: list[Path] = []
+    try:
+        with os.scandir(base_dir) as entries:
+            for entry in entries:
+                try:
+                    if not entry.is_dir():
+                        continue
+                except OSError:
+                    continue
+                name = entry.name.strip()
+                if wanted and not name.casefold().startswith(wanted):
+                    continue
+                rows.append(Path(entry.path).resolve())
+    except OSError:
+        return []
+    rows.sort(key=lambda path: (path.name.casefold(), str(path)))
+    return rows[: max(0, int(limit))]
+
+
+def _cwd_suggestion_entry(path: Path, *, kind: str) -> dict[str, Any] | None:
+    try:
+        resolved = path.expanduser().resolve()
+    except OSError:
+        return None
+    if not resolved.is_dir():
+        return None
+    value = str(resolved)
+    return {
+        "value": value,
+        "label": resolved.name or value,
+        "kind": kind,
+    }
+
+
+def _list_directory_suggestions(raw: str, *, recent_cwds: list[str] | None = None, limit: int = 12) -> dict[str, Any]:
+    query = str(raw or "").strip()
+    cap = max(1, min(int(limit), 48))
+    suggestions: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def push(path: Path, *, kind: str) -> None:
+        if len(suggestions) >= cap:
+            return
+        row = _cwd_suggestion_entry(path, kind=kind)
+        if row is None:
+            return
+        value = row["value"]
+        if value in seen:
+            return
+        seen.add(value)
+        suggestions.append(row)
+
+    search_root: Path | None = None
+    prefix = ""
+    resolved_query = ""
+    if query:
+        target = _expand_user_path(query)
+        target = target.resolve() if target.is_absolute() else (Path.cwd() / target).resolve()
+        resolved_query = str(target)
+        if query.endswith((os.sep, "/")) or target.is_dir():
+            search_root = target
+        else:
+            search_root = target.parent
+            prefix = target.name
+        while search_root is not None and (not search_root.exists() or not search_root.is_dir()):
+            if search_root.parent == search_root:
+                search_root = None
+                break
+            prefix = search_root.name or prefix
+            search_root = search_root.parent
+        if search_root is not None:
+            for child in _iter_matching_directories(search_root, prefix=prefix, limit=cap):
+                push(child, kind="directory")
+    else:
+        for recent in recent_cwds or []:
+            push(Path(recent), kind="recent")
+        if len(suggestions) < cap:
+            home_dir = Path.home().resolve()
+            for child in _iter_matching_directories(home_dir, prefix="", limit=cap - len(suggestions)):
+                push(child, kind="directory")
+
+    if recent_cwds and len(suggestions) < cap:
+        for recent in recent_cwds:
+            row = _cwd_suggestion_entry(Path(recent), kind="recent")
+            if row is None:
+                continue
+            if resolved_query and not str(row["value"]).startswith(resolved_query):
+                continue
+            value = row["value"]
+            if value in seen:
+                continue
+            seen.add(value)
+            suggestions.append(row)
+            if len(suggestions) >= cap:
+                break
+
+    return {
+        "ok": True,
+        "query": query,
+        "suggestions": suggestions,
+    }
 
 
 def _codex_trust_override_for_path(path: Path) -> str:
@@ -2229,7 +2378,43 @@ def _is_scaffold_user_text(text: str) -> bool:
     return s.startswith("# AGENTS.md instructions") or s.startswith("<environment_context>")
 
 
-def _first_user_message_preview_from_log(log_path: Path, *, max_scan_bytes: int = 256 * 1024) -> str:
+def _last_user_message_preview_from_log(log_path: Path, *, max_scan_bytes: int = 256 * 1024) -> str:
+    try:
+        stat = log_path.stat()
+    except FileNotFoundError:
+        return ""
+    except Exception:
+        return ""
+
+    start = max(0, int(stat.st_size) - max(1, int(max_scan_bytes)))
+    try:
+        records, _ = _read_jsonl_from_offset(log_path, start, max_bytes=max_scan_bytes)
+    except FileNotFoundError:
+        return ""
+    except Exception:
+        return ""
+
+    preview = ""
+    for obj in records:
+        if not isinstance(obj, dict):
+            continue
+        if obj.get("type") == "message":
+            text = _pi_user_text(obj) or ""
+        elif obj.get("type") == "response_item":
+            payload = obj.get("payload")
+            if not isinstance(payload, dict):
+                continue
+            if payload.get("type") != "message" or payload.get("role") != "user":
+                continue
+            text = _user_message_text(payload)
+        else:
+            continue
+        if not text or _is_scaffold_user_text(text):
+            continue
+        preview = _resume_preview_from_text(text)
+    if preview:
+        return preview
+
     try:
         with log_path.open("rb") as f:
             total = 0
@@ -2259,7 +2444,9 @@ def _first_user_message_preview_from_log(log_path: Path, *, max_scan_bytes: int 
                 return _resume_preview_from_text(text)
     except FileNotFoundError:
         return ""
-    return ""
+    except Exception:
+        return ""
+    return preview
 
 
 def _coerce_main_thread_log(*, thread_id: str, log_path: Path) -> tuple[str, Path]:
@@ -2511,7 +2698,10 @@ class SessionManager:
                 "remaining_injections": remaining_injections,
             }
         with self._lock:
+            stale_last_injected = [sid for sid in self._harness_last_injected.keys() if not bool(cleaned.get(sid, {}).get("enabled"))]
             self._harness = cleaned
+            for sid in stale_last_injected:
+                self._harness_last_injected.pop(sid, None)
 
     def _save_harness(self) -> None:
         with self._lock:
@@ -3391,6 +3581,7 @@ class SessionManager:
         # Keep discovery fresh; sessions can appear/disappear without UI polling.
         self._discover_existing_if_stale()
         self._prune_dead_sessions()
+        self._load_harness()
         with self._lock:
             items: list[tuple[str, Session, dict[str, Any], float]] = []
             for sid, s in self._sessions.items():
@@ -4351,7 +4542,14 @@ class SessionManager:
             if tmux_proc.returncode != 0:
                 detail = (tmux_proc.stderr or tmux_proc.stdout or f"exit status {tmux_proc.returncode}").strip()
                 raise RuntimeError(f"tmux launch failed: {detail}")
-            meta = _wait_for_spawned_broker_meta(spawn_nonce)
+            pane_id = (tmux_proc.stdout or "").strip()
+            try:
+                meta = _wait_for_spawned_broker_meta(spawn_nonce)
+            except RuntimeError as exc:
+                pane_tail = _tmux_capture_pane_tail(tmux_bin, pane_id)
+                if pane_tail:
+                    raise RuntimeError(f"{exc}\nLast tmux pane output:\n{pane_tail}") from exc
+                raise
             broker_pid = meta.get("broker_pid")
             if not isinstance(broker_pid, int):
                 raise RuntimeError("tmux launch metadata is missing broker_pid")
@@ -4730,6 +4928,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def _handle_nova_post(self, path: str, u: urllib.parse.ParseResult, body: bytes) -> bool:
         if not NOVA_ENABLED:
             return False
+        incremental_v1_path = _nova_incremental_v1_path(path, self.command)
+        if incremental_v1_path is not None:
+            request_path = incremental_v1_path + (("?" + u.query) if u.query else "")
+            self._proxy_request(target_base=NOVA_API_BASE, request_path=request_path, body=body, require_auth=True)
+            return True
         request_path = path + (("?" + u.query) if u.query else "")
         if path.startswith("/api/v1/"):
             self._proxy_request(target_base=NOVA_API_BASE, request_path=request_path, body=body, require_auth=True)
@@ -4955,10 +5158,30 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     alias = MANAGER.alias_get(sid) if isinstance(sid, str) and sid else ""
                     preview = ""
                     if isinstance(log_path_raw, str) and log_path_raw:
-                        preview = _first_user_message_preview_from_log(Path(log_path_raw))
+                        preview = _last_user_message_preview_from_log(Path(log_path_raw))
                     row["alias"] = alias
-                    row["first_user_message"] = preview
+                    row["last_user_message"] = preview
                 _json_response(self, 200, {"ok": True, **info, "sessions": rows})
+                return
+
+            if path == "/api/cwd_suggestions":
+                if not _require_auth(self):
+                    self._unauthorized()
+                    return
+                qs = urllib.parse.parse_qs(u.query)
+                raw_query = qs.get("q", [""])[0]
+                limit_raw = qs.get("limit", ["12"])[0]
+                try:
+                    limit = int(limit_raw)
+                except ValueError:
+                    _json_response(self, 400, {"error": "limit must be an integer", "field": "limit"})
+                    return
+                try:
+                    payload = _list_directory_suggestions(raw_query, recent_cwds=MANAGER.recent_cwds(limit=limit * 2), limit=limit)
+                except (ValueError, OSError) as e:
+                    _json_response(self, 400, {"error": str(e), "field": "cwd"})
+                    return
+                _json_response(self, 200, payload)
                 return
 
             if path == "/api/metrics":
@@ -5617,214 +5840,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 )
                 return
 
-            session_id = _match_session_route(path, "messages", "tail")
-            if session_id is not None:
-                if not _require_auth(self):
-                    self._unauthorized()
-                    return
-                t0_total = time.perf_counter()
-                MANAGER.refresh_session_meta(session_id)
-                s = MANAGER.get_session(session_id)
-                if not s:
-                    _json_response(self, 404, {"error": "unknown session"})
-                    return
-                qs = urllib.parse.parse_qs(u.query)
-                limit_q = qs.get("limit")
-                if limit_q is None:
-                    limit = 80
-                else:
-                    if not limit_q:
-                        raise ValueError("invalid limit")
-                    limit = int(limit_q[0])
-                limit = max(20, min(200, limit))
-                if s.log_path is None or (not s.log_path.exists()):
-                    _state, busy_val, queue_val, token_val = _message_runtime_snapshot(session_id, s)
-                    _json_response(
-                        self,
-                        200,
-                        {
-                            "thread_id": s.thread_id,
-                            "log_path": None,
-                            "live_cursor": None,
-                            "history_cursor": None,
-                            "events": [],
-                            "has_older": False,
-                            "busy": bool(busy_val),
-                            "queue_len": int(queue_val),
-                            "token": token_val,
-                        },
-                    )
-                    _record_metric("api_messages_init_ms", (time.perf_counter() - t0_total) * 1000.0)
-                    return
-                events, before_byte, after_byte, has_older = _read_chat_tail_page(s.log_path, limit=limit)
-                events = MANAGER._attach_notification_texts(events)
-                live_cursor = _encode_message_cursor(kind="live", session=s, pos=after_byte)
-                history_cursor = _encode_message_cursor(kind="history", session=s, pos=before_byte) if has_older and before_byte > 0 else None
-                _state, busy_val, queue_val, token_val = _message_runtime_snapshot(session_id, s)
-                _json_response(
-                    self,
-                    200,
-                    {
-                        "thread_id": s.thread_id,
-                        "log_path": str(s.log_path),
-                        "live_cursor": live_cursor,
-                        "history_cursor": history_cursor,
-                        "events": events,
-                        "has_older": bool(has_older),
-                        "busy": bool(busy_val),
-                        "queue_len": int(queue_val),
-                        "token": token_val,
-                    },
-                )
-                _record_metric("api_messages_init_ms", (time.perf_counter() - t0_total) * 1000.0)
-                return
-
-            session_id = _match_session_route(path, "messages", "history")
-            if session_id is not None:
-                if not _require_auth(self):
-                    self._unauthorized()
-                    return
-                MANAGER.refresh_session_meta(session_id)
-                s = MANAGER.get_session(session_id)
-                if not s:
-                    _json_response(self, 404, {"error": "unknown session"})
-                    return
-                qs = urllib.parse.parse_qs(u.query)
-                cursor_q = qs.get("cursor")
-                if cursor_q is None or not cursor_q or not cursor_q[0].strip():
-                    _json_response(self, 400, {"error": "cursor required"})
-                    return
-                limit_q = qs.get("limit")
-                if limit_q is None:
-                    limit = 60
-                else:
-                    if not limit_q:
-                        raise ValueError("invalid limit")
-                    limit = int(limit_q[0])
-                limit = max(20, min(200, limit))
-                if s.log_path is None or (not s.log_path.exists()):
-                    _state, busy_val, queue_val, token_val = _message_runtime_snapshot(session_id, s)
-                    _json_response(
-                        self,
-                        200,
-                        {
-                            "thread_id": s.thread_id,
-                            "log_path": None,
-                            "history_cursor": None,
-                            "events": [],
-                            "has_older": False,
-                            "busy": bool(busy_val),
-                            "queue_len": int(queue_val),
-                            "token": token_val,
-                        },
-                    )
-                    return
-                try:
-                    before_byte = _decode_message_cursor(cursor_q[0], kind="history", session=s)
-                except MessageCursorError as e:
-                    _json_response(self, 409, {"error": str(e)})
-                    return
-                events, next_before, has_older = _read_chat_history_page(s.log_path, before_byte=before_byte, limit=limit)
-                events = MANAGER._attach_notification_texts(events)
-                history_cursor = _encode_message_cursor(kind="history", session=s, pos=next_before) if has_older and next_before > 0 else None
-                _state, busy_val, queue_val, token_val = _message_runtime_snapshot(session_id, s)
-                _json_response(
-                    self,
-                    200,
-                    {
-                        "thread_id": s.thread_id,
-                        "log_path": str(s.log_path),
-                        "history_cursor": history_cursor,
-                        "events": events,
-                        "has_older": bool(has_older),
-                        "busy": bool(busy_val),
-                        "queue_len": int(queue_val),
-                        "token": token_val,
-                    },
-                )
-                return
-
-            session_id = _match_session_route(path, "messages", "live")
-            if session_id is not None:
-                if not _require_auth(self):
-                    self._unauthorized()
-                    return
-                t0_total = time.perf_counter()
-                t0_meta = time.perf_counter()
-                MANAGER.refresh_session_meta(session_id)
-                dt_meta_ms = (time.perf_counter() - t0_meta) * 1000.0
-                s = MANAGER.get_session(session_id)
-                if not s:
-                    _json_response(self, 404, {"error": "unknown session"})
-                    return
-                qs = urllib.parse.parse_qs(u.query)
-                cursor_q = qs.get("cursor")
-                if cursor_q is None or not cursor_q or not cursor_q[0].strip():
-                    _json_response(self, 400, {"error": "cursor required"})
-                    return
-                if s.log_path is None or (not s.log_path.exists()):
-                    _state, busy_val, queue_val, token_val = _message_runtime_snapshot(session_id, s)
-                    _json_response(
-                        self,
-                        200,
-                        {
-                            "thread_id": s.thread_id,
-                            "log_path": None,
-                            "live_cursor": None,
-                            "events": [],
-                            "meta_delta": {"thinking": 0, "tool": 0, "system": 0},
-                            "turn_start": False,
-                            "turn_end": False,
-                            "turn_aborted": False,
-                            "diag": {"pending_log": True, "meta_refresh_ms": round(dt_meta_ms, 3)},
-                            "busy": bool(busy_val),
-                            "queue_len": int(queue_val),
-                            "token": token_val,
-                        },
-                    )
-                    _record_metric("api_messages_poll_ms", (time.perf_counter() - t0_total) * 1000.0)
-                    return
-                try:
-                    after_byte = _decode_message_cursor(cursor_q[0], kind="live", session=s)
-                except MessageCursorError as e:
-                    _json_response(self, 409, {"error": str(e)})
-                    return
-                records, next_after = _read_jsonl_records_from_offset(s.log_path, after_byte)
-                objs = [record.obj for record in records]
-                events, meta_delta, flags, diag = _extract_chat_events(objs)
-                token_update = _extract_token_update(objs)
-                if objs:
-                    MANAGER.mark_log_delta(session_id, objs=objs, new_off=next_after)
-                s2 = MANAGER.get_session(session_id)
-                if token_update is not None and s2 is not None:
-                    s2.token = token_update
-                events = MANAGER._attach_notification_texts(events)
-                live_cursor = _encode_message_cursor(kind="live", session=s, pos=next_after)
-                t0_state = time.perf_counter()
-                _state, busy_val, queue_val, token_val = _message_runtime_snapshot(session_id, s, token_update=token_update)
-                diag["state_ms"] = round((time.perf_counter() - t0_state) * 1000.0, 3)
-                diag["meta_refresh_ms"] = round(dt_meta_ms, 3)
-                _json_response(
-                    self,
-                    200,
-                    {
-                        "thread_id": s.thread_id,
-                        "log_path": str(s.log_path),
-                        "live_cursor": live_cursor,
-                        "events": events,
-                        "meta_delta": meta_delta,
-                        "turn_start": bool(flags.get("turn_start")),
-                        "turn_end": bool(flags.get("turn_end")),
-                        "turn_aborted": bool(flags.get("turn_aborted")),
-                        "diag": diag,
-                        "busy": bool(busy_val),
-                        "queue_len": int(queue_val),
-                        "token": token_val,
-                    },
-                )
-                _record_metric("api_messages_poll_ms", (time.perf_counter() - t0_total) * 1000.0)
-                return
-
             if path.startswith("/api/sessions/") and path.endswith("/tail"):
                 if not _require_auth(self):
                     self._unauthorized()
@@ -5879,7 +5894,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self.send_error(404)
                     return
                 path = stripped
-            if NOVA_ENABLED and path.startswith("/api/v1/"):
+            incremental_v1_path = _nova_incremental_v1_path(path, self.command)
+            if NOVA_ENABLED and (
+                incremental_v1_path is not None
+                or path.startswith("/api/v1/")
+                or path == "/legacy"
+                or path.startswith("/legacy/")
+            ):
                 body = _read_body(self)
                 if self._handle_nova_post(path, u, body):
                     return
@@ -6047,138 +6068,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     return
                 payload = MANAGER._voice_push.listener_heartbeat(client_id=client_id, enabled=enabled)
                 _json_response(self, 200, {"ok": True, **payload})
-                return
-
-            if path == "/api/sessions":
-                if not _require_auth(self):
-                    self._unauthorized()
-                    return
-                body = _read_body(self)
-                body_text = body.decode("utf-8")
-                if not body_text.strip():
-                    raise ValueError("empty request body")
-                obj = json.loads(body_text)
-                if not isinstance(obj, dict):
-                    raise ValueError("invalid json body (expected object)")
-                try:
-                    agent_backend = normalize_agent_backend(obj.get("agent_backend"), default=DEFAULT_AGENT_BACKEND)
-                except ValueError as e:
-                    _json_response(self, 400, {"error": str(e)})
-                    return
-                cwd = obj.get("cwd")
-                if not isinstance(cwd, str) or not cwd.strip():
-                    _json_response(self, 400, {"error": "cwd required", "field": "cwd"})
-                    return
-                try:
-                    if agent_backend == "codex":
-                        allowed_providers = set(_read_codex_launch_defaults().get("model_providers") or ["openai"])
-                        model_provider = _normalize_requested_model_provider(
-                            obj.get("model_provider"),
-                            allowed=set(["openai", *[p for p in allowed_providers if p not in {"chatgpt", "openai-api"}]]),
-                        )
-                    else:
-                        pi_provider_choices = {
-                            str(value)
-                            for value in (_read_pi_launch_defaults().get("provider_choices") or [])
-                            if isinstance(value, str) and value.strip()
-                        }
-                        model_provider = _normalize_requested_model_provider(
-                            obj.get("model_provider"),
-                            allowed=pi_provider_choices or None,
-                        )
-                except ValueError as e:
-                    _json_response(self, 400, {"error": str(e)})
-                    return
-                if agent_backend == "codex":
-                    try:
-                        preferred_auth_method = _normalize_requested_preferred_auth_method(obj.get("preferred_auth_method"))
-                    except ValueError as e:
-                        _json_response(self, 400, {"error": str(e)})
-                        return
-                else:
-                    if obj.get("preferred_auth_method") not in (None, ""):
-                        _json_response(self, 400, {"error": "preferred_auth_method is not supported for pi"})
-                        return
-                    preferred_auth_method = None
-                try:
-                    model = _normalize_requested_model(obj.get("model"))
-                except ValueError as e:
-                    _json_response(self, 400, {"error": str(e)})
-                    return
-                if agent_backend == "codex":
-                    try:
-                        reasoning_effort = _normalize_requested_reasoning_effort(obj.get("reasoning_effort"))
-                    except ValueError as e:
-                        _json_response(self, 400, {"error": str(e)})
-                        return
-                    try:
-                        service_tier = _normalize_requested_service_tier(obj.get("service_tier"))
-                    except ValueError as e:
-                        _json_response(self, 400, {"error": str(e)})
-                        return
-                else:
-                    try:
-                        reasoning_effort = _normalize_requested_pi_reasoning_effort(obj.get("reasoning_effort"))
-                    except ValueError as e:
-                        _json_response(self, 400, {"error": str(e)})
-                        return
-                    if obj.get("service_tier") not in (None, ""):
-                        _json_response(self, 400, {"error": "service_tier is not supported for pi"})
-                        return
-                    service_tier = None
-                create_in_tmux_raw = obj.get("create_in_tmux")
-                if create_in_tmux_raw is None:
-                    create_in_tmux = False
-                elif isinstance(create_in_tmux_raw, bool):
-                    create_in_tmux = create_in_tmux_raw
-                else:
-                    _json_response(self, 400, {"error": "create_in_tmux must be a boolean"})
-                    return
-                resume_session_id_raw = obj.get("resume_session_id")
-                if resume_session_id_raw is None:
-                    resume_session_id = None
-                elif isinstance(resume_session_id_raw, str):
-                    resume_session_id = resume_session_id_raw.strip() or None
-                else:
-                    _json_response(self, 400, {"error": "resume_session_id must be a string"})
-                    return
-                worktree_branch_raw = obj.get("worktree_branch")
-                if worktree_branch_raw is None:
-                    worktree_branch = None
-                elif isinstance(worktree_branch_raw, str):
-                    worktree_branch = worktree_branch_raw.strip() or None
-                else:
-                    _json_response(self, 400, {"error": "worktree_branch must be a string"})
-                    return
-                args = obj.get("args")
-                if args is None:
-                    args_list = None
-                elif isinstance(args, list) and all(isinstance(x, str) for x in args):
-                    args_list = [x for x in args if x]
-                else:
-                    _json_response(self, 400, {"error": "args must be a list of strings"})
-                    return
-                try:
-                    res = MANAGER.spawn_web_session(
-                        cwd=cwd,
-                        args=args_list,
-                        agent_backend=agent_backend,
-                        resume_session_id=resume_session_id,
-                        worktree_branch=worktree_branch,
-                        model_provider=model_provider,
-                        preferred_auth_method=preferred_auth_method,
-                        model=model,
-                        reasoning_effort=reasoning_effort,
-                        service_tier=service_tier,
-                        create_in_tmux=create_in_tmux,
-                    )
-                except ValueError as e:
-                    payload: dict[str, Any] = {"error": str(e)}
-                    if str(e).startswith("cwd "):
-                        payload["field"] = "cwd"
-                    _json_response(self, 400, payload)
-                    return
-                _json_response(self, 200, {"ok": True, **res})
                 return
 
             if path == "/api/files/read":
@@ -6451,103 +6340,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 )
                 return
 
-            session_id = _match_session_route(path, "delete")
-            if session_id is not None:
-                if not _require_auth(self):
-                    self._unauthorized()
-                    return
-                _read_body(self)
-                ok = MANAGER.delete_session(session_id)
-                if not ok:
-                    _json_response(self, 404, {"error": "unknown session"})
-                    return
-                _json_response(self, 200, {"ok": True})
-                return
-
-            if path.startswith("/api/sessions/") and path.endswith("/edit"):
-                if not _require_auth(self):
-                    self._unauthorized()
-                    return
-                parts = path.split("/")
-                session_id = parts[3] if len(parts) >= 4 else ""
-                body = _read_body(self)
-                body_text = body.decode("utf-8")
-                if not body_text.strip():
-                    raise ValueError("empty request body")
-                obj = json.loads(body_text)
-                if not isinstance(obj, dict):
-                    raise ValueError("invalid json body (expected object)")
-                name = obj.get("name")
-                if not isinstance(name, str):
-                    _json_response(self, 400, {"error": "name required"})
-                    return
-                try:
-                    alias, sidebar_meta = MANAGER.edit_session(
-                        session_id,
-                        name=name,
-                        priority_offset=obj.get("priority_offset"),
-                        snooze_until=obj.get("snooze_until"),
-                        dependency_session_id=obj.get("dependency_session_id"),
-                    )
-                except KeyError:
-                    _json_response(self, 404, {"error": "unknown session"})
-                    return
-                except ValueError as e:
-                    _json_response(self, 400, {"error": str(e)})
-                    return
-                _json_response(self, 200, {"ok": True, "alias": alias, **sidebar_meta})
-                return
-
-            if path.startswith("/api/sessions/") and path.endswith("/rename"):
-                if not _require_auth(self):
-                    self._unauthorized()
-                    return
-                parts = path.split("/")
-                session_id = parts[3] if len(parts) >= 4 else ""
-                body = _read_body(self)
-                body_text = body.decode("utf-8")
-                if not body_text.strip():
-                    raise ValueError("empty request body")
-                obj = json.loads(body_text)
-                if not isinstance(obj, dict):
-                    raise ValueError("invalid json body (expected object)")
-                name = obj.get("name")
-                if not isinstance(name, str):
-                    _json_response(self, 400, {"error": "name required"})
-                    return
-                try:
-                    alias = MANAGER.alias_set(session_id, name)
-                except KeyError:
-                    _json_response(self, 404, {"error": "unknown session"})
-                    return
-                _json_response(self, 200, {"ok": True, "alias": alias})
-                return
-
-            if path.startswith("/api/sessions/") and path.endswith("/rename"):
-                if not _require_auth(self):
-                    self._unauthorized()
-                    return
-                parts = path.split("/")
-                session_id = parts[3] if len(parts) >= 4 else ""
-                body = _read_body(self)
-                body_text = body.decode("utf-8")
-                if not body_text.strip():
-                    raise ValueError("empty request body")
-                obj = json.loads(body_text)
-                if not isinstance(obj, dict):
-                    raise ValueError("invalid json body (expected object)")
-                name = obj.get("name")
-                if not isinstance(name, str):
-                    _json_response(self, 400, {"error": "name required"})
-                    return
-                try:
-                    alias = MANAGER.alias_set(session_id, name)
-                except KeyError:
-                    _json_response(self, 404, {"error": "unknown session"})
-                    return
-                _json_response(self, 200, {"ok": True, "alias": alias})
-                return
-
             if path.startswith("/api/sessions/") and path.endswith("/send"):
                 if not _require_auth(self):
                     self._unauthorized()
@@ -6689,69 +6481,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 _json_response(self, 200, res)
                 return
 
-            if path.startswith("/api/sessions/") and path.endswith("/harness"):
-                if not _require_auth(self):
-                    self._unauthorized()
-                    return
-                parts = path.split("/")
-                session_id = parts[3] if len(parts) >= 4 else ""
-                body = _read_body(self)
-                body_text = body.decode("utf-8")
-                if not body_text.strip():
-                    raise ValueError("empty request body")
-                obj = json.loads(body_text)
-                if not isinstance(obj, dict):
-                    raise ValueError("invalid json body (expected object)")
-                enabled_raw = obj.get("enabled", None)
-                request_raw = obj.get("request", None)
-                cooldown_minutes_raw = obj.get("cooldown_minutes", None)
-                remaining_injections_raw = obj.get("remaining_injections", None)
-                if "text" in obj:
-                    _json_response(self, 400, {"error": "unknown field: text (use request)"})
-                    return
-                enabled: bool | None
-                if enabled_raw is None:
-                    enabled = None
-                else:
-                    enabled = bool(enabled_raw)
-
-                if request_raw is not None and (not isinstance(request_raw, str)):
-                    _json_response(self, 400, {"error": "request must be a string"})
-                    return
-                request: str | None
-                if request_raw is not None:
-                    request = request_raw
-                else:
-                    request = None
-                cooldown_minutes: int | None
-                if cooldown_minutes_raw is not None:
-                    try:
-                        cooldown_minutes = _clean_harness_cooldown_minutes(cooldown_minutes_raw)
-                    except ValueError as e:
-                        _json_response(self, 400, {"error": str(e)})
-                        return
-                else:
-                    cooldown_minutes = None
-                remaining_injections: int | None
-                if remaining_injections_raw is not None:
-                    try:
-                        remaining_injections = _clean_harness_remaining_injections(remaining_injections_raw, allow_zero=True)
-                    except ValueError as e:
-                        _json_response(self, 400, {"error": str(e)})
-                        return
-                else:
-                    remaining_injections = None
-
-                cfg = MANAGER.harness_set(
-                    session_id,
-                    enabled=enabled,
-                    request=request,
-                    cooldown_minutes=cooldown_minutes,
-                    remaining_injections=remaining_injections,
-                )
-                _json_response(self, 200, {"ok": True, **cfg})
-                return
-
             if path.startswith("/api/sessions/") and path.endswith("/interrupt"):
                 if not _require_auth(self):
                     self._unauthorized()
@@ -6767,62 +6496,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     _json_response(self, 404, {"error": "unknown session"})
                     return
                 _json_response(self, 200, {"ok": True, "broker": resp})
-                return
-
-            if path.startswith("/api/sessions/") and (path.endswith("/inject_file") or path.endswith("/inject_image")):
-                if not _require_auth(self):
-                    self._unauthorized()
-                    return
-                parts = path.split("/")
-                session_id = parts[3] if len(parts) >= 4 else ""
-                try:
-                    body = _read_body(self, limit=ATTACH_UPLOAD_BODY_MAX_BYTES)
-                except ValueError:
-                    _json_response(self, 413, {"error": f"file too large (max {ATTACH_UPLOAD_MAX_BYTES} bytes)"})
-                    return
-                body_text = body.decode("utf-8")
-                if not body_text.strip():
-                    raise ValueError("empty request body")
-                obj = json.loads(body_text)
-                if not isinstance(obj, dict):
-                    raise ValueError("invalid json body (expected object)")
-                data_b64 = obj.get("data_b64")
-                filename = obj.get("filename")
-                attachment_index = obj.get("attachment_index")
-                if not isinstance(filename, str) or (not filename.strip()):
-                    raise ValueError("filename required")
-                if isinstance(attachment_index, bool) or not isinstance(attachment_index, int):
-                    _json_response(self, 400, {"error": "attachment_index must be an integer"})
-                    return
-                if not isinstance(data_b64, str) or not data_b64:
-                    _json_response(self, 400, {"error": "data_b64 required"})
-                    return
-                try:
-                    raw = base64.b64decode(data_b64.encode("ascii"), validate=True)
-                except Exception:
-                    _json_response(self, 400, {"error": "invalid base64"})
-                    return
-                try:
-                    out_path = _stage_uploaded_file(session_id, filename, raw)
-                except ValueError as e:
-                    status = 413 if str(e).startswith("file too large") else 400
-                    _json_response(self, status, {"error": str(e)})
-                    return
-
-                try:
-                    inject_text = _attachment_inject_text(attachment_index, out_path)
-                except ValueError as e:
-                    _json_response(self, 400, {"error": str(e)})
-                    return
-
-                # Bracketed paste: inject the staged attachment line into the active broker input.
-                seq = f"\x1b[200~{inject_text}\x1b[201~"
-                try:
-                    resp = MANAGER.inject_keys(session_id, seq)
-                except KeyError:
-                    _json_response(self, 404, {"error": "unknown session"})
-                    return
-                _json_response(self, 200, {"ok": True, "path": str(out_path), "inject_text": inject_text, "broker": resp})
                 return
 
             if path == "/api/hooks/notify":

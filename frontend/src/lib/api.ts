@@ -1,7 +1,9 @@
 import type {
   ChangedFilesResponse,
   CodexConfigResponse,
+  CwdSuggestionsResponse,
   DiagnosticsResponse,
+  EditSessionResponse,
   FileReadResponse,
   FileSearchResponse,
   HarnessConfig,
@@ -66,6 +68,11 @@ export const api = {
       `/api/session_resume_candidates?cwd=${encodeURIComponent(cwd)}&agent_backend=${encodeURIComponent(agentBackend)}`,
     );
   },
+  fetchCwdSuggestions(query: string, limit = 12): Promise<CwdSuggestionsResponse> {
+    return readJson<CwdSuggestionsResponse>(
+      `/api/cwd_suggestions?q=${encodeURIComponent(query)}&limit=${encodeURIComponent(String(limit))}`,
+    );
+  },
   createSession(payload: {
     cwd: string;
     agent_backend: string;
@@ -112,6 +119,15 @@ export const api = {
     return readJson<{ ok?: true; alias: string }>(`/api/sessions/${encodeURIComponent(sessionId)}/rename`, {
       method: "POST",
       body: JSON.stringify({ name }),
+    });
+  },
+  editSession(
+    sessionId: string,
+    payload: { name: string; priority_offset: number; snooze_until: number | null; dependency_session_id: string | null },
+  ): Promise<EditSessionResponse> {
+    return readJson<EditSessionResponse>(`/api/sessions/${encodeURIComponent(sessionId)}/edit`, {
+      method: "POST",
+      body: JSON.stringify(payload),
     });
   },
   enqueueMessage(sessionId: string, text: string): Promise<{ ok?: true; queued?: boolean; queue_len?: number }> {

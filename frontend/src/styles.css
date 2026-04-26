@@ -10,14 +10,25 @@
   --danger: #ff8a9a;
   --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.28);
   --shadow-md: 0 18px 46px rgba(0, 0, 0, 0.42);
+  --floating-progress-border: rgba(45, 212, 191, 0.24);
+  --floating-progress-bg: rgba(16, 21, 29, 0.94);
+  --floating-progress-shadow: 0 16px 42px rgba(0, 0, 0, 0.36);
+  --floating-progress-status-border: rgba(226, 232, 240, 0.12);
+  --floating-progress-status-running-border: rgba(45, 212, 191, 0.3);
+  --floating-progress-status-running-text: #7dd3c7;
+  --floating-progress-bar-bg: rgba(226, 232, 240, 0.08);
+  --floating-progress-item-color: rgba(216, 222, 233, 0.82);
+  --floating-progress-mark-border: rgba(216, 222, 233, 0.22);
+  --floating-progress-item-completed-color: rgba(216, 222, 233, 0.5);
   --sidebar-w: clamp(280px, 24vw, 360px);
+  --sidebar-resizer-w: 10px;
   --rail-w: 360px;
   color-scheme: dark;
   font-family: "Segoe UI", ui-sans-serif, system-ui, -apple-system, sans-serif;
 }
 
 :root[data-theme="light"] {
-  --bg: #e9eef5;
+  --bg: #eef4f8;
   --panel: #ffffff;
   --panel-muted: #f8fafc;
   --border: rgba(15, 23, 42, 0.12);
@@ -28,6 +39,16 @@
   --danger: #b91c1c;
   --shadow-sm: 0 1px 2px rgba(15, 23, 42, 0.08);
   --shadow-md: 0 18px 46px rgba(15, 23, 42, 0.18);
+  --floating-progress-border: rgba(20, 184, 166, 0.22);
+  --floating-progress-bg: rgba(248, 250, 252, 0.96);
+  --floating-progress-shadow: 0 14px 36px rgba(15, 23, 42, 0.16);
+  --floating-progress-status-border: rgba(15, 23, 42, 0.1);
+  --floating-progress-status-running-border: rgba(20, 184, 166, 0.28);
+  --floating-progress-status-running-text: #0f766e;
+  --floating-progress-bar-bg: rgba(15, 23, 42, 0.08);
+  --floating-progress-item-color: var(--text);
+  --floating-progress-mark-border: rgba(15, 23, 42, 0.22);
+  --floating-progress-item-completed-color: var(--muted);
   color-scheme: light;
 }
 
@@ -84,12 +105,12 @@ button:disabled {
   position: fixed;
   inset: 0;
   display: grid;
-  grid-template-columns: var(--sidebar-w) minmax(0, 1fr);
+  grid-template-columns: var(--sidebar-w) var(--sidebar-resizer-w) minmax(0, 1fr);
   min-height: 100dvh;
 }
 
 .app.withRail {
-  grid-template-columns: var(--sidebar-w) minmax(0, 1fr);
+  grid-template-columns: var(--sidebar-w) var(--sidebar-resizer-w) minmax(0, 1fr);
 }
 
 .app.sidebarCollapsed,
@@ -97,16 +118,49 @@ button:disabled {
   grid-template-columns: minmax(0, 1fr);
 }
 
-.app.sidebarCollapsed .sidebar {
+.app.sidebarCollapsed .sidebar,
+.app.sidebarCollapsed .sidebarResizer {
   display: none;
 }
 
 .sidebar {
   display: flex;
   flex-direction: column;
+  width: 100%;
+  min-width: 0;
   min-height: 0;
+  overflow: hidden;
   border-right: 1px solid var(--border);
   background: var(--panel);
+}
+
+.sidebarResizer {
+  position: relative;
+  width: var(--sidebar-resizer-w);
+  min-width: var(--sidebar-resizer-w);
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  cursor: col-resize;
+  touch-action: none;
+}
+
+.sidebarResizer::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: calc(50% - 1px);
+  width: 2px;
+  background: transparent;
+  transition: background 140ms ease, box-shadow 140ms ease;
+}
+
+.sidebarResizer:hover::before,
+.app.sidebarResizing .sidebarResizer::before {
+  background: rgba(159, 193, 255, 0.45);
+  box-shadow: 0 0 0 3px rgba(159, 193, 255, 0.12);
 }
 
 .sidebar header {
@@ -114,6 +168,7 @@ button:disabled {
   align-items: center;
   justify-content: space-between;
   gap: 12px;
+  min-width: 0;
   padding: 12px 14px;
   border-bottom: 1px solid var(--border);
 }
@@ -142,6 +197,10 @@ button:disabled {
   gap: 6px;
 }
 
+.topMeta > .status-chip.working {
+  margin-left: 3px;
+}
+
 .sidebar .sessions {
   flex: 1 1 auto;
   min-height: 0;
@@ -155,6 +214,7 @@ button:disabled {
 .sidebar footer {
   display: flex;
   gap: 8px;
+  min-width: 0;
   padding: 10px 12px;
   border-top: 1px solid var(--border);
 }
@@ -174,6 +234,7 @@ button:disabled {
   position: relative;
   display: grid;
   gap: 6px;
+  min-width: 0;
   transition: opacity 140ms ease, transform 140ms ease;
 }
 
@@ -254,6 +315,7 @@ button:disabled {
 
 .workspaceGroupHeader {
   width: 100%;
+  min-width: 0;
   display: grid;
   grid-template-columns: auto minmax(0, 1fr) auto;
   gap: 8px;
@@ -308,14 +370,18 @@ button:disabled {
 }
 
 .workspaceGroupMeta {
+  min-width: 0;
   color: var(--muted);
   font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .workspaceSessions {
   display: grid;
   gap: 8px;
+  min-width: 0;
   padding-left: 12px;
   border-left: 1px solid rgba(15, 23, 42, 0.08);
 }
@@ -323,11 +389,10 @@ button:disabled {
 .workspace {
   position: relative;
   width: 100%;
-  display: flex;
-  flex-direction: column;
+  min-width: 0;
+  display: grid;
   gap: 8px;
   padding: 10px;
-  text-align: left;
   border: 1px solid var(--border);
   border-radius: 12px;
   background: rgba(255, 255, 255, 0.96);
@@ -345,15 +410,40 @@ button:disabled {
   background: var(--accent-soft);
 }
 
+.workspace.is-important {
+  border-color: rgba(245, 158, 11, 0.34);
+  box-shadow: 0 10px 24px rgba(245, 158, 11, 0.08);
+}
+
+.workspaceSelect {
+  width: 100%;
+  min-width: 0;
+  display: grid;
+  gap: 8px;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+}
+
+.workspaceSelect:hover {
+  background: transparent;
+}
+
 .workspaceHeader {
   display: grid;
   gap: 4px;
+  min-width: 0;
+  padding-right: 48px;
 }
 
 .workspaceTitleRow {
   display: flex;
   align-items: center;
   gap: 8px;
+  min-width: 0;
 }
 
 .workspaceTitle {
@@ -364,6 +454,15 @@ button:disabled {
   white-space: nowrap;
   font-size: 13px;
   font-weight: 650;
+}
+
+.workspaceDraftMark {
+  width: 7px;
+  height: 7px;
+  flex: 0 0 auto;
+  border-radius: 999px;
+  background: rgba(37, 99, 235, 0.88);
+  box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.14);
 }
 
 .workspacePath,
@@ -383,6 +482,41 @@ button:disabled {
   line-height: 1.35;
 }
 
+.workspaceMarkers {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.workspaceMarkerBtn {
+  width: 26px;
+  height: 26px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border-radius: 999px;
+  border-color: transparent;
+  background: transparent;
+  color: var(--muted);
+  box-shadow: none;
+}
+
+.workspaceMarkerBtn:hover:not(:disabled) {
+  color: var(--text);
+  border-color: transparent;
+  background: rgba(148, 163, 184, 0.12);
+}
+
+.workspaceMarkerBtn.active {
+  color: #b45309;
+  border-color: transparent;
+  background: transparent;
+}
+
 .status-dot {
   position: relative;
   width: 9px;
@@ -398,12 +532,27 @@ button:disabled {
   animation: breathe-dot 1.8s ease-in-out infinite;
 }
 
+.status-dot.waiting {
+  background: #f59e0b;
+  box-shadow: 0 0 0 0 rgba(245, 158, 11, 0.38), 0 0 12px rgba(245, 158, 11, 0.55);
+  animation: breathe-dot-waiting 1.8s ease-in-out infinite;
+}
+
 .status-dot.running::after {
   content: "";
   position: absolute;
   inset: -5px;
   border-radius: inherit;
   background: rgba(34, 197, 94, 0.14);
+  animation: breathe-halo 1.8s ease-in-out infinite;
+}
+
+.status-dot.waiting::after {
+  content: "";
+  position: absolute;
+  inset: -5px;
+  border-radius: inherit;
+  background: rgba(245, 158, 11, 0.16);
   animation: breathe-halo 1.8s ease-in-out infinite;
 }
 
@@ -415,6 +564,17 @@ button:disabled {
   50% {
     transform: scale(1.08);
     box-shadow: 0 0 0 5px rgba(34, 197, 94, 0), 0 0 16px rgba(34, 197, 94, 0.72);
+  }
+}
+
+@keyframes breathe-dot-waiting {
+  0%, 100% {
+    transform: scale(0.92);
+    box-shadow: 0 0 0 0 rgba(245, 158, 11, 0.3), 0 0 8px rgba(245, 158, 11, 0.42);
+  }
+  50% {
+    transform: scale(1.08);
+    box-shadow: 0 0 0 5px rgba(245, 158, 11, 0), 0 0 16px rgba(245, 158, 11, 0.72);
   }
 }
 
@@ -503,8 +663,14 @@ button:disabled {
 
 .status-chip.working {
   gap: 6px;
-  background: rgba(37, 99, 235, 0.12);
-  color: rgba(30, 64, 175, 0.92);
+  background: rgba(22, 163, 74, 0.14);
+  color: rgba(21, 128, 61, 0.92);
+}
+
+.status-chip.waiting {
+  gap: 6px;
+  background: rgba(245, 158, 11, 0.16);
+  color: rgba(202, 138, 4, 0.96);
 }
 
 .status-chip.working::before {
@@ -512,9 +678,19 @@ button:disabled {
   width: 6px;
   height: 6px;
   border-radius: 999px;
-  background: #2563eb;
-  box-shadow: 0 0 0 0 rgba(37, 99, 235, 0.34);
+  background: #16a34a;
+  box-shadow: 0 0 0 0 rgba(22, 163, 74, 0.34);
   animation: status-chip-pulse 1.25s ease-out infinite;
+}
+
+.status-chip.waiting::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: 999px;
+  background: #f59e0b;
+  box-shadow: 0 0 0 0 rgba(245, 158, 11, 0.34);
+  animation: status-chip-pulse-waiting 1.25s ease-out infinite;
 }
 
 @keyframes status-chip-pulse {
@@ -526,6 +702,18 @@ button:disabled {
   }
   100% {
     box-shadow: 0 0 0 0 rgba(37, 99, 235, 0);
+  }
+}
+
+@keyframes status-chip-pulse-waiting {
+  0% {
+    box-shadow: 0 0 0 0 rgba(245, 158, 11, 0.34);
+  }
+  70% {
+    box-shadow: 0 0 0 6px rgba(245, 158, 11, 0);
+  }
+  100% {
+    box-shadow: 0 0 0 0 rgba(245, 158, 11, 0);
   }
 }
 
@@ -655,7 +843,7 @@ button.primary {
   display: block;
   margin: 0 auto 18px;
   padding: 8px 12px;
-  background: var(--panel);
+  width: fit-content;
 }
 
 .msg {
@@ -783,6 +971,11 @@ button.primary {
   color: var(--muted);
   line-height: 1;
   overflow-wrap: anywhere;
+}
+
+.workingRow.is-waiting .workingIndicator,
+.workingRow.is-waiting .workingLabel {
+  color: rgba(202, 138, 4, 0.96);
 }
 
 .workingDots {
@@ -1217,12 +1410,18 @@ button.primary {
 .tool-pair {
   display: grid;
   gap: 10px;
+  width: 100%;
   max-width: 760px;
+  padding-left: 12px;
+  box-sizing: border-box;
+  justify-items: start;
 }
 
 .tool-part {
   display: grid;
   gap: 6px;
+  width: 100%;
+  justify-items: start;
 }
 
 .tool-part-label {
@@ -1231,6 +1430,10 @@ button.primary {
   color: var(--muted);
   text-transform: uppercase;
   letter-spacing: 0.06em;
+}
+
+.tool-part .message-body {
+  width: 100%;
 }
 
 .extension-panel {
@@ -1543,11 +1746,15 @@ button.primary {
   display: grid;
   gap: 7px;
   padding: 10px 12px;
-  border: 1px solid rgba(20, 184, 166, 0.22);
+  border: 1px solid var(--floating-progress-border);
   border-radius: 8px;
-  background: rgba(248, 250, 252, 0.96);
-  box-shadow: 0 14px 36px rgba(15, 23, 42, 0.16);
+  background: var(--floating-progress-bg);
+  box-shadow: var(--floating-progress-shadow);
   backdrop-filter: blur(12px);
+}
+
+.floatingProgress.is-collapsed {
+  gap: 0;
 }
 
 .floatingProgressTop {
@@ -1555,6 +1762,13 @@ button.primary {
   align-items: center;
   justify-content: space-between;
   gap: 12px;
+}
+
+.floatingProgressHead {
+  min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
 }
 
 .floatingProgressTitle {
@@ -1568,7 +1782,7 @@ button.primary {
 .floatingProgressStatus {
   flex: 0 0 auto;
   padding: 2px 7px;
-  border: 1px solid rgba(15, 23, 42, 0.1);
+  border: 1px solid var(--floating-progress-status-border);
   border-radius: 999px;
   color: var(--muted);
   font-size: 11px;
@@ -1577,15 +1791,40 @@ button.primary {
 }
 
 .floatingProgressStatus.is-running {
-  border-color: rgba(20, 184, 166, 0.28);
-  color: #0f766e;
+  border-color: var(--floating-progress-status-running-border);
+  color: var(--floating-progress-status-running-text);
+}
+
+.floatingProgressToggle {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.floatingProgressToggle:hover:not(:disabled) {
+  color: var(--text);
+  border-color: rgba(148, 163, 184, 0.34);
+}
+
+.floatingProgressToggle svg {
+  width: 14px;
+  height: 14px;
 }
 
 .floatingProgressBar {
   height: 3px;
   overflow: hidden;
   border-radius: 999px;
-  background: rgba(15, 23, 42, 0.08);
+  background: var(--floating-progress-bar-bg);
 }
 
 .floatingProgressBar span {
@@ -1608,7 +1847,7 @@ button.primary {
   grid-template-columns: 14px minmax(0, 1fr);
   gap: 8px;
   align-items: center;
-  color: var(--text);
+  color: var(--floating-progress-item-color);
   font-size: 13px;
   line-height: 1.35;
 }
@@ -1620,7 +1859,7 @@ button.primary {
 .floatingProgressMark {
   width: 7px;
   height: 7px;
-  border: 1px solid rgba(15, 23, 42, 0.22);
+  border: 1px solid var(--floating-progress-mark-border);
   border-radius: 999px;
 }
 
@@ -1632,7 +1871,7 @@ button.primary {
 }
 
 .floatingProgressItem.is-completed {
-  color: var(--muted);
+  color: var(--floating-progress-item-completed-color);
 }
 
 .floatingProgressItem.is-completed .floatingProgressItemLabel {
@@ -1777,6 +2016,7 @@ button.primary {
 }
 
 .inputWrap textarea {
+  display: block;
   width: 100%;
   min-height: 42px;
   max-height: 180px;
@@ -1784,6 +2024,7 @@ button.primary {
   border: 0;
   resize: none;
   background: transparent;
+  line-height: 1.4;
 }
 
 .inputWrap textarea:focus {
@@ -1793,10 +2034,10 @@ button.primary {
 .ph {
   position: absolute;
   inset: 0;
-  display: flex;
-  align-items: center;
-  padding: 0 12px;
+  padding: 10px 12px;
   color: rgba(15, 23, 42, 0.35);
+  font: inherit;
+  line-height: 1.4;
   pointer-events: none;
 }
 
@@ -1937,6 +2178,83 @@ button.primary {
   padding: 10px 12px;
 }
 
+.cwdAutocomplete {
+  position: relative;
+}
+
+.cwdSuggestions {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  right: 0;
+  display: grid;
+  gap: 0;
+  max-height: 260px;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--panel);
+  box-shadow: var(--shadow-md);
+  z-index: 4;
+}
+
+.cwdSuggestion {
+  width: 100%;
+  display: grid;
+  gap: 4px;
+  padding: 10px 12px;
+  border: 0;
+  border-bottom: 1px solid var(--border);
+  border-radius: 0;
+  background: transparent;
+  text-align: left;
+}
+
+.cwdSuggestion:last-child {
+  border-bottom: 0;
+}
+
+.cwdSuggestion.active,
+.cwdSuggestion:hover {
+  background: var(--accent-soft);
+}
+
+.cwdSuggestionRow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.cwdSuggestionLabel {
+  font-weight: 650;
+}
+
+.cwdSuggestionPath {
+  font-size: 12px;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.cwdSuggestionBadge {
+  flex: 0 0 auto;
+  padding: 2px 7px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.cwdSuggestionHint {
+  padding: 10px 12px;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.cwdSuggestionHint.is-error {
+  color: #b91c1c;
+}
+
 .toggleRow {
   display: flex;
   align-items: center;
@@ -2026,7 +2344,8 @@ button.primary {
     grid-template-columns: 1fr;
   }
 
-  .sidebar {
+  .sidebar,
+  .sidebarResizer {
     display: none;
   }
 
@@ -2273,38 +2592,6 @@ select,
 
 .extension-item-mark {
   border-color: rgba(216, 222, 233, 0.22);
-}
-
-.floatingProgress {
-  border-color: rgba(45, 212, 191, 0.24);
-  background: rgba(16, 21, 29, 0.94);
-  box-shadow: 0 16px 42px rgba(0, 0, 0, 0.36);
-}
-
-.floatingProgressStatus {
-  border-color: rgba(226, 232, 240, 0.12);
-  color: rgba(216, 222, 233, 0.62);
-}
-
-.floatingProgressStatus.is-running {
-  border-color: rgba(45, 212, 191, 0.3);
-  color: #7dd3c7;
-}
-
-.floatingProgressBar {
-  background: rgba(226, 232, 240, 0.08);
-}
-
-.floatingProgressItem {
-  color: rgba(216, 222, 233, 0.82);
-}
-
-.floatingProgressMark {
-  border-color: rgba(216, 222, 233, 0.22);
-}
-
-.floatingProgressItem.is-completed {
-  color: rgba(216, 222, 233, 0.5);
 }
 
 .filePreviewMedia img {

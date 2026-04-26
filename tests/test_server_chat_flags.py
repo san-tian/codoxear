@@ -201,6 +201,45 @@ class TestServerChatFlags(unittest.TestCase):
         self.assertEqual(events[0]["progress_label"], "iterations")
         self.assertEqual(events[0]["items"][0]["status"], "completed")
 
+    def test_codoxear_display_tool_result_emits_extension_event(self) -> None:
+        events, meta, _flags, diag = _extract_chat_events(
+            [
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call_output",
+                        "name": "ralph_status",
+                        "call_id": "ralph-2",
+                        "output": "Loop: demo-loop",
+                        "structuredContent": {
+                            "codoxear_display": {
+                                "version": 1,
+                                "kind": "progress",
+                                "source": "ralph-loop",
+                                "title": "Ralph loop",
+                                "status": "running",
+                                "summary": "Iteration 2/5",
+                                "progress": {"current": 2, "total": 5, "label": "iterations"},
+                                "items": [
+                                    {"label": "Done item", "status": "completed"},
+                                    {"label": "Next item", "status": "in_progress"},
+                                ],
+                                "text": "Loop: demo-loop",
+                            }
+                        },
+                    },
+                    "ts": 10.0,
+                }
+            ]
+        )
+        self.assertEqual(meta["tool"], 1)
+        self.assertEqual(diag["last_tool"], "ralph_status")
+        self.assertEqual(events[0]["type"], "extension")
+        self.assertEqual(events[0]["source"], "ralph-loop")
+        self.assertEqual(events[0]["summary"], "Iteration 2/5")
+        self.assertEqual(events[0]["progress_current"], 2)
+        self.assertEqual(events[0]["items"][1]["status"], "in_progress")
+
     def test_pi_ask_user_call_and_result_are_normalized(self) -> None:
         events, meta, _flags, diag = _extract_chat_events(
             [

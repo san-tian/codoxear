@@ -1,30 +1,60 @@
 use crate::models::{
-    ApiBackendDefaults, ApiDiagnosticsResponse, ApiHarnessResponse, ApiMessagesHistoryResponse,
-    ApiMessagesLiveResponse, ApiMessagesTailResponse, ApiNewSessionDefaults, ApiQueueItem,
-    ApiQueueResponse, ApiSessionSummary, ApiSessionsResponse, SessionDetail, SessionSummary,
+    ApiBackendDefaults, ApiChangedFileEntry, ApiChangedFilesResponse, ApiDiagnosticsResponse,
+    ApiFileSearchMatch, ApiFileSearchResponse, ApiGitDiffResponse, ApiGitFileVersionsResponse,
+    ApiHarnessResponse,
+    ApiMessagesHistoryResponse, ApiMessagesLiveResponse, ApiMessagesTailResponse,
+    ApiNewSessionDefaults, ApiQueueItem, ApiQueueResponse, ApiSessionSummary,
+    ApiSessionsResponse, SessionDetail, SessionSummary,
 };
+use base64::Engine;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::collections::{hash_map::DefaultHasher, HashMap, HashSet};
+use std::cmp::Reverse;
+use std::collections::{hash_map::DefaultHasher, BinaryHeap, HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::hash::{Hash, Hasher};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::Duration;
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 use toml::Value as TomlValue;
 
 const APP_VERSION: &str = "0.1.0";
 const CONTEXT_WINDOW_BASELINE_TOKENS: i64 = 12000;
 const HARNESS_DEFAULT_IDLE_MINUTES: f64 = 15.0;
 const HARNESS_DEFAULT_MAX_INJECTIONS: i64 = 1;
+const ATTACH_UPLOAD_MAX_BYTES: usize = 16 * 1024 * 1024;
 const FILE_READ_MAX_BYTES: u64 = 2 * 1024 * 1024;
+const FILE_SEARCH_LIMIT: usize = 120;
+const FILE_SEARCH_TIMEOUT_SECONDS: f64 = 0.75;
+const FILE_SEARCH_MAX_CANDIDATES: usize = 200000;
+const GIT_DIFF_MAX_BYTES: usize = 800 * 1024;
+const GIT_DIFF_TIMEOUT_SECONDS: f64 = 4.0;
+const GIT_CHANGED_FILES_MAX: usize = 400;
 const SIDEBAR_PRIORITY_HALF_LIFE_SECONDS: f64 = 8.0 * 3600.0;
 const SIDEBAR_PRIORITY_LAMBDA: f64 = std::f64::consts::LN_2 / SIDEBAR_PRIORITY_HALF_LIFE_SECONDS;
 const SUPPORTED_REASONING_EFFORTS: &[&str] = &["xhigh", "high", "medium", "low"];
 const SUPPORTED_PI_REASONING_EFFORTS: &[&str] = &["off", "minimal", "low", "medium", "high", "xhigh"];
+const TMUX_META_WAIT_SECONDS: f64 = 10.0;
+static QUEUE_ITEM_COUNTER: AtomicU64 = AtomicU64::new(0);
+const FILE_LIST_IGNORED_DIRS: &[&str] = &[
+    ".git",
+    ".hg",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".svn",
+    "__pycache__",
+    "build",
+    "dist",
+    "node_modules",
+    "venv",
+    ".venv",
+];
 const TEXTUAL_EXTENSIONS: &[&str] = &[
     "bash", "c", "cc", "cfg", "conf", "cpp", "css", "csv", "diff", "go", "h", "hpp", "htm",
     "html", "ini", "java", "js", "json", "jsonl", "log", "md", "markdown", "mdown", "mkd", "patch",
@@ -86,7 +116,67 @@ struct SessionMeta {
 #[derive(Debug)]
 struct BrokerState {
     busy: bool,
+    _queue_len: usize,
     token: Option<Value>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CreateSessionRequest {
+    pub cwd: String,
+    pub args: Vec<String>,
+    pub agent_backend: String,
+    pub resume_session_id: Option<String>,
+    pub worktree_branch: Option<String>,
+    pub model_provider: Option<String>,
+    pub preferred_auth_method: Option<String>,
+    pub model: Option<String>,
+    pub reasoning_effort: Option<String>,
+    pub service_tier: Option<String>,
+    pub create_in_tmux: bool,
+}
+
+#[derive(Debug, Clone)]
+pub enum CreateSessionError {
+    BadRequest { message: String, field: Option<String> },
+    Internal(String),
+}
+
+impl CreateSessionError {
+    pub fn bad_request(message: impl Into<String>) -> Self {
+        Self::BadRequest {
+            message: message.into(),
+            field: None,
+        }
+    }
+
+    pub fn bad_request_with_field(message: impl Into<String>, field: impl Into<String>) -> Self {
+        Self::BadRequest {
+            message: message.into(),
+            field: Some(field.into()),
+        }
+    }
+
+    pub fn internal(message: impl Into<String>) -> Self {
+        Self::Internal(message.into())
+    }
+
+    pub fn message(&self) -> &str {
+        match self {
+            Self::BadRequest { message, .. } => message,
+            Self::Internal(message) => message,
+        }
+    }
+
+    pub fn field(&self) -> Option<&str> {
+        match self {
+            Self::BadRequest { field, .. } => field.as_deref(),
+            Self::Internal(_) => None,
+        }
+    }
+
+    pub fn is_bad_request(&self) -> bool {
+        matches!(self, Self::BadRequest { .. })
+    }
 }
 
 pub fn default_app_dir() -> Result<PathBuf, String> {
@@ -338,6 +428,15 @@ pub fn load_preview_bootstrap(config: &RuntimeConfig) -> Result<(Vec<SessionSumm
 
 pub fn load_diagnostics_response(config: &RuntimeConfig, session_id: &str) -> Result<ApiDiagnosticsResponse, String> {
     let session = find_session(config, session_id)?;
+    let broker_state = read_live_broker_state(config, &session)?;
+    let broker_busy = broker_state.busy;
+    let busy = session
+        .log_path
+        .as_deref()
+        .map(Path::new)
+        .filter(|path| path.exists())
+        .map(|_| session.busy)
+        .unwrap_or(broker_busy);
     let now = epoch_now();
     let time_priority = priority_from_elapsed_seconds((now - session.updated_ts).max(0.0));
     let base_priority = clip01(time_priority + session.priority_offset);
@@ -356,10 +455,10 @@ pub fn load_diagnostics_response(config: &RuntimeConfig, session_id: &str) -> Re
         log_path: session.log_path,
         broker_pid: session.broker_pid,
         codex_pid: session.pid,
-        busy: session.busy,
-        broker_busy: session.busy,
+        busy,
+        broker_busy,
         queue_len: session.queue_len,
-        token: session.token,
+        token: broker_state.token.or(session.token),
         model_provider: session.model_provider.clone(),
         preferred_auth_method: session.preferred_auth_method.clone(),
         provider_choice: provider_choice_for_settings(
@@ -384,10 +483,8 @@ pub fn load_diagnostics_response(config: &RuntimeConfig, session_id: &str) -> Re
 pub fn load_queue_response(config: &RuntimeConfig, session_id: &str) -> Result<ApiQueueResponse, String> {
     let _ = find_session(config, session_id)?;
     let queues = read_array_map(&config.app_dir.join("session_queues.json"))?;
-    let items = queues
-        .get(session_id)
-        .into_iter()
-        .flat_map(|values| values.iter())
+    let items = normalized_queue_values(queues.get(session_id).map(Vec::as_slice).unwrap_or(&[]))
+        .iter()
         .map(queue_item_from_value)
         .collect::<Vec<_>>();
     let queue = items.iter().map(|item| item.text.clone()).collect::<Vec<_>>();
@@ -396,6 +493,154 @@ pub fn load_queue_response(config: &RuntimeConfig, session_id: &str) -> Result<A
         items,
         queue,
     })
+}
+
+pub fn enqueue_session_message(config: &RuntimeConfig, session_id: &str, text: &str) -> Result<Value, String> {
+    if text.trim().is_empty() {
+        return Err("text required".to_string());
+    }
+    let session = find_session(config, session_id)?;
+    let queue_path = config.app_dir.join("session_queues.json");
+    let mut queues = read_array_map(&queue_path)?;
+    let mut items = normalized_queue_values(queues.get(session_id).map(Vec::as_slice).unwrap_or(&[]));
+    let item = new_queue_item_value(text, None);
+    let item_id = item
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    items.push(item.clone());
+    let queue_len = items.len();
+    set_normalized_queue_values(&mut queues, session_id, items.clone());
+    write_queue_map(&queue_path, &queues)?;
+    if queue_len != 1 {
+        return Ok(json!({"queued": true, "queue_len": queue_len, "item": item}));
+    }
+    let ready = match queue_remote_ready(config, &session) {
+        Ok(ready) => ready,
+        Err(_) => false,
+    };
+    if !ready {
+        return Ok(json!({"queued": true, "queue_len": queue_len, "item": item}));
+    }
+    if let Some(first) = items.first_mut() {
+        first["sending"] = Value::Bool(true);
+    }
+    set_normalized_queue_values(&mut queues, session_id, items.clone());
+    write_queue_map(&queue_path, &queues)?;
+
+    let send_result = broker_request_for_session(
+        config,
+        &session,
+        &json!({"cmd": "send", "text": text}),
+        Duration::from_secs_f64(3.0),
+    )
+    .and_then(|response| {
+        if !response.is_object() || response.get("queue_len").and_then(Value::as_u64).is_none() {
+            return Err("invalid broker send response".to_string());
+        }
+        Ok(response)
+    });
+
+    match send_result {
+        Ok(response) => {
+            let mut remaining = normalized_queue_values(queues.get(session_id).map(Vec::as_slice).unwrap_or(&[]));
+            if let Some(index) = remaining.iter().position(|entry| entry.get("id").and_then(Value::as_str) == Some(item_id.as_str())) {
+                remaining.remove(index);
+            }
+            set_normalized_queue_values(&mut queues, session_id, remaining);
+            write_queue_map(&queue_path, &queues)?;
+            Ok(response)
+        }
+        Err(_) => {
+            let mut reverted = normalized_queue_values(queues.get(session_id).map(Vec::as_slice).unwrap_or(&[]));
+            if let Some(entry) = reverted.iter_mut().find(|entry| entry.get("id").and_then(Value::as_str) == Some(item_id.as_str())) {
+                entry.as_object_mut().map(|object| object.remove("sending"));
+            }
+            set_normalized_queue_values(&mut queues, session_id, reverted);
+            write_queue_map(&queue_path, &queues)?;
+            Ok(json!({"queued": true, "queue_len": queue_len, "item": item}))
+        }
+    }
+}
+
+pub fn delete_queue_item(config: &RuntimeConfig, session_id: &str, item_id: &str) -> Result<Value, String> {
+    let item_id = item_id.trim();
+    if item_id.is_empty() {
+        return Err("id required".to_string());
+    }
+    let _ = find_session(config, session_id)?;
+    let queue_path = config.app_dir.join("session_queues.json");
+    let mut queues = read_array_map(&queue_path)?;
+    let mut items = normalized_queue_values(queues.get(session_id).map(Vec::as_slice).unwrap_or(&[]));
+    let Some(index) = items.iter().position(|entry| entry.get("id").and_then(Value::as_str) == Some(item_id)) else {
+        return Err("item not found".to_string());
+    };
+    if items[index].get("sending").and_then(Value::as_bool) == Some(true) {
+        return Err("item is already sending".to_string());
+    }
+    items.remove(index);
+    let queue_len = items.len();
+    set_normalized_queue_values(&mut queues, session_id, items);
+    write_queue_map(&queue_path, &queues)?;
+    Ok(json!({"ok": true, "queue_len": queue_len}))
+}
+
+pub fn update_queue_item(config: &RuntimeConfig, session_id: &str, item_id: &str, text: &str) -> Result<Value, String> {
+    let item_id = item_id.trim();
+    if item_id.is_empty() {
+        return Err("id required".to_string());
+    }
+    if text.trim().is_empty() {
+        return Err("text required".to_string());
+    }
+    let _ = find_session(config, session_id)?;
+    let queue_path = config.app_dir.join("session_queues.json");
+    let mut queues = read_array_map(&queue_path)?;
+    let mut items = normalized_queue_values(queues.get(session_id).map(Vec::as_slice).unwrap_or(&[]));
+    let Some(index) = items.iter().position(|entry| entry.get("id").and_then(Value::as_str) == Some(item_id)) else {
+        return Err("item not found".to_string());
+    };
+    if items[index].get("sending").and_then(Value::as_bool) == Some(true) {
+        return Err("item is already sending".to_string());
+    }
+    items[index]["text"] = Value::String(text.to_string());
+    let item = queue_item_from_value(&items[index]);
+    let queue_len = items.len();
+    set_normalized_queue_values(&mut queues, session_id, items);
+    write_queue_map(&queue_path, &queues)?;
+    Ok(json!({"ok": true, "queue_len": queue_len, "item": item}))
+}
+
+pub fn move_queue_item(config: &RuntimeConfig, session_id: &str, item_id: &str, to_index: i64) -> Result<Value, String> {
+    let item_id = item_id.trim();
+    if item_id.is_empty() {
+        return Err("id required".to_string());
+    }
+    let _ = find_session(config, session_id)?;
+    let queue_path = config.app_dir.join("session_queues.json");
+    let mut queues = read_array_map(&queue_path)?;
+    let mut items = normalized_queue_values(queues.get(session_id).map(Vec::as_slice).unwrap_or(&[]));
+    let Some(index) = items.iter().position(|entry| entry.get("id").and_then(Value::as_str) == Some(item_id)) else {
+        return Err("item not found".to_string());
+    };
+    if items[index].get("sending").and_then(Value::as_bool) == Some(true) {
+        return Err("item is already sending".to_string());
+    }
+    let min_index = if items.iter().any(|entry| entry.get("sending").and_then(Value::as_bool) == Some(true)) {
+        1usize
+    } else {
+        0usize
+    };
+    if to_index < min_index as i64 || to_index >= items.len() as i64 {
+        return Err("to_index out of range".to_string());
+    }
+    let item = items.remove(index);
+    items.insert(to_index as usize, item);
+    let queue_len = items.len();
+    set_normalized_queue_values(&mut queues, session_id, items);
+    write_queue_map(&queue_path, &queues)?;
+    Ok(json!({"ok": true, "queue_len": queue_len}))
 }
 
 pub fn load_harness_response(config: &RuntimeConfig, session_id: &str) -> Result<ApiHarnessResponse, String> {
@@ -408,6 +653,275 @@ pub fn load_harness_response(config: &RuntimeConfig, session_id: &str) -> Result
         request: object_string(entry, "request").unwrap_or_default(),
         cooldown_minutes: object_number(entry, "cooldown_minutes").unwrap_or(HARNESS_DEFAULT_IDLE_MINUTES),
         remaining_injections: object_i64(entry, "remaining_injections").unwrap_or(HARNESS_DEFAULT_MAX_INJECTIONS),
+    })
+}
+
+pub fn set_harness_config(
+    config: &RuntimeConfig,
+    session_id: &str,
+    enabled: Option<&Value>,
+    request: Option<&Value>,
+    cooldown_minutes: Option<&Value>,
+    remaining_injections: Option<&Value>,
+    text_field_present: bool,
+) -> Result<ApiHarnessResponse, String> {
+    let _ = find_session(config, session_id)?;
+    if text_field_present {
+        return Err("unknown field: text (use request)".to_string());
+    }
+
+    let harness_path = config.app_dir.join("harness.json");
+    let mut harness = read_object_map(&harness_path)?;
+    let mut entry = harness
+        .get(session_id)
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+
+    if let Some(value) = enabled.filter(|value| !value.is_null()) {
+        entry.insert("enabled".to_string(), Value::Bool(json_truthy(value)));
+    }
+    if let Some(value) = request.filter(|value| !value.is_null()) {
+        let Some(text) = value.as_str() else {
+            return Err("request must be a string".to_string());
+        };
+        entry.insert("request".to_string(), Value::String(text.to_string()));
+    }
+    if let Some(value) = cooldown_minutes.filter(|value| !value.is_null()) {
+        let cooldown = clean_harness_cooldown_minutes_value(value)?;
+        entry.insert("cooldown_minutes".to_string(), json!(cooldown));
+    }
+    if let Some(value) = remaining_injections.filter(|value| !value.is_null()) {
+        let remaining = clean_harness_remaining_injections_value(value, true)?;
+        entry.insert("remaining_injections".to_string(), json!(remaining));
+    }
+
+    let enabled_clean = entry.get("enabled").map(json_truthy).unwrap_or(false);
+    let request_clean = entry
+        .get("request")
+        .map(|value| {
+            value
+                .as_str()
+                .map(ToString::to_string)
+                .ok_or_else(|| "request must be a string".to_string())
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let cooldown_clean = entry
+        .get("cooldown_minutes")
+        .map(clean_harness_cooldown_minutes_value)
+        .transpose()?
+        .unwrap_or(HARNESS_DEFAULT_IDLE_MINUTES as i64);
+    let remaining_clean = entry
+        .get("remaining_injections")
+        .map(|value| clean_harness_remaining_injections_value(value, true))
+        .transpose()?
+        .unwrap_or(HARNESS_DEFAULT_MAX_INJECTIONS);
+
+    let mut cleaned = serde_json::Map::new();
+    cleaned.insert("enabled".to_string(), Value::Bool(enabled_clean));
+    cleaned.insert("request".to_string(), Value::String(request_clean.clone()));
+    cleaned.insert("cooldown_minutes".to_string(), json!(cooldown_clean));
+    cleaned.insert("remaining_injections".to_string(), json!(remaining_clean));
+    harness.insert(session_id.to_string(), Value::Object(cleaned));
+    write_object_map(&harness_path, &harness)?;
+
+    Ok(ApiHarnessResponse {
+        ok: true,
+        enabled: enabled_clean,
+        request: request_clean,
+        cooldown_minutes: cooldown_clean as f64,
+        remaining_injections: remaining_clean,
+    })
+}
+
+pub fn load_file_search_response(
+    config: &RuntimeConfig,
+    session_id: &str,
+    raw_query: &str,
+    limit: usize,
+) -> Result<ApiFileSearchResponse, String> {
+    let session = find_session(config, session_id)?;
+    let root = resolve_search_root(&session.cwd)?;
+    if !root.exists() {
+        return Err("session cwd not found".to_string());
+    }
+    if !root.is_dir() {
+        return Err("session cwd is not a directory".to_string());
+    }
+    let query = raw_query.trim().to_string();
+    if query.is_empty() {
+        return Err("query required".to_string());
+    }
+    let clamped_limit = limit.max(1).min(default_file_search_limit());
+    let result = if git_repo_root(&root).is_some() {
+        search_git_relative_files(&root, &query, clamped_limit)?
+    } else {
+        search_walk_relative_files(&root, &query, clamped_limit)?
+    };
+    Ok(ApiFileSearchResponse {
+        ok: true,
+        cwd: root.display().to_string(),
+        query,
+        mode: result.mode,
+        matches: result.matches,
+        scanned: result.scanned,
+        truncated: result.truncated,
+    })
+}
+
+pub fn load_changed_files_response(config: &RuntimeConfig, session_id: &str) -> Result<ApiChangedFilesResponse, String> {
+    let session = find_session(config, session_id)?;
+    let cwd = resolve_search_root(&session.cwd)?;
+    ensure_git_repo(&cwd)?;
+
+    let unstaged = normalize_git_path_list(
+        &run_git_capture(
+            &cwd,
+            &["diff", "--name-only"],
+            default_git_diff_timeout(),
+            default_git_diff_max_bytes(),
+        )?,
+        default_git_changed_files_max(),
+    );
+    let staged = normalize_git_path_list(
+        &run_git_capture(
+            &cwd,
+            &["diff", "--name-only", "--cached"],
+            default_git_diff_timeout(),
+            default_git_diff_max_bytes(),
+        )?,
+        default_git_changed_files_max(),
+    );
+    let unstaged_numstat = run_git_capture(
+        &cwd,
+        &["diff", "--numstat"],
+        default_git_diff_timeout(),
+        default_git_diff_max_bytes().max(128 * 1024),
+    )?;
+    let staged_numstat = run_git_capture(
+        &cwd,
+        &["diff", "--numstat", "--cached"],
+        default_git_diff_timeout(),
+        default_git_diff_max_bytes().max(128 * 1024),
+    )?;
+
+    let mut merged = Vec::new();
+    let mut seen = HashSet::new();
+    for path in unstaged.iter().chain(staged.iter()) {
+        if seen.insert(path.clone()) {
+            merged.push(path.clone());
+        }
+    }
+
+    let mut stats = parse_git_numstat(&unstaged_numstat);
+    for (path, values) in parse_git_numstat(&staged_numstat) {
+        if let Some(prev) = stats.get_mut(&path) {
+            prev.0 = match (prev.0, values.0) {
+                (Some(left), Some(right)) => Some(left + right),
+                _ => None,
+            };
+            prev.1 = match (prev.1, values.1) {
+                (Some(left), Some(right)) => Some(left + right),
+                _ => None,
+            };
+        } else {
+            stats.insert(path, values);
+        }
+    }
+
+    let entries = merged
+        .iter()
+        .map(|path| {
+            let (additions, deletions) = stats.get(path).copied().unwrap_or((None, None));
+            ApiChangedFileEntry {
+                path: path.clone(),
+                additions,
+                deletions,
+                changed: true,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    Ok(ApiChangedFilesResponse {
+        ok: true,
+        cwd: cwd.display().to_string(),
+        files: merged,
+        entries,
+        unstaged,
+        staged,
+    })
+}
+
+pub fn load_git_diff_response(
+    config: &RuntimeConfig,
+    session_id: &str,
+    raw_path: &str,
+    staged: bool,
+) -> Result<ApiGitDiffResponse, String> {
+    let session = find_session(config, session_id)?;
+    let cwd = resolve_search_root(&session.cwd)?;
+    ensure_git_repo(&cwd)?;
+    let (_target, _repo_root, rel) = resolve_git_path(&cwd, raw_path)?;
+
+    let mut args = vec!["diff", "-U3"];
+    if staged {
+        args.push("--cached");
+    }
+    args.push("--");
+    args.push(rel.as_str());
+    let diff = run_git_capture(&cwd, &args, default_git_diff_timeout(), default_git_diff_max_bytes())?;
+
+    Ok(ApiGitDiffResponse {
+        ok: true,
+        cwd: cwd.display().to_string(),
+        path: rel,
+        staged,
+        diff,
+    })
+}
+
+pub fn load_git_file_versions_response(
+    config: &RuntimeConfig,
+    session_id: &str,
+    raw_path: &str,
+) -> Result<ApiGitFileVersionsResponse, String> {
+    let session = find_session(config, session_id)?;
+    let cwd = resolve_search_root(&session.cwd)?;
+    ensure_git_repo(&cwd)?;
+    let (target, _repo_root, rel) = resolve_git_path(&cwd, raw_path)?;
+
+    let mut current_text = String::new();
+    let mut current_size = 0_u64;
+    let current_exists = target.exists() && target.is_file();
+    if current_exists {
+        let (text, size) = read_text_file_strict(&target, FILE_READ_MAX_BYTES)?;
+        current_text = text;
+        current_size = size;
+    }
+
+    let mut base_exists = false;
+    let mut base_text = String::new();
+    if let Ok(text) = run_git_capture(
+        &cwd,
+        &["show", &format!("HEAD:{rel}")],
+        default_git_diff_timeout(),
+        FILE_READ_MAX_BYTES as usize,
+    ) {
+        base_exists = true;
+        base_text = text;
+    }
+
+    Ok(ApiGitFileVersionsResponse {
+        ok: true,
+        cwd: cwd.display().to_string(),
+        path: rel,
+        abs_path: target.display().to_string(),
+        current_exists,
+        current_size,
+        current_text,
+        base_exists,
+        base_text,
     })
 }
 
@@ -504,6 +1018,7 @@ fn session_from_meta(
     let start_ts = meta
         .start_ts
         .ok_or_else(|| format!("missing start_ts in metadata for session {session_id}"))?;
+    let meta_updated_ts = meta.updated_ts.unwrap_or(start_ts);
     let pid = meta
         .codex_pid
         .ok_or_else(|| format!("missing codex_pid in metadata for session {session_id}"))?;
@@ -531,7 +1046,11 @@ fn session_from_meta(
     let mut model = clean_optional(meta.model);
     let mut reasoning_effort = clean_optional(meta.reasoning_effort);
     let service_tier = clean_optional(meta.service_tier);
-    let log_path = clean_optional(meta.log_path);
+    let mut log_path = clean_optional(meta.log_path);
+    if log_path.is_none() && pid_alive(pid) {
+        log_path = discover_open_log_for_process(pid, &cwd, &agent_backend)
+            .map(|path| path.to_string_lossy().to_string());
+    }
     let broker_state = match read_broker_state(sock_path) {
         Ok(state) => state,
         Err(_) if !pid_alive(pid) && !pid_alive(broker_pid) => return Ok(None),
@@ -557,7 +1076,7 @@ fn session_from_meta(
         .map(Path::new)
         .filter(|path| path.exists())
         .and_then(last_conversation_ts_from_log)
-        .unwrap_or(start_ts);
+        .unwrap_or(meta_updated_ts);
     let time_priority = priority_from_elapsed_seconds((epoch_now() - updated_ts).max(0.0));
     let base_priority = clip01(time_priority + priority_offset);
     let final_priority = if blocked || snoozed { 0.0 } else { base_priority };
@@ -577,6 +1096,7 @@ fn session_from_meta(
         .map(Path::new)
         .filter(|path| path.exists())
         .and_then(last_assistant_ts_from_log);
+    let git_branch = current_git_branch(Path::new(&cwd));
     Ok(Some(ApiSessionSummary {
         session_id: session_id.to_string(),
         thread_id: Some(thread_id),
@@ -597,7 +1117,7 @@ fn session_from_meta(
         harness_remaining_injections: object_i64(harness_entry, "remaining_injections").unwrap_or(HARNESS_DEFAULT_MAX_INJECTIONS),
         alias: aliases.get(session_id).cloned().unwrap_or_default(),
         files: files.get(session_id).cloned().unwrap_or_default(),
-        git_branch: current_git_branch(Path::new(&cwd)),
+        git_branch,
         model_provider: model_provider.clone(),
         preferred_auth_method: preferred_auth_method.clone(),
         provider_choice: provider_choice_for_settings(model_provider.as_deref(), preferred_auth_method.as_deref()),
@@ -640,12 +1160,923 @@ fn queue_item_from_value(value: &Value) -> ApiQueueItem {
     }
 }
 
+fn normalized_queue_values(values: &[Value]) -> Vec<Value> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for value in values {
+        let Some(item) = coerce_queue_item_value(value) else {
+            continue;
+        };
+        let item_id = item.get("id").and_then(Value::as_str).unwrap_or_default().to_string();
+        let unique_item = if seen.insert(item_id.clone()) {
+            item
+        } else {
+            let text = item.get("text").and_then(Value::as_str).unwrap_or_default().to_string();
+            let created_ts = item.get("created_ts").and_then(Value::as_f64);
+            let sending = item.get("sending").and_then(Value::as_bool).unwrap_or(false);
+            let mut regenerated = new_queue_item_value(&text, created_ts);
+            if sending {
+                regenerated["sending"] = Value::Bool(true);
+            }
+            regenerated
+        };
+        seen.insert(
+            unique_item
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        );
+        out.push(unique_item);
+    }
+    out
+}
+
+fn coerce_queue_item_value(value: &Value) -> Option<Value> {
+    match value {
+        Value::String(text) => {
+            if text.trim().is_empty() {
+                None
+            } else {
+                Some(new_queue_item_value(text, None))
+            }
+        }
+        Value::Object(object) => {
+            let text = object.get("text").and_then(Value::as_str)?;
+            if text.trim().is_empty() {
+                return None;
+            }
+            let id = object
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(new_queue_item_id);
+            let created_ts = object
+                .get("created_ts")
+                .and_then(Value::as_f64)
+                .filter(|ts| ts.is_finite() && *ts > 0.0);
+            let sending = object.get("sending").and_then(Value::as_bool).unwrap_or(false);
+            let mut item = new_queue_item_value(text, created_ts);
+            item["id"] = Value::String(id);
+            if sending {
+                item["sending"] = Value::Bool(true);
+            }
+            Some(item)
+        }
+        _ => None,
+    }
+}
+
+fn new_queue_item_id() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let counter = QUEUE_ITEM_COUNTER.fetch_add(1, Ordering::Relaxed) as u128;
+    format!("queue-{nanos:016x}{counter:016x}")
+}
+
+fn new_queue_item_value(text: &str, created_ts: Option<f64>) -> Value {
+    let ts = created_ts
+        .filter(|ts| ts.is_finite() && *ts > 0.0)
+        .unwrap_or_else(epoch_now);
+    json!({
+        "id": new_queue_item_id(),
+        "text": text,
+        "created_ts": ts,
+    })
+}
+
+fn set_normalized_queue_values(queues: &mut HashMap<String, Vec<Value>>, session_id: &str, items: Vec<Value>) {
+    if items.is_empty() {
+        queues.remove(session_id);
+    } else {
+        queues.insert(session_id.to_string(), items);
+    }
+}
+
+fn write_json_value(path: &Path, value: &Value) -> Result<(), String> {
+    let parent = path.parent().ok_or_else(|| format!("missing parent for {}", path.display()))?;
+    fs::create_dir_all(parent).map_err(|err| format!("create {}: {err}", parent.display()))?;
+    let tmp = path.with_extension("json.tmp");
+    let raw = serde_json::to_string_pretty(value)
+        .map(|body| body + "\n")
+        .map_err(|err| format!("serialize {}: {err}", path.display()))?;
+    fs::write(&tmp, raw).map_err(|err| format!("write {}: {err}", tmp.display()))?;
+    fs::rename(&tmp, path).map_err(|err| format!("rename {} -> {}: {err}", tmp.display(), path.display()))
+}
+
+fn write_string_map(path: &Path, values: &HashMap<String, String>) -> Result<(), String> {
+    let mut keys = values.keys().cloned().collect::<Vec<_>>();
+    keys.sort();
+    let mut object = serde_json::Map::new();
+    for key in keys {
+        let Some(value) = values.get(&key) else {
+            continue;
+        };
+        object.insert(key, Value::String(value.clone()));
+    }
+    write_json_value(path, &Value::Object(object))
+}
+
+fn write_string_array_map(path: &Path, values: &HashMap<String, Vec<String>>) -> Result<(), String> {
+    let mut keys = values.keys().cloned().collect::<Vec<_>>();
+    keys.sort();
+    let mut object = serde_json::Map::new();
+    for key in keys {
+        let Some(items) = values.get(&key) else {
+            continue;
+        };
+        if items.is_empty() {
+            continue;
+        }
+        object.insert(
+            key,
+            Value::Array(items.iter().cloned().map(Value::String).collect::<Vec<_>>()),
+        );
+    }
+    write_json_value(path, &Value::Object(object))
+}
+
+fn write_object_map(path: &Path, values: &HashMap<String, Value>) -> Result<(), String> {
+    let mut keys = values.keys().cloned().collect::<Vec<_>>();
+    keys.sort();
+    let mut object = serde_json::Map::new();
+    for key in keys {
+        let Some(value) = values.get(&key) else {
+            continue;
+        };
+        object.insert(key, value.clone());
+    }
+    write_json_value(path, &Value::Object(object))
+}
+
+fn write_queue_map(path: &Path, queues: &HashMap<String, Vec<Value>>) -> Result<(), String> {
+    let mut keys = queues.keys().cloned().collect::<Vec<_>>();
+    keys.sort();
+    let mut object = serde_json::Map::new();
+    for key in keys {
+        let Some(items) = queues.get(&key) else {
+            continue;
+        };
+        if items.is_empty() {
+            continue;
+        }
+        object.insert(key, Value::Array(items.clone()));
+    }
+    write_json_value(path, &Value::Object(object))
+}
+
+fn clean_alias(name: &str) -> String {
+    let mut cleaned = name.split_whitespace().collect::<Vec<_>>().join(" ");
+    if cleaned.is_empty() {
+        return String::new();
+    }
+    if cleaned.chars().count() > 80 {
+        cleaned = cleaned.chars().take(80).collect::<String>().trim_end().to_string();
+    }
+    cleaned
+}
+
+fn json_truthy(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::Bool(flag) => *flag,
+        Value::Number(number) => {
+            number.as_i64().map(|value| value != 0).or_else(|| number.as_u64().map(|value| value != 0)).or_else(|| number.as_f64().map(|value| value != 0.0)).unwrap_or(false)
+        }
+        Value::String(text) => !text.is_empty(),
+        Value::Array(items) => !items.is_empty(),
+        Value::Object(map) => !map.is_empty(),
+    }
+}
+
+fn clean_harness_cooldown_minutes_value(value: &Value) -> Result<i64, String> {
+    if value.is_boolean() {
+        return Err("harness cooldown_minutes must be an integer".to_string());
+    }
+    let Some(raw) = value.as_i64() else {
+        return Err("harness cooldown_minutes must be an integer".to_string());
+    };
+    if raw < 1 {
+        return Err("harness cooldown_minutes must be at least 1".to_string());
+    }
+    Ok(raw)
+}
+
+fn clean_harness_remaining_injections_value(value: &Value, allow_zero: bool) -> Result<i64, String> {
+    if value.is_boolean() {
+        return Err("harness remaining_injections must be an integer".to_string());
+    }
+    let Some(raw) = value.as_i64() else {
+        return Err("harness remaining_injections must be an integer".to_string());
+    };
+    let minimum = if allow_zero { 0 } else { 1 };
+    if raw < minimum {
+        return Err(format!(
+            "harness remaining_injections must be at least {}",
+            if allow_zero { 0 } else { 1 }
+        ));
+    }
+    Ok(raw)
+}
+
+fn safe_filename(name: &str, default: &str) -> String {
+    let base = Path::new(name)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    let mut out = String::new();
+    for ch in base.chars() {
+        if ch.is_alphanumeric() || matches!(ch, '-' | '_' | '.' | ' ') {
+            out.push(ch);
+        }
+    }
+    let cleaned = out.trim().replace(' ', "_");
+    if cleaned.is_empty() {
+        return default.to_string();
+    }
+    cleaned.chars().take(96).collect()
+}
+
+fn stage_uploaded_file(config: &RuntimeConfig, session_id: &str, filename: &str, raw: &[u8]) -> Result<PathBuf, String> {
+    if session_id.trim().is_empty() {
+        return Err("session_id required".to_string());
+    }
+    if filename.trim().is_empty() {
+        return Err("filename required".to_string());
+    }
+    if raw.len() > ATTACH_UPLOAD_MAX_BYTES {
+        return Err(format!("file too large (max {ATTACH_UPLOAD_MAX_BYTES} bytes)"));
+    }
+    let safe_name = safe_filename(filename, "file");
+    let subdir = config.app_dir.join("uploads").join(session_id);
+    fs::create_dir_all(&subdir).map_err(|err| format!("create upload dir {}: {err}", subdir.display()))?;
+    let out_path = subdir.join(format!("{}_{}", (epoch_now() * 1000.0) as i64, safe_name));
+    fs::write(&out_path, raw).map_err(|err| format!("write upload {}: {err}", out_path.display()))?;
+    fs::set_permissions(&out_path, fs::Permissions::from_mode(0o600))
+        .map_err(|err| format!("chmod upload {}: {err}", out_path.display()))?;
+    Ok(out_path)
+}
+
+fn attachment_inject_text(attachment_index: i64, path: &Path) -> Result<String, String> {
+    if attachment_index <= 0 {
+        return Err("attachment_index must be >= 1".to_string());
+    }
+    Ok(format!("Attachment {attachment_index}: {}\n", path.display()))
+}
+
+fn clean_priority_offset_value(raw: Option<&Value>) -> Result<f64, String> {
+    let Some(value) = raw else {
+        return Ok(0.0);
+    };
+    if value.is_null() {
+        return Ok(0.0);
+    }
+    if value.is_boolean() {
+        return Err("priority_offset must be a number".to_string());
+    }
+    let Some(out) = value.as_f64() else {
+        return Err("priority_offset must be a number".to_string());
+    };
+    if !out.is_finite() {
+        return Err("priority_offset must be finite".to_string());
+    }
+    if !(-1.0..=1.0).contains(&out) {
+        return Err("priority_offset must be within [-1, 1]".to_string());
+    }
+    Ok(out)
+}
+
+fn clean_snooze_until_value(raw: Option<&Value>) -> Result<Option<f64>, String> {
+    let Some(value) = raw else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    if let Some(text) = value.as_str() {
+        if text.trim().is_empty() {
+            return Ok(None);
+        }
+        return Err("snooze_until must be a unix timestamp or null".to_string());
+    }
+    if value.is_boolean() {
+        return Err("snooze_until must be a unix timestamp or null".to_string());
+    }
+    let Some(out) = value.as_f64() else {
+        return Err("snooze_until must be a unix timestamp or null".to_string());
+    };
+    if !out.is_finite() {
+        return Err("snooze_until must be finite".to_string());
+    }
+    if out <= 0.0 {
+        return Ok(None);
+    }
+    Ok(Some(out))
+}
+
+fn clean_dependency_session_id_value(raw: Option<&Value>) -> Result<Option<String>, String> {
+    let Some(value) = raw else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let Some(text) = value.as_str() else {
+        return Err("dependency_session_id must be a string or null".to_string());
+    };
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(trimmed.to_string()))
+}
+
+fn clear_deleted_session_state(config: &RuntimeConfig, session_id: &str, cwd: Option<&str>) -> Result<(), String> {
+    let alias_path = config.app_dir.join("session_aliases.json");
+    let mut aliases = read_string_map(&alias_path)?;
+    aliases.remove(session_id);
+    write_string_map(&alias_path, &aliases)?;
+
+    let sidebar_path = config.app_dir.join("session_sidebar.json");
+    let mut sidebar = read_object_map(&sidebar_path)?;
+    sidebar.remove(session_id);
+    for value in sidebar.values_mut() {
+        let Some(object) = value.as_object_mut() else {
+            continue;
+        };
+        if object.get("dependency_session_id").and_then(Value::as_str) == Some(session_id) {
+            object.remove("dependency_session_id");
+        }
+    }
+    write_object_map(&sidebar_path, &sidebar)?;
+
+    let harness_path = config.app_dir.join("harness.json");
+    let mut harness = read_object_map(&harness_path)?;
+    harness.remove(session_id);
+    write_object_map(&harness_path, &harness)?;
+
+    let files_path = config.app_dir.join("session_files.json");
+    let mut files = read_string_array_map(&files_path)?;
+    files.remove(session_id);
+    files.remove(&format!("sid:{session_id}"));
+    if let Some(cwd_value) = cwd.filter(|value| !value.trim().is_empty()) {
+        files.remove(&format!("cwd:{cwd_value}"));
+    }
+    write_string_array_map(&files_path, &files)?;
+
+    let queue_path = config.app_dir.join("session_queues.json");
+    let mut queues = read_array_map(&queue_path)?;
+    queues.remove(session_id);
+    write_queue_map(&queue_path, &queues)
+}
+
+fn unlink_quiet(path: &Path) {
+    let _ = fs::remove_file(path);
+}
+
+fn signal_process(pid: i64, signal: &str) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    Command::new("kill")
+        .args([signal, &pid.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn signal_process_group(root_pid: i64, signal: &str) -> bool {
+    if root_pid <= 0 {
+        return false;
+    }
+    Command::new("kill")
+        .args([signal, "--", &format!("-{root_pid}")])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn process_group_alive(root_pid: i64) -> bool {
+    if root_pid <= 0 {
+        return false;
+    }
+    Command::new("kill")
+        .args(["-0", "--", &format!("-{root_pid}")])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn terminate_process(pid: i64, wait: Duration) -> bool {
+    if !pid_alive(pid) {
+        return true;
+    }
+    if !signal_process(pid, "-TERM") {
+        return false;
+    }
+    let deadline = Instant::now() + wait;
+    while pid_alive(pid) {
+        if Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    if !pid_alive(pid) {
+        return true;
+    }
+    if !signal_process(pid, "-KILL") {
+        return false;
+    }
+    let deadline = Instant::now() + Duration::from_millis(200);
+    while pid_alive(pid) {
+        if Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    !pid_alive(pid)
+}
+
+fn terminate_process_group(root_pid: i64, wait: Duration) -> bool {
+    if !process_group_alive(root_pid) {
+        return true;
+    }
+    if !signal_process_group(root_pid, "-TERM") {
+        return false;
+    }
+    let deadline = Instant::now() + wait;
+    while process_group_alive(root_pid) {
+        if Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    if !process_group_alive(root_pid) {
+        return true;
+    }
+    if !signal_process_group(root_pid, "-KILL") {
+        return false;
+    }
+    let deadline = Instant::now() + Duration::from_millis(200);
+    while process_group_alive(root_pid) {
+        if Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    !process_group_alive(root_pid)
+}
+
+fn kill_session_via_pids(config: &RuntimeConfig, session: &ApiSessionSummary) -> bool {
+    let sock_path = session_sock_path(config, &session.session_id);
+    let meta_path = sock_path.with_extension("json");
+    let group_alive = process_group_alive(session.pid);
+    let broker_alive = pid_alive(session.broker_pid);
+    if !group_alive && !broker_alive {
+        unlink_quiet(&sock_path);
+        unlink_quiet(&meta_path);
+        return true;
+    }
+    if group_alive && !terminate_process_group(session.pid, Duration::from_secs_f64(1.0)) {
+        return false;
+    }
+    if pid_alive(session.broker_pid) && !terminate_process(session.broker_pid, Duration::from_secs_f64(1.0)) {
+        return false;
+    }
+    let group_dead = !process_group_alive(session.pid);
+    let broker_dead = !pid_alive(session.broker_pid);
+    if group_dead && broker_dead {
+        unlink_quiet(&sock_path);
+        unlink_quiet(&meta_path);
+        return true;
+    }
+    false
+}
+
+fn queue_remote_ready(config: &RuntimeConfig, session: &ApiSessionSummary) -> Result<bool, String> {
+    let broker_state = read_live_broker_state(config, session)?;
+    if broker_state.busy || broker_state._queue_len > 0 {
+        return Ok(false);
+    }
+    if let Some(log_path) = session.log_path.as_deref() {
+        let path = Path::new(log_path);
+        if path.exists() {
+            return Ok(matches!(compute_idle_from_log(path), Some(true)));
+        }
+    }
+    Ok(true)
+}
+
 fn map_io_error(err: std::io::Error) -> String {
     match err.kind() {
         std::io::ErrorKind::NotFound => "file not found".to_string(),
         std::io::ErrorKind::PermissionDenied => "permission denied".to_string(),
         _ => err.to_string(),
     }
+}
+
+fn default_git_diff_max_bytes() -> usize {
+    env::var("CODEX_WEB_GIT_DIFF_MAX_BYTES")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(GIT_DIFF_MAX_BYTES)
+}
+
+fn default_git_diff_timeout() -> Duration {
+    let seconds = env::var("CODEX_WEB_GIT_DIFF_TIMEOUT_SECONDS")
+        .ok()
+        .and_then(|value| value.trim().parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .unwrap_or(GIT_DIFF_TIMEOUT_SECONDS);
+    Duration::from_secs_f64(seconds)
+}
+
+fn default_git_changed_files_max() -> usize {
+    env::var("CODEX_WEB_GIT_CHANGED_FILES_MAX")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(GIT_CHANGED_FILES_MAX)
+}
+
+fn ensure_git_repo(cwd: &Path) -> Result<(), String> {
+    run_git_capture(cwd, &["rev-parse", "--is-inside-work-tree"], default_git_diff_timeout(), 4096).map(|_| ())
+}
+
+fn run_git_capture(cwd: &Path, args: &[&str], timeout: Duration, max_bytes: usize) -> Result<String, String> {
+    let mut child = Command::new("git")
+        .current_dir(cwd)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(map_io_error)?;
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        if child.try_wait().map_err(map_io_error)?.is_some() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("git command timed out".to_string());
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let output = child.wait_with_output().map_err(map_io_error)?;
+    if !output.status.success() {
+        let err = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if err.is_empty() {
+            format!("git failed with code {}", output.status.code().unwrap_or_default())
+        } else {
+            err
+        });
+    }
+    if output.stdout.len() > max_bytes {
+        return Err(format!("git output too large (max {max_bytes} bytes)"));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn normalize_git_path_list(text: &str, limit: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    for raw in text.lines() {
+        let path = raw.trim();
+        if path.is_empty() {
+            continue;
+        }
+        out.push(path.to_string());
+        if out.len() >= limit {
+            break;
+        }
+    }
+    out
+}
+
+fn parse_git_numstat(text: &str) -> HashMap<String, (Option<i64>, Option<i64>)> {
+    let mut out: HashMap<String, (Option<i64>, Option<i64>)> = HashMap::new();
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let parts = line.splitn(3, '\t').collect::<Vec<_>>();
+        if parts.len() != 3 {
+            continue;
+        }
+        let path = parts[2].trim();
+        if path.is_empty() {
+            continue;
+        }
+        let additions = if parts[0] == "-" {
+            None
+        } else {
+            parts[0].parse::<i64>().ok()
+        };
+        let deletions = if parts[1] == "-" {
+            None
+        } else {
+            parts[1].parse::<i64>().ok()
+        };
+        if let Some(prev) = out.get_mut(path) {
+            prev.0 = match (prev.0, additions) {
+                (Some(left), Some(right)) => Some(left + right),
+                _ => None,
+            };
+            prev.1 = match (prev.1, deletions) {
+                (Some(left), Some(right)) => Some(left + right),
+                _ => None,
+            };
+            continue;
+        }
+        out.insert(path.to_string(), (additions, deletions));
+    }
+    out
+}
+
+struct FileSearchState {
+    heap: BinaryHeap<Reverse<(i64, String)>>,
+    scanned: usize,
+    truncated: bool,
+    limit: usize,
+    max_candidates: usize,
+    deadline: Instant,
+}
+
+struct FileSearchResult {
+    mode: String,
+    matches: Vec<ApiFileSearchMatch>,
+    scanned: usize,
+    truncated: bool,
+}
+
+pub(crate) fn default_file_search_limit() -> usize {
+    env::var("CODEX_WEB_FILE_SEARCH_LIMIT")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(FILE_SEARCH_LIMIT)
+}
+
+fn file_search_timeout() -> Duration {
+    let seconds = env::var("CODEX_WEB_FILE_SEARCH_TIMEOUT_SECONDS")
+        .ok()
+        .and_then(|value| value.trim().parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .unwrap_or(FILE_SEARCH_TIMEOUT_SECONDS);
+    Duration::from_secs_f64(seconds)
+}
+
+fn file_search_max_candidates() -> usize {
+    env::var("CODEX_WEB_FILE_SEARCH_MAX_CANDIDATES")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(FILE_SEARCH_MAX_CANDIDATES)
+}
+
+fn resolve_search_root(raw_cwd: &str) -> Result<PathBuf, String> {
+    let path = expand_home(raw_cwd);
+    if path.is_absolute() {
+        return Ok(path);
+    }
+    env::current_dir()
+        .map(|cwd| cwd.join(path))
+        .map_err(|err| err.to_string())
+}
+
+fn git_repo_root(cwd: &Path) -> Option<PathBuf> {
+    let output = Command::new("git")
+        .current_dir(cwd)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let root = String::from_utf8(output.stdout).ok()?;
+    let trimmed = root.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(trimmed))
+}
+
+fn search_walk_relative_files(root: &Path, query: &str, limit: usize) -> Result<FileSearchResult, String> {
+    let mut state = FileSearchState {
+        heap: BinaryHeap::new(),
+        scanned: 0,
+        truncated: false,
+        limit,
+        max_candidates: file_search_max_candidates(),
+        deadline: Instant::now() + file_search_timeout(),
+    };
+    walk_relative_files(root, root, query, &mut state)?;
+    Ok(finish_file_search(state, "walk"))
+}
+
+fn walk_relative_files(root: &Path, current: &Path, query: &str, state: &mut FileSearchState) -> Result<(), String> {
+    let mut entries = fs::read_dir(current)
+        .map_err(map_io_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(map_io_error)?;
+    entries.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+    for entry in entries {
+        if state.truncated {
+            break;
+        }
+        let path = entry.path();
+        let file_type = entry.file_type().map_err(map_io_error)?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if file_type.is_dir() {
+            if FILE_LIST_IGNORED_DIRS.iter().any(|ignored| *ignored == name) {
+                continue;
+            }
+            walk_relative_files(root, &path, query, state)?;
+            continue;
+        }
+        state.scanned += 1;
+        if state.scanned > state.max_candidates || Instant::now() > state.deadline {
+            state.truncated = true;
+            break;
+        }
+        let rel = path
+            .strip_prefix(root)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let score = file_search_score(&rel, query);
+        if score < 0 {
+            continue;
+        }
+        push_file_search_match(&mut state.heap, &rel, score, state.limit);
+    }
+    Ok(())
+}
+
+fn search_git_relative_files(root: &Path, query: &str, limit: usize) -> Result<FileSearchResult, String> {
+    let mut state = FileSearchState {
+        heap: BinaryHeap::new(),
+        scanned: 0,
+        truncated: false,
+        limit,
+        max_candidates: file_search_max_candidates(),
+        deadline: Instant::now() + file_search_timeout(),
+    };
+    let mut child = Command::new("git")
+        .current_dir(root)
+        .args(["ls-files", "--cached", "--others", "--exclude-standard"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(map_io_error)?;
+    let stdout = child.stdout.take().ok_or_else(|| "git ls-files missing stdout".to_string())?;
+    let stderr = child.stderr.take().ok_or_else(|| "git ls-files missing stderr".to_string())?;
+    let reader = BufReader::new(stdout);
+    for line in reader.lines() {
+        let path = line.map_err(map_io_error)?;
+        if path.is_empty() {
+            continue;
+        }
+        state.scanned += 1;
+        if state.scanned > state.max_candidates || Instant::now() > state.deadline {
+            state.truncated = true;
+            let _ = child.kill();
+            break;
+        }
+        let score = file_search_score(&path, query);
+        if score < 0 {
+            continue;
+        }
+        push_file_search_match(&mut state.heap, &path, score, state.limit);
+    }
+    let status = child.wait().map_err(map_io_error)?;
+    let mut stderr_text = String::new();
+    BufReader::new(stderr)
+        .read_to_string(&mut stderr_text)
+        .map_err(map_io_error)?;
+    if state.truncated {
+        return Ok(finish_file_search(state, "git"));
+    }
+    if !status.success() {
+        let err = stderr_text.trim();
+        return Err(if err.is_empty() {
+            format!("git ls-files failed with code {}", status.code().unwrap_or_default())
+        } else {
+            err.to_string()
+        });
+    }
+    Ok(finish_file_search(state, "git"))
+}
+
+fn push_file_search_match(heap: &mut BinaryHeap<Reverse<(i64, String)>>, path: &str, score: i64, limit: usize) {
+    let item = Reverse((score, path.to_string()));
+    if heap.len() < limit {
+        heap.push(item);
+        return;
+    }
+    if heap.peek().map(|current| item > *current).unwrap_or(true) {
+        let _ = heap.pop();
+        heap.push(item);
+    }
+}
+
+fn finish_file_search(state: FileSearchState, mode: &str) -> FileSearchResult {
+    let mut matches = state
+        .heap
+        .into_iter()
+        .map(|Reverse((score, path))| ApiFileSearchMatch { path, score })
+        .collect::<Vec<_>>();
+    matches.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.path.cmp(&b.path)));
+    FileSearchResult {
+        mode: mode.to_string(),
+        matches,
+        scanned: if state.truncated {
+            state.scanned.saturating_sub(1)
+        } else {
+            state.scanned
+        },
+        truncated: state.truncated,
+    }
+}
+
+fn file_search_score(candidate: &str, query: &str) -> i64 {
+    let raw = query.trim().to_ascii_lowercase();
+    if raw.is_empty() {
+        return 0;
+    }
+    let lower = candidate.to_ascii_lowercase();
+    if lower == raw {
+        return 12000;
+    }
+    let base = Path::new(candidate)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(candidate)
+        .to_ascii_lowercase();
+    if base == raw {
+        return 10000;
+    }
+    let mut total = 0_i64;
+    for token in raw.split_whitespace().filter(|part| !part.is_empty()) {
+        if let Some(exact_idx) = lower.find(token) {
+            let prev = if exact_idx > 0 {
+                lower.as_bytes()[exact_idx - 1] as char
+            } else {
+                '\0'
+            };
+            let boundary_bonus = if exact_idx == 0 || is_file_search_boundary(prev) { 24 } else { 0 };
+            let base_idx = base.find(token);
+            total += 240 - (exact_idx as i64) * 2 + boundary_bonus + base_idx.map(|idx| 44 - idx as i64).unwrap_or(0);
+            continue;
+        }
+        let mut search_start = 0_usize;
+        let mut first: Option<usize> = None;
+        let mut last: Option<usize> = None;
+        let mut consecutive = 0_i64;
+        let mut boundaries = 0_i64;
+        for ch in token.chars() {
+            let found = lower[search_start..].find(ch).map(|idx| idx + search_start);
+            let Some(found_idx) = found else {
+                return -1;
+            };
+            if first.is_none() {
+                first = Some(found_idx);
+            }
+            if let Some(last_idx) = last {
+                if found_idx == last_idx + 1 {
+                    consecutive += 1;
+                }
+            }
+            if found_idx == 0 || is_file_search_boundary(lower.as_bytes()[found_idx - 1] as char) {
+                boundaries += 1;
+            }
+            last = Some(found_idx);
+            search_start = found_idx + ch.len_utf8();
+        }
+        let first_idx = first.unwrap_or(0);
+        let last_idx = last.unwrap_or(first_idx);
+        let span = last_idx.saturating_sub(first_idx) + 1;
+        total += 120 - first_idx as i64 - ((span.saturating_sub(token.len())) as i64 * 4) + consecutive * 10 + boundaries * 8;
+    }
+    total
+}
+
+fn is_file_search_boundary(ch: char) -> bool {
+    matches!(ch, '/' | '.' | '_' | '-')
 }
 
 fn resolve_session_path(cwd: &str, raw_path: &str) -> Result<PathBuf, String> {
@@ -665,6 +2096,22 @@ fn resolve_session_path(cwd: &str, raw_path: &str) -> Result<PathBuf, String> {
     Ok(fs::canonicalize(&joined).unwrap_or(joined))
 }
 
+fn resolve_git_path(cwd: &Path, raw_path: &str) -> Result<(PathBuf, PathBuf, String), String> {
+    let repo_root_raw = run_git_capture(cwd, &["rev-parse", "--show-toplevel"], default_git_diff_timeout(), 64 * 1024)?;
+    let repo_root_candidate = PathBuf::from(repo_root_raw.trim());
+    let repo_root = fs::canonicalize(&repo_root_candidate).unwrap_or(repo_root_candidate);
+    let target = resolve_session_path(&cwd.display().to_string(), raw_path)?;
+    let rel_path = target
+        .strip_prefix(&repo_root)
+        .map_err(|_| "path is outside git repo".to_string())?;
+    let rel = if rel_path.as_os_str().is_empty() {
+        ".".to_string()
+    } else {
+        rel_path.to_string_lossy().replace('\\', "/")
+    };
+    Ok((target, repo_root, rel))
+}
+
 fn expand_home(raw: &str) -> PathBuf {
     if raw == "~" {
         return home_dir().unwrap_or_else(|| PathBuf::from(raw));
@@ -682,13 +2129,24 @@ fn home_dir() -> Option<PathBuf> {
 }
 
 fn read_prefix(path: &Path, limit: usize) -> Result<Vec<u8>, String> {
-    use std::io::Read;
-
     let mut file = fs::File::open(path).map_err(map_io_error)?;
     let mut buf = vec![0_u8; limit];
     let read = file.read(&mut buf).map_err(map_io_error)?;
     buf.truncate(read);
     Ok(buf)
+}
+
+fn read_text_file_strict(path: &Path, max_bytes: u64) -> Result<(String, u64), String> {
+    let metadata = fs::metadata(path).map_err(map_io_error)?;
+    let size = metadata.len();
+    if size > max_bytes {
+        return Err(format!("file too large (max {max_bytes} bytes)"));
+    }
+    let raw = fs::read(path).map_err(map_io_error)?;
+    if raw.contains(&0) {
+        return Err("binary file not supported".to_string());
+    }
+    Ok((String::from_utf8_lossy(&raw).into_owned(), size))
 }
 
 fn detect_file_kind(path: &Path, raw: &[u8]) -> (&'static str, Option<&'static str>) {
@@ -1078,6 +2536,564 @@ fn normalize_backend(value: Option<&str>) -> Result<String, String> {
     }
 }
 
+pub fn create_session_request_from_payload(payload: &Value) -> Result<CreateSessionRequest, CreateSessionError> {
+    let obj = payload
+        .as_object()
+        .ok_or_else(|| CreateSessionError::bad_request("invalid json body (expected object)"))?;
+
+    let agent_backend_raw = obj.get("agent_backend").map(value_to_pythonish_text);
+    let agent_backend = normalize_backend(agent_backend_raw.as_deref()).map_err(CreateSessionError::bad_request)?;
+
+    let cwd = obj
+        .get("cwd")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| CreateSessionError::bad_request_with_field("cwd required", "cwd"))?;
+
+    let (model_provider, preferred_auth_method, model, reasoning_effort, service_tier) = if agent_backend == "codex" {
+        let defaults = read_codex_launch_defaults().map_err(CreateSessionError::bad_request)?;
+        let allowed = allowed_model_providers(&defaults.provider_choices);
+        let model_provider = normalize_requested_model_provider(obj.get("model_provider").and_then(Value::as_str), Some(&allowed))
+            .map_err(CreateSessionError::bad_request)?;
+        let preferred_auth_method = normalize_requested_preferred_auth_method(
+            obj.get("preferred_auth_method").and_then(Value::as_str),
+        )
+        .map_err(CreateSessionError::bad_request)?;
+        let model = normalize_requested_model(obj.get("model")).map_err(CreateSessionError::bad_request)?;
+        let reasoning_effort = normalize_requested_reasoning_effort(obj.get("reasoning_effort").and_then(Value::as_str))
+            .map_err(CreateSessionError::bad_request)?;
+        let service_tier = normalize_requested_service_tier(obj.get("service_tier").and_then(Value::as_str))
+            .map_err(CreateSessionError::bad_request)?;
+        (model_provider, preferred_auth_method, model, reasoning_effort, service_tier)
+    } else {
+        let defaults = read_pi_launch_defaults().map_err(CreateSessionError::bad_request)?;
+        let allowed = (!defaults.provider_choices.is_empty()).then_some(defaults.provider_choices.iter().cloned().collect::<HashSet<_>>());
+        let model_provider = normalize_requested_model_provider(
+            obj.get("model_provider").and_then(Value::as_str),
+            allowed.as_ref(),
+        )
+        .map_err(CreateSessionError::bad_request)?;
+        if !value_is_missing_or_empty_string(obj.get("preferred_auth_method")) {
+            return Err(CreateSessionError::bad_request("preferred_auth_method is not supported for pi"));
+        }
+        let model = normalize_requested_model(obj.get("model")).map_err(CreateSessionError::bad_request)?;
+        let reasoning_effort = normalize_requested_pi_reasoning_effort(obj.get("reasoning_effort"))
+            .map_err(CreateSessionError::bad_request)?;
+        if !value_is_missing_or_empty_string(obj.get("service_tier")) {
+            return Err(CreateSessionError::bad_request("service_tier is not supported for pi"));
+        }
+        (model_provider, None, model, reasoning_effort, None)
+    };
+
+    let create_in_tmux = match obj.get("create_in_tmux") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(value)) => *value,
+        _ => return Err(CreateSessionError::bad_request("create_in_tmux must be a boolean")),
+    };
+
+    let resume_session_id = match obj.get("resume_session_id") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(value)) => {
+            let trimmed = value.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        }
+        _ => return Err(CreateSessionError::bad_request("resume_session_id must be a string")),
+    };
+
+    let worktree_branch = match obj.get("worktree_branch") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(value)) => {
+            let trimmed = value.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        }
+        _ => return Err(CreateSessionError::bad_request("worktree_branch must be a string")),
+    };
+
+    let args = match obj.get("args") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(values)) => {
+            let mut out = Vec::new();
+            for value in values {
+                let Some(text) = value.as_str() else {
+                    return Err(CreateSessionError::bad_request("args must be a list of strings"));
+                };
+                if !text.is_empty() {
+                    out.push(text.to_string());
+                }
+            }
+            out
+        }
+        _ => return Err(CreateSessionError::bad_request("args must be a list of strings")),
+    };
+
+    Ok(CreateSessionRequest {
+        cwd,
+        args,
+        agent_backend,
+        resume_session_id,
+        worktree_branch,
+        model_provider,
+        preferred_auth_method,
+        model,
+        reasoning_effort,
+        service_tier,
+        create_in_tmux,
+    })
+}
+
+fn value_to_pythonish_text(value: &Value) -> String {
+    match value {
+        Value::Null => String::new(),
+        Value::String(text) => text.clone(),
+        other => other.to_string(),
+    }
+}
+
+fn value_is_missing_or_empty_string(value: Option<&Value>) -> bool {
+    matches!(value, None | Some(Value::Null))
+        || value
+            .and_then(Value::as_str)
+            .map(|text| text.trim().is_empty())
+            .unwrap_or(false)
+}
+
+fn create_session_cwd_error(message: &str) -> CreateSessionError {
+    CreateSessionError::bad_request_with_field(message.to_string(), "cwd")
+}
+
+fn normalize_requested_model(value: Option<&Value>) -> Result<Option<String>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let Some(text) = value.as_str() else {
+        return Ok(None);
+    };
+    let trimmed = text.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("default") {
+        return Ok(None);
+    }
+    Ok(Some(trimmed.to_string()))
+}
+
+fn normalize_requested_pi_reasoning_effort(value: Option<&Value>) -> Result<Option<String>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let Some(text) = value.as_str() else {
+        return Err(format!(
+            "reasoning_effort must be one of {}",
+            SUPPORTED_PI_REASONING_EFFORTS.join(", ")
+        ));
+    };
+    let trimmed = text.trim().to_ascii_lowercase();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if display_pi_reasoning_effort(&trimmed).is_none() {
+        return Err(format!(
+            "reasoning_effort must be one of {}",
+            SUPPORTED_PI_REASONING_EFFORTS.join(", ")
+        ));
+    }
+    Ok(Some(trimmed))
+}
+
+fn codex_trust_override_for_path(path: &Path) -> String {
+    format!(
+        "projects={{ {} = {{ trust_level = \"trusted\" }} }}",
+        serde_json::to_string(&path.display().to_string()).unwrap_or_else(|_| "\"\"".to_string())
+    )
+}
+
+fn tmux_session_name() -> String {
+    env::var("CODEX_WEB_TMUX_SESSION")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "codoxear".to_string())
+}
+
+fn next_spawn_nonce() -> String {
+    format!("{:08x}{:08x}", std::process::id(), QUEUE_ITEM_COUNTER.fetch_add(1, Ordering::Relaxed))
+}
+
+fn base_spawn_env_overrides(backend_name: &str, resume_session_id: Option<&str>) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    out.insert("CODEX_WEB_OWNER".to_string(), "web".to_string());
+    out.insert("CODEX_WEB_AGENT_BACKEND".to_string(), backend_name.to_string());
+    if backend_name == "codex" {
+        out.insert("CODEX_HOME".to_string(), codex_home().display().to_string());
+    } else {
+        out.insert("PI_HOME".to_string(), pi_home().display().to_string());
+    }
+    if let Some(resume_session_id) = resume_session_id {
+        out.insert(
+            "CODEX_WEB_RESUME_SESSION_ID".to_string(),
+            resume_session_id.to_string(),
+        );
+    }
+    out
+}
+
+fn apply_spawn_env(command: &mut Command, env_overrides: &HashMap<String, String>) {
+    for key in [
+        "CODEX_WEB_MODEL_PROVIDER",
+        "CODEX_WEB_PREFERRED_AUTH_METHOD",
+        "CODEX_WEB_MODEL",
+        "CODEX_WEB_REASONING_EFFORT",
+        "CODEX_WEB_SERVICE_TIER",
+        "CODEX_WEB_TRANSPORT",
+        "CODEX_WEB_TMUX_SESSION",
+        "CODEX_WEB_TMUX_WINDOW",
+        "CODEX_WEB_SPAWN_NONCE",
+        "CODEX_WEB_RESUME_SESSION_ID",
+        "CODEX_WEB_RESUME_LOG_PATH",
+    ] {
+        command.env_remove(key);
+    }
+    if env_overrides.get("CODEX_HOME").is_some() {
+        command.env_remove("PI_HOME");
+    }
+    if env_overrides.get("PI_HOME").is_some() {
+        command.env_remove("CODEX_HOME");
+    }
+    command.envs(env_overrides.iter().map(|(key, value)| (key, value)));
+}
+
+fn sorted_env_items(env_overrides: &HashMap<String, String>) -> Vec<(String, String)> {
+    let mut items = env_overrides
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect::<Vec<_>>();
+    items.sort_by(|left, right| left.0.cmp(&right.0));
+    items
+}
+
+fn spawn_command(program: &str) -> Command {
+    let env_key = match program {
+        "tmux" => Some("CODOXEAR_TMUX_BIN"),
+        "setsid" => Some("CODOXEAR_SETSID_BIN"),
+        _ => None,
+    };
+    if let Some(env_key) = env_key {
+        if let Some(path) = env::var(env_key).ok().map(|value| value.trim().to_string()).filter(|value| !value.is_empty()) {
+            return Command::new(path);
+        }
+    }
+    Command::new(program)
+}
+
+fn wait_or_raise(child: &mut std::process::Child, label: &str, timeout: Duration) -> Result<(), String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait().map_err(map_io_error)? {
+            Some(status) => {
+                let mut err_text = String::new();
+                if let Some(mut stderr) = child.stderr.take() {
+                    let _ = stderr.read_to_string(&mut err_text);
+                }
+                let trimmed = err_text.trim();
+                return Err(format!(
+                    "{label} exited early (rc={}): {}",
+                    status.code().unwrap_or_default(),
+                    if trimmed.is_empty() { String::new() } else { trimmed.chars().rev().take(4000).collect::<String>().chars().rev().collect() }
+                ));
+            }
+            None if Instant::now() >= deadline => return Ok(()),
+            None => std::thread::sleep(Duration::from_millis(50)),
+        }
+    }
+}
+
+fn wait_for_spawned_broker_meta(config: &RuntimeConfig, spawn_nonce: &str, timeout: Duration) -> Result<Value, String> {
+    let deadline = Instant::now() + timeout;
+    let socks_dir = config.app_dir.join("socks");
+    while Instant::now() <= deadline {
+        let mut entries = match fs::read_dir(&socks_dir) {
+            Ok(entries) => entries.flatten().collect::<Vec<_>>(),
+            Err(_) => Vec::new(),
+        };
+        entries.sort_by_key(|entry| entry.path());
+        for entry in entries {
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                continue;
+            }
+            let Ok(value) = read_json_file::<Value>(&path) else {
+                continue;
+            };
+            let Some(obj) = value.as_object() else {
+                continue;
+            };
+            if obj.get("spawn_nonce").and_then(Value::as_str) != Some(spawn_nonce) {
+                continue;
+            }
+            if obj.get("broker_pid").and_then(Value::as_i64).is_none() {
+                continue;
+            }
+            return Ok(value);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    Err(format!(
+        "tmux launch did not publish broker metadata within {:.1}s",
+        timeout.as_secs_f64()
+    ))
+}
+
+fn tmux_capture_pane_tail(pane_id: &str, lines: i64) -> String {
+    let pane = pane_id.trim();
+    if pane.is_empty() {
+        return String::new();
+    }
+    let output = match spawn_command("tmux")
+        .args(["capture-pane", "-p", "-t", pane, "-S", &format!("-{}", lines.max(1))])
+        .output()
+    {
+        Ok(output) => output,
+        Err(_) => return String::new(),
+    };
+    if !output.status.success() {
+        return String::new();
+    }
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if text.is_empty() {
+        return String::new();
+    }
+    let lines = text
+        .lines()
+        .map(str::trim_end)
+        .filter(|line| !line.trim().is_empty())
+        .collect::<Vec<_>>();
+    if lines.is_empty() {
+        return String::new();
+    }
+    let joined = lines[lines.len().saturating_sub(12)..].join("\n");
+    joined
+        .chars()
+        .rev()
+        .take(4000)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect()
+}
+
+fn shell_quote(raw: &str) -> String {
+    if raw.is_empty() {
+        return "''".to_string();
+    }
+    if raw
+        .bytes()
+        .all(|byte| matches!(byte, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'@' | b'%' | b'+' | b'=' | b':' | b',' | b'.' | b'/' | b'-'))
+    {
+        return raw.to_string();
+    }
+    format!("'{}'", raw.replace('\'', "'\"'\"'"))
+}
+
+fn shell_join(argv: &[String]) -> String {
+    argv.iter().map(|value| shell_quote(value)).collect::<Vec<_>>().join(" ")
+}
+
+fn repo_root() -> Result<PathBuf, String> {
+    if let Some(path) = env::var("CODOXEAR_REPO_ROOT").ok().map(|value| value.trim().to_string()).filter(|value| !value.is_empty()) {
+        return Ok(PathBuf::from(path));
+    }
+    let mut candidates = Vec::new();
+    if let Ok(cwd) = env::current_dir() {
+        candidates.push(cwd);
+    }
+    if let Ok(exe) = env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            candidates.push(parent.to_path_buf());
+        }
+    }
+    for start in candidates {
+        for candidate in start.ancestors() {
+            if looks_like_repo_root(candidate) {
+                return Ok(candidate.to_path_buf());
+            }
+        }
+    }
+    Err("unable to locate Codoxear repo root".to_string())
+}
+
+fn looks_like_repo_root(path: &Path) -> bool {
+    path.join("pyproject.toml").is_file() && path.join("codoxear").is_dir()
+}
+
+fn python_bin(repo_root: &Path) -> PathBuf {
+    if let Some(path) = env::var("CODOXEAR_PYTHON_BIN").ok().map(|value| value.trim().to_string()).filter(|value| !value.is_empty()) {
+        return PathBuf::from(path);
+    }
+    let venv_python = repo_root.join(".venv").join("bin").join("python");
+    if venv_python.exists() {
+        return venv_python;
+    }
+    if let Some(path) = env::var("VIRTUAL_ENV").ok().map(|value| value.trim().to_string()).filter(|value| !value.is_empty()) {
+        let candidate = PathBuf::from(path).join("bin").join("python");
+        if candidate.exists() {
+            return candidate;
+        }
+    }
+    PathBuf::from("python3")
+}
+
+fn expand_user_and_vars(raw: &str) -> PathBuf {
+    let home = home_dir().unwrap_or_else(|| PathBuf::from("~"));
+    let home_text = home.display().to_string();
+    let expanded = raw
+        .trim()
+        .replace("${HOME}", &home_text)
+        .replace("$HOME", &home_text);
+    expand_home(&expanded)
+}
+
+fn resolve_dir_target(raw: &str) -> Result<PathBuf, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("cwd required".to_string());
+    }
+    let path = expand_user_and_vars(trimmed);
+    let absolute = if path.is_absolute() {
+        path
+    } else {
+        env::current_dir().map_err(map_io_error)?.join(path)
+    };
+    if absolute.exists() && !absolute.is_dir() {
+        return Err(format!("cwd is not a directory: {}", absolute.display()));
+    }
+    Ok(fs::canonicalize(&absolute).unwrap_or(absolute))
+}
+
+fn worktree_path_slug(branch: &str) -> String {
+    let mut slug = String::new();
+    let mut last_dash = false;
+    for ch in branch.chars() {
+        let allowed = ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-');
+        if allowed {
+            slug.push(ch);
+            last_dash = false;
+        } else if !last_dash {
+            slug.push('-');
+            last_dash = true;
+        }
+    }
+    let trimmed = slug.trim_matches(|ch| ch == '.' || ch == '-').to_string();
+    if trimmed.is_empty() {
+        "worktree".to_string()
+    } else {
+        trimmed
+    }
+}
+
+fn default_worktree_path(source_cwd: &Path, branch: &str) -> PathBuf {
+    let slug = worktree_path_slug(branch);
+    source_cwd
+        .parent()
+        .unwrap_or(source_cwd)
+        .join(format!("{}-{slug}", source_cwd.file_name().and_then(|name| name.to_str()).unwrap_or("worktree")))
+}
+
+fn create_git_worktree(source_cwd: &Path, worktree_branch: &str) -> Result<PathBuf, String> {
+    let Some(repo_root) = git_repo_root(source_cwd) else {
+        return Err("cwd is not inside a git worktree".to_string());
+    };
+    let branch = worktree_branch.trim();
+    if branch.is_empty() {
+        return Err("worktree_branch required".to_string());
+    }
+    let target = default_worktree_path(source_cwd, branch);
+    if target.exists() {
+        return Err(format!("derived worktree path already exists: {}", target.display()));
+    }
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent).map_err(map_io_error)?;
+    }
+    let output = Command::new("git")
+        .current_dir(&repo_root)
+        .args(["worktree", "add", "-b", branch, &target.display().to_string()])
+        .output()
+        .map_err(map_io_error)?;
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let fallback = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        return Err(if !detail.is_empty() {
+            detail
+        } else if !fallback.is_empty() {
+            fallback
+        } else {
+            format!("git worktree add failed with code {}", output.status.code().unwrap_or_default())
+        });
+    }
+    Ok(fs::canonicalize(&target).unwrap_or(target))
+}
+
+fn find_resume_candidate_for_cwd(cwd: &str, agent_backend: &str, target_session_id: &str) -> Option<(String, Option<PathBuf>)> {
+    let cwd_text = fs::canonicalize(expand_user_and_vars(cwd))
+        .unwrap_or_else(|_| expand_user_and_vars(cwd))
+        .display()
+        .to_string();
+    for log_path in iter_session_logs_for_backend(agent_backend) {
+        let payload = read_session_log_header(&log_path, agent_backend)?;
+        if agent_backend == "codex" && is_subagent_session_payload(&payload) {
+            continue;
+        }
+        let session_id = payload.get("id").and_then(Value::as_str)?;
+        let row_cwd = payload.get("cwd").and_then(Value::as_str)?;
+        if session_id == target_session_id && row_cwd == cwd_text {
+            return Some((session_id.to_string(), Some(log_path)));
+        }
+    }
+    None
+}
+
+fn iter_session_logs_for_backend(agent_backend: &str) -> Vec<PathBuf> {
+    let sessions_dir = agent_sessions_dir(agent_backend);
+    if !sessions_dir.exists() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut stack = vec![sessions_dir.clone()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if !session_log_matches_backend(&path, agent_backend, &sessions_dir) {
+                continue;
+            }
+            out.push(path);
+        }
+    }
+    out.sort_by(|left, right| {
+        file_mtime(right)
+            .partial_cmp(&file_mtime(left))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    out
+}
+
+fn session_log_matches_backend(path: &Path, agent_backend: &str, sessions_dir: &Path) -> bool {
+    if agent_backend == "pi" {
+        return path.extension().and_then(|ext| ext.to_str()) == Some("jsonl") && path.starts_with(sessions_dir);
+    }
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| name.starts_with("rollout-") && name.ends_with(".jsonl"))
+        .unwrap_or(false)
+}
+
 fn object_bool(value: Option<&Value>, key: &str) -> Option<bool> {
     value?.as_object()?.get(key)?.as_bool()
 }
@@ -1101,48 +3117,1412 @@ fn epoch_now() -> f64 {
         .unwrap_or(0.0)
 }
 
-fn new_session_defaults() -> ApiNewSessionDefaults {
-    let mut backends = HashMap::new();
-    backends.insert(
-        "codex".to_string(),
-        ApiBackendDefaults {
-            agent_backend: "codex".to_string(),
-            model_provider: None,
-            preferred_auth_method: None,
-            provider_choice: None,
-            provider_choices: vec![],
-            model: None,
-            models: vec![],
-            reasoning_effort: "medium".to_string(),
-            reasoning_efforts: vec!["low".to_string(), "medium".to_string(), "high".to_string()],
-            service_tier: None,
-            supports_fast: true,
-        },
-    );
-    backends.insert(
-        "pi".to_string(),
-        ApiBackendDefaults {
-            agent_backend: "pi".to_string(),
-            model_provider: None,
-            preferred_auth_method: None,
-            provider_choice: None,
-            provider_choices: vec![],
-            model: None,
-            models: vec![],
-            reasoning_effort: "medium".to_string(),
-            reasoning_efforts: vec!["low".to_string(), "medium".to_string(), "high".to_string()],
-            service_tier: None,
-            supports_fast: false,
-        },
-    );
-    ApiNewSessionDefaults {
-        default_backend: "codex".to_string(),
-        backends,
+fn broker_request(sock_path: &Path, request: &Value, timeout: Duration) -> Result<Value, String> {
+    let mut stream = UnixStream::connect(sock_path).map_err(|err| format!("connect {}: {err}", sock_path.display()))?;
+    let _ = stream.set_read_timeout(Some(timeout));
+    let _ = stream.set_write_timeout(Some(timeout));
+    let mut line = serde_json::to_string(request).map_err(|err| format!("serialize broker request {}: {err}", sock_path.display()))?;
+    line.push('\n');
+    stream
+        .write_all(line.as_bytes())
+        .map_err(|err| format!("write {}: {err}", sock_path.display()))?;
+    let mut reader = BufReader::new(stream);
+    let mut response_line = String::new();
+    reader
+        .read_line(&mut response_line)
+        .map_err(|err| format!("read {}: {err}", sock_path.display()))?;
+    let trimmed = response_line.trim();
+    if trimmed.is_empty() {
+        return Err(format!("empty broker response from {}", sock_path.display()));
+    }
+    serde_json::from_str(trimmed).map_err(|err| format!("parse broker response {}: {err}", sock_path.display()))
+}
+
+fn session_sock_path(config: &RuntimeConfig, session_id: &str) -> PathBuf {
+    config.app_dir.join("socks").join(format!("{}.sock", session_id))
+}
+
+fn read_broker_state(sock_path: &Path) -> Result<Option<BrokerState>, String> {
+    if !sock_path.exists() {
+        return Ok(None);
+    }
+    let value = broker_request(sock_path, &json!({"cmd": "state"}), Duration::from_millis(500))?;
+    if !value.is_object() {
+        return Ok(None);
+    }
+    let busy = value
+        .get("busy")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| format!("missing busy in broker state for {}", sock_path.display()))?;
+    let queue_len = value
+        .get("queue_len")
+        .and_then(Value::as_u64)
+        .map(|value| value as usize)
+        .ok_or_else(|| format!("missing queue_len in broker state for {}", sock_path.display()))?;
+    let token = match value.get("token") {
+        Some(Value::Object(_)) => value.get("token").cloned(),
+        _ => None,
+    };
+    Ok(Some(BrokerState {
+        busy,
+        _queue_len: queue_len,
+        token,
+    }))
+}
+
+fn read_live_broker_state(config: &RuntimeConfig, session: &ApiSessionSummary) -> Result<BrokerState, String> {
+    let sock_path = session_sock_path(config, &session.session_id);
+    match read_broker_state(&sock_path) {
+        Ok(Some(state)) => Ok(state),
+        Ok(None) | Err(_) if !pid_alive(session.pid) && !pid_alive(session.broker_pid) => {
+            Err(format!("unknown session: {}", session.session_id))
+        }
+        Ok(None) => Err(format!("missing broker state for {}", sock_path.display())),
+        Err(err) => Err(err),
     }
 }
 
+fn broker_request_for_session(
+    config: &RuntimeConfig,
+    session: &ApiSessionSummary,
+    request: &Value,
+    timeout: Duration,
+) -> Result<Value, String> {
+    let sock_path = session_sock_path(config, &session.session_id);
+    match broker_request(&sock_path, request, timeout) {
+        Ok(value) => Ok(value),
+        Err(_) if !pid_alive(session.pid) && !pid_alive(session.broker_pid) => {
+            Err(format!("unknown session: {}", session.session_id))
+        }
+        Err(err) => Err(err),
+    }
+}
+
+pub fn send_session_message(config: &RuntimeConfig, session_id: &str, text: &str) -> Result<Value, String> {
+    if text.trim().is_empty() {
+        return Err("text required".to_string());
+    }
+    let session = find_session(config, session_id)?;
+    let response = broker_request_for_session(
+        config,
+        &session,
+        &json!({"cmd": "send", "text": text}),
+        Duration::from_secs_f64(3.0),
+    )?;
+    if !response.is_object() || response.get("queue_len").and_then(Value::as_u64).is_none() {
+        return Err("invalid broker send response".to_string());
+    }
+    Ok(response)
+}
+
+pub fn interrupt_session(config: &RuntimeConfig, session_id: &str) -> Result<Value, String> {
+    let session = find_session(config, session_id)?;
+    let broker = broker_request_for_session(
+        config,
+        &session,
+        &json!({"cmd": "keys", "seq": "\\x1b"}),
+        Duration::from_secs_f64(2.0),
+    )?;
+    Ok(json!({"ok": true, "broker": broker}))
+}
+
+pub fn rename_session(config: &RuntimeConfig, session_id: &str, name: &str) -> Result<Value, String> {
+    let _ = find_session(config, session_id)?;
+    let alias_path = config.app_dir.join("session_aliases.json");
+    let mut aliases = read_string_map(&alias_path)?;
+    let alias = clean_alias(name);
+    if alias.is_empty() {
+        aliases.remove(session_id);
+    } else {
+        aliases.insert(session_id.to_string(), alias.clone());
+    }
+    write_string_map(&alias_path, &aliases)?;
+    Ok(json!({"ok": true, "alias": alias}))
+}
+
+pub fn edit_session(
+    config: &RuntimeConfig,
+    session_id: &str,
+    name: &str,
+    priority_offset: Option<&Value>,
+    snooze_until: Option<&Value>,
+    dependency_session_id: Option<&Value>,
+) -> Result<Value, String> {
+    let _ = find_session(config, session_id)?;
+    let alias = clean_alias(name);
+    let offset = clean_priority_offset_value(priority_offset)?;
+    let snooze_until_clean = clean_snooze_until_value(snooze_until)?;
+    let dependency_clean = clean_dependency_session_id_value(dependency_session_id)?;
+    if dependency_clean.as_deref() == Some(session_id) {
+        return Err("session cannot depend on itself".to_string());
+    }
+    if let Some(dependency_id) = dependency_clean.as_deref() {
+        find_session(config, dependency_id).map_err(|_| "dependency session not found".to_string())?;
+    }
+
+    let alias_path = config.app_dir.join("session_aliases.json");
+    let mut aliases = read_string_map(&alias_path)?;
+    if alias.is_empty() {
+        aliases.remove(session_id);
+    } else {
+        aliases.insert(session_id.to_string(), alias.clone());
+    }
+    write_string_map(&alias_path, &aliases)?;
+
+    let sidebar_path = config.app_dir.join("session_sidebar.json");
+    let mut sidebar = read_object_map(&sidebar_path)?;
+    let mut entry = serde_json::Map::new();
+    entry.insert("priority_offset".to_string(), json!(offset));
+    if let Some(value) = snooze_until_clean {
+        entry.insert("snooze_until".to_string(), json!(value));
+    }
+    if let Some(value) = dependency_clean.clone() {
+        entry.insert("dependency_session_id".to_string(), json!(value));
+    }
+    sidebar.insert(session_id.to_string(), Value::Object(entry));
+    write_object_map(&sidebar_path, &sidebar)?;
+
+    Ok(json!({
+        "ok": true,
+        "alias": alias,
+        "priority_offset": offset,
+        "snooze_until": snooze_until_clean,
+        "dependency_session_id": dependency_clean,
+    }))
+}
+
+pub fn inject_session_attachment(
+    config: &RuntimeConfig,
+    session_id: &str,
+    filename: &str,
+    data_b64: &str,
+    attachment_index: i64,
+) -> Result<Value, String> {
+    if filename.trim().is_empty() {
+        return Err("filename required".to_string());
+    }
+    if data_b64.is_empty() {
+        return Err("data_b64 required".to_string());
+    }
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(data_b64.as_bytes())
+        .map_err(|_| "invalid base64".to_string())?;
+    let out_path = stage_uploaded_file(config, session_id, filename, &raw)?;
+    let inject_text = attachment_inject_text(attachment_index, &out_path)?;
+    let seq = format!("\u{1b}[200~{}\u{1b}[201~", inject_text);
+    let session = find_session(config, session_id)?;
+    let broker = broker_request_for_session(
+        config,
+        &session,
+        &json!({"cmd": "keys", "seq": seq}),
+        Duration::from_secs_f64(2.0),
+    )?;
+    Ok(json!({
+        "ok": true,
+        "path": out_path.display().to_string(),
+        "inject_text": inject_text,
+        "broker": broker,
+    }))
+}
+
+pub fn create_session(config: &RuntimeConfig, request: CreateSessionRequest) -> Result<Value, CreateSessionError> {
+    let backend_name = normalize_backend(Some(request.agent_backend.as_str())).map_err(CreateSessionError::bad_request)?;
+    let cwd_path = resolve_dir_target(&request.cwd).map_err(|message| create_session_cwd_error(&message))?;
+    if !cwd_path.exists() {
+        fs::create_dir_all(&cwd_path).map_err(|err| {
+            CreateSessionError::bad_request_with_field(
+                format!("cwd could not be created: {}: {}", cwd_path.display(), err),
+                "cwd",
+            )
+        })?;
+    }
+    if !cwd_path.is_dir() {
+        return Err(CreateSessionError::bad_request_with_field(
+            format!("cwd is not a directory: {}", cwd_path.display()),
+            "cwd",
+        ));
+    }
+    if request.resume_session_id.is_some() && request.worktree_branch.is_some() {
+        return Err(CreateSessionError::bad_request("worktree_branch cannot be used when resuming a session"));
+    }
+
+    let cwd_display = cwd_path.display().to_string();
+    let resume_id = request.resume_session_id.as_deref().map(str::trim).filter(|value| !value.is_empty());
+    let resume_target = if let Some(resume_id) = resume_id {
+        Some(
+            find_resume_candidate_for_cwd(&cwd_display, &backend_name, resume_id)
+                .ok_or_else(|| CreateSessionError::bad_request(format!("resume session not found for cwd: {resume_id}")))?,
+        )
+    } else {
+        None
+    };
+
+    let spawn_cwd = if let Some(branch) = request.worktree_branch.as_deref() {
+        create_git_worktree(&cwd_path, branch).map_err(CreateSessionError::bad_request)?
+    } else {
+        cwd_path.clone()
+    };
+
+    let mut broker_args = vec![
+        "-m".to_string(),
+        "codoxear.broker".to_string(),
+        "--cwd".to_string(),
+        spawn_cwd.display().to_string(),
+        "--".to_string(),
+    ];
+    if backend_name == "codex" {
+        broker_args.push("-c".to_string());
+        broker_args.push(codex_trust_override_for_path(&spawn_cwd));
+        broker_args.push("--dangerously-bypass-approvals-and-sandbox".to_string());
+        if let Some(model) = request.model.as_deref() {
+            broker_args.push("--model".to_string());
+            broker_args.push(model.to_string());
+        }
+        if let Some(reasoning_effort) = request.reasoning_effort.as_deref() {
+            broker_args.push("-c".to_string());
+            broker_args.push(format!("model_reasoning_effort=\"{}\"", reasoning_effort));
+        }
+        if let Some(model_provider) = request.model_provider.as_deref() {
+            broker_args.push("-c".to_string());
+            broker_args.push(format!("model_provider=\"{}\"", model_provider));
+        }
+        if let Some(preferred_auth_method) = request.preferred_auth_method.as_deref() {
+            broker_args.push("-c".to_string());
+            broker_args.push(format!("preferred_auth_method=\"{}\"", preferred_auth_method));
+        }
+        if let Some(service_tier) = request.service_tier.as_deref() {
+            broker_args.push("-c".to_string());
+            broker_args.push(format!("service_tier=\"{}\"", service_tier));
+        }
+        if let Some(resume_id) = resume_id {
+            broker_args.push("resume".to_string());
+            broker_args.push(resume_id.to_string());
+        }
+    } else {
+        if request.preferred_auth_method.is_some() {
+            return Err(CreateSessionError::bad_request("preferred_auth_method is not supported for pi"));
+        }
+        if request.service_tier.is_some() {
+            return Err(CreateSessionError::bad_request("service_tier is not supported for pi"));
+        }
+        if let Some(model_provider) = request.model_provider.as_deref() {
+            broker_args.push("--provider".to_string());
+            broker_args.push(model_provider.to_string());
+        }
+        if let Some(model) = request.model.as_deref() {
+            broker_args.push("--model".to_string());
+            broker_args.push(model.to_string());
+        }
+        if let Some(reasoning_effort) = request.reasoning_effort.as_deref() {
+            broker_args.push("--thinking".to_string());
+            broker_args.push(reasoning_effort.to_string());
+        }
+        if let Some((resume_id, resume_log_path)) = resume_target.as_ref() {
+            broker_args.push("--session".to_string());
+            broker_args.push(
+                resume_log_path
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| resume_id.clone()),
+            );
+        }
+    }
+    broker_args.extend(request.args.iter().filter(|value| !value.is_empty()).cloned());
+
+    let repo_root = repo_root().map_err(CreateSessionError::internal)?;
+    let python_bin = python_bin(&repo_root);
+    let tmux_session = tmux_session_name();
+    let mut env_overrides = base_spawn_env_overrides(&backend_name, resume_id);
+    if let Some(model_provider) = request.model_provider.as_deref() {
+        env_overrides.insert("CODEX_WEB_MODEL_PROVIDER".to_string(), model_provider.to_string());
+    }
+    if let Some(preferred_auth_method) = request.preferred_auth_method.as_deref() {
+        env_overrides.insert(
+            "CODEX_WEB_PREFERRED_AUTH_METHOD".to_string(),
+            preferred_auth_method.to_string(),
+        );
+    }
+    if let Some(model) = request.model.as_deref() {
+        env_overrides.insert("CODEX_WEB_MODEL".to_string(), model.to_string());
+    }
+    if let Some(reasoning_effort) = request.reasoning_effort.as_deref() {
+        env_overrides.insert(
+            "CODEX_WEB_REASONING_EFFORT".to_string(),
+            reasoning_effort.to_string(),
+        );
+    }
+    if let Some(service_tier) = request.service_tier.as_deref() {
+        env_overrides.insert("CODEX_WEB_SERVICE_TIER".to_string(), service_tier.to_string());
+    }
+
+    if request.create_in_tmux {
+        if !tmux_available() {
+            return Err(CreateSessionError::bad_request("tmux is unavailable on this host"));
+        }
+        let spawn_nonce = next_spawn_nonce();
+        let tmux_window = safe_filename(
+            &format!(
+                "{}-{}",
+                spawn_cwd.file_name().and_then(|name| name.to_str()).unwrap_or("session"),
+                &spawn_nonce[..6],
+            ),
+            "session",
+        );
+        env_overrides.insert("CODEX_WEB_TRANSPORT".to_string(), "tmux".to_string());
+        env_overrides.insert("CODEX_WEB_TMUX_SESSION".to_string(), tmux_session.clone());
+        env_overrides.insert("CODEX_WEB_TMUX_WINDOW".to_string(), tmux_window.clone());
+        env_overrides.insert("CODEX_WEB_SPAWN_NONCE".to_string(), spawn_nonce.clone());
+
+        let mut inline_argv = vec!["env".to_string()];
+        for (key, value) in sorted_env_items(&env_overrides) {
+            inline_argv.push(format!("{key}={value}"));
+        }
+        if let Some(codex_bin) = env::var("CODEX_BIN").ok().map(|value| value.trim().to_string()).filter(|value| !value.is_empty()) {
+            inline_argv.push(format!("CODEX_BIN={codex_bin}"));
+        }
+        inline_argv.push(python_bin.display().to_string());
+        inline_argv.extend(broker_args.iter().cloned());
+        let shell_cmd = format!(
+            "cd {} && exec {}",
+            shell_quote(&repo_root.display().to_string()),
+            shell_join(&inline_argv),
+        );
+
+        let has_session = spawn_command("tmux")
+            .args(["has-session", "-t", &tmux_session])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map_err(|err| CreateSessionError::internal(format!("tmux launch failed: {err}")))?;
+        let tmux_args = if has_session.success() {
+            vec![
+                "new-window".to_string(),
+                "-d".to_string(),
+                "-P".to_string(),
+                "-F".to_string(),
+                "#{pane_id}".to_string(),
+                "-t".to_string(),
+                format!("{tmux_session}:"),
+                "-n".to_string(),
+                tmux_window.clone(),
+                shell_cmd,
+            ]
+        } else {
+            vec![
+                "new-session".to_string(),
+                "-d".to_string(),
+                "-P".to_string(),
+                "-F".to_string(),
+                "#{pane_id}".to_string(),
+                "-s".to_string(),
+                tmux_session.clone(),
+                "-n".to_string(),
+                tmux_window.clone(),
+                shell_cmd,
+            ]
+        };
+        let mut tmux_proc = spawn_command("tmux");
+        tmux_proc.current_dir(&repo_root);
+        apply_spawn_env(&mut tmux_proc, &env_overrides);
+        let tmux_output = tmux_proc
+            .args(tmux_args.iter().map(String::as_str))
+            .output()
+            .map_err(|err| CreateSessionError::internal(format!("tmux launch failed: {err}")))?;
+        if !tmux_output.status.success() {
+            let detail = String::from_utf8_lossy(&tmux_output.stderr).trim().to_string();
+            let fallback = String::from_utf8_lossy(&tmux_output.stdout).trim().to_string();
+            let message = if !detail.is_empty() {
+                detail
+            } else if !fallback.is_empty() {
+                fallback
+            } else {
+                format!("exit status {}", tmux_output.status.code().unwrap_or_default())
+            };
+            return Err(CreateSessionError::internal(format!("tmux launch failed: {message}")));
+        }
+        let pane_id = String::from_utf8_lossy(&tmux_output.stdout).trim().to_string();
+        let meta = wait_for_spawned_broker_meta(config, &spawn_nonce, Duration::from_secs_f64(TMUX_META_WAIT_SECONDS)).map_err(
+            |message| {
+                let pane_tail = tmux_capture_pane_tail(&pane_id, 80);
+                if pane_tail.is_empty() {
+                    CreateSessionError::internal(message)
+                } else {
+                    CreateSessionError::internal(format!("{message}\nLast tmux pane output:\n{pane_tail}"))
+                }
+            },
+        )?;
+        let broker_pid = meta
+            .get("broker_pid")
+            .and_then(Value::as_i64)
+            .ok_or_else(|| CreateSessionError::internal("tmux launch metadata is missing broker_pid"))?;
+        return Ok(json!({
+            "ok": true,
+            "broker_pid": broker_pid,
+            "tmux_session": tmux_session,
+            "tmux_window": tmux_window,
+        }));
+    }
+
+    let mut child = spawn_command("setsid");
+    child
+        .current_dir(&repo_root)
+        .arg(&python_bin)
+        .args(broker_args.iter().map(String::as_str))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    apply_spawn_env(&mut child, &env_overrides);
+    let mut child = child
+        .spawn()
+        .map_err(|err| CreateSessionError::internal(format!("spawn failed: {err}")))?;
+    wait_or_raise(&mut child, "broker", Duration::from_secs_f64(1.5)).map_err(CreateSessionError::internal)?;
+    let broker_pid = i64::from(child.id());
+    let stderr = child.stderr.take();
+    std::thread::spawn(move || {
+        if let Some(mut stderr) = stderr {
+            let mut sink = Vec::new();
+            let _ = stderr.read_to_end(&mut sink);
+        }
+        let _ = child.wait();
+    });
+    Ok(json!({"ok": true, "broker_pid": broker_pid}))
+}
+
+pub fn delete_session(config: &RuntimeConfig, session_id: &str) -> Result<Value, String> {
+    let session = find_session(config, session_id)?;
+    let deleted = match broker_request_for_session(
+        config,
+        &session,
+        &json!({"cmd": "shutdown"}),
+        Duration::from_secs_f64(1.0),
+    ) {
+        Ok(response) if response.get("ok").and_then(Value::as_bool) == Some(true) => true,
+        Ok(_) | Err(_) => kill_session_via_pids(config, &session),
+    };
+    if !deleted {
+        return Err(format!("unknown session: {session_id}"));
+    }
+    clear_deleted_session_state(config, session_id, Some(session.cwd.as_str()))?;
+    Ok(json!({"ok": true}))
+}
+
+fn discover_open_log_for_process(root_pid: i64, cwd: &str, agent_backend: &str) -> Option<PathBuf> {
+    if root_pid <= 0 {
+        return None;
+    }
+    let proc_root = Path::new("/proc");
+    if !proc_root.exists() {
+        return None;
+    }
+    let mut candidates = proc_open_writable_rollout_logs(proc_root, root_pid, agent_backend);
+    if candidates.is_empty() {
+        return None;
+    }
+    candidates.sort_by(|a, b| {
+        file_mtime(b)
+            .partial_cmp(&file_mtime(a))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut matches = Vec::new();
+    let mut unique_open_main = Vec::new();
+    for path in candidates {
+        let Some(payload) = read_session_log_header(&path, agent_backend) else {
+            continue;
+        };
+        if agent_backend == "codex" && is_subagent_session_payload(&payload) {
+            continue;
+        }
+        unique_open_main.push(path.clone());
+        if payload.get("cwd").and_then(Value::as_str) == Some(cwd) {
+            matches.push(path);
+        }
+    }
+    if matches.len() == 1 {
+        return matches.into_iter().next();
+    }
+    if !cwd.is_empty() && matches.is_empty() && unique_open_main.len() == 1 {
+        return unique_open_main.into_iter().next();
+    }
+    None
+}
+
+fn proc_open_writable_rollout_logs(proc_root: &Path, root_pid: i64, agent_backend: &str) -> Vec<PathBuf> {
+    let uid = fs::metadata(proc_root.join("self")).ok().map(|meta| meta.uid());
+    let sessions_dir = agent_sessions_dir(agent_backend);
+    let mut out = HashSet::new();
+    for pid in proc_descendants(proc_root, root_pid) {
+        let pid_uid = proc_pid_uid(proc_root, pid);
+        if uid.is_some() && pid_uid.is_some() && uid != pid_uid {
+            continue;
+        }
+        let fd_dir = proc_root.join(pid.to_string()).join("fd");
+        let Ok(entries) = fs::read_dir(fd_dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let fd_name = entry.file_name();
+            let Some(fd_name) = fd_name.to_str() else {
+                continue;
+            };
+            let Some(flags) = proc_fd_flags(proc_root, pid, fd_name) else {
+                continue;
+            };
+            if !fd_has_write_intent(flags) {
+                continue;
+            }
+            let Ok(target) = fs::read_link(entry.path()) else {
+                continue;
+            };
+            let path_text = target.to_string_lossy();
+            if path_text.ends_with(" (deleted)") {
+                continue;
+            }
+            if !target.is_absolute() || target.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+                continue;
+            }
+            if is_rollout_log_path(&target, agent_backend, &sessions_dir) {
+                out.insert(target);
+            }
+        }
+    }
+    out.into_iter().collect()
+}
+
+fn agent_sessions_dir(agent_backend: &str) -> PathBuf {
+    if agent_backend == "pi" {
+        pi_home().join("agent").join("sessions")
+    } else {
+        codex_home().join("sessions")
+    }
+}
+
+fn is_rollout_log_path(path: &Path, agent_backend: &str, sessions_dir: &Path) -> bool {
+    if agent_backend == "pi" {
+        return path.extension().and_then(|ext| ext.to_str()) == Some("jsonl")
+            && path.starts_with(sessions_dir);
+    }
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| name.starts_with("rollout-") && name.ends_with(".jsonl"))
+        .unwrap_or(false)
+}
+
+fn proc_pid_uid(proc_root: &Path, pid: i64) -> Option<u32> {
+    fs::metadata(proc_root.join(pid.to_string())).ok().map(|meta| meta.uid())
+}
+
+fn proc_children(proc_root: &Path, pid: i64) -> Vec<i64> {
+    let path = proc_root
+        .join(pid.to_string())
+        .join("task")
+        .join(pid.to_string())
+        .join("children");
+    let Ok(raw) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    raw.split_whitespace()
+        .filter_map(|value| value.parse::<i64>().ok())
+        .collect()
+}
+
+fn proc_descendants(proc_root: &Path, root_pid: i64) -> Vec<i64> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    let mut stack = vec![root_pid];
+    while let Some(pid) = stack.pop() {
+        if !seen.insert(pid) {
+            continue;
+        }
+        out.push(pid);
+        stack.extend(proc_children(proc_root, pid));
+    }
+    out
+}
+
+fn proc_fd_flags(proc_root: &Path, pid: i64, fd_name: &str) -> Option<i64> {
+    let path = proc_root.join(pid.to_string()).join("fdinfo").join(fd_name);
+    let raw = fs::read_to_string(path).ok()?;
+    for line in raw.lines() {
+        if !line.starts_with("flags:") {
+            continue;
+        }
+        let value = line.split_once(':')?.1.trim().split_whitespace().next()?;
+        return i64::from_str_radix(value, 8).ok();
+    }
+    None
+}
+
+fn fd_has_write_intent(flags: i64) -> bool {
+    matches!(flags & 0o3, 0o1 | 0o2)
+}
+
+fn read_session_log_header(path: &Path, agent_backend: &str) -> Option<Value> {
+    if agent_backend == "pi" {
+        let value = read_first_json_object(path)?;
+        return (value.get("type").and_then(Value::as_str) == Some("session")).then_some(value);
+    }
+    read_codex_session_meta_payload(path)
+}
+
+fn is_subagent_session_payload(payload: &Value) -> bool {
+    payload
+        .get("source")
+        .and_then(Value::as_object)
+        .and_then(|source| source.get("subagent"))
+        .is_some()
+}
+
+fn file_mtime(path: &Path) -> f64 {
+    path.metadata()
+        .ok()
+        .and_then(|meta| meta.modified().ok())
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs_f64())
+        .unwrap_or(0.0)
+}
+
+fn pid_alive(pid: i64) -> bool {
+    pid > 0 && Path::new("/proc").join(pid.to_string()).exists()
+}
+
+fn last_conversation_ts_from_log(path: &Path) -> Option<f64> {
+    read_positioned_records(path)
+        .ok()?
+        .iter()
+        .filter_map(|record| sidebar_conversation_ts(&record.obj))
+        .last()
+}
+
+fn last_assistant_ts_from_log(path: &Path) -> Option<f64> {
+    let mut last = None;
+    for record in read_positioned_records(path).ok()? {
+        if has_assistant_output(&record.obj) {
+            last = event_ts(&record.obj);
+        }
+    }
+    last
+}
+
+fn latest_token_update_from_log(path: &Path) -> Option<Value> {
+    let records = read_positioned_records(path).ok()?;
+    for record in records.iter().rev() {
+        if let Some(update) = token_update_from_obj(&record.obj) {
+            return Some(update);
+        }
+    }
+    None
+}
+
+fn compute_idle_from_log(path: &Path) -> Option<bool> {
+    let size = file_len(path).ok()?;
+    let records = read_positioned_records(path).ok()?;
+    if records.is_empty() {
+        return None;
+    }
+    let mut saw_terminal_signal = false;
+    let mut idle = true;
+    for record in records {
+        let obj = &record.obj;
+        match obj.get("type").and_then(Value::as_str) {
+            Some("message") => {
+                if pi_user_text_value(obj).is_some() {
+                    saw_terminal_signal = true;
+                    idle = false;
+                    continue;
+                }
+                if pi_assistant_text_value(obj).is_some() {
+                    saw_terminal_signal = true;
+                    idle = pi_assistant_is_final_turn_end(obj);
+                    continue;
+                }
+                if pi_message_keeps_turn_busy(obj) {
+                    saw_terminal_signal = true;
+                    idle = false;
+                    continue;
+                }
+            }
+            Some("event_msg") => {
+                let Some(payload) = obj.get("payload").and_then(Value::as_object) else {
+                    continue;
+                };
+                match payload.get("type").and_then(Value::as_str) {
+                    Some("user_message") if payload.get("message" ).and_then(Value::as_str).is_some() => {
+                        saw_terminal_signal = true;
+                        idle = false;
+                    }
+                    Some("agent_message") if payload.get("message").and_then(Value::as_str).map(|text| !text.trim().is_empty()).unwrap_or(false) => {
+                        saw_terminal_signal = true;
+                        idle = false;
+                    }
+                    Some("agent_reasoning") => {
+                        saw_terminal_signal = true;
+                        idle = false;
+                    }
+                    Some("turn_aborted") | Some("thread_rolled_back") | Some("task_complete") | Some("turn_complete") => {
+                        saw_terminal_signal = true;
+                        idle = true;
+                    }
+                    _ => {}
+                }
+            }
+            Some("response_item") => {
+                let Some(payload) = obj.get("payload").and_then(Value::as_object) else {
+                    continue;
+                };
+                let payload_type = payload.get("type").and_then(Value::as_str);
+                if response_item_has_assistant_output(obj) {
+                    saw_terminal_signal = true;
+                    idle = payload.get("end_turn").and_then(Value::as_bool) == Some(true);
+                    continue;
+                }
+                if matches!(payload_type, Some("reasoning") | Some("function_call") | Some("function_call_output") | Some("custom_tool_call") | Some("custom_tool_call_output") | Some("web_search_call") | Some("local_shell_call")) {
+                    saw_terminal_signal = true;
+                    idle = false;
+                }
+            }
+            _ => {}
+        }
+    }
+    if !saw_terminal_signal {
+        return Some(size <= 128 * 1024);
+    }
+    Some(idle)
+}
+
+fn sidebar_conversation_ts(obj: &Value) -> Option<f64> {
+    match obj.get("type").and_then(Value::as_str) {
+        Some("event_msg") => {
+            let payload = obj.get("payload").and_then(Value::as_object)?;
+            match payload.get("type").and_then(Value::as_str) {
+                Some("user_message") if payload.get("message").and_then(Value::as_str).is_some() => event_ts(obj),
+                Some("task_complete") | Some("turn_complete")
+                    if payload
+                        .get("last_agent_message")
+                        .and_then(Value::as_str)
+                        .map(|text| !text.trim().is_empty())
+                        .unwrap_or(false) =>
+                {
+                    event_ts(obj)
+                }
+                Some("agent_message")
+                    if payload.get("phase").and_then(Value::as_str) == Some("final_answer")
+                        && payload
+                            .get("message")
+                            .and_then(Value::as_str)
+                            .map(|text| !text.trim().is_empty())
+                            .unwrap_or(false) =>
+                {
+                    event_ts(obj)
+                }
+                _ => None,
+            }
+        }
+        Some("message") => {
+            if pi_user_text_value(obj).is_some() || pi_assistant_text_value(obj).is_some() {
+                event_ts(obj)
+            } else {
+                None
+            }
+        }
+        Some("response_item") => {
+            let payload = obj.get("payload").and_then(Value::as_object)?;
+            if payload.get("type").and_then(Value::as_str) != Some("message")
+                || payload.get("role").and_then(Value::as_str) != Some("assistant")
+                || !(payload.get("phase").and_then(Value::as_str) == Some("final_answer")
+                    || payload.get("end_turn").and_then(Value::as_bool) == Some(true))
+                || output_text(payload.get("content")?).is_none()
+            {
+                None
+            } else {
+                event_ts(obj)
+            }
+        }
+        _ => None,
+    }
+}
+
+fn has_assistant_output(obj: &Value) -> bool {
+    matches!(obj.get("type").and_then(Value::as_str), Some("message") | Some("response_item") | Some("event_msg"))
+        && (pi_assistant_text_value(obj).is_some() || response_item_has_assistant_output(obj) || event_msg_has_assistant_output(obj))
+}
+
+fn event_msg_has_assistant_output(obj: &Value) -> bool {
+    obj.get("type").and_then(Value::as_str) == Some("event_msg")
+        && obj
+            .get("payload")
+            .and_then(Value::as_object)
+            .map(|payload| {
+                payload.get("type").and_then(Value::as_str) == Some("agent_message")
+                    && payload
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .map(|text| !text.trim().is_empty())
+                        .unwrap_or(false)
+            })
+            .unwrap_or(false)
+}
+
+fn response_item_has_assistant_output(obj: &Value) -> bool {
+    let Some(payload) = obj.get("payload").and_then(Value::as_object) else {
+        return false;
+    };
+    payload.get("type").and_then(Value::as_str) == Some("message")
+        && payload.get("role").and_then(Value::as_str) == Some("assistant")
+        && payload.get("content").and_then(output_text).is_some()
+}
+
+fn pi_message_role_value(obj: &Value) -> Option<&str> {
+    obj.get("message")?.get("role")?.as_str()
+}
+
+fn pi_message_content_parts(obj: &Value) -> Vec<&serde_json::Map<String, Value>> {
+    obj.get("message")
+        .and_then(Value::as_object)
+        .and_then(|message| message.get("content"))
+        .and_then(Value::as_array)
+        .map(|parts| parts.iter().filter_map(Value::as_object).collect())
+        .unwrap_or_default()
+}
+
+fn pi_user_text_value(obj: &Value) -> Option<String> {
+    if obj.get("type").and_then(Value::as_str) != Some("message") || pi_message_role_value(obj) != Some("user") {
+        return None;
+    }
+    content_text(obj.get("message")?.get("content")?)
+}
+
+fn pi_assistant_text_value(obj: &Value) -> Option<String> {
+    if obj.get("type").and_then(Value::as_str) != Some("message") || pi_message_role_value(obj) != Some("assistant") {
+        return None;
+    }
+    let text = pi_message_content_parts(obj)
+        .iter()
+        .filter_map(|part| {
+            if part.get("type").and_then(Value::as_str) == Some("text") {
+                part.get("text").and_then(Value::as_str)
+            } else {
+                None
+            }
+        })
+        .collect::<String>();
+    if text.is_empty() { None } else { Some(text) }
+}
+
+fn pi_assistant_tool_use_count(obj: &Value) -> usize {
+    if pi_message_role_value(obj) != Some("assistant") {
+        return 0;
+    }
+    pi_message_content_parts(obj)
+        .iter()
+        .filter(|part| part.get("type").and_then(Value::as_str) == Some("toolCall"))
+        .count()
+}
+
+fn pi_assistant_thinking_count(obj: &Value) -> usize {
+    if pi_message_role_value(obj) != Some("assistant") {
+        return 0;
+    }
+    pi_message_content_parts(obj)
+        .iter()
+        .filter(|part| part.get("type").and_then(Value::as_str) == Some("thinking"))
+        .count()
+}
+
+fn pi_assistant_is_final_turn_end(obj: &Value) -> bool {
+    if pi_assistant_text_value(obj).is_none() {
+        return false;
+    }
+    let stop_reason = obj
+        .get("message")
+        .and_then(Value::as_object)
+        .and_then(|message| message.get("stopReason"))
+        .and_then(Value::as_str);
+    if pi_assistant_tool_use_count(obj) == 0 && pi_assistant_thinking_count(obj) == 0 && stop_reason != Some("toolUse") {
+        return true;
+    }
+    matches!(stop_reason, Some(reason) if reason != "toolUse")
+}
+
+fn pi_message_keeps_turn_busy(obj: &Value) -> bool {
+    pi_message_role_value(obj) == Some("toolResult") || pi_assistant_tool_use_count(obj) > 0 || pi_assistant_thinking_count(obj) > 0
+}
+
+fn token_update_from_obj(obj: &Value) -> Option<Value> {
+    pi_token_update_from_obj(obj).or_else(|| codex_token_update_from_obj(obj))
+}
+
+fn codex_token_update_from_obj(obj: &Value) -> Option<Value> {
+    if obj.get("type").and_then(Value::as_str) != Some("event_msg") {
+        return None;
+    }
+    let payload = obj.get("payload")?.as_object()?;
+    if payload.get("type").and_then(Value::as_str) != Some("token_count") {
+        return None;
+    }
+    let info = payload.get("info")?.as_object()?;
+    let total_usage = info.get("total_token_usage")?.as_object()?;
+    let _ = total_usage;
+    let context_window = info.get("model_context_window")?.as_i64()?;
+    let total_tokens = info.get("last_token_usage")?.get("total_tokens")?.as_i64()?;
+    Some(json!({
+        "context_window": context_window,
+        "tokens_in_context": total_tokens,
+        "tokens_remaining": (context_window - total_tokens).max(0),
+        "percent_remaining": context_percent_remaining(total_tokens, context_window),
+        "baseline_tokens": CONTEXT_WINDOW_BASELINE_TOKENS,
+        "as_of": obj.get("timestamp").and_then(Value::as_str),
+    }))
+}
+
+fn pi_token_update_from_obj(obj: &Value) -> Option<Value> {
+    if obj.get("type").and_then(Value::as_str) != Some("message") || pi_message_role_value(obj) != Some("assistant") {
+        return None;
+    }
+    let message = obj.get("message")?.as_object()?;
+    let total_tokens = message.get("usage")?.get("totalTokens")?.as_i64()?;
+    let provider = message.get("provider")?.as_str()?;
+    let model = message.get("model")?.as_str()?;
+    let context_window = pi_model_context_window(provider, model)?;
+    Some(json!({
+        "context_window": context_window,
+        "tokens_in_context": total_tokens,
+        "tokens_remaining": (context_window - total_tokens).max(0),
+        "percent_remaining": context_percent_remaining(total_tokens, context_window),
+        "baseline_tokens": CONTEXT_WINDOW_BASELINE_TOKENS,
+        "as_of": obj.get("timestamp").and_then(Value::as_str),
+    }))
+}
+
+fn context_percent_remaining(tokens_in_context: i64, context_window: i64) -> i64 {
+    if context_window <= CONTEXT_WINDOW_BASELINE_TOKENS {
+        return 0;
+    }
+    let effective = context_window - CONTEXT_WINDOW_BASELINE_TOKENS;
+    let used = (tokens_in_context - CONTEXT_WINDOW_BASELINE_TOKENS).max(0);
+    let remaining = (effective - used).max(0);
+    ((remaining as f64 / effective as f64) * 100.0).round() as i64
+}
+
+fn pi_model_context_window(provider: &str, model: &str) -> Option<i64> {
+    let data: Value = read_json_file(&pi_models_path()).ok()?;
+    data.get("providers")?
+        .get(provider)?
+        .get("models")?
+        .as_array()?
+        .iter()
+        .find(|row| row.get("id").and_then(Value::as_str) == Some(model))?
+        .get("contextWindow")?
+        .as_i64()
+}
+
+fn read_run_settings_from_log(path: &Path, agent_backend: &str) -> (Option<String>, Option<String>, Option<String>) {
+    if agent_backend == "pi" {
+        let Some(obj) = read_first_json_object(path) else {
+            return (None, None, None);
+        };
+        let provider = obj.get("provider").and_then(Value::as_str).map(ToString::to_string);
+        let model = obj.get("model").and_then(Value::as_str).map(ToString::to_string);
+        let reasoning = obj
+            .get("thinking_level")
+            .and_then(Value::as_str)
+            .and_then(display_pi_reasoning_effort)
+            .or(Some("high".to_string()));
+        return (provider, model, reasoning);
+    }
+    let Some(payload) = read_codex_session_meta_payload(path) else {
+        return (None, None, None);
+    };
+    (
+        payload.get("model_provider").and_then(Value::as_str).map(ToString::to_string),
+        payload.get("model").and_then(Value::as_str).map(ToString::to_string),
+        payload
+            .get("reasoning_effort")
+            .and_then(Value::as_str)
+            .and_then(display_reasoning_effort),
+    )
+}
+
+fn read_first_json_object(path: &Path) -> Option<Value> {
+    let raw = fs::read_to_string(path).ok()?;
+    for line in raw.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Ok(value) = serde_json::from_str::<Value>(line) {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn read_codex_session_meta_payload(path: &Path) -> Option<Value> {
+    let raw = fs::read_to_string(path).ok()?;
+    for line in raw.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if value.get("type").and_then(Value::as_str) != Some("session_meta") {
+            continue;
+        }
+        let payload = value.get("payload")?;
+        if payload.is_object() {
+            return Some(payload.clone());
+        }
+    }
+    None
+}
+
+fn new_session_defaults() -> Result<ApiNewSessionDefaults, String> {
+    let mut backends = HashMap::new();
+    backends.insert("codex".to_string(), read_codex_launch_defaults()?);
+    backends.insert("pi".to_string(), read_pi_launch_defaults()?);
+    let default_backend_raw = env::var("CODEX_WEB_DEFAULT_AGENT_BACKEND").unwrap_or_else(|_| "codex".to_string());
+    Ok(ApiNewSessionDefaults {
+        default_backend: normalize_backend(Some(default_backend_raw.as_str()))?,
+        backends,
+    })
+}
+
+fn read_codex_launch_defaults() -> Result<ApiBackendDefaults, String> {
+    let mut configured_model = None;
+    let mut configured_effort = None;
+    let mut configured_provider = Some("openai".to_string());
+    let mut configured_auth_method = Some("apikey".to_string());
+    let mut configured_service_tier = Some("flex".to_string());
+    let mut configured_providers = vec!["chatgpt".to_string(), "openai-api".to_string()];
+    let config_path = codex_config_path();
+    if config_path.exists() {
+        let data = fs::read_to_string(&config_path).map_err(|err| format!("read {}: {err}", config_path.display()))?;
+        let parsed: TomlValue = toml::from_str(&data).map_err(|err| format!("parse {}: {err}", config_path.display()))?;
+        let table = parsed
+            .as_table()
+            .ok_or_else(|| format!("invalid Codex config in {}", config_path.display()))?;
+        configured_model = table.get("model").and_then(toml_string);
+        configured_effort = table
+            .get("model_reasoning_effort")
+            .and_then(toml_string)
+            .and_then(|value| display_reasoning_effort(&value));
+        if let Some(value) = table.get("preferred_auth_method").and_then(toml_string) {
+            if let Some(method) = normalize_requested_preferred_auth_method(Some(&value))? {
+                configured_auth_method = Some(method);
+            }
+        }
+        configured_providers = vec!["chatgpt".to_string(), "openai-api".to_string()];
+        configured_providers.extend(configured_model_providers(table).into_iter().filter(|provider| provider != "openai"));
+        let allowed = allowed_model_providers(&configured_providers);
+        if let Some(value) = table
+            .get("model_provider")
+            .or_else(|| table.get("model_provider_id"))
+            .and_then(toml_string)
+        {
+            if let Some(provider) = normalize_requested_model_provider(Some(&value), Some(&allowed))? {
+                configured_provider = Some(provider);
+            }
+        }
+        if let Some(value) = table.get("service_tier").and_then(toml_string) {
+            if let Some(tier) = normalize_requested_service_tier(Some(&value))? {
+                configured_service_tier = Some(tier);
+            }
+        }
+    }
+
+    if configured_effort.is_none() {
+        let cache_path = models_cache_path();
+        if cache_path.exists() {
+            let cache: Value = read_json_file(&cache_path)?;
+            let rows = cache
+                .get("models")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            if let Some(model) = configured_model.as_deref() {
+                configured_effort = rows
+                    .iter()
+                    .find(|row| {
+                        [row.get("slug").and_then(Value::as_str), row.get("display_name").and_then(Value::as_str)]
+                            .into_iter()
+                            .flatten()
+                            .any(|candidate| candidate == model)
+                    })
+                    .and_then(|row| row.get("default_reasoning_level").and_then(Value::as_str))
+                    .and_then(display_reasoning_effort);
+            }
+            if configured_effort.is_none() {
+                configured_effort = rows
+                    .iter()
+                    .min_by(|left, right| {
+                        left.get("priority")
+                            .and_then(Value::as_i64)
+                            .unwrap_or(999_999)
+                            .cmp(&right.get("priority").and_then(Value::as_i64).unwrap_or(999_999))
+                            .then_with(|| {
+                                left.get("slug")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default()
+                                    .cmp(right.get("slug").and_then(Value::as_str).unwrap_or_default())
+                            })
+                    })
+                    .and_then(|row| row.get("default_reasoning_level").and_then(Value::as_str))
+                    .and_then(display_reasoning_effort);
+            }
+        }
+    }
+
+    let mut defaults = ApiBackendDefaults {
+        agent_backend: "codex".to_string(),
+        model_provider: configured_provider,
+        preferred_auth_method: configured_auth_method,
+        provider_choice: None,
+        provider_choices: configured_providers,
+        model: configured_model,
+        models: vec![],
+        reasoning_effort: configured_effort.unwrap_or_default(),
+        reasoning_efforts: SUPPORTED_REASONING_EFFORTS.iter().map(|value| (*value).to_string()).collect(),
+        service_tier: configured_service_tier,
+        supports_fast: true,
+    };
+    apply_codex_launch_default_env_overrides(&mut defaults)?;
+    defaults.provider_choice = provider_choice_for_settings(defaults.model_provider.as_deref(), defaults.preferred_auth_method.as_deref());
+    Ok(defaults)
+}
+
+fn read_pi_launch_defaults() -> Result<ApiBackendDefaults, String> {
+    let mut configured_provider = None;
+    let mut configured_model = None;
+    let configured_effort = "high".to_string();
+    let mut provider_choices = Vec::new();
+    let mut model_choices = Vec::new();
+
+    let settings_path = pi_settings_path();
+    if settings_path.exists() {
+        let settings: Value = read_json_file(&settings_path)?;
+        configured_provider = settings.get("defaultProvider").and_then(Value::as_str).map(ToString::to_string);
+        configured_model = settings.get("defaultModel").and_then(Value::as_str).map(ToString::to_string);
+    }
+
+    let models_path = pi_models_path();
+    if models_path.exists() {
+        let data: Value = read_json_file(&models_path)?;
+        if let Some(providers) = data.get("providers").and_then(Value::as_object) {
+            for (key, value) in providers {
+                let name = key.trim();
+                if name.is_empty() || provider_choices.iter().any(|item| item == name) {
+                    continue;
+                }
+                provider_choices.push(name.to_string());
+                if configured_provider.as_deref().is_some() && configured_provider.as_deref() != Some(name) {
+                    continue;
+                }
+                for row in value
+                    .get("models")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    if let Some(model_id) = row.get("id").and_then(Value::as_str) {
+                        if !model_choices.iter().any(|item| item == model_id) {
+                            model_choices.push(model_id.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let auth_path = pi_auth_path();
+    if auth_path.exists() {
+        let data: Value = read_json_file(&auth_path)?;
+        if let Some(entries) = data.as_object() {
+            for (key, value) in entries {
+                let auth_type = value.get("type").and_then(Value::as_str);
+                let access = value.get("access").and_then(Value::as_str);
+                let refresh = value.get("refresh").and_then(Value::as_str);
+                if auth_type == Some("oauth") && (access.is_some() || refresh.is_some()) && !provider_choices.iter().any(|item| item == key) {
+                    provider_choices.push(key.to_string());
+                }
+            }
+        }
+    }
+
+    if let Some(provider) = configured_provider.clone() {
+        if !provider_choices.iter().any(|item| item == &provider) {
+            provider_choices.insert(0, provider);
+        }
+    }
+    if let Some(model) = configured_model.clone() {
+        if !model_choices.iter().any(|item| item == &model) {
+            model_choices.insert(0, model);
+        }
+    }
+
+    Ok(ApiBackendDefaults {
+        agent_backend: "pi".to_string(),
+        model_provider: configured_provider.clone(),
+        preferred_auth_method: None,
+        provider_choice: configured_provider,
+        provider_choices,
+        model: configured_model,
+        models: model_choices,
+        reasoning_effort: configured_effort,
+        reasoning_efforts: SUPPORTED_PI_REASONING_EFFORTS.iter().map(|value| (*value).to_string()).collect(),
+        service_tier: None,
+        supports_fast: false,
+    })
+}
+
+fn codex_home() -> PathBuf {
+    env::var("CODEX_HOME")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home_dir().unwrap_or_else(|| PathBuf::from(".")).join(".codex"))
+}
+
+fn pi_home() -> PathBuf {
+    env::var("PI_HOME")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home_dir().unwrap_or_else(|| PathBuf::from(".")).join(".pi"))
+}
+
+fn codex_config_path() -> PathBuf {
+    codex_home().join("config.toml")
+}
+
+fn models_cache_path() -> PathBuf {
+    codex_home().join("models_cache.json")
+}
+
+fn pi_settings_path() -> PathBuf {
+    pi_home().join("agent").join("settings.json")
+}
+
+fn pi_models_path() -> PathBuf {
+    pi_home().join("agent").join("models.json")
+}
+
+fn pi_auth_path() -> PathBuf {
+    pi_home().join("agent").join("auth.json")
+}
+
+fn toml_string(value: &TomlValue) -> Option<String> {
+    value.as_str().map(|text| text.trim().to_string()).filter(|text| !text.is_empty())
+}
+
+fn display_reasoning_effort(value: &str) -> Option<String> {
+    let lowered = value.trim().to_ascii_lowercase();
+    SUPPORTED_REASONING_EFFORTS
+        .iter()
+        .find(|candidate| **candidate == lowered)
+        .map(|candidate| (*candidate).to_string())
+}
+
+fn display_pi_reasoning_effort(value: &str) -> Option<String> {
+    let lowered = value.trim().to_ascii_lowercase();
+    SUPPORTED_PI_REASONING_EFFORTS
+        .iter()
+        .find(|candidate| **candidate == lowered)
+        .map(|candidate| (*candidate).to_string())
+}
+
+fn configured_model_providers(table: &toml::map::Map<String, TomlValue>) -> Vec<String> {
+    let mut providers = vec!["openai".to_string()];
+    let Some(raw) = table.get("model_providers").and_then(TomlValue::as_table) else {
+        return providers;
+    };
+    for key in raw.keys() {
+        let name = key.trim();
+        if !name.is_empty() && !providers.iter().any(|item| item == name) {
+            providers.push(name.to_string());
+        }
+    }
+    providers
+}
+
+fn allowed_model_providers(provider_choices: &[String]) -> HashSet<String> {
+    let mut out = HashSet::from(["openai".to_string()]);
+    for value in provider_choices {
+        if value != "chatgpt" && value != "openai-api" {
+            out.insert(value.clone());
+        }
+    }
+    out
+}
+
+fn normalize_requested_model_provider(value: Option<&str>, allowed: Option<&HashSet<String>>) -> Result<Option<String>, String> {
+    let provider = value.map(str::trim).filter(|value| !value.is_empty()).map(ToString::to_string);
+    let Some(provider) = provider else {
+        return Ok(None);
+    };
+    if let Some(allowed_set) = allowed {
+        if !allowed_set.contains(&provider) {
+            let mut allowed_values = allowed_set.iter().cloned().collect::<Vec<_>>();
+            allowed_values.sort();
+            return Err(format!("model_provider must be one of {}", allowed_values.join(", ")));
+        }
+    }
+    Ok(Some(provider))
+}
+
+fn normalize_requested_preferred_auth_method(value: Option<&str>) -> Result<Option<String>, String> {
+    let method = value.map(str::trim).filter(|value| !value.is_empty()).map(ToString::to_string);
+    let Some(method) = method else {
+        return Ok(None);
+    };
+    if method != "chatgpt" && method != "apikey" {
+        return Err("preferred_auth_method must be one of chatgpt, apikey".to_string());
+    }
+    Ok(Some(method))
+}
+
+fn normalize_requested_service_tier(value: Option<&str>) -> Result<Option<String>, String> {
+    let tier = value.map(str::trim).filter(|value| !value.is_empty()).map(ToString::to_string);
+    let Some(tier) = tier else {
+        return Ok(None);
+    };
+    if tier != "fast" && tier != "flex" {
+        return Err("service_tier must be one of fast, flex".to_string());
+    }
+    Ok(Some(tier))
+}
+
+fn normalize_requested_reasoning_effort(value: Option<&str>) -> Result<Option<String>, String> {
+    let effort = value.map(str::trim).filter(|value| !value.is_empty()).map(ToString::to_string);
+    let Some(effort) = effort else {
+        return Ok(None);
+    };
+    if display_reasoning_effort(&effort).is_none() {
+        return Err(format!("reasoning_effort must be one of {}", SUPPORTED_REASONING_EFFORTS.join(", ")));
+    }
+    Ok(Some(effort))
+}
+
+fn apply_codex_launch_default_env_overrides(defaults: &mut ApiBackendDefaults) -> Result<(), String> {
+    let allowed = allowed_model_providers(&defaults.provider_choices);
+    if let Some(model_provider) = normalize_requested_model_provider(env::var("CODEX_WEB_DEFAULT_MODEL_PROVIDER").ok().as_deref(), Some(&allowed))? {
+        defaults.model_provider = Some(model_provider);
+    }
+    if let Some(method) = normalize_requested_preferred_auth_method(env::var("CODEX_WEB_DEFAULT_PREFERRED_AUTH_METHOD").ok().as_deref())? {
+        defaults.preferred_auth_method = Some(method);
+    }
+    if let Some(model) = env::var("CODEX_WEB_DEFAULT_MODEL").ok().map(|value| value.trim().to_string()).filter(|value| !value.is_empty()) {
+        defaults.model = Some(model);
+    }
+    if let Some(effort) = normalize_requested_reasoning_effort(env::var("CODEX_WEB_DEFAULT_REASONING_EFFORT").ok().as_deref())? {
+        defaults.reasoning_effort = effort;
+    }
+    if let Some(tier) = normalize_requested_service_tier(env::var("CODEX_WEB_DEFAULT_SERVICE_TIER").ok().as_deref())? {
+        defaults.service_tier = Some(tier);
+    }
+    Ok(())
+}
+
 fn tmux_available() -> bool {
-    Command::new("tmux")
+    spawn_command("tmux")
         .arg("-V")
         .output()
         .map(|output| output.status.success())
@@ -1151,9 +4531,20 @@ fn tmux_available() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{load_messages_history, load_messages_live, load_messages_tail, load_sessions_response, RuntimeConfig};
+    use super::{
+        load_changed_files_response, load_file_search_response, load_git_diff_response,
+        load_git_file_versions_response, load_messages_history, load_messages_live,
+        load_messages_tail, load_sessions_response, RuntimeConfig,
+    };
+    use std::env;
     use std::fs;
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
     use std::path::PathBuf;
+    use std::process::{Command, Stdio};
+    use std::sync::{Mutex, OnceLock};
+    use std::thread;
+    use std::time::Duration;
 
     fn temp_app_dir(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
@@ -1165,6 +4556,11 @@ mod tests {
         ));
         fs::create_dir_all(path.join("socks")).unwrap();
         path
+    }
+
+    fn env_lock() -> &'static Mutex<()> {
+        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        ENV_LOCK.get_or_init(|| Mutex::new(()))
     }
 
     #[test]
@@ -1232,6 +4628,490 @@ mod tests {
 
         let response = load_sessions_response(&RuntimeConfig { app_dir }).unwrap();
         assert!(response.sessions.is_empty());
+    }
+
+    #[test]
+    fn load_sessions_skips_stale_dead_sockets_and_reads_live_defaults() {
+        let _guard = env_lock().lock().unwrap();
+        let app_dir = temp_app_dir("live-defaults");
+        let codex_home = app_dir.join("codex-home");
+        let pi_home = app_dir.join("pi-home");
+        fs::create_dir_all(codex_home.join("sessions")).unwrap();
+        fs::create_dir_all(pi_home.join("agent")).unwrap();
+        fs::write(
+            codex_home.join("config.toml"),
+            r#"
+model = "gpt-5.4"
+model_provider = "crs"
+preferred_auth_method = "apikey"
+service_tier = "fast"
+
+[model_providers.crs]
+name = "CRS"
+"#,
+        )
+        .unwrap();
+        fs::write(
+            codex_home.join("models_cache.json"),
+            r#"{"models":[{"slug":"gpt-5.4","default_reasoning_level":"medium","priority":1}]}"#,
+        )
+        .unwrap();
+        fs::write(
+            pi_home.join("agent").join("settings.json"),
+            r#"{"defaultProvider":"macaron","defaultModel":"gpt-5.4"}"#,
+        )
+        .unwrap();
+        fs::write(
+            pi_home.join("agent").join("models.json"),
+            r#"{"providers":{"macaron":{"models":[{"id":"gpt-5.4","contextWindow":200000}]}}}"#,
+        )
+        .unwrap();
+        fs::write(
+            pi_home.join("agent").join("auth.json"),
+            r#"{"openai-codex":{"type":"oauth","access":"abc"}}"#,
+        )
+        .unwrap();
+
+        let prev_codex_home = env::var("CODEX_HOME").ok();
+        let prev_pi_home = env::var("PI_HOME").ok();
+        let prev_default_backend = env::var("CODEX_WEB_DEFAULT_AGENT_BACKEND").ok();
+        env::set_var("CODEX_HOME", &codex_home);
+        env::set_var("PI_HOME", &pi_home);
+        env::set_var("CODEX_WEB_DEFAULT_AGENT_BACKEND", "pi");
+
+        let live_sock = app_dir.join("socks").join("sid-live.sock");
+        let listener = UnixListener::bind(&live_sock).unwrap();
+        let thread = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(stream.try_clone().unwrap()).read_line(&mut line).unwrap();
+            assert_eq!(line.trim(), "{\"cmd\":\"state\"}");
+            stream
+                .write_all(b"{\"busy\":true,\"queue_len\":0,\"token\":{\"context_window\":128000,\"tokens_in_context\":64000,\"percent_remaining\":50}}\n")
+                .unwrap();
+        });
+
+        let log_path = app_dir.join("live-rollout.jsonl");
+        fs::write(
+            &log_path,
+            [
+                r#"{"type":"session_meta","payload":{"model_provider":"crs","model":"gpt-5.4","reasoning_effort":"medium"}}"#,
+                r#"{"type":"event_msg","payload":{"type":"user_message","message":"hello"},"ts":2.0}"#,
+                r#"{"type":"event_msg","payload":{"type":"task_complete","last_agent_message":"done"},"ts":4.0}"#,
+            ]
+            .join("\n")
+                + "\n",
+        )
+        .unwrap();
+        fs::write(
+            app_dir.join("socks").join("sid-live.json"),
+            format!(
+                r#"{{"session_id":"thread-live","codex_pid":{},"broker_pid":{},"agent_backend":"codex","owner":"web","cwd":"{}","log_path":"{}","start_ts":1.0}}"#,
+                std::process::id(),
+                std::process::id(),
+                app_dir.display(),
+                log_path.display(),
+            ),
+        )
+        .unwrap();
+        fs::write(app_dir.join("session_queues.json"), r#"{"sid-live":[{"id":"q1","text":"queued"}],"sid-dead":[{"id":"q2","text":"dead"}]}"#).unwrap();
+
+        fs::write(app_dir.join("socks").join("sid-dead.sock"), "").unwrap();
+        fs::write(
+            app_dir.join("socks").join("sid-dead.json"),
+            r#"{"session_id":"thread-dead","codex_pid":999999,"broker_pid":999998,"cwd":"/tmp","start_ts":1.0}"#,
+        )
+        .unwrap();
+
+        let response = load_sessions_response(&RuntimeConfig { app_dir: app_dir.clone() }).unwrap();
+        thread.join().unwrap();
+
+        match prev_codex_home {
+            Some(value) => env::set_var("CODEX_HOME", value),
+            None => env::remove_var("CODEX_HOME"),
+        }
+        match prev_pi_home {
+            Some(value) => env::set_var("PI_HOME", value),
+            None => env::remove_var("PI_HOME"),
+        }
+        match prev_default_backend {
+            Some(value) => env::set_var("CODEX_WEB_DEFAULT_AGENT_BACKEND", value),
+            None => env::remove_var("CODEX_WEB_DEFAULT_AGENT_BACKEND"),
+        }
+
+        assert_eq!(response.sessions.len(), 1);
+        let session = &response.sessions[0];
+        assert_eq!(session.session_id, "sid-live");
+        assert_eq!(session.updated_ts, 4.0);
+        assert!(!session.busy);
+        assert_eq!(session.token.as_ref().unwrap()["context_window"], 128000);
+        assert_eq!(response.new_session_defaults.default_backend, "pi");
+        assert_eq!(response.new_session_defaults.backends["codex"].provider_choice.as_deref(), Some("crs"));
+        assert_eq!(response.new_session_defaults.backends["codex"].reasoning_effort, "medium");
+        assert_eq!(response.new_session_defaults.backends["pi"].provider_choice.as_deref(), Some("macaron"));
+        assert_eq!(response.new_session_defaults.backends["pi"].provider_choices, vec!["macaron".to_string(), "openai-codex".to_string()]);
+    }
+
+    #[test]
+    fn load_sessions_discovers_missing_log_path_from_live_process() {
+        let _guard = env_lock().lock().unwrap();
+        let app_dir = temp_app_dir("discover-log");
+        let codex_home = app_dir.join("codex-home");
+        let pi_home = app_dir.join("pi-home");
+        fs::create_dir_all(codex_home.join("sessions")).unwrap();
+        fs::create_dir_all(pi_home.join("agent")).unwrap();
+        fs::write(
+            codex_home.join("config.toml"),
+            r#"
+model_provider = "crs"
+
+[model_providers.crs]
+name = "CRS"
+"#,
+        )
+        .unwrap();
+        fs::write(pi_home.join("agent").join("settings.json"), r#"{"defaultProvider":"macaron"}"#).unwrap();
+        fs::write(
+            pi_home.join("agent").join("models.json"),
+            r#"{"providers":{"macaron":{"models":[{"id":"gpt-5.4","contextWindow":200000}]}}}"#,
+        )
+        .unwrap();
+
+        let prev_codex_home = env::var("CODEX_HOME").ok();
+        let prev_pi_home = env::var("PI_HOME").ok();
+        env::set_var("CODEX_HOME", &codex_home);
+        env::set_var("PI_HOME", &pi_home);
+
+        let log_path = codex_home.join("sessions").join("rollout-discovered.jsonl");
+        fs::write(
+            &log_path,
+            [
+                format!(
+                    r#"{{"type":"session_meta","payload":{{"cwd":"{}","model_provider":"crs","model":"gpt-5.5","reasoning_effort":"high"}}}}"#,
+                    app_dir.display(),
+                ),
+                r#"{"type":"event_msg","payload":{"type":"user_message","message":"hello"},"ts":2.0}"#.to_string(),
+                r#"{"type":"event_msg","payload":{"type":"task_complete","last_agent_message":"done"},"ts":3.0}"#.to_string(),
+            ]
+            .join("\n")
+                + "\n",
+        )
+        .unwrap();
+
+        let mut child = Command::new("/bin/bash")
+            .arg("-lc")
+            .arg("exec 3>>\"$1\"; sleep 30")
+            .arg("_")
+            .arg(&log_path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        thread::sleep(Duration::from_millis(150));
+
+        fs::write(app_dir.join("socks").join("sid-open.sock"), "").unwrap();
+        fs::write(
+            app_dir.join("socks").join("sid-open.json"),
+            format!(
+                r#"{{"session_id":"thread-open","codex_pid":{},"broker_pid":{},"agent_backend":"codex","owner":"web","cwd":"{}","start_ts":1.0}}"#,
+                child.id(),
+                child.id(),
+                app_dir.display(),
+            ),
+        )
+        .unwrap();
+
+        let response = load_sessions_response(&RuntimeConfig { app_dir: app_dir.clone() }).unwrap();
+
+        let _ = child.kill();
+        let _ = child.wait();
+
+        match prev_codex_home {
+            Some(value) => env::set_var("CODEX_HOME", value),
+            None => env::remove_var("CODEX_HOME"),
+        }
+        match prev_pi_home {
+            Some(value) => env::set_var("PI_HOME", value),
+            None => env::remove_var("PI_HOME"),
+        }
+
+        assert_eq!(response.sessions.len(), 1);
+        let session = &response.sessions[0];
+        assert_eq!(session.session_id, "sid-open");
+        assert_eq!(session.log_path.as_deref(), Some(log_path.to_string_lossy().as_ref()));
+        assert_eq!(session.updated_ts, 3.0);
+        assert!(!session.busy);
+        assert_eq!(session.model_provider.as_deref(), Some("crs"));
+        assert_eq!(session.model.as_deref(), Some("gpt-5.5"));
+        assert_eq!(session.reasoning_effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn file_search_uses_git_listing_when_repo_exists() {
+        let app_dir = temp_app_dir("file-search-git");
+        let repo_dir = app_dir.join("repo");
+        fs::create_dir_all(repo_dir.join("src")).unwrap();
+        fs::write(repo_dir.join("src").join("notes.txt"), "tracked note\n").unwrap();
+        fs::write(repo_dir.join("notes-draft.md"), "draft note\n").unwrap();
+        fs::write(repo_dir.join(".gitignore"), "ignored.log\n").unwrap();
+        fs::write(repo_dir.join("ignored.log"), "ignore me\n").unwrap();
+        assert!(Command::new("git").current_dir(&repo_dir).args(["init", "-q"]).status().unwrap().success());
+        assert!(Command::new("git")
+            .current_dir(&repo_dir)
+            .args(["add", ".gitignore", "src/notes.txt"])
+            .status()
+            .unwrap()
+            .success());
+        fs::write(app_dir.join("socks").join("sid-search.sock"), "").unwrap();
+        fs::write(
+            app_dir.join("socks").join("sid-search.json"),
+            format!(
+                r#"{{"session_id":"thread-search","codex_pid":{},"broker_pid":{},"cwd":"{}","start_ts":1.0}}"#,
+                std::process::id(),
+                std::process::id(),
+                repo_dir.display(),
+            ),
+        )
+        .unwrap();
+
+        let response = load_file_search_response(&RuntimeConfig { app_dir }, "sid-search", "notes", 10).unwrap();
+
+        assert_eq!(response.mode, "git");
+        assert!(!response.truncated);
+        assert!(response.matches.iter().any(|entry| entry.path == "src/notes.txt"));
+        assert!(response.matches.iter().any(|entry| entry.path == "notes-draft.md"));
+        assert!(!response.matches.iter().any(|entry| entry.path == "ignored.log"));
+    }
+
+    #[test]
+    fn file_search_walk_ignores_default_directories() {
+        let app_dir = temp_app_dir("file-search-walk");
+        let repo_dir = app_dir.join("workspace");
+        fs::create_dir_all(repo_dir.join("node_modules")).unwrap();
+        fs::write(repo_dir.join("notes.txt"), "visible\n").unwrap();
+        fs::write(repo_dir.join("node_modules").join("notes-hidden.txt"), "hidden\n").unwrap();
+        fs::write(app_dir.join("socks").join("sid-walk.sock"), "").unwrap();
+        fs::write(
+            app_dir.join("socks").join("sid-walk.json"),
+            format!(
+                r#"{{"session_id":"thread-walk","codex_pid":{},"broker_pid":{},"cwd":"{}","start_ts":1.0}}"#,
+                std::process::id(),
+                std::process::id(),
+                repo_dir.display(),
+            ),
+        )
+        .unwrap();
+
+        let response = load_file_search_response(&RuntimeConfig { app_dir }, "sid-walk", "notes", 10).unwrap();
+
+        assert_eq!(response.mode, "walk");
+        assert_eq!(response.matches.len(), 1);
+        assert_eq!(response.matches[0].path, "notes.txt");
+    }
+
+    #[test]
+    fn changed_files_reads_git_status_and_merged_numstat() {
+        let app_dir = temp_app_dir("changed-files");
+        let repo_dir = app_dir.join("repo");
+        fs::create_dir_all(&repo_dir).unwrap();
+        assert!(Command::new("git").current_dir(&repo_dir).args(["init", "-q"]).status().unwrap().success());
+        assert!(Command::new("git")
+            .current_dir(&repo_dir)
+            .args(["config", "user.email", "test@example.com"])
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .current_dir(&repo_dir)
+            .args(["config", "user.name", "Test User"])
+            .status()
+            .unwrap()
+            .success());
+
+        fs::write(repo_dir.join("notes.txt"), "base\n").unwrap();
+        fs::write(repo_dir.join("mod.txt"), "keep\n").unwrap();
+        assert!(Command::new("git")
+            .current_dir(&repo_dir)
+            .args(["add", "notes.txt", "mod.txt"])
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .current_dir(&repo_dir)
+            .args(["commit", "-qm", "init"])
+            .status()
+            .unwrap()
+            .success());
+
+        fs::write(repo_dir.join("notes.txt"), "base\nstaged\n").unwrap();
+        assert!(Command::new("git")
+            .current_dir(&repo_dir)
+            .args(["add", "notes.txt"])
+            .status()
+            .unwrap()
+            .success());
+        fs::write(repo_dir.join("notes.txt"), "base\nstaged\nunstaged\n").unwrap();
+        fs::write(repo_dir.join("mod.txt"), "keep\nedit\n").unwrap();
+        fs::write(repo_dir.join("staged.txt"), "staged only\n").unwrap();
+        assert!(Command::new("git")
+            .current_dir(&repo_dir)
+            .args(["add", "staged.txt"])
+            .status()
+            .unwrap()
+            .success());
+
+        fs::write(app_dir.join("socks").join("sid-git.sock"), "").unwrap();
+        fs::write(
+            app_dir.join("socks").join("sid-git.json"),
+            format!(
+                r#"{{"session_id":"thread-git","codex_pid":{},"broker_pid":{},"cwd":"{}","start_ts":1.0}}"#,
+                std::process::id(),
+                std::process::id(),
+                repo_dir.display(),
+            ),
+        )
+        .unwrap();
+
+        let response = load_changed_files_response(&RuntimeConfig { app_dir }, "sid-git").unwrap();
+
+        assert!(response.unstaged.iter().any(|path| path == "notes.txt"));
+        assert!(response.unstaged.iter().any(|path| path == "mod.txt"));
+        assert!(response.staged.iter().any(|path| path == "notes.txt"));
+        assert!(response.staged.iter().any(|path| path == "staged.txt"));
+        assert!(response.files.iter().any(|path| path == "notes.txt"));
+        assert!(response.files.iter().any(|path| path == "mod.txt"));
+        assert!(response.files.iter().any(|path| path == "staged.txt"));
+
+        let notes = response.entries.iter().find(|entry| entry.path == "notes.txt").unwrap();
+        assert_eq!(notes.additions, Some(2));
+        assert_eq!(notes.deletions, Some(0));
+        let staged = response.entries.iter().find(|entry| entry.path == "staged.txt").unwrap();
+        assert_eq!(staged.additions, Some(1));
+        assert_eq!(staged.deletions, Some(0));
+    }
+
+    #[test]
+    fn git_diff_reads_staged_and_unstaged_content() {
+        let app_dir = temp_app_dir("git-diff");
+        let repo_dir = app_dir.join("repo");
+        fs::create_dir_all(&repo_dir).unwrap();
+        assert!(Command::new("git").current_dir(&repo_dir).args(["init", "-q"]).status().unwrap().success());
+        assert!(Command::new("git")
+            .current_dir(&repo_dir)
+            .args(["config", "user.email", "test@example.com"])
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .current_dir(&repo_dir)
+            .args(["config", "user.name", "Test User"])
+            .status()
+            .unwrap()
+            .success());
+
+        fs::write(repo_dir.join("notes.txt"), "base\n").unwrap();
+        assert!(Command::new("git")
+            .current_dir(&repo_dir)
+            .args(["add", "notes.txt"])
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .current_dir(&repo_dir)
+            .args(["commit", "-qm", "init"])
+            .status()
+            .unwrap()
+            .success());
+
+        fs::write(repo_dir.join("notes.txt"), "base\nstaged\n").unwrap();
+        assert!(Command::new("git")
+            .current_dir(&repo_dir)
+            .args(["add", "notes.txt"])
+            .status()
+            .unwrap()
+            .success());
+        fs::write(repo_dir.join("notes.txt"), "base\nstaged\nunstaged\n").unwrap();
+
+        fs::write(app_dir.join("socks").join("sid-diff.sock"), "").unwrap();
+        fs::write(
+            app_dir.join("socks").join("sid-diff.json"),
+            format!(
+                r#"{{"session_id":"thread-diff","codex_pid":{},"broker_pid":{},"cwd":"{}","start_ts":1.0}}"#,
+                std::process::id(),
+                std::process::id(),
+                repo_dir.display(),
+            ),
+        )
+        .unwrap();
+
+        let unstaged = load_git_diff_response(&RuntimeConfig { app_dir: app_dir.clone() }, "sid-diff", "notes.txt", false).unwrap();
+        assert_eq!(unstaged.path, "notes.txt");
+        assert!(!unstaged.staged);
+        assert!(unstaged.diff.contains("+unstaged"));
+        assert!(!unstaged.diff.contains("path is outside git repo"));
+
+        let staged = load_git_diff_response(&RuntimeConfig { app_dir }, "sid-diff", "notes.txt", true).unwrap();
+        assert!(staged.staged);
+        assert!(staged.diff.contains("+staged"));
+        assert!(!staged.diff.contains("+unstaged"));
+    }
+
+    #[test]
+    fn git_file_versions_reads_head_and_worktree_text() {
+        let app_dir = temp_app_dir("git-file-versions");
+        let repo_dir = app_dir.join("repo");
+        fs::create_dir_all(&repo_dir).unwrap();
+        assert!(Command::new("git").current_dir(&repo_dir).args(["init", "-q"]).status().unwrap().success());
+        assert!(Command::new("git")
+            .current_dir(&repo_dir)
+            .args(["config", "user.email", "test@example.com"])
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .current_dir(&repo_dir)
+            .args(["config", "user.name", "Test User"])
+            .status()
+            .unwrap()
+            .success());
+
+        fs::write(repo_dir.join("notes.txt"), "base\n").unwrap();
+        assert!(Command::new("git")
+            .current_dir(&repo_dir)
+            .args(["add", "notes.txt"])
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .current_dir(&repo_dir)
+            .args(["commit", "-qm", "init"])
+            .status()
+            .unwrap()
+            .success());
+
+        fs::write(repo_dir.join("notes.txt"), "base\nworktree\n").unwrap();
+
+        fs::write(app_dir.join("socks").join("sid-versions.sock"), "").unwrap();
+        fs::write(
+            app_dir.join("socks").join("sid-versions.json"),
+            format!(
+                r#"{{"session_id":"thread-versions","codex_pid":{},"broker_pid":{},"cwd":"{}","start_ts":1.0}}"#,
+                std::process::id(),
+                std::process::id(),
+                repo_dir.display(),
+            ),
+        )
+        .unwrap();
+
+        let response =
+            load_git_file_versions_response(&RuntimeConfig { app_dir }, "sid-versions", "notes.txt").unwrap();
+
+        assert_eq!(response.path, "notes.txt");
+        assert!(response.current_exists);
+        assert_eq!(response.current_size, 14);
+        assert_eq!(response.current_text, "base\nworktree\n");
+        assert!(response.base_exists);
+        assert_eq!(response.base_text, "base\n");
     }
 
     #[test]

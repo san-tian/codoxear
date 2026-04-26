@@ -227,6 +227,63 @@ pub struct ApiQueueResponse {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
+pub struct ApiFileSearchMatch {
+    pub path: String,
+    pub score: i64,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct ApiFileSearchResponse {
+    pub ok: bool,
+    pub cwd: String,
+    pub query: String,
+    pub mode: String,
+    pub matches: Vec<ApiFileSearchMatch>,
+    pub scanned: usize,
+    pub truncated: bool,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct ApiChangedFileEntry {
+    pub path: String,
+    pub additions: Option<i64>,
+    pub deletions: Option<i64>,
+    pub changed: bool,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct ApiChangedFilesResponse {
+    pub ok: bool,
+    pub cwd: String,
+    pub files: Vec<String>,
+    pub entries: Vec<ApiChangedFileEntry>,
+    pub unstaged: Vec<String>,
+    pub staged: Vec<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct ApiGitDiffResponse {
+    pub ok: bool,
+    pub cwd: String,
+    pub path: String,
+    pub staged: bool,
+    pub diff: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct ApiGitFileVersionsResponse {
+    pub ok: bool,
+    pub cwd: String,
+    pub path: String,
+    pub abs_path: String,
+    pub current_exists: bool,
+    pub current_size: u64,
+    pub current_text: String,
+    pub base_exists: bool,
+    pub base_text: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ApiHarnessResponse {
     pub ok: bool,
     pub enabled: bool,

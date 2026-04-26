@@ -5398,8 +5398,8 @@
         function newSessionResumeLabel(item) {
           if (!item || typeof item !== "object") return "Start fresh";
           const alias = typeof item.alias === "string" ? item.alias.trim() : "";
-          const firstUser = typeof item.first_user_message === "string" ? item.first_user_message.trim() : "";
-          const primary = alias || firstUser || shortSessionId(item.session_id);
+          const lastUser = typeof item.last_user_message === "string" ? item.last_user_message.trim() : "";
+          const primary = alias || lastUser || shortSessionId(item.session_id);
           const ts = Number(item.updated_ts || 0);
           const age = ts > 0 ? fmtRelativeAge(Math.max(0, Date.now() / 1000 - ts)) : "";
           return `${age ? `${age} | ` : ""}${primary}`;

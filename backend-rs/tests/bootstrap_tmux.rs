@@ -26,17 +26,21 @@ async fn bootstrap_exposes_tmux_metadata() {
     fs::write(app_dir.join("socks").join("sess-alpha.sock"), "").unwrap();
     fs::write(
         app_dir.join("socks").join("sess-alpha.json"),
-        r#"{
+        format!(
+            r#"{{
           "session_id": "thread-alpha",
-          "codex_pid": 11,
-          "broker_pid": 22,
+          "codex_pid": {},
+          "broker_pid": {},
           "agent_backend": "codex",
           "transport": "tmux",
           "cwd": "/work/codoxear",
           "start_ts": 10.0,
           "tmux_session": "codoxear-dev",
           "tmux_window": "nova"
-        }"#,
+        }}"#,
+            std::process::id(),
+            std::process::id(),
+        ),
     )
     .unwrap();
 

@@ -11,10 +11,85 @@ export function isCollapsibleEvent(kind: UiTranscriptEvent["kind"]) {
   return kind === "tool" || kind === "tool_result" || kind === "ask_user";
 }
 
+function compactPreviewText(text: string) {
+  return text.replace(/\s+/g, " ").trim().slice(0, 160);
+}
+
+function parsedToolJsonEnvelope(text: string) {
+  const trimmed = text.trim();
+  if (!trimmed.startsWith("{")) return null;
+  try {
+    const parsed = JSON.parse(trimmed);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : null;
+  } catch {
+    return null;
+  }
+}
+
+function unwrapToolResultEnvelope(text: string) {
+  const parsed = parsedToolJsonEnvelope(text);
+  if (!parsed) return text.trim();
+  for (const key of ["output", "text", "result"]) {
+    const value = parsed[key];
+    if (typeof value === "string" && value.trim()) return value.trim();
+  }
+  return text.trim();
+}
+
+function applyPatchPreview(event: UiTranscriptEvent) {
+  const raw = String(event.toolResultBody || event.body || event.toolCallBody || "").trim();
+  if (!raw) return "";
+  const text = unwrapToolResultEnvelope(raw);
+  const lines = text
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const updatedIndex = lines.findIndex((line) => /^Success\. Updated the following files:?$/i.test(line));
+  if (updatedIndex < 0) return compactPreviewText(text);
+  const files = lines
+    .slice(updatedIndex + 1)
+    .map((line) => line.replace(/^[A-Z?]+\s+/, "").trim())
+    .filter(Boolean);
+  if (!files.length) return "Updated files";
+  if (files.length === 1) return `Updated ${files[0]}`;
+  const preview = files.slice(0, 3).join(", ");
+  return `Updated ${files.length} files: ${preview}${files.length > 3 ? ", ..." : ""}`;
+}
+
+function writeStdinPreview(event: UiTranscriptEvent) {
+  const raw = String(event.toolResultBody || event.body || "").trim();
+  if (!raw) return "";
+  const text = unwrapToolResultEnvelope(raw);
+  const marker = "\nOutput:\n";
+  const outputIndex = text.indexOf(marker);
+  const header = outputIndex >= 0 ? text.slice(0, outputIndex) : text;
+  const output = outputIndex >= 0 ? text.slice(outputIndex + marker.length) : text;
+  const line = output
+    .split(/\r?\n/)
+    .map((entry) => entry.trim())
+    .find((entry) => entry && !/^Total output lines: \d+$/i.test(entry));
+  if (line) return compactPreviewText(line);
+  const exitMatch = header.match(/Process exited with code (-?\d+)/i);
+  if (exitMatch) {
+    return Number(exitMatch[1]) === 0 ? "No new terminal output" : `Exited with code ${exitMatch[1]}`;
+  }
+  return "No new terminal output";
+}
+
+function toolSpecificPreview(event: UiTranscriptEvent) {
+  if (event.kind !== "tool" && event.kind !== "tool_result") return "";
+  const toolName = String(event.title || "").trim().toLocaleLowerCase();
+  if (toolName === "apply_patch") return applyPatchPreview(event);
+  if (toolName === "write_stdin") return writeStdinPreview(event);
+  return "";
+}
+
 export function eventTextPreview(event: UiTranscriptEvent) {
-  const body = String((event.kind === "tool" && event.toolResultBody) || event.body || event.toolCallBody || "").trim();
+  const specialized = toolSpecificPreview(event);
+  if (specialized) return specialized;
+  const body = String((event.kind === "tool" && event.toolCallBody) || event.body || event.toolResultBody || "").trim();
   if (!body) return isCollapsibleEvent(event.kind) ? "" : event.title || "";
-  const preview = body.replace(/\s+/g, " ").slice(0, 160);
+  const preview = compactPreviewText(body);
   if (!isCollapsibleEvent(event.kind) || !event.title) return preview;
   return stripRepeatedTitlePrefix(preview, event.title);
 }
@@ -603,6 +678,7 @@ export function TranscriptEventRow(props: {
 
   return (
     <article
+      data-event-id={event.id}
       className={`msg ${eventClassName(event.kind)}${collapsible ? " is-collapsible" : ""}${collapsed ? " is-collapsed" : ""}`}
       role={collapsible ? "button" : undefined}
       tabIndex={collapsible ? 0 : undefined}

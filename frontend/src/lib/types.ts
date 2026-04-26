@@ -52,12 +52,32 @@ export type MeResponse = {
   server_pid: number;
 };
 
+export type CwdSuggestion = {
+  value: string;
+  label: string;
+  kind: "directory" | "recent";
+};
+
+export type CwdSuggestionsResponse = {
+  ok: true;
+  query: string;
+  suggestions: CwdSuggestion[];
+};
+
 export type RestartServiceResponse = {
   ok: true;
   scheduled: true;
   restart_pid: number;
   script: string;
   server_pid: number;
+};
+
+export type EditSessionResponse = {
+  ok?: true;
+  alias: string;
+  priority_offset: number;
+  snooze_until: number | null;
+  dependency_session_id: string | null;
 };
 
 export type NewSessionBackendDefaults = {
@@ -85,7 +105,7 @@ export type NewSessionDefaults = {
 export type ResumeCandidate = {
   session_id: string;
   alias?: string;
-  first_user_message?: string;
+  last_user_message?: string;
   updated_ts?: number;
   log_path?: string | null;
 };

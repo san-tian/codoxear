@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 axum = { version = "0.7.9", features = ["macros", "json"] }
+base64 = "0.22.1"
 futures-util = "0.3.30"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
@@ -14,4 +15,5 @@ tower = { version = "0.5.2", features = ["util"] }
 tower-http = { version = "0.5.2", features = ["cors", "trace"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
-toml = "0.8.23"
+indexmap = "=2.2.6"
+toml = "=0.8.8"

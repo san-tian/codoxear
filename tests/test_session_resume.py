@@ -12,7 +12,7 @@ from codoxear.server import SessionManager
 from codoxear.server import _create_git_worktree
 from codoxear.server import _describe_session_cwd
 from codoxear.server import _default_worktree_path
-from codoxear.server import _first_user_message_preview_from_log
+from codoxear.server import _last_user_message_preview_from_log
 from codoxear.server import _list_resume_candidates_for_cwd
 
 
@@ -65,7 +65,7 @@ class TestSessionResumeCandidates(unittest.TestCase):
         self.assertEqual(rows[0]["cwd"], "/repo")
         self.assertEqual(rows[0]["log_path"], str(same_new))
 
-    def test_first_user_message_preview_skips_harness_scaffolding(self) -> None:
+    def test_last_user_message_preview_skips_harness_scaffolding(self) -> None:
         with TemporaryDirectory() as td:
             log_path = Path(td) / "rollout-2026-03-08T01-00-00-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa.jsonl"
             _write_jsonl(
@@ -96,15 +96,59 @@ class TestSessionResumeCandidates(unittest.TestCase):
                             ],
                         },
                     },
+                    {
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": "Need anything else?"}],
+                        },
+                    },
+                    {
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "Use the last user message instead."}],
+                        },
+                    },
                 ],
             )
 
-            preview = _first_user_message_preview_from_log(log_path)
+            preview = _last_user_message_preview_from_log(log_path)
 
         self.assertEqual(
             preview,
-            "Is it possible to extract something like the conversation title or at least the first user message?",
+            "Use the last user message instead.",
         )
+
+    def test_last_user_message_preview_handles_pi_logs(self) -> None:
+        with TemporaryDirectory() as td:
+            log_path = Path(td) / "2026-03-08T01-00-00_aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa.jsonl"
+            _write_jsonl(
+                log_path,
+                [
+                    {"type": "session", "id": "pi-a", "cwd": "/repo", "timestamp": "2026-03-08T01:00:00Z"},
+                    {
+                        "type": "message",
+                        "message": {
+                            "role": "user",
+                            "content": [{"type": "text", "text": "first pi prompt"}],
+                        },
+                    },
+                    {
+                        "type": "message",
+                        "message": {
+                            "role": "user",
+                            "content": [{"type": "text", "text": "latest pi prompt"}],
+                        },
+                    },
+                ],
+            )
+
+            preview = _last_user_message_preview_from_log(log_path)
+
+        self.assertEqual(preview, "latest pi prompt")
 
     def test_list_pi_resume_candidates_filters_same_cwd(self) -> None:
         with TemporaryDirectory() as td:
@@ -341,6 +385,23 @@ class TestSpawnWebSessionResume(unittest.TestCase):
         self.assertIn("CODEX_WEB_SERVICE_TIER=fast", shell_cmd)
         self.assertIn("codoxear.broker", shell_cmd)
         wait_mock.assert_called_once()
+
+    def test_spawn_web_session_surfaces_tmux_pane_output_on_metadata_timeout(self) -> None:
+        manager = SessionManager.__new__(SessionManager)
+
+        with TemporaryDirectory() as td, patch("codoxear.server.shutil.which", return_value="/usr/bin/tmux"), patch(
+            "codoxear.server._wait_for_spawned_broker_meta",
+            side_effect=RuntimeError("tmux launch did not publish broker metadata within 10.0s"),
+        ), patch(
+            "codoxear.server.subprocess.run",
+            side_effect=[
+                subprocess.CompletedProcess(["/usr/bin/tmux", "has-session", "-t", "codoxear"], 1, stdout="", stderr=""),
+                subprocess.CompletedProcess(["/usr/bin/tmux", "new-session"], 0, stdout="%8\n", stderr=""),
+                subprocess.CompletedProcess(["/usr/bin/tmux", "capture-pane"], 0, stdout="booting\nwaiting for broker\n", stderr=""),
+            ],
+        ):
+            with self.assertRaisesRegex(RuntimeError, r"tmux launch did not publish broker metadata within 10\.0s[\s\S]*Last tmux pane output:[\s\S]*booting"):
+                SessionManager.spawn_web_session(manager, cwd=td, create_in_tmux=True)
 
     def test_spawn_web_session_rejects_tmux_when_unavailable(self) -> None:
         manager = SessionManager.__new__(SessionManager)
