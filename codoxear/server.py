@@ -106,6 +106,20 @@ def _match_session_route(path: str, *suffix: str) -> str | None:
     return session_id
 
 
+def _nova_incremental_v1_path(path: str, method: str) -> str | None:
+    if str(method).upper() != "GET":
+        return None
+    if path == "/api/sessions":
+        return None
+    for suffix in (("diagnostics",), ("queue",), ("harness",), ("file", "read"), ("file", "blob")):
+        session_id = _match_session_route(path, *suffix)
+        if session_id is None:
+            continue
+        quoted_sid = urllib.parse.quote(session_id, safe="")
+        return f"/api/v1/sessions/{quoted_sid}/{'/'.join(suffix)}"
+    return None
+
+
 def _strip_url_prefix(prefix: str, path: str) -> str | None:
     if not prefix:
         return path
@@ -116,10 +130,13 @@ def _strip_url_prefix(prefix: str, path: str) -> str | None:
     return None
 
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
 APP_DIR = _default_app_dir()
 PROC_ROOT = Path("/proc")
 STATIC_DIR = Path(__file__).resolve().parent / "static"
-NOVA_DIST_DIR = Path(__file__).resolve().parents[1] / "frontend" / "dist"
+NOVA_DIST_DIR = REPO_ROOT / "frontend" / "dist"
+LOCAL_DAEMON_SCRIPT_PATH = REPO_ROOT / "scripts" / "codoxear-local"
+LOCAL_SERVICE_RESTART_DELAY_SECONDS = 0.75
 STATIC_ASSET_VERSION_PLACEHOLDER = "__CODOXEAR_ASSET_VERSION__"
 STATIC_ATTACH_MAX_BYTES_PLACEHOLDER = "__CODOXEAR_ATTACH_MAX_BYTES__"
 STATIC_ASSET_VERSION_FILES = ("app.js", "app.css")
@@ -1878,7 +1895,10 @@ def _copy_queue_item(item: dict[str, Any]) -> dict[str, Any]:
         ts = time.time()
     if not math.isfinite(ts) or ts <= 0:
         ts = time.time()
-    return {"id": str(item.get("id") or ""), "text": str(item.get("text") or ""), "created_ts": ts}
+    copied = {"id": str(item.get("id") or ""), "text": str(item.get("text") or ""), "created_ts": ts}
+    if item.get("sending") is True:
+        copied["sending"] = True
+    return copied
 
 
 def _coerce_queue_item(raw: Any) -> dict[str, Any] | None:
@@ -1986,6 +2006,31 @@ def _write_codex_config_for_settings(text: str) -> dict[str, Any]:
     tmp_path.write_text(text, encoding="utf-8")
     tmp_path.replace(CODEX_CONFIG_PATH)
     return _read_codex_config_for_settings()
+
+
+def _schedule_local_service_restart() -> dict[str, Any]:
+    if not LOCAL_DAEMON_SCRIPT_PATH.exists():
+        raise FileNotFoundError(f"missing {LOCAL_DAEMON_SCRIPT_PATH}")
+    if not os.access(LOCAL_DAEMON_SCRIPT_PATH, os.X_OK):
+        raise PermissionError(f"{LOCAL_DAEMON_SCRIPT_PATH} is not executable")
+    proc = subprocess.Popen(
+        [
+            "/bin/bash",
+            "-lc",
+            f"sleep {LOCAL_SERVICE_RESTART_DELAY_SECONDS:.2f}; exec {shlex.quote(str(LOCAL_DAEMON_SCRIPT_PATH))} restart",
+        ],
+        cwd=REPO_ROOT,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    return {
+        "scheduled": True,
+        "restart_pid": int(proc.pid),
+        "script": str(LOCAL_DAEMON_SCRIPT_PATH),
+        "server_pid": int(os.getpid()),
+    }
 
 
 def _read_pi_launch_defaults() -> dict[str, Any]:
@@ -3098,7 +3143,9 @@ class SessionManager:
                     return None
             s0.queue_idle_since = None
             s0.queue_sending_item_id = head_id
+            head["sending"] = True
             text = str(head.get("text") or "")
+        self._save_queues()
         try:
             resp = self.send(session_id, text)
         except Exception:
@@ -3107,6 +3154,13 @@ class SessionManager:
                 if s0 and s0.queue_sending_item_id == head_id:
                     s0.queue_sending_item_id = None
                     s0.queue_idle_since = None
+                q0 = self._queues.get(session_id)
+                if isinstance(q0, list):
+                    for item in q0:
+                        if item.get("id") == head_id:
+                            item.pop("sending", None)
+                            break
+            self._save_queues()
             return None
         with self._lock:
             s0 = self._sessions.get(session_id)
@@ -3117,6 +3171,7 @@ class SessionManager:
             if isinstance(q, list):
                 idx = next((i for i, item in enumerate(q) if item.get("id") == head_id), -1)
                 if idx >= 0:
+                    q[idx].pop("sending", None)
                     q.pop(idx)
                 if not q:
                     self._queues.pop(session_id, None)
@@ -3640,10 +3695,10 @@ class SessionManager:
     def _prune_dead_sessions(self) -> None:
         with self._lock:
             items = list(self._sessions.items())
-        dead: list[tuple[str, Path]] = []
+        dead: list[tuple[str, Path, str]] = []
         for sid, s in items:
             if not s.sock_path.exists():
-                dead.append((sid, s.sock_path))
+                dead.append((sid, s.sock_path, s.cwd))
                 continue
             ok, err = self._refresh_session_state(sid, s.sock_path, timeout_s=0.4)
             if ok:
@@ -4643,6 +4698,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def _handle_nova_get(self, path: str, u: urllib.parse.ParseResult) -> bool:
         if not NOVA_ENABLED:
             return False
+        incremental_v1_path = _nova_incremental_v1_path(path, self.command)
+        if incremental_v1_path is not None:
+            request_path = incremental_v1_path + (("?" + u.query) if u.query else "")
+            self._proxy_request(target_base=NOVA_API_BASE, request_path=request_path, require_auth=True)
+            return True
         request_path = path + (("?" + u.query) if u.query else "")
         if path == "/nova-preview" or path == "/nova-preview/" or (
             path.startswith("/nova-preview/")
@@ -4756,7 +4816,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if not _require_auth(self):
                     self._unauthorized()
                     return
-                _json_response(self, 200, {"ok": True})
+                _json_response(self, 200, {"ok": True, "server_pid": int(os.getpid())})
                 return
 
             if path == "/api/settings/voice":
@@ -5896,6 +5956,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     payload = _write_codex_config_for_settings(text)
                 except tomllib.TOMLDecodeError as e:
                     _json_response(self, 400, {"error": str(e)})
+                    return
+                _json_response(self, 200, {"ok": True, **payload})
+                return
+
+            if path == "/api/settings/restart_service":
+                if not _require_auth(self):
+                    self._unauthorized()
+                    return
+                try:
+                    payload = _schedule_local_service_restart()
+                except (FileNotFoundError, PermissionError, OSError) as e:
+                    _json_response(self, 500, {"error": str(e)})
                     return
                 _json_response(self, 200, {"ok": True, **payload})
                 return

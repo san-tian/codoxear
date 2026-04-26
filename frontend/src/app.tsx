@@ -153,6 +153,14 @@ function moveOrderedKey(keys: string[], source: string, target: string, position
   return next;
 }
 
+function prependOrderedKey(keys: string[], key: string) {
+  return [key, ...keys.filter((item) => item !== key)];
+}
+
+function appendOrderedKey(keys: string[], key: string) {
+  return [...keys.filter((item) => item !== key), key];
+}
+
 function dropPositionFromEvent(event: SidebarDragEvent): SidebarDropPosition {
   const rect = event.currentTarget.getBoundingClientRect();
   return event.clientY > rect.top + rect.height / 2 ? "after" : "before";
@@ -336,6 +344,80 @@ function sessionById(items: SessionSummary[], sessionId: string) {
 
 function isNearScrollBottom(element: HTMLElement) {
   return element.scrollHeight - element.scrollTop - element.clientHeight <= CHAT_BOTTOM_FOLLOW_THRESHOLD_PX;
+}
+
+function todoStatusLabel(status: string | undefined) {
+  const value = String(status || "").replace(/_/g, " ").trim();
+  return value || "pending";
+}
+
+function todoStatusClass(status: string | undefined) {
+  const value = String(status || "").replace(/_/g, "-").trim();
+  return value ? ` is-${value}` : "";
+}
+
+function isFloatingProgressEvent(event: UiTranscriptEvent) {
+  const title = event.title.trim().toLocaleLowerCase();
+  const source = String(event.source || "").trim().toLocaleLowerCase();
+  if (event.extensionKind !== "progress") return false;
+  return title === "todo" || title === "ralph loop" || source === "codex" || source === "ralph-loop";
+}
+
+function isFloatingTodoProgressEvent(event: UiTranscriptEvent) {
+  const title = event.title.trim().toLocaleLowerCase();
+  const source = String(event.source || "").trim().toLocaleLowerCase();
+  return title === "todo" || source === "codex";
+}
+
+function FloatingProgress(props: { event: UiTranscriptEvent }) {
+  const { event } = props;
+  const items = event.items || [];
+  const total = event.progressTotal;
+  const current = event.progressCurrent;
+  const hasProgress = !isFloatingTodoProgressEvent(event) && typeof total === "number" && total > 0 && typeof current === "number";
+  const percent = hasProgress ? Math.max(0, Math.min(100, (current / total) * 100)) : 0;
+  const title = event.title.trim() || "Progress";
+  return (
+    <div className="floatingProgress" role="status" aria-label={title}>
+      <div className="floatingProgressTop">
+        <span className="floatingProgressTitle">{title}</span>
+        {event.status ? <span className={`floatingProgressStatus${todoStatusClass(event.status)}`}>{todoStatusLabel(event.status)}</span> : null}
+      </div>
+      {hasProgress ? (
+        <div className="floatingProgressBar" aria-label={`${current} of ${total} ${event.progressLabel || "items"}`}>
+          <span style={{ width: `${percent}%` }} />
+        </div>
+      ) : null}
+      <ol className="floatingProgressItems">
+        {items.slice(0, 4).map((item, index) => (
+          <li className={`floatingProgressItem${todoStatusClass(item.status)}`} key={`${item.label || "item"}-${index}`}>
+            <span className="floatingProgressMark" />
+            <span className="floatingProgressItemLabel">{item.label || "Untitled item"}</span>
+          </li>
+        ))}
+        {items.length > 4 ? <li className="floatingProgressMore">+{items.length - 4} more</li> : null}
+      </ol>
+    </div>
+  );
+}
+
+function WorkingIndicator(props: { label: string }) {
+  const { label } = props;
+  return (
+    <article className="msg event-working workingRow" role="status" aria-live="polite" aria-label={label}>
+      <div className="message-side is-hidden" />
+      <div className="message-main">
+        <div className="workingIndicator">
+          <span className="workingDots" aria-hidden="true">
+            <span className="workingDot" />
+            <span className="workingDot" />
+            <span className="workingDot" />
+          </span>
+          <span className="workingLabel">{label}</span>
+        </div>
+      </div>
+    </article>
+  );
 }
 
 function icon(name: string) {
@@ -679,6 +761,7 @@ export function App() {
   const [voiceSettingsLoading, setVoiceSettingsLoading] = useState(false);
   const [voiceSettingsSaving, setVoiceSettingsSaving] = useState(false);
   const [codexConfigSaving, setCodexConfigSaving] = useState(false);
+  const [serviceRestarting, setServiceRestarting] = useState(false);
   const [settingsLoadError, setSettingsLoadError] = useState("");
   const [voiceBaseUrl, setVoiceBaseUrl] = useState("");
   const [voiceApiKey, setVoiceApiKey] = useState("");
@@ -784,6 +867,13 @@ export function App() {
       ),
     [showTools, transcript],
   );
+  const floatingProgressEvent = useMemo(() => {
+    for (let index = visibleTranscript.length - 1; index >= 0; index -= 1) {
+      const event = visibleTranscript[index];
+      if (isFloatingProgressEvent(event)) return event.status === "completed" ? null : event;
+    }
+    return null;
+  }, [visibleTranscript]);
   const visibleFileEntries = useMemo(
     () => (fileSearchQuery.trim() ? fileSearchEntries : fileEntries),
     [fileEntries, fileSearchEntries, fileSearchQuery],
@@ -815,6 +905,8 @@ export function App() {
     return "idle";
   }, [awaitingAssistantReply, busy, closingSession, queueLen, selectedSession, sending]);
   const topSessionStatusClass = topSessionStatus === "working" || topSessionStatus === "starting" ? "status-chip working" : "status-chip";
+  const workingIndicatorLabel =
+    topSessionStatus === "sending" ? "Sending" : topSessionStatus === "starting" ? "Starting" : topSessionStatus === "working" ? "Working" : "";
 
   function askUserDefaultsOpen(event: UiTranscriptEvent) {
     return event.kind === "ask_user" && !event.askResolved && !event.askAnswer && !event.askCancelled;
@@ -931,6 +1023,27 @@ export function App() {
       writeLocalStorage(SELECTED_SESSION_KEY, null);
       writeSessionHash("");
     }
+  }
+
+  function promoteOpenedSession(session: SessionSummary, previousSessions: SessionSummary[], nextSessions: SessionSummary[]) {
+    const workspaceKey = workspaceKeyForSession(session);
+    const workspaceAlreadyOpen = previousSessions.some(
+      (item) => item.session_id !== session.session_id && workspaceKeyForSession(item) === workspaceKey,
+    );
+    if (!workspaceAlreadyOpen) setWorkspaceOrder((current) => prependOrderedKey(current, workspaceKey));
+    const siblingSessionIds = nextSessions
+      .filter((item) => item.session_id !== session.session_id && workspaceKeyForSession(item) === workspaceKey)
+      .map((item) => item.session_id);
+    setSessionOrderByWorkspace((current) => ({
+      ...current,
+      [workspaceKey]: appendOrderedKey(
+        [
+          ...(current[workspaceKey] || []).filter((sessionId) => siblingSessionIds.includes(sessionId)),
+          ...siblingSessionIds.filter((sessionId) => !(current[workspaceKey] || []).includes(sessionId)),
+        ],
+        session.session_id,
+      ),
+    }));
   }
 
   function focusComposerInput() {
@@ -1070,7 +1183,7 @@ export function App() {
       const data = await api.fetchHistory(selectedSessionId, historyCursorRef.current, OLDER_PAGE_LIMIT);
       if (selectedSessionRef.current !== selectedSessionId) return;
       const older = normalizeEvents(data.events || []);
-      setTranscript((current) => older.concat(current));
+      setTranscript((current) => mergeTranscriptEvents(older, current));
       historyCursorRef.current = data.history_cursor ?? null;
       setHistoryCursor(historyCursorRef.current);
       setHasOlder(Boolean(data.has_older));
@@ -1513,6 +1626,7 @@ export function App() {
       setSessions(ordered);
       const found = ordered.find((item) => Number(item.broker_pid || 0) === Number(brokerPid || 0));
       if (found) {
+        promoteOpenedSession(found, sessions, ordered);
         selectSession(found.session_id);
         pushToast("Session started");
         focusComposerInput();
@@ -1654,6 +1768,37 @@ export function App() {
       setErrorText(error instanceof Error ? error.message : "Unable to save config.toml");
     } finally {
       setCodexConfigSaving(false);
+    }
+  }
+
+  async function waitForRestartedService(previousServerPid: number) {
+    const deadline = Date.now() + 45000;
+    while (Date.now() < deadline) {
+      await new Promise((resolve) => window.setTimeout(resolve, 1000));
+      try {
+        const status = await api.me();
+        if (status.server_pid !== previousServerPid) {
+          window.location.reload();
+          return;
+        }
+      } catch {
+        // Ignore transient fetch failures while the daemon is restarting.
+      }
+    }
+    setServiceRestarting(false);
+    setErrorText("Service restart was triggered, but the UI could not confirm recovery yet. Refresh this page in a few seconds.");
+  }
+
+  async function restartLocalService() {
+    setServiceRestarting(true);
+    setErrorText("");
+    try {
+      const restart = await api.restartService();
+      pushToast("Service restarting… the page will reload when the new server is ready");
+      void waitForRestartedService(restart.server_pid);
+    } catch (error) {
+      setServiceRestarting(false);
+      setErrorText(error instanceof Error ? error.message : "Unable to restart service");
     }
   }
 
@@ -1854,17 +1999,18 @@ export function App() {
       lastEvent?.id || "",
       lastEvent?.body.length || 0,
       lastEvent?.meta.length || 0,
+      workingIndicatorLabel,
     ].join(":");
     if (!scrollKey || scrollKey === lastAutoScrollKeyRef.current) return;
     lastAutoScrollKeyRef.current = scrollKey;
-    if (!visibleTranscript.length || !stickToBottomRef.current) return;
+    if ((!visibleTranscript.length && !workingIndicatorLabel) || !stickToBottomRef.current) return;
     window.requestAnimationFrame(() => {
       const element = chatScrollRef.current;
       if (!element) return;
       element.scrollTop = element.scrollHeight;
       stickToBottomRef.current = true;
     });
-  }, [selectedSessionId, visibleTranscript]);
+  }, [selectedSessionId, visibleTranscript, workingIndicatorLabel]);
 
   useEffect(() => {
     if (authState !== "ready") return;
@@ -2150,32 +2296,36 @@ export function App() {
 
           <div className="toast muted">{toastText}</div>
 
-          <div className="workspaceBody">
-            <div className="chatWrap">
-              <div className="chat" ref={chatScrollRef} onScroll={updateChatScrollFollowState}>
-                <div className="chatInner">
-                  {hasOlder ? (
-                    <button className="olderBtn" type="button" disabled={loadingOlder} onClick={() => void loadOlder()}>
-                      {loadingOlder ? "Loading older messages…" : "Load older messages"}
-                    </button>
-                  ) : null}
-                  {visibleTranscript.map((event, index) => {
-                    const collapsed = transcriptEventCollapsed(event);
-                    return (
-                      <TranscriptEventRow
-                        key={event.id}
-                        event={event}
-                        events={visibleTranscript}
-                        index={index}
-                        collapsed={collapsed}
-                        onToggle={toggleTranscriptEvent}
-                        onAskUserRespond={handleAskUserRespond}
-                      />
-                    );
-                  })}
-                  {!visibleTranscript.length ? <div className="emptyState">No transcript yet for this session.</div> : null}
+          <div className={`workspaceBody${floatingProgressEvent ? " hasFloatingProgress" : ""}`}>
+            <div className="workspaceMain">
+              <div className="chatWrap">
+                <div className="chat" ref={chatScrollRef} onScroll={updateChatScrollFollowState}>
+                  <div className="chatInner">
+                    {hasOlder ? (
+                      <button className="olderBtn" type="button" disabled={loadingOlder} onClick={() => void loadOlder()}>
+                        {loadingOlder ? "Loading older messages…" : "Load older messages"}
+                      </button>
+                    ) : null}
+                    {visibleTranscript.map((event, index) => {
+                      const collapsed = transcriptEventCollapsed(event);
+                      return (
+                        <TranscriptEventRow
+                          key={event.id}
+                          event={event}
+                          events={visibleTranscript}
+                          index={index}
+                          collapsed={collapsed}
+                          onToggle={toggleTranscriptEvent}
+                          onAskUserRespond={handleAskUserRespond}
+                        />
+                      );
+                    })}
+                    {workingIndicatorLabel ? <WorkingIndicator label={workingIndicatorLabel} /> : null}
+                    {!visibleTranscript.length && !workingIndicatorLabel ? <div className="emptyState">No transcript yet for this session.</div> : null}
+                  </div>
                 </div>
               </div>
+              {floatingProgressEvent ? <FloatingProgress event={floatingProgressEvent} /> : null}
             </div>
 
             {showFilesPanel || showDetailsPanel ? (
@@ -2277,7 +2427,6 @@ export function App() {
               </aside>
             ) : null}
           </div>
-
           <div className="composer">
             {queueLen > 0 ? (
               <button className="queuePreview" type="button" onClick={() => openQueueModal()}>
@@ -2702,7 +2851,11 @@ export function App() {
                   <button className="secondaryBtn" type="button" disabled={codexConfigSaving} onClick={() => void saveCodexConfig()}>
                     {codexConfigSaving ? "Saving…" : "Save config.toml"}
                   </button>
+                  <button className="secondaryBtn" type="button" disabled={codexConfigSaving || serviceRestarting} onClick={() => void restartLocalService()}>
+                    {serviceRestarting ? "Restarting service…" : "Restart service"}
+                  </button>
                 </div>
+                <div className="muted">Save config.toml, then restart the local service so provider changes are reloaded.</div>
                 <div className="modalActions">
                   <button className="secondaryBtn" type="button" onClick={() => setSettingsOpen(false)}>
                     Close

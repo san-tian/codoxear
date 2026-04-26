@@ -12,7 +12,7 @@ export function isCollapsibleEvent(kind: UiTranscriptEvent["kind"]) {
 }
 
 export function eventTextPreview(event: UiTranscriptEvent) {
-  const body = String(event.body || "").trim();
+  const body = String((event.kind === "tool" && event.toolResultBody) || event.body || event.toolCallBody || "").trim();
   if (!body) return isCollapsibleEvent(event.kind) ? "" : event.title || "";
   const preview = body.replace(/\s+/g, " ").slice(0, 160);
   if (!isCollapsibleEvent(event.kind) || !event.title) return preview;
@@ -48,6 +48,12 @@ function normalizeAskOption(option: AskUserOptionInput, index: number): AskUserO
     value: option.value || option.title || label,
     description: option.description || "",
   };
+}
+
+function isTodoExtensionEvent(raw: Extract<RawChatEvent, { type: "extension" }>) {
+  const title = typeof raw.title === "string" ? raw.title.trim().toLocaleLowerCase() : "";
+  const source = typeof raw.source === "string" ? raw.source.trim().toLocaleLowerCase() : "";
+  return title === "todo" || source === "codex";
 }
 
 function normalizeAskOptions(options: unknown): AskUserOption[] {
@@ -96,6 +102,55 @@ function describeAskUser(raw: {
 
 function numberOrUndefined(value: unknown) {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function toolEventMeta(toolCallId: string, isError: boolean) {
+  return [toolCallId, isError ? "error" : ""].filter(Boolean).join(" · ");
+}
+
+function mergeToolCallAndResult(toolCall: UiTranscriptEvent, toolResult: UiTranscriptEvent): UiTranscriptEvent {
+  const toolCallId = toolCall.toolCallId || toolResult.toolCallId || toolCall.id || toolResult.id;
+  const toolCallBody = String(toolCall.toolCallBody || (toolCall.kind === "tool" && !toolCall.toolResultBody ? toolCall.body : "") || "");
+  const toolResultBody = String(toolResult.toolResultBody || toolResult.body || toolCall.toolResultBody || "");
+  const toolResultIsError = Boolean(toolCall.toolResultIsError || toolResult.toolResultIsError);
+  return {
+    ...toolCall,
+    id: toolCallId,
+    kind: "tool",
+    ts: toolResult.ts ?? toolCall.ts,
+    title: toolCall.title || toolResult.title || "Tool call",
+    body: toolResultBody || toolCallBody,
+    meta: toolEventMeta(toolCallId, toolResultIsError),
+    toolCallId,
+    toolCallBody,
+    toolResultBody,
+    toolResultIsError,
+  };
+}
+
+function mergeToolPair(existing: UiTranscriptEvent, incoming: UiTranscriptEvent) {
+  const existingToolCallId = existing.toolCallId || existing.id;
+  const incomingToolCallId = incoming.toolCallId || incoming.id;
+  if (!existingToolCallId || existingToolCallId !== incomingToolCallId) return null;
+  if (existing.kind === "tool" && incoming.kind === "tool_result") return mergeToolCallAndResult(existing, incoming);
+  if (existing.kind === "tool_result" && incoming.kind === "tool") return mergeToolCallAndResult(incoming, existing);
+  if (existing.kind === "tool" && existing.toolResultBody && incoming.kind === "tool_result") return mergeToolCallAndResult(existing, incoming);
+  if (existing.kind === "tool_result" && incoming.kind === "tool" && incoming.toolResultBody) return incoming;
+  return null;
+}
+
+function collapseToolResultPairs(events: UiTranscriptEvent[]) {
+  const out: UiTranscriptEvent[] = [];
+  events.forEach((event) => {
+    for (let index = out.length - 1; index >= 0; index -= 1) {
+      const merged = mergeToolPair(out[index], event);
+      if (!merged) continue;
+      out[index] = merged;
+      return;
+    }
+    out.push(event);
+  });
+  return out;
 }
 
 function normalizeEvent(raw: RawChatEvent, index: number, knownToolTitles: Map<string, string>): UiTranscriptEvent | null {
@@ -153,11 +208,11 @@ function normalizeEvent(raw: RawChatEvent, index: number, knownToolTitles: Map<s
     const items = Array.isArray(raw.items) ? raw.items : [];
     return {
       id: raw.tool_call_id || `extension-${source || title}-${ts ?? "na"}-${index}`,
-      kind: "extension",
+      kind: isTodoExtensionEvent(raw) ? "tool" : "extension",
       ts,
       title,
-      body: String(raw.text || ""),
-      meta: [source, status].filter(Boolean).join(" · "),
+      body: isTodoExtensionEvent(raw) ? String(summary || raw.text || "") : String(raw.text || ""),
+      meta: isTodoExtensionEvent(raw) ? [raw.tool_call_id || "", status].filter(Boolean).join(" · ") : [source, status].filter(Boolean).join(" · "),
       extensionKind,
       source,
       status,
@@ -170,15 +225,20 @@ function normalizeEvent(raw: RawChatEvent, index: number, knownToolTitles: Map<s
   }
 
   const rawName = typeof raw.name === "string" && raw.name.trim() ? raw.name.trim() : "";
+  const toolCallId = raw.tool_call_id || "";
   const knownName = raw.tool_call_id ? knownToolTitles.get(raw.tool_call_id) || "" : "";
   const toolTitle = raw.type === "tool_result" ? knownName || (rawName === "tool" ? "" : rawName) : rawName;
   return {
-    id: raw.tool_call_id || `${raw.type}-${raw.name || "tool"}-${ts ?? "na"}-${index}`,
+    id: toolCallId || `${raw.type}-${raw.name || "tool"}-${ts ?? "na"}-${index}`,
     kind: raw.type,
     ts,
     title: toolTitle || (raw.type === "tool_result" ? "Tool result" : "Tool call"),
     body: String(raw.text || ""),
-    meta: [raw.tool_call_id || "", raw.is_error ? "error" : ""].filter(Boolean).join(" · "),
+    meta: toolEventMeta(toolCallId, Boolean(raw.is_error)),
+    toolCallId: toolCallId || undefined,
+    toolCallBody: raw.type === "tool" ? String(raw.text || "") : undefined,
+    toolResultBody: raw.type === "tool_result" ? String(raw.text || "") : undefined,
+    toolResultIsError: raw.type === "tool_result" ? Boolean(raw.is_error) : undefined,
   };
 }
 
@@ -193,7 +253,7 @@ export function normalizeEvents(events: RawChatEvent[]) {
     const normalized = normalizeEvent(event, index, knownToolTitles);
     if (normalized) out.push(normalized);
   });
-  return out;
+  return collapseToolResultPairs(out);
 }
 
 function joinAssistantBodies(left: string, right: string) {
@@ -251,14 +311,20 @@ function shouldShowMessageFooter(events: UiTranscriptEvent[], index: number, col
 
 export function mergeTranscriptEvents(current: UiTranscriptEvent[], incoming: UiTranscriptEvent[]) {
   if (!incoming.length) return current;
-  const incomingIds = new Set(incoming.map((event) => event.id));
   const incomingUserBodies = new Set(
     incoming.filter((event) => event.kind === "user").map((event) => event.body.trim()).filter(Boolean),
   );
-  return current
-    .filter((event) => !incomingIds.has(event.id))
-    .filter((event) => !(event.id.startsWith("local-user-") && incomingUserBodies.has(event.body.trim())))
-    .concat(incoming);
+  const next = current.filter((event) => !(event.id.startsWith("local-user-") && incomingUserBodies.has(event.body.trim())));
+  incoming.forEach((event) => {
+    const existingIndex = next.findIndex((currentEvent) => currentEvent.id === event.id);
+    if (existingIndex < 0) {
+      next.push(event);
+      return;
+    }
+    const merged = mergeToolPair(next[existingIndex], event);
+    next[existingIndex] = merged || event;
+  });
+  return next;
 }
 
 export function previewFromEvents(events: UiTranscriptEvent[]) {
@@ -338,6 +404,28 @@ function ExtensionProgress(props: { event: UiTranscriptEvent }) {
       {event.body ? <MarkdownBlock text={event.body} className="message-body markdown-body extension-body" /> : null}
     </div>
   );
+}
+
+function ToolEventDetails(props: { event: UiTranscriptEvent }) {
+  const { event } = props;
+  const toolCallBody = String(event.toolCallBody || "").trim();
+  const toolResultBody = String(event.toolResultBody || "").trim();
+  if (toolCallBody && toolResultBody) {
+    return (
+      <div className="tool-pair">
+        <section className="tool-part">
+          <div className="tool-part-label">Call</div>
+          <MarkdownBlock text={toolCallBody} className="message-body markdown-body" />
+        </section>
+        <section className="tool-part">
+          <div className="tool-part-label">Result</div>
+          <MarkdownBlock text={toolResultBody} className="message-body markdown-body" />
+        </section>
+      </div>
+    );
+  }
+  const body = toolResultBody || toolCallBody || String(event.body || "").trim();
+  return body ? <MarkdownBlock text={body} className="message-body markdown-body" /> : null;
 }
 
 function answerTextForAskUser(event: UiTranscriptEvent, values: string[], freeform: string, bridgeAnswers: Record<string, string | string[]>) {
@@ -551,7 +639,8 @@ export function TranscriptEventRow(props: {
             ) : null}
             {event.kind === "extension" ? <ExtensionProgress event={event} /> : null}
             {event.kind === "ask_user" ? <AskUserPrompt event={event} onRespond={onAskUserRespond} /> : null}
-            {event.kind !== "extension" && event.kind !== "ask_user" && event.body ? <MarkdownBlock text={event.body} className="message-body markdown-body" /> : null}
+            {event.kind === "tool" ? <ToolEventDetails event={event} /> : null}
+            {event.kind !== "extension" && event.kind !== "ask_user" && event.kind !== "tool" && event.body ? <MarkdownBlock text={event.body} className="message-body markdown-body" /> : null}
             {collapsible && event.meta ? <div className="message-meta">{event.meta}</div> : null}
             {showMessageFooter ? (
               <div className="message-footer">

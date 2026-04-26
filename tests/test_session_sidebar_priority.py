@@ -120,6 +120,23 @@ class TestSessionSidebarPriority(unittest.TestCase):
         self.assertNotIn("cwd:/tmp/target", mgr._files)
         self.assertIsNone(mgr._sidebar_meta["blocked"].get("dependency_session_id"))
 
+    def test_prune_dead_session_with_missing_socket_clears_cwd_state(self) -> None:
+        mgr = _make_manager()
+        now = time.time()
+        target = _session(sid="target", start_ts=now - 100, last_chat_ts=now - 10)
+        target.sock_path = Path("/tmp/codoxear-missing-target.sock")
+        mgr._sessions = {target.session_id: target}
+        mgr._queues = {"target": ["queued"]}
+        mgr._files = {"cwd:/tmp/target": ["/tmp/target/a.py"]}
+
+        with patch("codoxear.server._unlink_quiet") as unlink:
+            SessionManager._prune_dead_sessions(mgr)
+
+        self.assertNotIn("target", mgr._sessions)
+        self.assertNotIn("target", mgr._queues)
+        self.assertNotIn("cwd:/tmp/target", mgr._files)
+        self.assertEqual(unlink.call_count, 2)
+
     def test_kill_session_falls_back_to_pid_teardown_when_socket_is_dead(self) -> None:
         mgr = _make_manager()
         s = _session(sid="target", start_ts=time.time() - 10, last_chat_ts=None, owned=False)

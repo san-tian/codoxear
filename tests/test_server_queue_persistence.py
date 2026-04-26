@@ -8,6 +8,7 @@ from unittest.mock import patch
 from codoxear.server import Session
 from codoxear.server import SessionManager
 from codoxear.server import _match_session_route
+from codoxear.server import _nova_incremental_v1_path
 
 
 def _make_session(sid: str) -> Session:
@@ -42,6 +43,46 @@ class TestServerQueuePersistence(unittest.TestCase):
         self.assertEqual(_match_session_route("/api/sessions/s1/delete", "delete"), "s1")
         self.assertIsNone(_match_session_route("/api/sessions/s1/queue/delete", "delete"))
         self.assertEqual(_match_session_route("/api/sessions/s1/queue/delete", "queue", "delete"), "s1")
+
+    def test_nova_incremental_v1_path_only_rewrites_selected_get_routes(self) -> None:
+        self.assertEqual(
+            _nova_incremental_v1_path("/api/sessions", "GET"),
+            None,
+        )
+        self.assertEqual(
+            _nova_incremental_v1_path("/api/sessions/s1/diagnostics", "GET"),
+            "/api/v1/sessions/s1/diagnostics",
+        )
+        self.assertEqual(
+            _nova_incremental_v1_path("/api/sessions/s1/queue", "GET"),
+            "/api/v1/sessions/s1/queue",
+        )
+        self.assertEqual(
+            _nova_incremental_v1_path("/api/sessions/s1/harness", "GET"),
+            "/api/v1/sessions/s1/harness",
+        )
+        self.assertEqual(
+            _nova_incremental_v1_path("/api/sessions/s1/file/read", "GET"),
+            "/api/v1/sessions/s1/file/read",
+        )
+        self.assertEqual(
+            _nova_incremental_v1_path("/api/sessions/s1/file/blob", "GET"),
+            "/api/v1/sessions/s1/file/blob",
+        )
+        self.assertIsNone(_nova_incremental_v1_path("/api/sessions/s1/harness", "POST"))
+
+    def test_save_queues_persists_transient_sending_flag_for_runtime_readers(self) -> None:
+        mgr = self._mgr()
+        mgr._queues = {"s1": [{"id": "a", "text": "first", "created_ts": 1.0, "sending": True}]}
+        with TemporaryDirectory() as td:
+            queue_path = Path(td) / "session_queues.json"
+            with patch("codoxear.server.QUEUE_PATH", queue_path), patch("codoxear.server.APP_DIR", Path(td)):
+                SessionManager._save_queues(mgr)
+
+            payload = json.loads(queue_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(payload["s1"][0]["id"], "a")
+        self.assertTrue(payload["s1"][0]["sending"])
 
     def test_enqueue_sends_immediately_when_idle(self) -> None:
         mgr = self._mgr()

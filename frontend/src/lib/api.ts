@@ -7,8 +7,10 @@ import type {
   HarnessConfig,
   HistoryResponse,
   LiveResponse,
+  MeResponse,
   NotificationSubscriptionsResponse,
   QueueResponse,
+  RestartServiceResponse,
   ResumeCandidatesResponse,
   SessionsResponse,
   TailResponse,
@@ -42,8 +44,8 @@ async function readJson<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export const api = {
-  me(): Promise<{ ok: true }> {
-    return readJson<{ ok: true }>("/api/me");
+  me(): Promise<MeResponse> {
+    return readJson<MeResponse>("/api/me");
   },
   login(password: string): Promise<{ ok: true }> {
     return readJson<{ ok: true }>("/api/login", {
@@ -199,6 +201,12 @@ export const api = {
     return readJson<CodexConfigResponse>("/api/settings/codex_config", {
       method: "POST",
       body: JSON.stringify({ text }),
+    });
+  },
+  restartService(): Promise<RestartServiceResponse> {
+    return readJson<RestartServiceResponse>("/api/settings/restart_service", {
+      method: "POST",
+      body: JSON.stringify({}),
     });
   },
   fetchNotificationSubscriptions(): Promise<NotificationSubscriptionsResponse> {

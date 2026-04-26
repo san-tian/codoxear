@@ -23,7 +23,7 @@
 
 ## Default Workflow
 
-1. Read — read this `AGENTS.md`, `Records/WORK_RECORDS.md`, and every Feature whose hook keywords in the Feature Index match the current task. If a relevant work-record entry links to a work-topic narrative, read that narrative too. Then check `Workflows/` and both global and project `Skills/`.
+1. Read — read this `AGENTS.md`, `Records/WORK_RECORDS.md`, and every Feature whose hook keywords in the Feature Index match the current task. If a relevant work-record entry links to a work-topic narrative, read that narrative too. Then check project workflow skills (`Skills/workflow-*.md`) and other relevant global/project `Skills/`.
 2. Code — modify only files relevant to the request. Do not write fallbacks or safety nets.
 3. Test — run the check closest to the change. If none exists, explain why and provide manual verification steps.
 4. Update docs — sync the relevant `Features/<feature>.md`, update the `AGENTS.md` Feature Index and Documentation Index if docs were added/renamed, and append one entry to `Records/WORK_RECORDS.md`.

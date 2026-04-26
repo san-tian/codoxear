@@ -47,6 +47,19 @@ export type SessionsResponse = {
   tmux_session_name: string | null;
 };
 
+export type MeResponse = {
+  ok: true;
+  server_pid: number;
+};
+
+export type RestartServiceResponse = {
+  ok: true;
+  scheduled: true;
+  restart_pid: number;
+  script: string;
+  server_pid: number;
+};
+
 export type NewSessionBackendDefaults = {
   agent_backend: "codex" | "pi";
   model_provider: string | null;
@@ -179,6 +192,10 @@ export type UiTranscriptEvent = {
   title: string;
   body: string;
   meta: string;
+  toolCallId?: string;
+  toolCallBody?: string;
+  toolResultBody?: string;
+  toolResultIsError?: boolean;
   extensionKind?: string;
   source?: string;
   status?: string;

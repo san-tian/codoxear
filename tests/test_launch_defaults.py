@@ -11,6 +11,7 @@ from codoxear.server import _normalize_requested_service_tier
 from codoxear.server import _read_codex_launch_defaults
 from codoxear.server import _read_codex_config_for_settings
 from codoxear.server import _read_new_session_defaults
+from codoxear.server import _schedule_local_service_restart
 from codoxear.server import _write_codex_config_for_settings
 from codoxear.server import _read_pi_launch_defaults
 
@@ -51,6 +52,39 @@ class TestLaunchDefaults(unittest.TestCase):
                 with self.assertRaises(tomllib.TOMLDecodeError):
                     _write_codex_config_for_settings("model = [\n")
                 self.assertFalse(config_path.exists())
+
+    def test_schedule_local_service_restart_spawns_detached_restart_shell(self) -> None:
+        with TemporaryDirectory() as td:
+            repo_root = Path(td)
+            script_path = repo_root / "scripts" / "codoxear-local"
+            script_path.parent.mkdir(parents=True, exist_ok=True)
+            script_path.write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+            script_path.chmod(0o755)
+
+            proc = type("_Proc", (), {"pid": 4321})()
+            with patch("codoxear.server.REPO_ROOT", repo_root), patch("codoxear.server.LOCAL_DAEMON_SCRIPT_PATH", script_path), patch(
+                "codoxear.server.subprocess.Popen", return_value=proc
+            ) as popen_mock, patch("codoxear.server.os.getpid", return_value=9876):
+                payload = _schedule_local_service_restart()
+
+        self.assertTrue(payload["scheduled"])
+        self.assertEqual(payload["restart_pid"], 4321)
+        self.assertEqual(payload["server_pid"], 9876)
+        self.assertEqual(payload["script"], str(script_path))
+        argv = popen_mock.call_args.args[0]
+        self.assertEqual(argv[:2], ["/bin/bash", "-lc"])
+        self.assertIn(str(script_path), argv[2])
+        self.assertIn("restart", argv[2])
+        self.assertEqual(popen_mock.call_args.kwargs["cwd"], repo_root)
+        self.assertTrue(popen_mock.call_args.kwargs["start_new_session"])
+
+    def test_schedule_local_service_restart_requires_local_daemon_script(self) -> None:
+        with TemporaryDirectory() as td:
+            repo_root = Path(td)
+            script_path = repo_root / "scripts" / "codoxear-local"
+            with patch("codoxear.server.REPO_ROOT", repo_root), patch("codoxear.server.LOCAL_DAEMON_SCRIPT_PATH", script_path):
+                with self.assertRaisesRegex(FileNotFoundError, "missing"):
+                    _schedule_local_service_restart()
 
     def test_read_codex_launch_defaults_includes_provider_list_and_service_tier(self) -> None:
         with TemporaryDirectory() as td:

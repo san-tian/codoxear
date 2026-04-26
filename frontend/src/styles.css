@@ -10,7 +10,7 @@
   --danger: #ff8a9a;
   --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.28);
   --shadow-md: 0 18px 46px rgba(0, 0, 0, 0.42);
-  --sidebar-w: 330px;
+  --sidebar-w: clamp(280px, 24vw, 360px);
   --rail-w: 360px;
   color-scheme: dark;
   font-family: "Segoe UI", ui-sans-serif, system-ui, -apple-system, sans-serif;
@@ -600,6 +600,14 @@ button.primary {
   overflow: hidden;
 }
 
+.workspaceMain {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
 .detailRail {
   width: var(--rail-w);
   max-width: 40vw;
@@ -611,6 +619,14 @@ button.primary {
 
 .workspaceBody:has(.detailRail) {
   grid-template-columns: minmax(0, 1fr) auto;
+}
+
+.workspaceBody.hasFloatingProgress .workspaceMain {
+  gap: 10px;
+}
+
+.workspaceBody.hasFloatingProgress .chat {
+  padding-bottom: 24px;
 }
 
 .chatWrap {
@@ -746,6 +762,71 @@ button.primary {
 .event-result .message-kind,
 .event-question .message-kind {
   background: transparent;
+}
+
+.workingRow {
+  padding: 4px 0 22px;
+}
+
+.workingRow .message-main {
+  grid-column: 2;
+  border-left: 0;
+  background: transparent;
+  padding: 2px 0;
+}
+
+.workingIndicator {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 20px;
+  color: var(--muted);
+  line-height: 1;
+  overflow-wrap: anywhere;
+}
+
+.workingDots {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 12px;
+}
+
+.workingDot {
+  width: 5px;
+  height: 5px;
+  border-radius: 999px;
+  background: currentColor;
+  opacity: 0.42;
+  animation: workingDot 1.2s infinite ease-in-out;
+}
+
+.workingDot:nth-child(2) {
+  animation-delay: 0.15s;
+}
+
+.workingDot:nth-child(3) {
+  animation-delay: 0.3s;
+}
+
+.workingLabel {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 650;
+}
+
+@keyframes workingDot {
+  0%,
+  80%,
+  100% {
+    transform: translateY(0);
+    opacity: 0.32;
+  }
+
+  40% {
+    transform: translateY(-4px);
+    opacity: 0.86;
+  }
 }
 
 .message-side {
@@ -1133,6 +1214,25 @@ button.primary {
   color: var(--muted);
 }
 
+.tool-pair {
+  display: grid;
+  gap: 10px;
+  max-width: 760px;
+}
+
+.tool-part {
+  display: grid;
+  gap: 6px;
+}
+
+.tool-part-label {
+  font-size: 11px;
+  font-weight: 650;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
 .extension-panel {
   display: grid;
   gap: 10px;
@@ -1432,6 +1532,121 @@ button.primary {
   border-top: 1px solid var(--border);
   padding: 10px 12px calc(10px + env(safe-area-inset-bottom));
   background: var(--panel);
+}
+
+.floatingProgress {
+  flex: 0 0 auto;
+  width: min(920px, calc(100% - 48px));
+  max-height: min(220px, 34vh);
+  overflow: auto;
+  margin: 0 auto 10px;
+  display: grid;
+  gap: 7px;
+  padding: 10px 12px;
+  border: 1px solid rgba(20, 184, 166, 0.22);
+  border-radius: 8px;
+  background: rgba(248, 250, 252, 0.96);
+  box-shadow: 0 14px 36px rgba(15, 23, 42, 0.16);
+  backdrop-filter: blur(12px);
+}
+
+.floatingProgressTop {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.floatingProgressTitle {
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 760;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.floatingProgressStatus {
+  flex: 0 0 auto;
+  padding: 2px 7px;
+  border: 1px solid rgba(15, 23, 42, 0.1);
+  border-radius: 999px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: capitalize;
+}
+
+.floatingProgressStatus.is-running {
+  border-color: rgba(20, 184, 166, 0.28);
+  color: #0f766e;
+}
+
+.floatingProgressBar {
+  height: 3px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: rgba(15, 23, 42, 0.08);
+}
+
+.floatingProgressBar span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #14b8a6, #2563eb);
+}
+
+.floatingProgressItems {
+  display: grid;
+  gap: 5px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.floatingProgressItem {
+  display: grid;
+  grid-template-columns: 14px minmax(0, 1fr);
+  gap: 8px;
+  align-items: center;
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1.35;
+}
+
+.floatingProgressItemLabel {
+  min-width: 0;
+}
+
+.floatingProgressMark {
+  width: 7px;
+  height: 7px;
+  border: 1px solid rgba(15, 23, 42, 0.22);
+  border-radius: 999px;
+}
+
+.floatingProgressItem.is-in-progress .floatingProgressMark,
+.floatingProgressItem.is-running .floatingProgressMark {
+  border-color: rgba(20, 184, 166, 0.34);
+  background: #14b8a6;
+  box-shadow: 0 0 0 3px rgba(20, 184, 166, 0.14);
+}
+
+.floatingProgressItem.is-completed {
+  color: var(--muted);
+}
+
+.floatingProgressItem.is-completed .floatingProgressItemLabel {
+  text-decoration: line-through;
+}
+
+.floatingProgressItem.is-completed .floatingProgressMark {
+  border-color: rgba(22, 163, 74, 0.28);
+  background: #16a34a;
+}
+
+.floatingProgressMore {
+  color: var(--muted);
+  font-size: 12px;
 }
 
 .queuePreview {
@@ -1844,6 +2059,15 @@ button.primary {
     grid-row: 2;
   }
 
+  .workingRow {
+    padding: 4px 0 18px;
+  }
+
+  .workingRow .message-main,
+  .workingIndicator {
+    grid-column: 1;
+  }
+
   .event-tool.is-collapsed,
   .event-result.is-collapsed,
   .event-question.is-collapsed {
@@ -2049,6 +2273,38 @@ select,
 
 .extension-item-mark {
   border-color: rgba(216, 222, 233, 0.22);
+}
+
+.floatingProgress {
+  border-color: rgba(45, 212, 191, 0.24);
+  background: rgba(16, 21, 29, 0.94);
+  box-shadow: 0 16px 42px rgba(0, 0, 0, 0.36);
+}
+
+.floatingProgressStatus {
+  border-color: rgba(226, 232, 240, 0.12);
+  color: rgba(216, 222, 233, 0.62);
+}
+
+.floatingProgressStatus.is-running {
+  border-color: rgba(45, 212, 191, 0.3);
+  color: #7dd3c7;
+}
+
+.floatingProgressBar {
+  background: rgba(226, 232, 240, 0.08);
+}
+
+.floatingProgressItem {
+  color: rgba(216, 222, 233, 0.82);
+}
+
+.floatingProgressMark {
+  border-color: rgba(216, 222, 233, 0.22);
+}
+
+.floatingProgressItem.is-completed {
+  color: rgba(216, 222, 233, 0.5);
 }
 
 .filePreviewMedia img {

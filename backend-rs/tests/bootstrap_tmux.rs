@@ -1,13 +1,46 @@
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use codoxear_backend_rs::app_state::build_state;
+use codoxear_backend_rs::app_state::build_state_from_config;
 use codoxear_backend_rs::models::BootstrapPayload;
+use codoxear_backend_rs::runtime::RuntimeConfig;
 use codoxear_backend_rs::routes::router;
+use std::fs;
+use std::path::PathBuf;
 use tower::ServiceExt;
+
+fn temp_app_dir(name: &str) -> PathBuf {
+    let path = std::env::temp_dir().join(format!(
+        "codoxear-bootstrap-{name}-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir_all(path.join("socks")).unwrap();
+    path
+}
 
 #[tokio::test]
 async fn bootstrap_exposes_tmux_metadata() {
-    let response = router(build_state())
+    let app_dir = temp_app_dir("tmux");
+    fs::write(app_dir.join("socks").join("sess-alpha.sock"), "").unwrap();
+    fs::write(
+        app_dir.join("socks").join("sess-alpha.json"),
+        r#"{
+          "session_id": "thread-alpha",
+          "codex_pid": 11,
+          "broker_pid": 22,
+          "agent_backend": "codex",
+          "transport": "tmux",
+          "cwd": "/work/codoxear",
+          "start_ts": 10.0,
+          "tmux_session": "codoxear-dev",
+          "tmux_window": "nova"
+        }"#,
+    )
+    .unwrap();
+
+    let response = router(build_state_from_config(RuntimeConfig { app_dir }).unwrap())
         .oneshot(Request::builder().uri("/api/v1/bootstrap").body(Body::empty()).unwrap())
         .await
         .unwrap();
