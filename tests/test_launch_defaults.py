@@ -33,6 +33,53 @@ def _codex_launch_default_env(**values: str):
 
 
 class TestLaunchDefaults(unittest.TestCase):
+    def test_server_main_runtime_only_skips_http_bind(self) -> None:
+        import codoxear.server as server_module
+
+        class _StopEvent:
+            def __init__(self) -> None:
+                self.wait_calls: list[object | None] = []
+
+            def wait(self, timeout: object | None = None) -> bool:
+                self.wait_calls.append(timeout)
+                return True
+
+        class _Manager:
+            def __init__(self) -> None:
+                self._stop = _StopEvent()
+
+            def stop(self) -> None:
+                self._stop.wait_calls.append("stopped")
+
+        fake_manager = _Manager()
+
+        with patch.object(server_module, "MANAGER", fake_manager), \
+            patch.object(server_module.os, "makedirs", lambda *args, **kwargs: None), \
+            patch.object(server_module, "_require_password", lambda: None), \
+            patch.object(server_module, "ThreadingHTTPServer") as http_mock, \
+            patch.object(server_module, "ThreadingHTTPServerV6") as http6_mock, \
+            patch.object(server_module.signal, "signal") as signal_mock:
+            server_module.main(["--runtime-only"])
+
+        self.assertEqual(fake_manager._stop.wait_calls, [None])
+        http_mock.assert_not_called()
+        http6_mock.assert_not_called()
+        self.assertEqual(
+            [call.args[0] for call in signal_mock.call_args_list],
+            [server_module.signal.SIGTERM, server_module.signal.SIGINT],
+        )
+
+    def test_local_daemon_uses_runtime_only_python_companion(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        script_path = repo_root / "scripts" / "codoxear-local"
+        source = script_path.read_text(encoding="utf-8")
+
+        self.assertIn('"$PYTHON_BIN" -m codoxear.server --runtime-only', source)
+        self.assertNotIn('CODEX_WEB_PORT=8744', source)
+        self.assertNotIn('CODEX_WEB_NOVA_LEGACY_BASE=http://127.0.0.1:8744', source)
+        self.assertIn('runtime python pid', source)
+        self.assertNotIn('legacy python pid', source)
+
     def test_list_directory_suggestions_returns_children_for_existing_directory(self) -> None:
         with TemporaryDirectory() as td:
             workspace = Path(td) / "workspace"

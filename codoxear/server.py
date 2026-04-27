@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import argparse
 import base64
 import errno
 import hashlib
@@ -6268,7 +6269,15 @@ class ThreadingHTTPServerV6(ThreadingHTTPServer):
         super().server_bind()
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description="Codoxear Python runtime and legacy HTTP server")
+    parser.add_argument(
+        "--runtime-only",
+        action="store_true",
+        help="run broker/session/voice background loops without binding an HTTP server",
+    )
+    args = parser.parse_args(argv)
+
     os.makedirs(APP_DIR, exist_ok=True)
     os.makedirs(UPLOAD_DIR, exist_ok=True)
     try:
@@ -6277,20 +6286,26 @@ def main() -> None:
         sys.stderr.write(f"error: {e}\n")
         raise SystemExit(2)
 
+    def _sigterm(_signo: int, _frame: Any) -> None:
+        MANAGER.stop()
+        if server is not None:
+            # BaseServer.shutdown() must not run in the serve_forever thread.
+            threading.Thread(target=server.shutdown, daemon=True).start()
+
+    server: ThreadingHTTPServer | None = None
+
+    signal.signal(signal.SIGTERM, _sigterm)
+    signal.signal(signal.SIGINT, _sigterm)
+
+    if args.runtime_only:
+        MANAGER._stop.wait()
+        return
+
     host = DEFAULT_HOST
-    server: ThreadingHTTPServer
     if ":" in host:
         server = ThreadingHTTPServerV6((host, DEFAULT_PORT), Handler)
     else:
         server = ThreadingHTTPServer((host, DEFAULT_PORT), Handler)
-
-    def _sigterm(_signo: int, _frame: Any) -> None:
-        # BaseServer.shutdown() must not run in the serve_forever thread.
-        MANAGER.stop()
-        threading.Thread(target=server.shutdown, daemon=True).start()
-
-    signal.signal(signal.SIGTERM, _sigterm)
-    signal.signal(signal.SIGINT, _sigterm)
 
     server.serve_forever()
 

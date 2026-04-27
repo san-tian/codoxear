@@ -72,10 +72,7 @@ start_server() {
   app_dir="${CODOXEAR_APP_DIR:-$HOME/.local/share/codoxear}"
 
   setsid env \
-    CODEX_WEB_HOST=127.0.0.1 \
-    CODEX_WEB_PORT=8744 \
-    CODEX_WEB_NOVA=0 \
-    "$PYTHON_BIN" -m codoxear.server >>"$WEB_LOG_FILE" 2>&1 < /dev/null &
+    "$PYTHON_BIN" -m codoxear.server --runtime-only >>"$WEB_LOG_FILE" 2>&1 < /dev/null &
   web_pid=$!
   echo "$web_pid" > "$WEB_PID_FILE"
   for _ in {1..50}; do
@@ -88,7 +85,6 @@ start_server() {
   setsid env \
     CODOXEAR_BIND_HOST=127.0.0.1 \
     CODOXEAR_BIND_PORT=8743 \
-    CODEX_WEB_NOVA_LEGACY_BASE=http://127.0.0.1:8744 \
     "$NOVA_BIN" >>"$RUST_LOG_FILE" 2>&1 < /dev/null &
   rust_pid=$!
   echo "$rust_pid" > "$RUST_PID_FILE"
@@ -101,7 +97,7 @@ start_server() {
 
   echo "started Codoxear Nova"
   echo "public rust pid: $rust_pid"
-  echo "legacy python pid: $web_pid"
+  echo "runtime python pid: $web_pid"
   echo "web log: $WEB_LOG_FILE"
   echo "rust log: $RUST_LOG_FILE"
 }
@@ -141,7 +137,7 @@ status_server() {
   if web_pid="$(running_pid "$WEB_PID_FILE")" && rust_pid="$(running_pid "$RUST_PID_FILE")"; then
     echo "running"
     echo "public rust pid: $rust_pid"
-    echo "legacy python pid: $web_pid"
+    echo "runtime python pid: $web_pid"
     echo "web log: $WEB_LOG_FILE"
     echo "rust log: $RUST_LOG_FILE"
     exit 0
