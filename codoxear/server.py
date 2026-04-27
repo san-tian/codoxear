@@ -111,7 +111,16 @@ def _nova_incremental_v1_path(path: str, method: str) -> str | None:
     if method_upper == "GET":
         if path in ("/api/me", "/api/session_resume_candidates", "/api/cwd_suggestions"):
             return f"/api/v1{path[4:]}"
-        if path in ("/api/settings/codex_config", "/api/notifications/subscription"):
+        if path in (
+            "/api/settings/codex_config",
+            "/api/settings/voice",
+            "/api/notifications/subscription",
+            "/api/notifications/message",
+            "/api/notifications/feed",
+            "/api/audio/live.m3u8",
+        ):
+            return f"/api/v1{path[4:]}"
+        if path.startswith("/api/audio/segments/"):
             return f"/api/v1{path[4:]}"
         if path == "/api/sessions":
             return "/api/v1/sessions"
@@ -138,7 +147,13 @@ def _nova_incremental_v1_path(path: str, method: str) -> str | None:
     if method_upper == "POST":
         if path in ("/api/login", "/api/logout"):
             return f"/api/v1{path[4:]}"
-        if path in ("/api/settings/codex_config", "/api/settings/restart_service", "/api/notifications/subscription", "/api/notifications/subscription/toggle"):
+        if path in (
+            "/api/settings/codex_config",
+            "/api/settings/restart_service",
+            "/api/settings/voice",
+            "/api/notifications/subscription",
+            "/api/notifications/subscription/toggle",
+        ):
             return f"/api/v1{path[4:]}"
         if path == "/api/sessions":
             return "/api/v1/sessions"

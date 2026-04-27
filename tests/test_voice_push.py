@@ -1,3 +1,4 @@
+import json
 import threading
 import time
 import unittest
@@ -597,6 +598,54 @@ class TestVoicePushCoordinator(unittest.TestCase):
             self.assertEqual(len(snapshot["subscriptions"]), 1)
             self.assertFalse(snapshot["subscriptions"][0]["notifications_enabled"])
             self.assertEqual(snapshot["subscriptions"][0]["device_class"], "mobile")
+
+    def test_runtime_snapshot_persists_listener_and_queue_state(self) -> None:
+        with TemporaryDirectory() as td:
+            stop_event = threading.Event()
+            stop_event.set()
+            runtime_path = Path(td) / "voice_runtime.json"
+            coord = VoicePushCoordinator(
+                app_dir=Path(td),
+                stop_event=stop_event,
+                settings_path=Path(td) / "voice_settings.json",
+                subscriptions_path=Path(td) / "push_subscriptions.json",
+                delivery_ledger_path=Path(td) / "voice_delivery_ledger.json",
+                vapid_private_key_path=Path(td) / "vapid.pem",
+            )
+            coord.set_settings(
+                {
+                    "tts_enabled_for_narration": True,
+                    "tts_enabled_for_final_response": False,
+                    "tts_base_url": "https://api.openai.com/v1",
+                    "tts_api_key": "test-key",
+                }
+            )
+            initial = json.loads(runtime_path.read_text(encoding="utf-8"))
+            self.assertEqual(initial["audio"]["active_listener_count"], 0)
+            self.assertEqual(initial["audio"]["queue_depth"], 0)
+
+            coord.listener_heartbeat(client_id="listener-1", enabled=True)
+            coord.observe_messages(
+                session_id="sid-1",
+                session_display_name="Repo",
+                messages=_extract_delivery_messages(
+                    [
+                        {
+                            "type": "event_msg",
+                            "payload": {"type": "agent_message", "message": "working on it"},
+                            "ts": 2.0,
+                        }
+                    ]
+                ),
+            )
+            after_enqueue = json.loads(runtime_path.read_text(encoding="utf-8"))
+            self.assertEqual(after_enqueue["audio"]["active_listener_count"], 1)
+            self.assertEqual(after_enqueue["audio"]["queue_depth"], 1)
+
+            coord.listener_heartbeat(client_id="listener-1", enabled=False)
+            after_disable = json.loads(runtime_path.read_text(encoding="utf-8"))
+            self.assertEqual(after_disable["audio"]["active_listener_count"], 0)
+            self.assertEqual(after_disable["audio"]["queue_depth"], 0)
 
     def test_narration_is_dropped_immediately_without_listener(self) -> None:
         with TemporaryDirectory() as td:

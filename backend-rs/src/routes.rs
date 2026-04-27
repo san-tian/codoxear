@@ -7,16 +7,19 @@ use crate::models::{
 use crate::runtime::{
     create_session, create_session_request_from_payload,
     default_file_search_limit, load_changed_files_response, load_diagnostics_response,
-    load_codex_config_response, load_notification_subscriptions_response,
-    load_cwd_suggestions_response,
+    load_audio_playlist_bytes, load_audio_segment_bytes, load_codex_config_response,
+    load_notification_feed_response, load_notification_message_response,
+    load_notification_subscriptions_response, load_cwd_suggestions_response,
     load_file_blob, load_file_read_response, load_file_search_response, load_git_diff_response,
     load_git_file_versions_response, load_harness_response, load_messages_history,
     load_messages_live, load_messages_tail, load_queue_response,
     load_legacy_static_file, load_nova_shell_file,
+    load_voice_settings_response,
     load_resume_candidates_response, load_sessions_response, normalize_backend, resolve_dir_target,
     delete_queue_item, delete_session, edit_session, enqueue_session_message,
     inject_session_attachment, interrupt_session, move_queue_item, rename_session,
-    save_codex_config_response, schedule_local_service_restart_response, set_harness_config,
+    save_codex_config_response, save_voice_settings_response,
+    schedule_local_service_restart_response, set_harness_config,
     send_session_message, update_queue_item,
     toggle_notification_subscription_response, upsert_notification_subscription_response,
 };
@@ -70,6 +73,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/cwd_suggestions", get(cwd_suggestions))
         .route("/api/v1/settings/codex_config", get(settings_codex_config).post(settings_codex_config_save))
         .route("/api/v1/settings/restart_service", post(settings_restart_service))
+        .route("/api/v1/settings/voice", get(settings_voice).post(settings_voice_save))
         .route(
             "/api/v1/notifications/subscription",
             get(notification_subscriptions).post(notification_subscriptions_upsert),
@@ -78,6 +82,10 @@ pub fn router(state: AppState) -> Router {
             "/api/v1/notifications/subscription/toggle",
             post(notification_subscriptions_toggle),
         )
+        .route("/api/v1/notifications/message", get(notification_message))
+        .route("/api/v1/notifications/feed", get(notification_feed))
+        .route("/api/v1/audio/live.m3u8", get(audio_playlist))
+        .route("/api/v1/audio/segments/*path", get(audio_segment))
         .route("/api/v1/sessions", get(sessions).post(session_create))
         .route("/api/v1/login", post(login))
         .route("/api/v1/logout", post(logout))
@@ -129,7 +137,7 @@ fn public_api_router(state: AppState) -> Router<AppState> {
         .route("/cwd_suggestions", get(cwd_suggestions))
         .route("/settings/codex_config", get(settings_codex_config).post(settings_codex_config_save))
         .route("/settings/restart_service", post(settings_restart_service))
-        .route("/settings/voice", get(legacy_settings_voice_proxy).post(legacy_settings_voice_proxy))
+        .route("/settings/voice", get(settings_voice).post(settings_voice_save))
         .route(
             "/notifications/subscription",
             get(notification_subscriptions).post(notification_subscriptions_upsert),
@@ -138,11 +146,11 @@ fn public_api_router(state: AppState) -> Router<AppState> {
             "/notifications/subscription/toggle",
             post(notification_subscriptions_toggle),
         )
-        .route("/notifications/message", get(legacy_notification_message_proxy))
-        .route("/notifications/feed", get(legacy_notification_feed_proxy))
-        .route("/audio/live.m3u8", get(legacy_audio_playlist_proxy))
+        .route("/notifications/message", get(notification_message))
+        .route("/notifications/feed", get(notification_feed))
+        .route("/audio/live.m3u8", get(audio_playlist))
         .route("/audio/listener", post(legacy_audio_listener_proxy))
-        .route("/audio/segments/*path", get(legacy_audio_segment_proxy))
+        .route("/audio/segments/*path", get(audio_segment))
         .route("/sessions", get(sessions).post(session_create))
         .route("/sessions/:session_id/diagnostics", get(diagnostics))
         .route("/sessions/:session_id/queue", get(queue))
@@ -222,32 +230,7 @@ async fn legacy_entry_proxy(request: Request<Body>) -> Result<Response, (StatusC
     proxy_legacy_request(request, Some(request_path)).await
 }
 
-async fn legacy_settings_voice_proxy(request: Request<Body>) -> Result<Response, (StatusCode, String)> {
-    let request_path = rewrite_public_api_path(request.uri());
-    proxy_legacy_request(request, Some(request_path)).await
-}
-
-async fn legacy_notification_message_proxy(request: Request<Body>) -> Result<Response, (StatusCode, String)> {
-    let request_path = rewrite_public_api_path(request.uri());
-    proxy_legacy_request(request, Some(request_path)).await
-}
-
-async fn legacy_notification_feed_proxy(request: Request<Body>) -> Result<Response, (StatusCode, String)> {
-    let request_path = rewrite_public_api_path(request.uri());
-    proxy_legacy_request(request, Some(request_path)).await
-}
-
-async fn legacy_audio_playlist_proxy(request: Request<Body>) -> Result<Response, (StatusCode, String)> {
-    let request_path = rewrite_public_api_path(request.uri());
-    proxy_legacy_request(request, Some(request_path)).await
-}
-
 async fn legacy_audio_listener_proxy(request: Request<Body>) -> Result<Response, (StatusCode, String)> {
-    let request_path = rewrite_public_api_path(request.uri());
-    proxy_legacy_request(request, Some(request_path)).await
-}
-
-async fn legacy_audio_segment_proxy(request: Request<Body>) -> Result<Response, (StatusCode, String)> {
     let request_path = rewrite_public_api_path(request.uri());
     proxy_legacy_request(request, Some(request_path)).await
 }
@@ -528,6 +511,16 @@ struct CwdSuggestionsQuery {
 }
 
 #[derive(Deserialize)]
+struct NotificationMessageQuery {
+    message_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct NotificationFeedQuery {
+    since: Option<String>,
+}
+
+#[derive(Deserialize)]
 struct TextPayload {
     text: String,
 }
@@ -595,6 +588,26 @@ async fn settings_restart_service() -> Result<Json<Value>, (StatusCode, String)>
         .map_err(restart_route_error)
 }
 
+async fn settings_voice(
+    State(state): State<AppState>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    load_voice_settings_response(&state.config)
+        .map(Json)
+        .map_err(voice_route_error)
+}
+
+async fn settings_voice_save(
+    State(state): State<AppState>,
+    Json(payload): Json<Value>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    if !payload.is_object() {
+        return Err((StatusCode::BAD_REQUEST, "invalid json body (expected object)".to_string()));
+    }
+    save_voice_settings_response(&state.config, &payload)
+        .map(Json)
+        .map_err(voice_route_error)
+}
+
 async fn notification_subscriptions(
     State(state): State<AppState>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
@@ -637,6 +650,54 @@ async fn notification_subscriptions_toggle(
     toggle_notification_subscription_response(&state.config, endpoint, enabled)
         .map(Json)
         .map_err(notification_route_error)
+}
+
+async fn notification_message(
+    State(state): State<AppState>,
+    Query(query): Query<NotificationMessageQuery>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let message_id = query.message_id.unwrap_or_default();
+    if message_id.trim().is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "message_id required".to_string()));
+    }
+    load_notification_message_response(&state.config, &message_id)
+        .map(Json)
+        .map_err(notification_message_route_error)
+}
+
+async fn notification_feed(
+    State(state): State<AppState>,
+    Query(query): Query<NotificationFeedQuery>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let since_ts = query
+        .since
+        .as_deref()
+        .unwrap_or("0")
+        .trim()
+        .parse::<f64>()
+        .map_err(|_| (StatusCode::BAD_REQUEST, "invalid since".to_string()))?;
+    load_notification_feed_response(&state.config, since_ts)
+        .map(Json)
+        .map_err(notification_message_route_error)
+}
+
+async fn audio_playlist(
+    State(state): State<AppState>,
+) -> Result<Response, (StatusCode, String)> {
+    audio_response(
+        load_audio_playlist_bytes(&state.config).map_err(audio_route_error)?,
+        "application/vnd.apple.mpegurl",
+    )
+}
+
+async fn audio_segment(
+    State(state): State<AppState>,
+    Path(path): Path<String>,
+) -> Result<Response, (StatusCode, String)> {
+    audio_response(
+        load_audio_segment_bytes(&state.config, &path).map_err(audio_route_error)?,
+        "video/mp2t",
+    )
 }
 
 async fn login(
@@ -1014,6 +1075,30 @@ fn notification_route_error(message: String) -> (StatusCode, String) {
     (StatusCode::INTERNAL_SERVER_ERROR, message)
 }
 
+fn voice_route_error(message: String) -> (StatusCode, String) {
+    if message == "invalid json body (expected object)" || message == "tts_base_url must start with http:// or https://" {
+        return (StatusCode::BAD_REQUEST, message);
+    }
+    (StatusCode::INTERNAL_SERVER_ERROR, message)
+}
+
+fn notification_message_route_error(message: String) -> (StatusCode, String) {
+    if message == "message_id required" || message == "invalid since" {
+        return (StatusCode::BAD_REQUEST, message);
+    }
+    if message == "unknown message" {
+        return (StatusCode::NOT_FOUND, message);
+    }
+    (StatusCode::INTERNAL_SERVER_ERROR, message)
+}
+
+fn audio_route_error(message: String) -> (StatusCode, String) {
+    if message == "unknown audio segment" {
+        return (StatusCode::NOT_FOUND, message);
+    }
+    (StatusCode::INTERNAL_SERVER_ERROR, message)
+}
+
 fn git_route_error(message: String) -> (StatusCode, String) {
     if message.contains("not a git repository") {
         return (StatusCode::CONFLICT, message);
@@ -1085,6 +1170,22 @@ fn json_response(status: StatusCode, payload: Value) -> Response {
         headers.insert(header::CONTENT_LENGTH, value);
     }
     response
+}
+
+fn audio_response(raw: Vec<u8>, content_type: &'static str) -> Result<Response, (StatusCode, String)> {
+    let mut response = Response::new(Body::from(raw.clone()));
+    *response.status_mut() = StatusCode::OK;
+    let headers = response.headers_mut();
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
+    headers.insert(header::EXPIRES, HeaderValue::from_static("0"));
+    headers.insert(
+        header::CONTENT_LENGTH,
+        HeaderValue::from_str(&raw.len().to_string())
+            .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?,
+    );
+    Ok(response)
 }
 
 async fn require_public_api_auth(
@@ -1584,9 +1685,88 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn public_legacy_api_routes_proxy_to_python_backend() {
+    async fn public_voice_and_audio_routes_use_rust_runtime_except_listener_proxy() {
         let _guard = env_lock().lock().unwrap();
         let app_dir = temp_app_dir("legacy-api-proxy");
+        fs::create_dir_all(app_dir.join("audio").join("segments")).unwrap();
+        fs::write(
+            app_dir.join("voice_settings.json"),
+            r#"{
+  "tts_enabled_for_narration": true,
+  "tts_enabled_for_final_response": false,
+  "tts_base_url": "https://tts.example",
+  "tts_api_key": "secret-key",
+  "summarization_model": "gpt-4.1-mini",
+  "tts_model": "gpt-4o-mini-tts"
+}
+"#,
+        )
+        .unwrap();
+        fs::write(
+            app_dir.join("voice_runtime.json"),
+            r#"{
+  "audio": {
+    "queue_depth": 2,
+    "active_listener_count": 1,
+    "segment_count": 3,
+    "last_error": "",
+    "media_sequence": 9
+  },
+  "updated_ts": 12.5
+}
+"#,
+        )
+        .unwrap();
+        fs::write(
+            app_dir.join("push_subscriptions.json"),
+            r#"[
+  {
+    "subscription": {
+      "endpoint": "https://push.example/mobile-1",
+      "keys": {"p256dh": "abc", "auth": "def"}
+    },
+    "device_class": "mobile",
+    "notifications_enabled": true
+  },
+  {
+    "subscription": {
+      "endpoint": "https://push.example/desktop-1",
+      "keys": {"p256dh": "ghi", "auth": "jkl"}
+    },
+    "device_class": "desktop",
+    "notifications_enabled": true
+  }
+]
+"#,
+        )
+        .unwrap();
+        fs::write(
+            app_dir.join("voice_delivery_ledger.json"),
+            r#"{
+  "msg-final": {
+    "session_id": "sid-1",
+    "session_display_name": "Repo",
+    "message_class": "final_response",
+    "summary_status": "sent",
+    "push_status": "sent",
+    "notification_text": "  final    summary  ",
+    "updated_ts": 44.0
+  },
+  "msg-narration": {
+    "session_id": "sid-1",
+    "session_display_name": "Repo",
+    "message_class": "narration",
+    "summary_status": "sent",
+    "push_status": "skipped",
+    "notification_text": "narration summary",
+    "updated_ts": 45.0
+  }
+}
+"#,
+        )
+        .unwrap();
+        fs::write(app_dir.join("audio").join("live.m3u8"), b"#EXTM3U\n# rust playlist\n").unwrap();
+        fs::write(app_dir.join("audio").join("segments").join("clip-a.ts"), b"segment:clip-a").unwrap();
         let _password = EnvGuard::set("CODEX_WEB_PASSWORD", "topsecret");
         let _legacy_base = EnvGuard::set("CODEX_WEB_NOVA_LEGACY_BASE", spawn_mock_legacy_backend());
         let app = router(build_state_from_config(RuntimeConfig { app_dir }).unwrap());
@@ -1618,9 +1798,47 @@ mod tests {
         assert_eq!(settings.status(), StatusCode::OK);
         let settings_body = to_bytes(settings.into_body(), usize::MAX).await.unwrap();
         let settings_payload: Value = serde_json::from_slice(&settings_body).unwrap();
-        assert_eq!(settings_payload["path"], "/api/settings/voice");
-        assert_eq!(settings_payload["query"], "tab=tts");
-        assert!(settings_payload["cookie"].as_str().unwrap().contains("codoxear_auth="));
+        assert_eq!(settings_payload["tts_enabled_for_narration"], true);
+        assert_eq!(settings_payload["tts_base_url"], "https://tts.example");
+        assert_eq!(settings_payload["audio"]["queue_depth"], 2);
+        assert_eq!(settings_payload["audio"]["active_listener_count"], 1);
+        assert_eq!(settings_payload["notifications"]["enabled_devices"], 1);
+        assert_eq!(settings_payload["notifications"]["total_devices"], 1);
+
+        let message = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/notifications/message?message_id=msg-final")
+                    .header(header::COOKIE, cookie.clone())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(message.status(), StatusCode::OK);
+        let message_body = to_bytes(message.into_body(), usize::MAX).await.unwrap();
+        let message_payload: Value = serde_json::from_slice(&message_body).unwrap();
+        assert_eq!(message_payload["message_id"], "msg-final");
+        assert_eq!(message_payload["message_class"], "final_response");
+        assert_eq!(message_payload["notification_text"], "final summary");
+
+        let feed = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/notifications/feed?since=0")
+                    .header(header::COOKIE, cookie.clone())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(feed.status(), StatusCode::OK);
+        let feed_body = to_bytes(feed.into_body(), usize::MAX).await.unwrap();
+        let feed_payload: Value = serde_json::from_slice(&feed_body).unwrap();
+        assert_eq!(feed_payload["items"].as_array().unwrap().len(), 1);
+        assert_eq!(feed_payload["items"][0]["message_id"], "msg-final");
 
         let listener = app
             .clone()
@@ -1663,7 +1881,7 @@ mod tests {
         let playlist_body = to_bytes(playlist.into_body(), usize::MAX).await.unwrap();
         let playlist_text = std::str::from_utf8(&playlist_body).unwrap();
         assert!(playlist_text.contains("#EXTM3U"));
-        assert!(playlist_text.contains("codoxear_auth="));
+        assert!(playlist_text.contains("rust playlist"));
 
         let segment = app
             .oneshot(
@@ -1677,7 +1895,7 @@ mod tests {
             .unwrap();
         assert_eq!(segment.status(), StatusCode::OK);
         let segment_body = to_bytes(segment.into_body(), usize::MAX).await.unwrap();
-        assert_eq!(std::str::from_utf8(&segment_body).unwrap(), "segment:clip-a.ts");
+        assert_eq!(std::str::from_utf8(&segment_body).unwrap(), "segment:clip-a");
     }
 
     #[tokio::test]

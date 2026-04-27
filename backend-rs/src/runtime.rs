@@ -29,6 +29,9 @@ use toml::Value as TomlValue;
 
 const APP_VERSION: &str = "0.1.0";
 const CONTEXT_WINDOW_BASELINE_TOKENS: i64 = 12000;
+const DEFAULT_SUMMARIZATION_MODEL: &str = "gpt-4.1-mini";
+const DEFAULT_TTS_MODEL: &str = "gpt-4o-mini-tts";
+const DEFAULT_TTS_BASE_URL: &str = "https://api.openai.com/v1";
 const HARNESS_DEFAULT_IDLE_MINUTES: f64 = 15.0;
 const HARNESS_DEFAULT_MAX_INJECTIONS: i64 = 1;
 const ATTACH_UPLOAD_MAX_BYTES: usize = 16 * 1024 * 1024;
@@ -470,6 +473,140 @@ pub fn toggle_notification_subscription_response(
     object.insert("updated_ts".to_string(), json!(epoch_now()));
     write_notification_subscription_records(&path, &records)?;
     load_notification_subscriptions_response(config)
+}
+
+pub fn load_voice_settings_response(config: &RuntimeConfig) -> Result<Value, String> {
+    let settings = read_clean_voice_settings(&voice_settings_path(config))?;
+    let audio = read_voice_runtime_audio_snapshot(&voice_runtime_path(config))?;
+    let records = read_notification_subscription_records(&push_subscriptions_path(config))?;
+    let vapid_public_key = ensure_vapid_public_key(config)?;
+    let (enabled_devices, total_devices) = notification_mobile_device_counts(&records);
+    Ok(json!({
+        "ok": true,
+        "tts_enabled_for_narration": settings.get("tts_enabled_for_narration").and_then(Value::as_bool).unwrap_or(false),
+        "tts_enabled_for_final_response": settings.get("tts_enabled_for_final_response").and_then(Value::as_bool).unwrap_or(false),
+        "tts_base_url": settings.get("tts_base_url").and_then(Value::as_str).unwrap_or(DEFAULT_TTS_BASE_URL),
+        "tts_api_key": settings.get("tts_api_key").and_then(Value::as_str).unwrap_or_default(),
+        "summarization_model": settings.get("summarization_model").and_then(Value::as_str).unwrap_or(DEFAULT_SUMMARIZATION_MODEL),
+        "tts_model": settings.get("tts_model").and_then(Value::as_str).unwrap_or(DEFAULT_TTS_MODEL),
+        "audio": {
+            "queue_depth": audio.get("queue_depth").and_then(Value::as_i64).unwrap_or(0),
+            "active_listener_count": audio.get("active_listener_count").and_then(Value::as_i64).unwrap_or(0),
+            "stream_url": "/api/audio/live.m3u8",
+            "segment_count": audio.get("segment_count").and_then(Value::as_i64).unwrap_or(0),
+            "last_error": audio.get("last_error").and_then(Value::as_str).unwrap_or_default(),
+            "media_sequence": audio.get("media_sequence").and_then(Value::as_i64).unwrap_or(1),
+        },
+        "notifications": {
+            "enabled_devices": enabled_devices,
+            "total_devices": total_devices,
+            "vapid_public_key": vapid_public_key,
+        },
+    }))
+}
+
+pub fn save_voice_settings_response(config: &RuntimeConfig, payload: &Value) -> Result<Value, String> {
+    let settings = clean_voice_settings_value(payload)?;
+    let text = serde_json::to_string_pretty(&settings)
+        .map_err(|err| format!("serialize {}: {err}", voice_settings_path(config).display()))?;
+    let text = format!("{text}\n");
+    write_text_file_atomic(&voice_settings_path(config), &text)?;
+    load_voice_settings_response(config)
+}
+
+pub fn load_notification_message_response(config: &RuntimeConfig, message_id: &str) -> Result<Value, String> {
+    let message_id = message_id.trim();
+    if message_id.is_empty() {
+        return Err("message_id required".to_string());
+    }
+    let ledger = read_voice_delivery_ledger(&voice_delivery_ledger_path(config))?;
+    let Some(row) = ledger.get(message_id).and_then(Value::as_object) else {
+        return Err("unknown message".to_string());
+    };
+    Ok(json!({
+        "ok": true,
+        "message_id": message_id,
+        "message_class": string_field(row, "message_class"),
+        "summary_status": string_field(row, "summary_status"),
+        "push_status": string_field(row, "push_status"),
+        "notification_text": compact_text(string_field(row, "notification_text")),
+    }))
+}
+
+pub fn load_notification_feed_response(config: &RuntimeConfig, since_ts: f64) -> Result<Value, String> {
+    let ledger = read_voice_delivery_ledger(&voice_delivery_ledger_path(config))?;
+    let mut items = ledger
+        .iter()
+        .filter_map(|(message_id, value)| {
+            let row = value.as_object()?;
+            if string_field(row, "message_class") != "final_response" {
+                return None;
+            }
+            let updated_ts = row.get("updated_ts").and_then(Value::as_f64).unwrap_or(0.0);
+            if updated_ts <= since_ts {
+                return None;
+            }
+            let summary_status = string_field(row, "summary_status");
+            if summary_status != "sent" && summary_status != "skipped" && summary_status != "error" {
+                return None;
+            }
+            let notification_text = compact_text(string_field(row, "notification_text"));
+            if notification_text.is_empty() {
+                return None;
+            }
+            Some(json!({
+                "message_id": message_id,
+                "session_id": string_field(row, "session_id"),
+                "session_display_name": default_session_display_name(string_field(row, "session_display_name")),
+                "notification_text": notification_text,
+                "updated_ts": updated_ts,
+            }))
+        })
+        .collect::<Vec<_>>();
+    items.sort_by(|a, b| {
+        let a_ts = a.get("updated_ts").and_then(Value::as_f64).unwrap_or(0.0);
+        let b_ts = b.get("updated_ts").and_then(Value::as_f64).unwrap_or(0.0);
+        a_ts.partial_cmp(&b_ts)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                a.get("message_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .cmp(b.get("message_id").and_then(Value::as_str).unwrap_or_default())
+            })
+    });
+    Ok(json!({ "ok": true, "items": items }))
+}
+
+pub fn load_audio_playlist_bytes(config: &RuntimeConfig) -> Result<Vec<u8>, String> {
+    let path = audio_playlist_path(config);
+    match fs::read(&path) {
+        Ok(raw) => Ok(raw),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(b"#EXTM3U\n".to_vec()),
+        Err(err) => Err(format!("read {}: {err}", path.display())),
+    }
+}
+
+pub fn load_audio_segment_bytes(config: &RuntimeConfig, segment_name: &str) -> Result<Vec<u8>, String> {
+    let name = Path::new(segment_name)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| "unknown audio segment".to_string())?;
+    if name != segment_name || !name.ends_with(".ts") {
+        return Err("unknown audio segment".to_string());
+    }
+    let segments_dir = audio_segments_dir(config);
+    let base = segments_dir
+        .canonicalize()
+        .unwrap_or_else(|_| segments_dir.clone());
+    let candidate = segments_dir.join(name);
+    let resolved = candidate
+        .canonicalize()
+        .map_err(|_| "unknown audio segment".to_string())?;
+    if !resolved.starts_with(&base) {
+        return Err("unknown audio segment".to_string());
+    }
+    fs::read(&resolved).map_err(|_| "unknown audio segment".to_string())
 }
 
 fn describe_session_cwd(cwd: &Path) -> Value {
@@ -2158,6 +2295,160 @@ fn notification_subscriptions_snapshot_value(
         "vapid_public_key": vapid_public_key,
         "subscriptions": items,
     })
+}
+
+fn string_field(row: &serde_json::Map<String, Value>, field: &str) -> String {
+    row.get(field)
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_string()
+}
+
+fn compact_text(raw: impl AsRef<str>) -> String {
+    raw.as_ref().split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn default_session_display_name(raw: String) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        "Session".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn normalize_voice_base_url(raw: Option<&str>) -> Result<String, String> {
+    let value = raw
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(DEFAULT_TTS_BASE_URL);
+    if !value.starts_with("http://") && !value.starts_with("https://") {
+        return Err("tts_base_url must start with http:// or https://".to_string());
+    }
+    Ok(value.trim_end_matches('/').to_string())
+}
+
+fn clean_voice_settings_object(object: Option<&serde_json::Map<String, Value>>) -> Result<Value, String> {
+    let narration = object
+        .and_then(|row| row.get("tts_enabled_for_narration"))
+        .map(json_truthy)
+        .unwrap_or(false);
+    let final_response = object
+        .and_then(|row| row.get("tts_enabled_for_final_response"))
+        .map(json_truthy)
+        .unwrap_or(false);
+    let base_url = normalize_voice_base_url(
+        object
+            .and_then(|row| row.get("tts_base_url"))
+            .and_then(Value::as_str),
+    )?;
+    let api_key = object
+        .and_then(|row| row.get("tts_api_key"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let summarization_model = object
+        .and_then(|row| row.get("summarization_model"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(DEFAULT_SUMMARIZATION_MODEL)
+        .to_string();
+    let tts_model = object
+        .and_then(|row| row.get("tts_model"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(DEFAULT_TTS_MODEL)
+        .to_string();
+    Ok(json!({
+        "tts_enabled_for_narration": narration,
+        "tts_enabled_for_final_response": final_response,
+        "tts_base_url": base_url,
+        "tts_api_key": api_key,
+        "summarization_model": summarization_model,
+        "tts_model": tts_model,
+    }))
+}
+
+fn clean_voice_settings_value(payload: &Value) -> Result<Value, String> {
+    let Some(object) = payload.as_object() else {
+        return Err("invalid json body (expected object)".to_string());
+    };
+    clean_voice_settings_object(Some(object))
+}
+
+fn read_clean_voice_settings(path: &Path) -> Result<Value, String> {
+    let value = read_optional_value(path)?;
+    clean_voice_settings_object(value.as_ref().and_then(Value::as_object))
+}
+
+fn read_voice_runtime_audio_snapshot(path: &Path) -> Result<Value, String> {
+    let audio = read_optional_value(path)?
+        .and_then(|value| value.get("audio").cloned())
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    Ok(json!({
+        "queue_depth": audio.get("queue_depth").and_then(Value::as_i64).unwrap_or(0),
+        "active_listener_count": audio
+            .get("active_listener_count")
+            .and_then(Value::as_i64)
+            .unwrap_or(0),
+        "segment_count": audio.get("segment_count").and_then(Value::as_i64).unwrap_or(0),
+        "last_error": audio
+            .get("last_error")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim(),
+        "media_sequence": audio.get("media_sequence").and_then(Value::as_i64).unwrap_or(1),
+    }))
+}
+
+fn read_voice_delivery_ledger(path: &Path) -> Result<HashMap<String, Value>, String> {
+    let Some(Value::Object(object)) = read_optional_value(path)? else {
+        return Ok(HashMap::new());
+    };
+    let mut out = HashMap::new();
+    for (message_id, value) in object {
+        if message_id.trim().is_empty() {
+            continue;
+        }
+        let Some(mut row) = value.as_object().cloned() else {
+            continue;
+        };
+        let session_id = string_field(&row, "session_id");
+        let message_class = string_field(&row, "message_class");
+        if session_id.is_empty() || (message_class != "narration" && message_class != "final_response") {
+            continue;
+        }
+        row.insert("message_id".to_string(), Value::String(message_id.clone()));
+        out.insert(message_id, Value::Object(row));
+    }
+    Ok(out)
+}
+
+fn notification_mobile_device_counts(records: &HashMap<String, Value>) -> (i64, i64) {
+    let mut enabled = 0_i64;
+    let mut total = 0_i64;
+    for record in records.values() {
+        let Some(object) = record.as_object() else {
+            continue;
+        };
+        if object.get("device_class").and_then(Value::as_str) != Some("mobile") {
+            continue;
+        }
+        total += 1;
+        if object
+            .get("notifications_enabled")
+            .map(json_truthy)
+            .unwrap_or(false)
+        {
+            enabled += 1;
+        }
+    }
+    (enabled, total)
 }
 
 fn clean_harness_cooldown_minutes_value(value: &Value) -> Result<i64, String> {
@@ -6119,6 +6410,30 @@ fn codex_config_path() -> PathBuf {
 
 fn push_subscriptions_path(config: &RuntimeConfig) -> PathBuf {
     config.app_dir.join("push_subscriptions.json")
+}
+
+fn voice_settings_path(config: &RuntimeConfig) -> PathBuf {
+    config.app_dir.join("voice_settings.json")
+}
+
+fn voice_delivery_ledger_path(config: &RuntimeConfig) -> PathBuf {
+    config.app_dir.join("voice_delivery_ledger.json")
+}
+
+fn voice_runtime_path(config: &RuntimeConfig) -> PathBuf {
+    config.app_dir.join("voice_runtime.json")
+}
+
+fn audio_root_dir(config: &RuntimeConfig) -> PathBuf {
+    config.app_dir.join("audio")
+}
+
+fn audio_playlist_path(config: &RuntimeConfig) -> PathBuf {
+    audio_root_dir(config).join("live.m3u8")
+}
+
+fn audio_segments_dir(config: &RuntimeConfig) -> PathBuf {
+    audio_root_dir(config).join("segments")
 }
 
 fn vapid_private_key_path(config: &RuntimeConfig) -> PathBuf {

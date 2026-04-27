@@ -627,6 +627,7 @@ class VoicePushCoordinator:
         vapid_private_key_path: Path,
     ) -> None:
         self._app_dir = Path(app_dir)
+        self._runtime_path = self._app_dir / "voice_runtime.json"
         self._stop = stop_event
         self._settings_path = Path(settings_path)
         self._subscriptions_path = Path(subscriptions_path)
@@ -660,28 +661,25 @@ class VoicePushCoordinator:
         self._worker.start()
         self._keepalive = threading.Thread(target=self._keepalive_loop, name="voice-push-keepalive", daemon=True)
         self._keepalive.start()
+        self._save_runtime_snapshot()
 
     def settings_snapshot(self) -> dict[str, Any]:
         self._reload_settings_if_changed()
         self._reload_subscriptions_if_changed()
         with self._lock:
             settings = dict(self._voice_settings)
-            queue_depth = len(self._queue)
             enabled_devices = sum(
                 1
                 for item in self._subscriptions.values()
                 if item.get("notifications_enabled") and item.get("device_class") == "mobile"
             )
             total_devices = sum(1 for item in self._subscriptions.values() if item.get("device_class") == "mobile")
-            active_listener_count = self._active_listener_count_locked(now_ts=time.time())
-        audio_state = self._hls.snapshot()
+            audio = self._runtime_audio_snapshot_locked()
         return {
             **settings,
             "audio": {
-                "queue_depth": queue_depth,
-                "active_listener_count": active_listener_count,
                 "stream_url": "/api/audio/live.m3u8",
-                **audio_state,
+                **audio,
             },
             "notifications": {
                 "enabled_devices": enabled_devices,
@@ -723,6 +721,7 @@ class VoicePushCoordinator:
             self._mark_tasks_skipped_no_listener(dropped_tasks)
         if should_reset_hls:
             self._hls.reset()
+        self._save_runtime_snapshot()
         return {"active_listener_count": count}
 
     def set_settings(self, raw: Any) -> dict[str, Any]:
@@ -891,6 +890,7 @@ class VoicePushCoordinator:
             if drop_for_listener:
                 self._mark_tasks_skipped_no_listener([task])
             self._save_delivery_ledger()
+        self._save_runtime_snapshot()
 
     def playlist_bytes(self) -> bytes:
         return self._hls.playlist_bytes()
@@ -956,6 +956,7 @@ class VoicePushCoordinator:
                 self._keepalive_sweep()
             except Exception as e:
                 self._hls.set_last_error(str(e))
+                self._save_runtime_snapshot()
             self._stop.wait(1.0)
 
     def _keepalive_sweep(self) -> None:
@@ -970,7 +971,8 @@ class VoicePushCoordinator:
             )
         if not should_keepalive:
             return
-        self._hls.append_silence(force=False)
+        if self._hls.append_silence(force=False):
+            self._save_runtime_snapshot()
 
     def _worker_loop(self) -> None:
         while not self._stop.is_set():
@@ -1012,6 +1014,8 @@ class VoicePushCoordinator:
                     self._queue_ready.wait(timeout=timeout)
                 if self._stop.is_set():
                     return
+            if action or stale_task is not None:
+                self._save_runtime_snapshot()
             if action == "append" and prepared is not None:
                 self._append_prepared(prepared)
                 continue
@@ -1025,6 +1029,7 @@ class VoicePushCoordinator:
             except Exception as e:
                 self._set_task_error(task, str(e))
                 self._hls.set_last_error(str(e))
+                self._save_runtime_snapshot()
             finally:
                 with self._lock:
                     if self._generating_task is not None and self._generating_task.message_id == task.message_id:
@@ -1096,6 +1101,7 @@ class VoicePushCoordinator:
             self._playing_task = prepared.task
             self._playing_until_monotonic = time.monotonic() + max(0.2, float(duration))
             self._queue_ready.notify_all()
+        self._save_runtime_snapshot()
         self._set_task_ledger_fields(prepared.task, {"narrated_status": "sent"})
 
     def _prepare_final_response(
@@ -1132,6 +1138,7 @@ class VoicePushCoordinator:
                     },
                 )
                 self._hls.set_last_error(str(e))
+                self._save_runtime_snapshot()
                 return None
             self._set_ledger_fields(
                 message.message_id,
@@ -1396,6 +1403,35 @@ class VoicePushCoordinator:
             format=serialization.PublicFormat.UncompressedPoint,
         )
         self._vapid_public_key = _b64u(public_bytes)
+
+    def _runtime_audio_snapshot_locked(self) -> dict[str, Any]:
+        audio_state = self._hls.snapshot()
+        return {
+            "queue_depth": len(self._queue),
+            "active_listener_count": self._active_listener_count_locked(now_ts=time.time()),
+            "segment_count": int(audio_state.get("segment_count") or 0),
+            "last_error": str(audio_state.get("last_error") or "").strip(),
+            "media_sequence": int(audio_state.get("media_sequence") or 1),
+        }
+
+    def _save_runtime_snapshot(self) -> None:
+        os.makedirs(self._runtime_path.parent, exist_ok=True)
+        with self._lock:
+            payload = {
+                "audio": self._runtime_audio_snapshot_locked(),
+                "updated_ts": float(time.time()),
+            }
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=self._runtime_path.parent,
+            prefix=self._runtime_path.name + ".",
+            suffix=".tmp",
+            delete=False,
+        ) as tmp:
+            tmp.write(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+            tmp_path = Path(tmp.name)
+        os.replace(tmp_path, self._runtime_path)
 
     def _trim_locked(self) -> None:
         if len(self._delivery_ledger) <= DELIVERY_LEDGER_MAX:
