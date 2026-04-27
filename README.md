@@ -214,8 +214,8 @@ cargo run
 The Nova preview frontend uses same-origin `/api` by default in production. For standalone local dev against a different server, set `VITE_CODOXEAR_API_BASE=http://127.0.0.1:13780`.
 
 The local deploy helper `./scripts/codoxear-local` now runs two processes:
-- public Rust web entry on `:8743` redirecting `/` and `/nova/` to `/nova-preview/`, serving the Nova preview shell plus the migrated `/api/*` routes, and proxying only `/legacy/*` to Python
-- legacy Python backend on `127.0.0.1:8744` for `/legacy/*` plus the broker/runtime worker implementation still shared by the Rust front door
+- public Rust web entry on `:8743` redirecting `/` and `/nova/` to `/nova-preview/`, serving the Nova preview shell, the legacy shell at `/legacy/*`, and the migrated public `/api/*` routes
+- private Python companion on `127.0.0.1:8744` for the broker/runtime worker implementation still shared by the Rust front door
 - `CODEX_WEB_QUEUE_SWEEP_SECONDS` (default `1.0`)
 - `CODEX_WEB_QUEUE_IDLE_GRACE_SECONDS` (default `10.0`)
 - `CODEX_WEB_DISCOVER_MIN_INTERVAL_SECONDS` (default `1.0`)

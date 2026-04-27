@@ -197,7 +197,10 @@ class TestServerQueuePersistence(unittest.TestCase):
             _nova_incremental_v1_path("/api/sessions/s1/queue/move", "POST"),
             "/api/v1/sessions/s1/queue/move",
         )
-        self.assertIsNone(_nova_incremental_v1_path("/api/sessions/s1/file/write", "POST"))
+        self.assertEqual(
+            _nova_incremental_v1_path("/api/sessions/s1/file/write", "POST"),
+            "/api/v1/sessions/s1/file/write",
+        )
 
     def test_do_post_proxies_incremental_routes_before_python_fallbacks(self) -> None:
         source = SERVER_PY.read_text(encoding="utf-8")
@@ -223,6 +226,7 @@ class TestServerQueuePersistence(unittest.TestCase):
         self.assertEqual(source.count('if path.startswith("/api/sessions/") and path.endswith("/edit"):'), 0)
         self.assertEqual(source.count('if path.startswith("/api/sessions/") and (path.endswith("/inject_file") or path.endswith("/inject_image")):'), 0)
         self.assertNotIn('cfg = MANAGER.harness_set(', source)
+        self.assertNotIn('session_id = _match_session_route(path, "file", "write")', source)
         self.assertNotIn('session_id = _match_session_route(path, "messages", "tail")', source)
         self.assertNotIn('session_id = _match_session_route(path, "messages", "history")', source)
         self.assertNotIn('session_id = _match_session_route(path, "messages", "live")', source)

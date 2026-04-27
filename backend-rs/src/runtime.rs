@@ -16,8 +16,10 @@ use std::env;
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::path::Component;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -35,6 +37,9 @@ const DEFAULT_TTS_BASE_URL: &str = "https://api.openai.com/v1";
 const LISTENER_TTL_SECONDS: f64 = 45.0;
 const HARNESS_DEFAULT_IDLE_MINUTES: f64 = 15.0;
 const HARNESS_DEFAULT_MAX_INJECTIONS: i64 = 1;
+const STATIC_ASSET_VERSION_PLACEHOLDER: &str = "__CODOXEAR_ASSET_VERSION__";
+const STATIC_ATTACH_MAX_BYTES_PLACEHOLDER: &str = "__CODOXEAR_ATTACH_MAX_BYTES__";
+const STATIC_ASSET_VERSION_FILES: &[&str] = &["app.js", "app.css"];
 const ATTACH_UPLOAD_MAX_BYTES: usize = 16 * 1024 * 1024;
 const FILE_READ_MAX_BYTES: u64 = 2 * 1024 * 1024;
 const FILE_SEARCH_LIMIT: usize = 120;
@@ -85,6 +90,15 @@ impl RuntimeConfig {
             app_dir: default_app_dir()?,
         })
     }
+}
+
+#[derive(Debug)]
+pub enum FileWriteError {
+    BadRequest(String),
+    NotFound(String),
+    Forbidden(String),
+    Conflict(Value),
+    Internal(String),
 }
 
 #[derive(Debug, Deserialize)]
@@ -317,8 +331,45 @@ pub fn load_legacy_static_file(path: &str) -> Result<(Vec<u8>, String), String> 
     let normalized = normalize_legacy_static_path(path)?;
     let static_dir = repo_root.join("codoxear").join("static");
     let target = static_dir.join(&normalized);
-    let raw = fs::read(&target).map_err(|err| format!("read {}: {err}", target.display()))?;
+    let raw = read_legacy_static_bytes(&static_dir, &target)?;
     Ok((raw, content_type_for_static_path(&normalized).to_string()))
+}
+
+fn read_legacy_static_bytes(static_dir: &Path, path: &Path) -> Result<Vec<u8>, String> {
+    let data = fs::read(path).map_err(|err| format!("read {}: {err}", path.display()))?;
+    if path.extension().and_then(|ext| ext.to_str()) != Some("html") {
+        return Ok(data);
+    }
+    let mut text = String::from_utf8(data).map_err(|err| format!("decode {}: {err}", path.display()))?;
+    text = text.replace(
+        STATIC_ASSET_VERSION_PLACEHOLDER,
+        &legacy_static_asset_version(static_dir)?,
+    );
+    text = text.replace(
+        STATIC_ATTACH_MAX_BYTES_PLACEHOLDER,
+        &ATTACH_UPLOAD_MAX_BYTES.to_string(),
+    );
+    Ok(text.into_bytes())
+}
+
+fn legacy_static_asset_version(static_dir: &Path) -> Result<String, String> {
+    let base = fs::canonicalize(static_dir).unwrap_or_else(|_| static_dir.to_path_buf());
+    let mut digest = Sha256::new();
+    for rel in STATIC_ASSET_VERSION_FILES {
+        let path = base.join(rel);
+        if !path.starts_with(&base) {
+            return Err(format!("static asset escaped static dir: {}", path.display()));
+        }
+        if !path.is_file() {
+            continue;
+        }
+        digest.update(rel.as_bytes());
+        digest.update([0]);
+        digest.update(fs::read(&path).map_err(|err| format!("read {}: {err}", path.display()))?);
+        digest.update([0]);
+    }
+    let hex = format!("{:x}", digest.finalize());
+    Ok(hex.chars().take(12).collect())
 }
 
 pub fn load_codex_config_response() -> Result<Value, String> {
@@ -1778,6 +1829,86 @@ pub fn load_file_read_response(config: &RuntimeConfig, session_id: &str, raw_pat
     }))
 }
 
+pub fn save_file_write_response(
+    config: &RuntimeConfig,
+    session_id: &str,
+    payload: &Value,
+) -> Result<Value, FileWriteError> {
+    let object = payload
+        .as_object()
+        .ok_or_else(|| FileWriteError::BadRequest("invalid json body (expected object)".to_string()))?;
+    let path_raw = object
+        .get("path")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| FileWriteError::BadRequest("path required".to_string()))?;
+    let text_raw = object
+        .get("text")
+        .and_then(Value::as_str)
+        .ok_or_else(|| FileWriteError::BadRequest("text must be a string".to_string()))?;
+    let create = object.get("create").and_then(Value::as_bool).unwrap_or(false);
+    let version_raw = object.get("version").and_then(Value::as_str).map(str::trim).unwrap_or_default();
+    if !create && version_raw.is_empty() {
+        return Err(FileWriteError::BadRequest("version required".to_string()));
+    }
+
+    let session = find_session(config, session_id).map_err(|message| {
+        if message.starts_with("unknown session:") {
+            FileWriteError::NotFound("unknown session".to_string())
+        } else {
+            FileWriteError::Internal(message)
+        }
+    })?;
+    let base = expand_home(&session.cwd);
+    let (resolved, size, next_version) = if create {
+        let target = resolve_relative_under(&base, path_raw).map_err(FileWriteError::BadRequest)?;
+        match write_new_text_file_atomic(&target, text_raw) {
+            Ok(result) => (target, result.0, result.1),
+            Err(message) if message == "file already exists" => {
+                let mut payload = json!({
+                    "error": "file already exists",
+                    "conflict": true,
+                    "path": target.display().to_string(),
+                });
+                if target.is_file() {
+                    if let Ok((_text, _size, current_version)) = read_text_file_for_write(&target, FILE_READ_MAX_BYTES) {
+                        payload["version"] = Value::String(current_version);
+                    }
+                }
+                return Err(FileWriteError::Conflict(payload));
+            }
+            Err(message) => return Err(map_file_write_message(message)),
+        }
+    } else {
+        let target = resolve_session_path(&session.cwd, path_raw).map_err(FileWriteError::BadRequest)?;
+        let (_current_text, _current_size, current_version) =
+            read_text_file_for_write(&target, FILE_READ_MAX_BYTES).map_err(map_file_write_message)?;
+        if current_version != version_raw {
+            return Err(FileWriteError::Conflict(json!({
+                "error": "file changed on disk",
+                "conflict": true,
+                "path": target.display().to_string(),
+                "version": current_version,
+            })));
+        }
+        let (size, next_version) = write_editable_text_file_atomic(&target, text_raw).map_err(map_file_write_message)?;
+        (target, size, next_version)
+    };
+
+    update_session_file_history(config, session_id, &resolved.display().to_string())
+        .map_err(FileWriteError::Internal)?;
+
+    Ok(json!({
+        "ok": true,
+        "path": resolved.display().to_string(),
+        "rel": path_raw,
+        "size": size,
+        "version": next_version,
+        "editable": true,
+    }))
+}
+
 pub fn load_file_blob(config: &RuntimeConfig, session_id: &str, raw_path: &str) -> Result<(Vec<u8>, String), String> {
     let session = find_session(config, session_id)?;
     let resolved = resolve_session_path(&session.cwd, raw_path)?;
@@ -2063,6 +2194,90 @@ fn write_text_file_atomic(path: &Path, text: &str) -> Result<(), String> {
     let tmp = path.with_file_name(format!("{file_name}.tmp"));
     fs::write(&tmp, text).map_err(|err| format!("write {}: {err}", tmp.display()))?;
     fs::rename(&tmp, path).map_err(|err| format!("rename {} -> {}: {err}", tmp.display(), path.display()))
+}
+
+fn unique_temp_sibling_path(path: &Path) -> Result<PathBuf, String> {
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| format!("invalid filename for {}", path.display()))?;
+    let counter = QUEUE_ITEM_COUNTER.fetch_add(1, Ordering::Relaxed);
+    Ok(path.with_file_name(format!(".{file_name}.codoxear-tmp-{counter:016x}")))
+}
+
+fn write_editable_text_file_atomic(path: &Path, text: &str) -> Result<(u64, String), String> {
+    let data = text.as_bytes();
+    if data.len() as u64 > FILE_READ_MAX_BYTES {
+        return Err(format!("file too large (max {FILE_READ_MAX_BYTES} bytes)"));
+    }
+    let metadata = fs::metadata(path).map_err(map_io_error)?;
+    let tmp = unique_temp_sibling_path(path)?;
+    let mode = metadata.permissions().mode() & 0o777;
+    let mut write_result = Ok(());
+    if let Err(err) = fs::write(&tmp, data) {
+        write_result = Err(map_io_error(err));
+    }
+    if write_result.is_ok() {
+        if let Err(err) = fs::set_permissions(&tmp, fs::Permissions::from_mode(mode)) {
+            write_result = Err(map_io_error(err));
+        }
+    }
+    if write_result.is_ok() {
+        if let Err(err) = fs::rename(&tmp, path) {
+            write_result = Err(map_io_error(err));
+        }
+    }
+    if let Err(err) = fs::remove_file(&tmp) {
+        if err.kind() != std::io::ErrorKind::NotFound && write_result.is_ok() {
+            write_result = Err(map_io_error(err));
+        }
+    }
+    write_result?;
+    Ok((data.len() as u64, content_version(data)))
+}
+
+fn write_new_text_file_atomic(path: &Path, text: &str) -> Result<(u64, String), String> {
+    let parent = path.parent().ok_or_else(|| format!("missing parent for {}", path.display()))?;
+    if !parent.exists() {
+        return Err("parent directory not found".to_string());
+    }
+    if !parent.is_dir() {
+        return Err("parent path is not a directory".to_string());
+    }
+    if path.exists() {
+        return Err("file already exists".to_string());
+    }
+    let data = text.as_bytes();
+    if data.len() as u64 > FILE_READ_MAX_BYTES {
+        return Err(format!("file too large (max {FILE_READ_MAX_BYTES} bytes)"));
+    }
+    let tmp = unique_temp_sibling_path(path)?;
+    let mut write_result = Ok(());
+    if let Err(err) = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o666)
+        .open(&tmp)
+        .and_then(|mut file| file.write_all(data))
+    {
+        write_result = Err(map_io_error(err));
+    }
+    if write_result.is_ok() {
+        if let Err(err) = fs::hard_link(&tmp, path) {
+            write_result = Err(if err.kind() == std::io::ErrorKind::AlreadyExists {
+                "file already exists".to_string()
+            } else {
+                map_io_error(err)
+            });
+        }
+    }
+    if let Err(err) = fs::remove_file(&tmp) {
+        if err.kind() != std::io::ErrorKind::NotFound && write_result.is_ok() {
+            write_result = Err(map_io_error(err));
+        }
+    }
+    write_result?;
+    Ok((data.len() as u64, content_version(data)))
 }
 
 fn write_string_map(path: &Path, values: &HashMap<String, String>) -> Result<(), String> {
@@ -2959,6 +3174,14 @@ pub(crate) fn default_file_search_limit() -> usize {
         .unwrap_or(FILE_SEARCH_LIMIT)
 }
 
+fn default_file_history_max() -> usize {
+    env::var("CODEX_WEB_FILE_HISTORY_MAX")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(20)
+}
+
 fn file_search_timeout() -> Duration {
     let seconds = env::var("CODEX_WEB_FILE_SEARCH_TIMEOUT_SECONDS")
         .ok()
@@ -3224,6 +3447,43 @@ fn resolve_session_path(cwd: &str, raw_path: &str) -> Result<PathBuf, String> {
     Ok(fs::canonicalize(&joined).unwrap_or(joined))
 }
 
+fn resolve_relative_under(base: &Path, raw_path: &str) -> Result<PathBuf, String> {
+    let trimmed = raw_path.trim();
+    if trimmed.is_empty() {
+        return Err("path required".to_string());
+    }
+    if trimmed.contains('\0') {
+        return Err("invalid path".to_string());
+    }
+    let candidate = Path::new(trimmed);
+    if candidate.is_absolute() {
+        return Err("path must be relative".to_string());
+    }
+    let resolved_base = fs::canonicalize(base).unwrap_or_else(|_| base.to_path_buf());
+    let mut resolved = resolved_base.clone();
+    let mut depth = 0usize;
+    for component in candidate.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(segment) => {
+                resolved.push(segment);
+                depth += 1;
+            }
+            Component::ParentDir => {
+                if depth == 0 {
+                    return Err("path escapes session cwd".to_string());
+                }
+                resolved.pop();
+                depth = depth.saturating_sub(1);
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                return Err("path must be relative".to_string());
+            }
+        }
+    }
+    Ok(resolved)
+}
+
 fn resolve_git_path(cwd: &Path, raw_path: &str) -> Result<(PathBuf, PathBuf, String), String> {
     let repo_root_raw = run_git_capture(cwd, &["rev-parse", "--show-toplevel"], default_git_diff_timeout(), 64 * 1024)?;
     let repo_root_candidate = PathBuf::from(repo_root_raw.trim());
@@ -3275,6 +3535,63 @@ fn read_text_file_strict(path: &Path, max_bytes: u64) -> Result<(String, u64), S
         return Err("binary file not supported".to_string());
     }
     Ok((String::from_utf8_lossy(&raw).into_owned(), size))
+}
+
+fn read_text_file_for_write(path: &Path, max_bytes: u64) -> Result<(String, u64, String), String> {
+    let metadata = fs::metadata(path).map_err(map_io_error)?;
+    if !metadata.is_file() {
+        return Err("path is not a file".to_string());
+    }
+    let size = metadata.len();
+    if size > max_bytes {
+        return Err(format!("file too large (max {max_bytes} bytes)"));
+    }
+    let raw = fs::read(path).map_err(map_io_error)?;
+    if raw.contains(&0) {
+        return Err("binary file not supported".to_string());
+    }
+    let text = std::str::from_utf8(&raw)
+        .map_err(|_| "file is not editable as utf-8 text".to_string())?
+        .to_string();
+    Ok((text, size, content_version(&raw)))
+}
+
+fn map_file_write_message(message: String) -> FileWriteError {
+    match message.as_str() {
+        "file not found" | "parent directory not found" => FileWriteError::NotFound(message),
+        "permission denied" => FileWriteError::Forbidden(message),
+        "path required"
+        | "invalid path"
+        | "path must be relative"
+        | "path escapes session cwd"
+        | "text must be a string"
+        | "version required"
+        | "binary file not supported"
+        | "file is not editable as utf-8 text"
+        | "path is not a file"
+        | "parent path is not a directory" => FileWriteError::BadRequest(message),
+        _ if message.starts_with("file too large") => FileWriteError::BadRequest(message),
+        _ => FileWriteError::Internal(message),
+    }
+}
+
+fn update_session_file_history(config: &RuntimeConfig, session_id: &str, path: &str) -> Result<(), String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+    let files_path = config.app_dir.join("session_files.json");
+    let mut files = read_string_array_map(&files_path)?;
+    let key = format!("sid:{session_id}");
+    let mut current = files.remove(&key).unwrap_or_default();
+    if current.is_empty() {
+        current = files.remove(session_id).unwrap_or_default();
+    }
+    current.retain(|item| item != trimmed);
+    current.insert(0, trimmed.to_string());
+    current.truncate(default_file_history_max());
+    files.insert(key, current);
+    write_string_array_map(&files_path, &files)
 }
 
 fn detect_file_kind(path: &Path, raw: &[u8]) -> (&'static str, Option<&'static str>) {

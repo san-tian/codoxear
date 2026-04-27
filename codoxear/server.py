@@ -157,7 +157,7 @@ def _nova_incremental_v1_path(path: str, method: str) -> str | None:
             return f"/api/v1{path[4:]}"
         if path == "/api/sessions":
             return "/api/v1/sessions"
-        for suffix in (("rename",), ("delete",), ("edit",), ("send",), ("interrupt",), ("enqueue",), ("harness",), ("inject_file",), ("inject_image",), ("queue", "delete"), ("queue", "update"), ("queue", "move")):
+        for suffix in (("rename",), ("delete",), ("edit",), ("send",), ("interrupt",), ("enqueue",), ("harness",), ("inject_file",), ("inject_image",), ("file", "write"), ("queue", "delete"), ("queue", "update"), ("queue", "move")):
             session_id = _match_session_route(path, *suffix)
             if session_id is None:
                 continue
@@ -6076,109 +6076,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_header("Expires", "0")
                 self.end_headers()
                 self.wfile.write(raw)
-                return
-
-            session_id = _match_session_route(path, "file", "write")
-            if session_id is not None:
-                if not _require_auth(self):
-                    self._unauthorized()
-                    return
-                body = _read_body(self)
-                body_text = body.decode("utf-8")
-                if not body_text.strip():
-                    raise ValueError("empty request body")
-                obj = json.loads(body_text)
-                if not isinstance(obj, dict):
-                    raise ValueError("invalid json body (expected object)")
-                path_raw = obj.get("path")
-                if not isinstance(path_raw, str) or not path_raw.strip():
-                    _json_response(self, 400, {"error": "path required"})
-                    return
-                text_raw = obj.get("text")
-                if not isinstance(text_raw, str):
-                    _json_response(self, 400, {"error": "text must be a string"})
-                    return
-                create_raw = obj.get("create")
-                create = create_raw if isinstance(create_raw, bool) else False
-                version_raw = obj.get("version")
-                if not create and (not isinstance(version_raw, str) or not version_raw.strip()):
-                    _json_response(self, 400, {"error": "version required"})
-                    return
-                MANAGER.refresh_session_meta(session_id)
-                s = MANAGER.get_session(session_id)
-                if not s:
-                    _json_response(self, 404, {"error": "unknown session"})
-                    return
-                base = Path(s.cwd).expanduser()
-                if not base.is_absolute():
-                    base = base.resolve()
-                if create:
-                    try:
-                        p = _resolve_under(base, path_raw)
-                    except ValueError as e:
-                        _json_response(self, 400, {"error": str(e)})
-                        return
-                    try:
-                        size, next_version = _write_new_text_file_atomic(p, text=text_raw)
-                    except FileExistsError:
-                        payload: dict[str, Any] = {"error": "file already exists", "conflict": True, "path": str(p)}
-                        if p.is_file():
-                            try:
-                                _current_text, _current_size, current_version = _read_text_file_for_write(p, max_bytes=FILE_READ_MAX_BYTES)
-                                payload["version"] = current_version
-                            except (FileNotFoundError, PermissionError, ValueError):
-                                pass
-                        _json_response(self, 409, payload)
-                        return
-                    except FileNotFoundError as e:
-                        _json_response(self, 404, {"error": str(e)})
-                        return
-                    except PermissionError as e:
-                        _json_response(self, 403, {"error": str(e)})
-                        return
-                    except ValueError as e:
-                        _json_response(self, 400, {"error": str(e)})
-                        return
-                else:
-                    p = _resolve_session_path(base, path_raw)
-                    try:
-                        _current_text, _current_size, current_version = _read_text_file_for_write(p, max_bytes=FILE_READ_MAX_BYTES)
-                    except FileNotFoundError as e:
-                        _json_response(self, 404, {"error": str(e)})
-                        return
-                    except PermissionError as e:
-                        _json_response(self, 403, {"error": str(e)})
-                        return
-                    except ValueError as e:
-                        _json_response(self, 400, {"error": str(e)})
-                        return
-                    if current_version != version_raw:
-                        _json_response(
-                            self,
-                            409,
-                            {"error": "file changed on disk", "conflict": True, "path": str(p), "version": current_version},
-                        )
-                        return
-                    try:
-                        size, next_version = _write_text_file_atomic(p, text=text_raw)
-                    except FileNotFoundError as e:
-                        _json_response(self, 404, {"error": str(e)})
-                        return
-                    except PermissionError as e:
-                        _json_response(self, 403, {"error": str(e)})
-                        return
-                    except ValueError as e:
-                        _json_response(self, 400, {"error": str(e)})
-                        return
-                try:
-                    MANAGER.files_add(session_id, str(p))
-                except KeyError:
-                    pass
-                _json_response(
-                    self,
-                    200,
-                    {"ok": True, "path": str(p), "rel": str(path_raw), "size": int(size), "version": next_version, "editable": True},
-                )
                 return
 
             if path.startswith("/api/sessions/") and path.endswith("/send"):

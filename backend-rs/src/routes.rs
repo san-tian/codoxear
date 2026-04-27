@@ -18,14 +18,15 @@ use crate::runtime::{
     load_resume_candidates_response, load_sessions_response, normalize_backend, resolve_dir_target,
     delete_queue_item, delete_session, edit_session, enqueue_session_message,
     inject_session_attachment, interrupt_session, move_queue_item, rename_session,
-    save_codex_config_response, save_voice_settings_response,
+    save_codex_config_response, save_file_write_response, save_voice_settings_response,
     schedule_local_service_restart_response, set_harness_config,
     send_session_message, update_queue_item,
     update_audio_listener_heartbeat_response,
     toggle_notification_subscription_response, upsert_notification_subscription_response,
+    FileWriteError,
 };
 use axum::extract::{Path, Query, State};
-use axum::body::{to_bytes, Body};
+use axum::body::Body;
 use axum::http::{header, HeaderMap, HeaderValue, Request, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{Redirect, Response};
@@ -34,12 +35,8 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
-use bytes::Bytes;
 use futures_util::stream::{self, Stream};
 use hmac::{Hmac, Mac};
-use http_body_util::{BodyExt, Full};
-use hyper_util::client::legacy::Client;
-use hyper_util::rt::TokioExecutor;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::Sha256;
@@ -107,6 +104,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/sessions/:session_id/git/diff", get(git_diff))
         .route("/api/v1/sessions/:session_id/git/file_versions", get(git_file_versions))
         .route("/api/v1/sessions/:session_id/file/read", get(file_read))
+        .route("/api/v1/sessions/:session_id/file/write", post(file_write))
         .route("/api/v1/sessions/:session_id/file/search", get(file_search))
         .route("/api/v1/sessions/:session_id/file/blob", get(file_blob))
         .route("/api/v1/sessions/:session_id/messages/tail", get(messages_tail))
@@ -122,9 +120,9 @@ pub fn router(state: AppState) -> Router {
 
 fn legacy_router(state: AppState) -> Router<AppState> {
     Router::new()
-        .route("/legacy", get(legacy_entry_proxy).post(legacy_entry_proxy))
-        .route("/legacy/", get(legacy_entry_proxy).post(legacy_entry_proxy))
-        .route("/legacy/*path", get(legacy_entry_proxy).post(legacy_entry_proxy))
+        .route("/legacy", get(legacy_index))
+        .route("/legacy/", get(legacy_index))
+        .route("/legacy/*path", get(legacy_static))
         .route_layer(middleware::from_fn_with_state(
             state,
             require_public_api_auth,
@@ -170,6 +168,7 @@ fn public_api_router(state: AppState) -> Router<AppState> {
         .route("/sessions/:session_id/git/diff", get(git_diff))
         .route("/sessions/:session_id/git/file_versions", get(git_file_versions))
         .route("/sessions/:session_id/file/read", get(file_read))
+        .route("/sessions/:session_id/file/write", post(file_write))
         .route("/sessions/:session_id/file/search", get(file_search))
         .route("/sessions/:session_id/file/blob", get(file_blob))
         .route("/sessions/:session_id/messages/tail", get(messages_tail))
@@ -227,9 +226,16 @@ async fn service_worker() -> Result<Response, (StatusCode, String)> {
     static_file_response(load_legacy_static_file("service-worker.js"), true)
 }
 
-async fn legacy_entry_proxy(request: Request<Body>) -> Result<Response, (StatusCode, String)> {
-    let request_path = rewrite_legacy_path(request.uri());
-    proxy_legacy_request(request, Some(request_path)).await
+async fn legacy_index() -> Result<Response, (StatusCode, String)> {
+    static_file_response(load_legacy_static_file("index.html"), true)
+}
+
+async fn legacy_static(Path(path): Path<String>) -> Result<Response, (StatusCode, String)> {
+    let normalized = path.trim_matches('/');
+    if normalized.is_empty() {
+        return legacy_index().await;
+    }
+    static_file_response(load_legacy_static_file(normalized), true)
 }
 
 async fn legacy_manifest() -> Result<Response, (StatusCode, String)> {
@@ -274,94 +280,6 @@ fn static_file_response(
         headers.insert(header::EXPIRES, HeaderValue::from_static("0"));
     }
     Ok(response)
-}
-
-async fn proxy_legacy_request(
-    request: Request<Body>,
-    rewrite_path: Option<String>,
-) -> Result<Response, (StatusCode, String)> {
-    let target_base = legacy_backend_base();
-    proxy_request_to_base(&target_base, request, rewrite_path).await
-}
-
-async fn proxy_request_to_base(
-    target_base: &str,
-    request: Request<Body>,
-    rewrite_path: Option<String>,
-) -> Result<Response, (StatusCode, String)> {
-    let (parts, body) = request.into_parts();
-    let request_path = rewrite_path.unwrap_or_else(|| request_path_with_query(&parts.uri));
-    let url = format!("{target_base}{request_path}");
-    let request_body = to_bytes(body, usize::MAX)
-        .await
-        .map_err(|err| (StatusCode::BAD_GATEWAY, format!("proxy body read error: {err}")))?;
-    let client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
-    let mut upstream_request = Request::builder().method(parts.method).uri(&url);
-    for (name, value) in &parts.headers {
-        if should_skip_proxy_request_header(name.as_str()) {
-            continue;
-        }
-        upstream_request = upstream_request.header(name, value);
-    }
-    let upstream_request = upstream_request
-        .body(Full::new(request_body))
-        .map_err(|err| (StatusCode::BAD_GATEWAY, format!("proxy request build error: {err}")))?;
-    let upstream_response = tokio::time::timeout(Duration::from_secs(600), client.request(upstream_request))
-        .await
-        .map_err(|_| (StatusCode::BAD_GATEWAY, "proxy timeout".to_string()))?
-        .map_err(|err| (StatusCode::BAD_GATEWAY, format!("proxy error: {err}")))?;
-    let (upstream_parts, upstream_body) = upstream_response.into_parts();
-    let status = StatusCode::from_u16(upstream_parts.status.as_u16())
-        .map_err(|err| (StatusCode::BAD_GATEWAY, format!("invalid proxy status: {err}")))?;
-    let upstream_body = tokio::time::timeout(Duration::from_secs(600), upstream_body.collect())
-        .await
-        .map_err(|_| (StatusCode::BAD_GATEWAY, "proxy timeout".to_string()))?
-        .map_err(|err| (StatusCode::BAD_GATEWAY, format!("proxy error: {err}")))?
-        .to_bytes();
-    let mut response = Response::new(Body::from(upstream_body));
-    *response.status_mut() = status;
-    for (name, value) in &upstream_parts.headers {
-        if should_skip_proxy_response_header(name.as_str()) {
-            continue;
-        }
-        response.headers_mut().append(name, value.clone());
-    }
-    Ok(response)
-}
-
-fn legacy_backend_base() -> String {
-    env::var("CODEX_WEB_NOVA_LEGACY_BASE")
-        .ok()
-        .map(|value| value.trim().trim_end_matches('/').to_string())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "http://127.0.0.1:8744".to_string())
-}
-
-fn request_path_with_query(uri: &axum::http::Uri) -> String {
-    match uri.query() {
-        Some(query) => format!("{}?{query}", uri.path()),
-        None => uri.path().to_string(),
-    }
-}
-
-fn rewrite_legacy_path(uri: &axum::http::Uri) -> String {
-    let rewritten = uri.path().strip_prefix("/legacy").unwrap_or(uri.path());
-    let rewritten = if rewritten.is_empty() { "/" } else { rewritten };
-    match uri.query() {
-        Some(query) => format!("{rewritten}?{query}"),
-        None => rewritten.to_string(),
-    }
-}
-
-fn should_skip_proxy_request_header(name: &str) -> bool {
-    matches!(name.to_ascii_lowercase().as_str(), "host" | "content-length" | "connection")
-}
-
-fn should_skip_proxy_response_header(name: &str) -> bool {
-    matches!(
-        name.to_ascii_lowercase().as_str(),
-        "transfer-encoding" | "connection" | "server" | "date"
-    )
 }
 
 async fn health() -> Json<serde_json::Value> {
@@ -919,6 +837,16 @@ async fn file_read(
         .map_err(route_error)
 }
 
+async fn file_write(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<Value>)> {
+    save_file_write_response(&state.config, &session_id, &payload)
+        .map(Json)
+        .map_err(file_write_route_error)
+}
+
 async fn file_search(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
@@ -1045,6 +973,16 @@ fn route_error(message: String) -> (StatusCode, String) {
         return (StatusCode::NOT_FOUND, message);
     }
     (StatusCode::INTERNAL_SERVER_ERROR, message)
+}
+
+fn file_write_route_error(error: FileWriteError) -> (StatusCode, Json<Value>) {
+    match error {
+        FileWriteError::BadRequest(message) => json_error(StatusCode::BAD_REQUEST, &message, None),
+        FileWriteError::NotFound(message) => json_error(StatusCode::NOT_FOUND, &message, None),
+        FileWriteError::Forbidden(message) => json_error(StatusCode::FORBIDDEN, &message, None),
+        FileWriteError::Conflict(payload) => (StatusCode::CONFLICT, Json(payload)),
+        FileWriteError::Internal(message) => json_error(StatusCode::INTERNAL_SERVER_ERROR, &message, None),
+    }
 }
 
 fn settings_route_error(message: String) -> (StatusCode, String) {
@@ -1488,13 +1426,11 @@ async fn events(
 
 #[cfg(test)]
 mod tests {
-    use super::{json_response, router};
+    use super::router;
     use crate::app_state::{build_state, build_state_from_config};
     use crate::runtime::RuntimeConfig;
     use axum::body::{to_bytes, Body};
     use axum::http::{header, Request, StatusCode};
-    use axum::response::Response;
-    use axum::routing::{get, post};
     use serde_json::Value;
     use std::env;
     use std::fs;
@@ -1964,11 +1900,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_prefix_routes_strip_prefix_before_proxying() {
+    async fn legacy_routes_require_auth_and_serve_static_shell_from_rust() {
         let _guard = env_lock().lock().unwrap();
-        let app_dir = temp_app_dir("legacy-prefix-proxy");
+        let app_dir = temp_app_dir("legacy-static");
         let _password = EnvGuard::set("CODEX_WEB_PASSWORD", "topsecret");
-        let _legacy_base = EnvGuard::set("CODEX_WEB_NOVA_LEGACY_BASE", spawn_mock_legacy_backend());
         let app = router(build_state_from_config(RuntimeConfig { app_dir }).unwrap());
         let cookie = login_cookie(&app).await;
 
@@ -1979,41 +1914,37 @@ mod tests {
             .unwrap();
         assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
 
-        let nested = app
+        let index = app
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/legacy/files/view?tab=diff")
+                    .uri("/legacy/")
                     .header(header::COOKIE, cookie.clone())
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(nested.status(), StatusCode::OK);
-        let nested_body = to_bytes(nested.into_body(), usize::MAX).await.unwrap();
-        let nested_payload: Value = serde_json::from_slice(&nested_body).unwrap();
-        assert_eq!(nested_payload["path"], "/files/view");
-        assert_eq!(nested_payload["query"], "tab=diff");
+        assert_eq!(index.status(), StatusCode::OK);
+        let index_body = to_bytes(index.into_body(), usize::MAX).await.unwrap();
+        let index_text = String::from_utf8(index_body.to_vec()).unwrap();
+        assert!(index_text.contains("window.CODOXEAR_ASSET_VERSION = \""));
+        assert!(index_text.contains("window.CODOXEAR_ATTACH_MAX_BYTES = 16777216"));
+        assert!(!index_text.contains("__CODOXEAR_ASSET_VERSION__"));
+        assert!(!index_text.contains("__CODOXEAR_ATTACH_MAX_BYTES__"));
 
-        let root = app
+        let app_js = app
             .oneshot(
                 Request::builder()
-                    .method("POST")
-                    .uri("/legacy?source=rust")
-                    .header(header::CONTENT_TYPE, "text/plain")
+                    .uri("/legacy/app.js")
                     .header(header::COOKIE, cookie)
-                    .body(Body::from("legacy-body"))
+                    .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(root.status(), StatusCode::OK);
-        let root_body = to_bytes(root.into_body(), usize::MAX).await.unwrap();
-        let root_payload: Value = serde_json::from_slice(&root_body).unwrap();
-        assert_eq!(root_payload["path"], "/");
-        assert_eq!(root_payload["query"], "source=rust");
-        assert_eq!(root_payload["body"], "legacy-body");
+        assert_eq!(app_js.status(), StatusCode::OK);
+        assert_eq!(app_js.headers().get(header::CONTENT_TYPE).unwrap(), "text/javascript; charset=utf-8");
     }
 
     #[tokio::test]
@@ -2351,72 +2282,6 @@ mod tests {
             .to_str()
             .unwrap()
             .to_string()
-    }
-
-    fn spawn_mock_legacy_backend() -> String {
-        async fn echo_request(request: Request<Body>) -> Response {
-            let (parts, body) = request.into_parts();
-            let body = to_bytes(body, usize::MAX).await.unwrap();
-            json_response(
-                StatusCode::OK,
-                serde_json::json!({
-                    "method": parts.method.as_str(),
-                    "path": parts.uri.path(),
-                    "query": parts.uri.query().unwrap_or_default(),
-                    "cookie": parts
-                        .headers
-                        .get(header::COOKIE)
-                        .and_then(|value| value.to_str().ok())
-                        .unwrap_or_default(),
-                    "body": String::from_utf8_lossy(&body).to_string(),
-                }),
-            )
-        }
-
-        async fn playlist_request(request: Request<Body>) -> Response {
-            let cookie = request
-                .headers()
-                .get(header::COOKIE)
-                .and_then(|value| value.to_str().ok())
-                .unwrap_or_default();
-            let raw = format!("#EXTM3U\n# cookie:{cookie}\n");
-            let mut response = Response::new(Body::from(raw));
-            *response.status_mut() = StatusCode::OK;
-            response.headers_mut().insert(
-                header::CONTENT_TYPE,
-                header::HeaderValue::from_static("application/vnd.apple.mpegurl"),
-            );
-            response
-        }
-
-        async fn segment_request(request: Request<Body>) -> Response {
-            let segment = request
-                .uri()
-                .path()
-                .split("/api/audio/segments/")
-                .nth(1)
-                .unwrap_or_default();
-            Response::new(Body::from(format!("segment:{segment}")))
-        }
-
-        let router = axum::Router::new()
-            .route("/api/settings/voice", get(echo_request).post(echo_request))
-            .route("/api/notifications/message", get(echo_request))
-            .route("/api/notifications/feed", get(echo_request))
-            .route("/api/audio/live.m3u8", get(playlist_request))
-            .route("/api/audio/listener", post(echo_request))
-            .route("/api/audio/segments/*path", get(segment_request))
-            .route("/", get(echo_request).post(echo_request))
-            .route("/*path", get(echo_request).post(echo_request));
-
-        let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = std_listener.local_addr().unwrap();
-        std_listener.set_nonblocking(true).unwrap();
-        let listener = tokio::net::TcpListener::from_std(std_listener).unwrap();
-        tokio::spawn(async move {
-            axum::serve(listener, router).await.unwrap();
-        });
-        format!("http://{addr}")
     }
 
     #[tokio::test]
@@ -2952,6 +2817,165 @@ mod tests {
         assert_eq!(blob.status(), StatusCode::OK);
         assert_eq!(blob.headers()[header::CONTENT_TYPE], "image/png");
         listener_thread.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn public_file_write_route_accepts_rust_cookie_and_updates_file_history() {
+        let _guard = env_lock().lock().unwrap();
+        let app_dir = temp_app_dir("file-write-public");
+        let repo_dir = app_dir.join("repo");
+        fs::create_dir_all(&repo_dir).unwrap();
+        let file_path = repo_dir.join("notes.txt");
+        fs::write(&file_path, "old\n").unwrap();
+        fs::write(app_dir.join("socks").join("sid-write.sock"), "").unwrap();
+        fs::write(
+            app_dir.join("socks").join("sid-write.json"),
+            format!(
+                r#"{{"session_id":"thread-write","codex_pid":{},"broker_pid":{},"cwd":"{}","start_ts":11.0}}"#,
+                std::process::id(),
+                std::process::id(),
+                repo_dir.display(),
+            ),
+        )
+        .unwrap();
+        fs::write(
+            app_dir.join("session_files.json"),
+            r#"{"sid-write":["legacy.txt"],"other":["keep.txt"]}"#,
+        )
+        .unwrap();
+        let _password = EnvGuard::set("CODEX_WEB_PASSWORD", "topsecret");
+        let app = router(build_state_from_config(RuntimeConfig { app_dir: app_dir.clone() }).unwrap());
+
+        let unauthorized = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/sessions/sid-write/file/write")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"path":"notes.txt","text":"new\n","version":"stale"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let cookie = login_cookie(&app).await;
+        let current = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/sessions/sid-write/file/read?path=notes.txt")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(current.status(), StatusCode::OK);
+        let current_body = to_bytes(current.into_body(), usize::MAX).await.unwrap();
+        let current_payload: Value = serde_json::from_slice(&current_body).unwrap();
+        let version = current_payload["version"].as_str().unwrap().to_string();
+
+        let save = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/sessions/sid-write/file/write")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, cookie)
+                    .body(Body::from(format!(
+                        r#"{{"path":"notes.txt","text":"new\n","version":"{}"}}"#,
+                        version,
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(save.status(), StatusCode::OK);
+        let save_body = to_bytes(save.into_body(), usize::MAX).await.unwrap();
+        let save_payload: Value = serde_json::from_slice(&save_body).unwrap();
+        assert_eq!(save_payload["ok"], true);
+        assert_eq!(save_payload["rel"], "notes.txt");
+        assert_eq!(fs::read_to_string(&file_path).unwrap(), "new\n");
+
+        let files: Value = serde_json::from_str(&fs::read_to_string(app_dir.join("session_files.json")).unwrap()).unwrap();
+        assert_eq!(files["sid:sid-write"][0], file_path.display().to_string());
+        assert!(files.get("sid-write").is_none());
+        assert_eq!(files["other"][0], "keep.txt");
+    }
+
+    #[tokio::test]
+    async fn file_write_route_supports_create_and_conflict_responses() {
+        let app_dir = temp_app_dir("file-write-conflicts");
+        let repo_dir = app_dir.join("repo");
+        fs::create_dir_all(repo_dir.join("nested")).unwrap();
+        fs::write(app_dir.join("socks").join("sid-write.sock"), "").unwrap();
+        fs::write(
+            app_dir.join("socks").join("sid-write.json"),
+            format!(
+                r#"{{"session_id":"thread-write","codex_pid":{},"broker_pid":{},"cwd":"{}","start_ts":11.0}}"#,
+                std::process::id(),
+                std::process::id(),
+                repo_dir.display(),
+            ),
+        )
+        .unwrap();
+        let app = router(build_state_from_config(RuntimeConfig { app_dir }).unwrap());
+
+        let create = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/sessions/sid-write/file/write")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"path":"nested/new.txt","text":"created\n","create":true}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(create.status(), StatusCode::OK);
+        let create_body = to_bytes(create.into_body(), usize::MAX).await.unwrap();
+        let create_payload: Value = serde_json::from_slice(&create_body).unwrap();
+        assert_eq!(create_payload["rel"], "nested/new.txt");
+        assert_eq!(fs::read_to_string(repo_dir.join("nested").join("new.txt")).unwrap(), "created\n");
+
+        let create_conflict = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/sessions/sid-write/file/write")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"path":"nested/new.txt","text":"again\n","create":true}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(create_conflict.status(), StatusCode::CONFLICT);
+        let create_conflict_body = to_bytes(create_conflict.into_body(), usize::MAX).await.unwrap();
+        let create_conflict_payload: Value = serde_json::from_slice(&create_conflict_body).unwrap();
+        assert_eq!(create_conflict_payload["error"], "file already exists");
+        assert_eq!(create_conflict_payload["conflict"], true);
+        assert!(create_conflict_payload.get("version").is_some());
+
+        let stale = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/sessions/sid-write/file/write")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"path":"nested/new.txt","text":"stale\n","version":"old-version"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stale.status(), StatusCode::CONFLICT);
+        let stale_body = to_bytes(stale.into_body(), usize::MAX).await.unwrap();
+        let stale_payload: Value = serde_json::from_slice(&stale_body).unwrap();
+        assert_eq!(stale_payload["error"], "file changed on disk");
+        assert_eq!(stale_payload["conflict"], true);
+        assert!(stale_payload.get("version").is_some());
     }
 
     #[tokio::test]
