@@ -37,8 +37,8 @@ const DEFAULT_SUMMARIZATION_MODEL: &str = "gpt-4.1-mini";
 const DEFAULT_TTS_MODEL: &str = "gpt-4o-mini-tts";
 const DEFAULT_TTS_BASE_URL: &str = "https://api.openai.com/v1";
 const LISTENER_TTL_SECONDS: f64 = 45.0;
-const HARNESS_DEFAULT_IDLE_MINUTES: f64 = 15.0;
-const HARNESS_DEFAULT_MAX_INJECTIONS: i64 = 1;
+const HARNESS_DEFAULT_IDLE_MINUTES: f64 = 5.0;
+const HARNESS_DEFAULT_MAX_INJECTIONS: i64 = 10;
 const STATIC_ASSET_VERSION_PLACEHOLDER: &str = "__CODOXEAR_ASSET_VERSION__";
 const STATIC_ATTACH_MAX_BYTES_PLACEHOLDER: &str = "__CODOXEAR_ATTACH_MAX_BYTES__";
 const STATIC_ASSET_VERSION_FILES: &[&str] = &["app.js", "app.css"];
@@ -51,14 +51,49 @@ const GIT_DIFF_MAX_BYTES: usize = 800 * 1024;
 const GIT_DIFF_TIMEOUT_SECONDS: f64 = 4.0;
 const GIT_CHANGED_FILES_MAX: usize = 400;
 const LOCAL_SERVICE_RESTART_DELAY_SECONDS: f64 = 0.75;
+const DEFAULT_HARNESS_SWEEP_SECONDS: f64 = 2.5;
 const DEFAULT_QUEUE_SWEEP_SECONDS: f64 = 1.0;
 const DEFAULT_QUEUE_IDLE_GRACE_SECONDS: f64 = 10.0;
+const DEFAULT_HARNESS_MAX_SCAN_BYTES: usize = 8 * 1024 * 1024;
 const SIDEBAR_PRIORITY_HALF_LIFE_SECONDS: f64 = 8.0 * 3600.0;
 const SIDEBAR_PRIORITY_LAMBDA: f64 = std::f64::consts::LN_2 / SIDEBAR_PRIORITY_HALF_LIFE_SECONDS;
 const SUPPORTED_REASONING_EFFORTS: &[&str] = &["xhigh", "high", "medium", "low"];
 const SUPPORTED_PI_REASONING_EFFORTS: &[&str] = &["off", "minimal", "low", "medium", "high", "xhigh"];
 const BUILTIN_PI_PROVIDER_CHOICES: &[&str] = &["anthropic", "openai-codex", "github-copilot", "google-gemini-cli", "google-antigravity"];
 const TMUX_META_WAIT_SECONDS: f64 = 10.0;
+const HARNESS_PROMPT_PREFIX: &str = r#"Unattended-mode instructions (optimize for 8+ hours, minimal turns, minimal repetition, maximal progress)
+
+- Maintain four internal sections:
+  1. Deliverables
+     - The concrete outputs the agent owes the user by the end of the task.
+     - Stable unless the user changes the request.
+  2. Completed
+     - Verified facts already established while producing the Deliverables.
+  3. Next actions
+     - Ordered concrete steps from the current state toward the Deliverables.
+  4. Parked user decisions
+     - Decisions or inputs that only the user can provide.
+
+- Working rules:
+  - Keep these sections internal. Surface them only when yielding is necessary.
+  - Default to continuing in the same turn.
+  - Before each action, reason until the approach, failure modes, and verification path are clear.
+  - Exploration should happen through reading, tracing, inspection, and reasoning.
+  - Avoid trial and error.
+  - Resolve crashes, bugs, and design mistakes yourself unless a true user decision is required.
+  - Use the strongest available verification.
+  - Do not repeat the same command, edit, or analysis without a concrete new reason.
+
+- Yield only when:
+  - all Deliverables are finished and supported by Completed;
+  - the only remaining gap is a Parked user decision;
+  - or the next step is irreversible or high-risk and needs explicit user confirmation.
+
+- End-of-turn gate (only when yielding is necessary):
+  - Run a clean-room adversarial review via a dedicated subagent.
+  - Give it: user intent, Deliverables, Completed, remaining Next actions, Parked user decisions, constraints, and changed artifacts.
+  - Apply findings before yielding, or surface the exact remaining user decision or risk.
+"#;
 static QUEUE_ITEM_COUNTER: AtomicU64 = AtomicU64::new(0);
 const ASK_USER_TOOL_NAMES: &[&str] = &["ask_user", "AskUserQuestion"];
 const EXTENSION_DISPLAY_KEY: &str = "codoxear_display";
@@ -1490,6 +1525,54 @@ pub fn rust_queue_sweep_enabled() -> bool {
         .unwrap_or(false)
 }
 
+pub fn rust_harness_sweep_enabled() -> bool {
+    env::var("CODOXEAR_ENABLE_HARNESS_SWEEP")
+        .ok()
+        .map(|value| value.trim() == "1")
+        .unwrap_or(false)
+}
+
+pub fn spawn_harness_sweep_worker(config: RuntimeConfig) {
+    tokio::spawn(async move {
+        let mut last_injected: HashMap<String, f64> = HashMap::new();
+        let mut last_injected_scope: HashMap<String, f64> = HashMap::new();
+        let mut interval = time::interval(harness_sweep_interval());
+        interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            let sweep_config = config.clone();
+            let prior_last_injected = std::mem::take(&mut last_injected);
+            let prior_last_injected_scope = std::mem::take(&mut last_injected_scope);
+            match task::spawn_blocking(move || {
+                let mut next_last_injected = prior_last_injected;
+                let mut next_last_injected_scope = prior_last_injected_scope;
+                let result = run_harness_sweep_once(
+                    &sweep_config,
+                    &mut next_last_injected,
+                    &mut next_last_injected_scope,
+                    epoch_now(),
+                );
+                (next_last_injected, next_last_injected_scope, result)
+            })
+            .await
+            {
+                Ok((next_last_injected, next_last_injected_scope, Ok(_did_send))) => {
+                    last_injected = next_last_injected;
+                    last_injected_scope = next_last_injected_scope;
+                }
+                Ok((next_last_injected, next_last_injected_scope, Err(err))) => {
+                    last_injected = next_last_injected;
+                    last_injected_scope = next_last_injected_scope;
+                    tracing::warn!("rust harness sweep failed: {err}");
+                }
+                Err(err) => {
+                    tracing::warn!("rust harness sweep task join failed: {err}");
+                }
+            }
+        }
+    });
+}
+
 pub fn spawn_queue_sweep_worker(config: RuntimeConfig) {
     tokio::spawn(async move {
         let mut idle_since: HashMap<String, f64> = HashMap::new();
@@ -1652,6 +1735,141 @@ fn run_queue_sweep_once(
         write_queue_map(&queue_path, &queues)?;
     }
     Ok(false)
+}
+
+fn run_harness_sweep_once(
+    config: &RuntimeConfig,
+    last_injected: &mut HashMap<String, f64>,
+    last_injected_scope: &mut HashMap<String, f64>,
+    now_ts: f64,
+) -> Result<bool, String> {
+    let harness_path = config.app_dir.join("harness.json");
+    let queue_path = config.app_dir.join("session_queues.json");
+    let mut harness = read_object_map(&harness_path)?;
+    let queues = read_array_map(&queue_path)?;
+    let sessions = load_sessions_response(config)?;
+    let session_by_id = sessions
+        .sessions
+        .into_iter()
+        .map(|session| (session.session_id.clone(), session))
+        .collect::<HashMap<_, _>>();
+
+    let mut session_ids = session_by_id.keys().cloned().collect::<Vec<_>>();
+    session_ids.sort();
+    let mut did_send = false;
+
+    for session_id in session_ids {
+        let Some(session) = session_by_id.get(&session_id) else {
+            continue;
+        };
+        let Some(entry) = harness.get(&session_id).cloned() else {
+            continue;
+        };
+        if !object_bool(Some(&entry), "enabled").unwrap_or(false) {
+            continue;
+        }
+        let cooldown_minutes = entry
+            .get("cooldown_minutes")
+            .map(clean_harness_cooldown_minutes_value)
+            .transpose()?
+            .unwrap_or(HARNESS_DEFAULT_IDLE_MINUTES as i64);
+        let cooldown_seconds = (cooldown_minutes as f64) * 60.0;
+        let remaining_injections = entry
+            .get("remaining_injections")
+            .map(|value| clean_harness_remaining_injections_value(value, true))
+            .transpose()?
+            .unwrap_or(HARNESS_DEFAULT_MAX_INJECTIONS);
+        if remaining_injections <= 0 {
+            let mut updated = entry.as_object().cloned().unwrap_or_default();
+            updated.insert("enabled".to_string(), Value::Bool(false));
+            updated.insert("remaining_injections".to_string(), json!(0));
+            harness.insert(session_id.clone(), Value::Object(updated));
+            write_object_map(&harness_path, &harness)?;
+            last_injected.remove(&session_id);
+            continue;
+        }
+
+        let request = object_string(Some(&entry), "request");
+        let prompt = render_harness_prompt(request.as_deref());
+        let Some(log_path) = session.log_path.as_deref().map(PathBuf::from) else {
+            continue;
+        };
+        if !log_path.exists() {
+            continue;
+        }
+        let scope_key = session
+            .thread_id
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .map(|thread_id| format!("thread:{thread_id}"))
+            .unwrap_or_else(|| format!("log:{}", log_path.display()));
+        let session_last = last_injected.get(&session_id).copied().unwrap_or(0.0);
+        let scope_last = last_injected_scope.get(&scope_key).copied().unwrap_or(0.0);
+        if (session_last > 0.0 && (now_ts - session_last) < cooldown_seconds)
+            || (scope_last > 0.0 && (now_ts - scope_last) < cooldown_seconds)
+        {
+            continue;
+        }
+
+        let broker_state = match read_live_broker_state(config, session) {
+            Ok(state) => state,
+            Err(err) => {
+                tracing::warn!("rust harness sweep skipped session {}: {}", session_id, err);
+                continue;
+            }
+        };
+        let persisted_queue_len = normalized_queue_values(
+            queues.get(&session_id).map(Vec::as_slice).unwrap_or(&[]),
+        )
+        .len();
+        if broker_state.busy || broker_state._queue_len > 0 || persisted_queue_len > 0 {
+            continue;
+        }
+
+        let Some((role, ts)) = last_chat_role_ts_from_log(&log_path) else {
+            continue;
+        };
+        if role != "assistant" || (now_ts - ts) < cooldown_seconds {
+            continue;
+        }
+        let scope_last = last_injected_scope.get(&scope_key).copied().unwrap_or(0.0);
+        if scope_last > 0.0 && (now_ts - scope_last) < cooldown_seconds {
+            continue;
+        }
+
+        let send_result = broker_request_for_session(
+            config,
+            session,
+            &json!({"cmd": "send", "text": prompt}),
+            Duration::from_secs_f64(3.0),
+        )
+        .and_then(|response| {
+            if !response.is_object() || response.get("queue_len").and_then(Value::as_u64).is_none() {
+                return Err("invalid broker send response".to_string());
+            }
+            Ok(response)
+        });
+        if let Err(err) = send_result {
+            tracing::warn!("rust harness sweep skipped session {}: {}", session_id, err);
+            continue;
+        }
+
+        did_send = true;
+        last_injected.insert(session_id.clone(), now_ts);
+        last_injected_scope.insert(scope_key, now_ts);
+
+        let mut updated = entry.as_object().cloned().unwrap_or_default();
+        let next_remaining = std::cmp::max(0_i64, remaining_injections - 1);
+        updated.insert("remaining_injections".to_string(), json!(next_remaining));
+        if next_remaining <= 0 {
+            updated.insert("enabled".to_string(), Value::Bool(false));
+            last_injected.remove(&session_id);
+        }
+        harness.insert(session_id.clone(), Value::Object(updated));
+        write_object_map(&harness_path, &harness)?;
+    }
+
+    Ok(did_send)
 }
 
 pub fn load_harness_response(config: &RuntimeConfig, session_id: &str) -> Result<ApiHarnessResponse, String> {
@@ -3204,12 +3422,39 @@ fn queue_sweep_interval() -> Duration {
     Duration::from_secs_f64(seconds)
 }
 
+fn harness_sweep_interval() -> Duration {
+    let seconds = env::var("CODEX_WEB_HARNESS_SWEEP_SECONDS")
+        .ok()
+        .and_then(|value| value.trim().parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .unwrap_or(DEFAULT_HARNESS_SWEEP_SECONDS);
+    Duration::from_secs_f64(seconds)
+}
+
 fn queue_idle_grace_seconds() -> f64 {
     env::var("CODEX_WEB_QUEUE_IDLE_GRACE_SECONDS")
         .ok()
         .and_then(|value| value.trim().parse::<f64>().ok())
         .filter(|value| value.is_finite() && *value >= 0.0)
         .unwrap_or(DEFAULT_QUEUE_IDLE_GRACE_SECONDS)
+}
+
+fn harness_max_scan_bytes() -> usize {
+    env::var("CODEX_WEB_HARNESS_MAX_SCAN_BYTES")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_HARNESS_MAX_SCAN_BYTES)
+}
+
+fn render_harness_prompt(request: Option<&str>) -> String {
+    let base = HARNESS_PROMPT_PREFIX.trim_end();
+    let request_text = request.unwrap_or_default().trim();
+    if request_text.is_empty() {
+        format!("{base}\n")
+    } else {
+        format!("{base}\n\n---\n\nAdditional request from user: {request_text}\n")
+    }
 }
 
 fn map_io_error(err: std::io::Error) -> String {
@@ -6485,6 +6730,84 @@ fn compute_idle_from_log(path: &Path) -> Option<bool> {
     Some(idle)
 }
 
+fn last_chat_role_ts_from_log(path: &Path) -> Option<(&'static str, f64)> {
+    let records = read_positioned_records(path).ok()?;
+    if records.is_empty() {
+        return None;
+    }
+    let max_scan_bytes = harness_max_scan_bytes() as u64;
+    let file_size = file_len(path).ok()?;
+    let start_byte = file_size.saturating_sub(max_scan_bytes);
+
+    let mut last_user: Option<(u64, f64)> = None;
+    let mut last_assistant: Option<(u64, f64)> = None;
+    for record in records {
+        if record.start < start_byte {
+            continue;
+        }
+        let obj = &record.obj;
+        match obj.get("type").and_then(Value::as_str) {
+            Some("message") => {
+                if pi_user_text_value(obj).is_some() {
+                    if let Some(ts) = event_ts(obj) {
+                        last_user = Some((record.start, ts));
+                    }
+                    continue;
+                }
+                if pi_assistant_text_value(obj).is_some() || pi_message_keeps_turn_busy(obj) {
+                    if let Some(ts) = event_ts(obj) {
+                        last_assistant = Some((record.start, ts));
+                    }
+                    continue;
+                }
+            }
+            Some("event_msg") => {
+                let Some(payload) = obj.get("payload").and_then(Value::as_object) else {
+                    continue;
+                };
+                match payload.get("type").and_then(Value::as_str) {
+                    Some("user_message") if payload.get("message").and_then(Value::as_str).is_some() => {
+                        if let Some(ts) = event_ts(obj) {
+                            last_user = Some((record.start, ts));
+                        }
+                    }
+                    Some("agent_message")
+                        if payload
+                            .get("message")
+                            .and_then(Value::as_str)
+                            .map(|text| !text.trim().is_empty())
+                            .unwrap_or(false) =>
+                    {
+                        if let Some(ts) = event_ts(obj) {
+                            last_assistant = Some((record.start, ts));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Some("response_item") if response_item_has_assistant_output(obj) => {
+                if let Some(ts) = event_ts(obj) {
+                    last_assistant = Some((record.start, ts));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    match (last_user, last_assistant) {
+        (Some((user_pos, user_ts)), Some((assistant_pos, assistant_ts))) => {
+            if assistant_pos > user_pos {
+                Some(("assistant", assistant_ts))
+            } else {
+                Some(("user", user_ts))
+            }
+        }
+        (Some((_user_pos, user_ts)), None) => Some(("user", user_ts)),
+        (None, Some((_assistant_pos, assistant_ts))) => Some(("assistant", assistant_ts)),
+        (None, None) => None,
+    }
+}
+
 fn sidebar_conversation_ts(obj: &Value) -> Option<f64> {
     match obj.get("type").and_then(Value::as_str) {
         Some("event_msg") => {
@@ -7290,8 +7613,9 @@ fn tmux_available() -> bool {
 mod tests {
     use super::{
         load_changed_files_response, load_file_search_response, load_git_diff_response,
-        load_git_file_versions_response, load_messages_history, load_messages_live,
-        load_messages_tail, load_sessions_response, run_queue_sweep_once, RuntimeConfig,
+        load_git_file_versions_response, load_harness_response, load_messages_history,
+        load_messages_live, load_messages_tail, load_sessions_response,
+        run_harness_sweep_once, run_queue_sweep_once, RuntimeConfig,
     };
     use serde_json::Value;
     use std::env;
@@ -8106,5 +8430,162 @@ name = "CRS"
             Some(value) => env::set_var("CODEX_WEB_QUEUE_IDLE_GRACE_SECONDS", value),
             None => env::remove_var("CODEX_WEB_QUEUE_IDLE_GRACE_SECONDS"),
         }
+    }
+
+    #[test]
+    fn load_harness_response_uses_python_defaults_when_fields_are_missing() {
+        let app_dir = temp_app_dir("harness-defaults");
+        fs::write(app_dir.join("socks").join("sid-harness.sock"), "").unwrap();
+        fs::write(
+            app_dir.join("socks").join("sid-harness.json"),
+            format!(
+                r#"{{"session_id":"thread-harness","codex_pid":{},"broker_pid":{},"cwd":"{}","start_ts":11.0}}"#,
+                std::process::id(),
+                std::process::id(),
+                app_dir.display(),
+            ),
+        )
+        .unwrap();
+        fs::write(app_dir.join("harness.json"), r#"{"sid-harness":{"enabled":true,"request":"keep going"}}"#).unwrap();
+
+        let response = load_harness_response(&RuntimeConfig { app_dir }, "sid-harness").unwrap();
+        assert!(response.enabled);
+        assert_eq!(response.request, "keep going");
+        assert_eq!(response.cooldown_minutes, 5.0);
+        assert_eq!(response.remaining_injections, 10);
+    }
+
+    #[test]
+    fn run_harness_sweep_once_injects_prompt_and_decrements_remaining() {
+        let app_dir = temp_app_dir("harness-worker");
+        let sock_path = app_dir.join("socks").join("sid-harness.sock");
+        let listener = UnixListener::bind(&sock_path).unwrap();
+        let listener_thread = thread::spawn(move || {
+            for _ in 0..4 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut line = String::new();
+                BufReader::new(stream.try_clone().unwrap()).read_line(&mut line).unwrap();
+                if line.contains("\"cmd\":\"send\"") {
+                    assert!(line.contains("Additional request from user: Keep going"));
+                    stream.write_all(b"{\"queued\":false,\"queue_len\":0}\n").unwrap();
+                    return;
+                }
+                stream.write_all(b"{\"busy\":false,\"queue_len\":0}\n").unwrap();
+            }
+            panic!("harness worker never injected prompt");
+        });
+
+        let log_path = app_dir.join("rollout.jsonl");
+        fs::write(
+            &log_path,
+            r#"{"type":"event_msg","payload":{"type":"agent_message","message":"done"},"ts":100.0}
+"#,
+        )
+        .unwrap();
+        fs::write(
+            app_dir.join("socks").join("sid-harness.json"),
+            format!(
+                r#"{{"session_id":"thread-harness","codex_pid":{},"broker_pid":{},"cwd":"{}","log_path":"{}","start_ts":11.0}}"#,
+                std::process::id(),
+                std::process::id(),
+                app_dir.display(),
+                log_path.display(),
+            ),
+        )
+        .unwrap();
+        fs::write(
+            app_dir.join("harness.json"),
+            r#"{"sid-harness":{"enabled":true,"request":"Keep going","cooldown_minutes":5,"remaining_injections":2}}"#,
+        )
+        .unwrap();
+
+        let config = RuntimeConfig { app_dir: app_dir.clone() };
+        let mut last_injected = std::collections::HashMap::new();
+        let mut last_injected_scope = std::collections::HashMap::new();
+        assert!(run_harness_sweep_once(&config, &mut last_injected, &mut last_injected_scope, 500.0).unwrap());
+        assert_eq!(last_injected.get("sid-harness").copied(), Some(500.0));
+        assert_eq!(last_injected_scope.get("thread:thread-harness").copied(), Some(500.0));
+
+        let harness_after: Value = serde_json::from_str(&fs::read_to_string(app_dir.join("harness.json")).unwrap()).unwrap();
+        assert_eq!(harness_after["sid-harness"]["remaining_injections"], 1);
+        assert_eq!(harness_after["sid-harness"]["enabled"], true);
+
+        listener_thread.join().unwrap();
+    }
+
+    #[test]
+    fn run_harness_sweep_once_dedupes_same_thread_scope() {
+        let app_dir = temp_app_dir("harness-worker-dedupe");
+        let sock_path = app_dir.join("socks").join("sid-a.sock");
+        let listener = UnixListener::bind(&sock_path).unwrap();
+        let listener_thread = thread::spawn(move || {
+            for _ in 0..4 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut line = String::new();
+                BufReader::new(stream.try_clone().unwrap()).read_line(&mut line).unwrap();
+                if line.contains("\"cmd\":\"send\"") {
+                    assert!(line.contains("Additional request from user: A"));
+                    stream.write_all(b"{\"queued\":false,\"queue_len\":0}\n").unwrap();
+                    return;
+                }
+                stream.write_all(b"{\"busy\":false,\"queue_len\":0}\n").unwrap();
+            }
+            panic!("harness worker never injected first same-thread prompt");
+        });
+
+        let log_a = app_dir.join("rollout-a.jsonl");
+        let log_b = app_dir.join("rollout-b.jsonl");
+        fs::write(
+            &log_a,
+            r#"{"type":"event_msg","payload":{"type":"agent_message","message":"done a"},"ts":100.0}
+"#,
+        )
+        .unwrap();
+        fs::write(
+            &log_b,
+            r#"{"type":"event_msg","payload":{"type":"agent_message","message":"done b"},"ts":100.0}
+"#,
+        )
+        .unwrap();
+        fs::write(
+            app_dir.join("socks").join("sid-a.json"),
+            format!(
+                r#"{{"session_id":"thread-shared","codex_pid":{},"broker_pid":{},"cwd":"{}","log_path":"{}","start_ts":11.0}}"#,
+                std::process::id(),
+                std::process::id(),
+                app_dir.display(),
+                log_a.display(),
+            ),
+        )
+        .unwrap();
+        fs::write(app_dir.join("socks").join("sid-b.sock"), "").unwrap();
+        fs::write(
+            app_dir.join("socks").join("sid-b.json"),
+            format!(
+                r#"{{"session_id":"thread-shared","codex_pid":{},"broker_pid":{},"cwd":"{}","log_path":"{}","start_ts":12.0}}"#,
+                std::process::id(),
+                std::process::id(),
+                app_dir.display(),
+                log_b.display(),
+            ),
+        )
+        .unwrap();
+        fs::write(
+            app_dir.join("harness.json"),
+            r#"{"sid-a":{"enabled":true,"request":"A","cooldown_minutes":5,"remaining_injections":2},"sid-b":{"enabled":true,"request":"B","cooldown_minutes":5,"remaining_injections":2}}"#,
+        )
+        .unwrap();
+
+        let config = RuntimeConfig { app_dir: app_dir.clone() };
+        let mut last_injected = std::collections::HashMap::new();
+        let mut last_injected_scope = std::collections::HashMap::new();
+        assert!(run_harness_sweep_once(&config, &mut last_injected, &mut last_injected_scope, 500.0).unwrap());
+
+        let harness_after: Value = serde_json::from_str(&fs::read_to_string(app_dir.join("harness.json")).unwrap()).unwrap();
+        assert_eq!(harness_after["sid-a"]["remaining_injections"], 1);
+        assert_eq!(harness_after["sid-b"]["remaining_injections"], 2);
+        assert_eq!(last_injected_scope.get("thread:thread-shared").copied(), Some(500.0));
+
+        listener_thread.join().unwrap();
     }
 }

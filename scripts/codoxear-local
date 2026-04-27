@@ -72,6 +72,7 @@ start_server() {
   app_dir="${CODOXEAR_APP_DIR:-$HOME/.local/share/codoxear}"
 
   setsid env \
+    CODEX_WEB_DISABLE_HARNESS_SWEEP=1 \
     CODEX_WEB_DISABLE_QUEUE_SWEEP=1 \
     "$PYTHON_BIN" -m codoxear.server --runtime-only >>"$WEB_LOG_FILE" 2>&1 < /dev/null &
   web_pid=$!
@@ -86,6 +87,7 @@ start_server() {
   setsid env \
     CODOXEAR_BIND_HOST=127.0.0.1 \
     CODOXEAR_BIND_PORT=8743 \
+    CODOXEAR_ENABLE_HARNESS_SWEEP=1 \
     CODOXEAR_ENABLE_QUEUE_SWEEP=1 \
     "$NOVA_BIN" >>"$RUST_LOG_FILE" 2>&1 < /dev/null &
   rust_pid=$!

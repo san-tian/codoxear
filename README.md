@@ -215,7 +215,8 @@ The Nova preview frontend uses same-origin `/api` by default in production. For 
 
 The local deploy helper `./scripts/codoxear-local` now runs two processes:
 - public Rust web entry on `:8743` redirecting `/` and `/nova/` to `/nova-preview/`, serving the Nova preview shell, the legacy shell at `/legacy/*`, and the migrated public `/api/*` routes
-- runtime-only Python companion process (no HTTP listen socket) for the remaining broker/harness/voice runtime work still shared by the Rust front door; delayed queue draining now runs in the Rust daemon worker
+- runtime-only Python companion process (no HTTP listen socket) for the remaining broker/voice runtime work still shared by the Rust front door; delayed queue draining and harness sweep both now run in Rust daemon workers
+- `CODEX_WEB_HARNESS_SWEEP_SECONDS` (default `2.5`)
 - `CODEX_WEB_QUEUE_SWEEP_SECONDS` (default `1.0`)
 - `CODEX_WEB_QUEUE_IDLE_GRACE_SECONDS` (default `10.0`)
 - `CODEX_WEB_DISCOVER_MIN_INTERVAL_SECONDS` (default `1.0`)

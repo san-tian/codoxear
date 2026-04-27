@@ -1,6 +1,9 @@
 use codoxear_backend_rs::app_state::build_state;
 use codoxear_backend_rs::routes::router;
-use codoxear_backend_rs::runtime::{rust_queue_sweep_enabled, spawn_queue_sweep_worker};
+use codoxear_backend_rs::runtime::{
+    rust_harness_sweep_enabled, rust_queue_sweep_enabled, spawn_harness_sweep_worker,
+    spawn_queue_sweep_worker,
+};
 use std::net::SocketAddr;
 use std::{env, net::IpAddr};
 use tower_http::cors::{Any, CorsLayer};
@@ -14,6 +17,9 @@ async fn main() {
         .init();
 
     let state = build_state();
+    if rust_harness_sweep_enabled() {
+        spawn_harness_sweep_worker(state.config.clone());
+    }
     if rust_queue_sweep_enabled() {
         spawn_queue_sweep_worker(state.config.clone());
     }

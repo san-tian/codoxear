@@ -17,6 +17,7 @@ def _make_manager() -> SessionManager:
     mgr._harness_last_injected_scope = {}
     mgr._discover_existing = lambda: None  # type: ignore[method-assign]
     mgr._prune_dead_sessions = lambda: None  # type: ignore[method-assign]
+    mgr._load_harness = lambda: None  # type: ignore[method-assign]
     mgr._save_harness = lambda: None  # type: ignore[method-assign]
     return mgr
 
@@ -48,6 +49,7 @@ class TestHarnessSweep(unittest.TestCase):
             )
 
             mgr = _make_manager()
+            mgr._load_harness = SessionManager._load_harness.__get__(mgr, SessionManager)  # type: ignore[method-assign]
             mgr._sessions["sid-a"] = _make_session(sid="sid-a", thread_id="thread-1", log_path=p)
             mgr._harness["sid-a"] = {"enabled": False, "request": "Stale", "cooldown_minutes": 5, "remaining_injections": 10}
 
