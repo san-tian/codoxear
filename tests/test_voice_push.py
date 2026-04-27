@@ -1,4 +1,5 @@
 import threading
+import time
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -530,6 +531,72 @@ class TestVoicePushCoordinator(unittest.TestCase):
                 device_class="mobile",
             )
             self.assertTrue(snapshot["subscriptions"][0]["notifications_enabled"])
+
+    def test_observe_messages_reloads_voice_settings_written_from_disk(self) -> None:
+        with TemporaryDirectory() as td:
+            stop_event = threading.Event()
+            stop_event.set()
+            settings_path = Path(td) / "voice_settings.json"
+            coord = VoicePushCoordinator(
+                app_dir=Path(td),
+                stop_event=stop_event,
+                settings_path=settings_path,
+                subscriptions_path=Path(td) / "push_subscriptions.json",
+                delivery_ledger_path=Path(td) / "voice_delivery_ledger.json",
+                vapid_private_key_path=Path(td) / "vapid.pem",
+            )
+            coord.set_settings(
+                {
+                    "tts_enabled_for_narration": False,
+                    "tts_enabled_for_final_response": False,
+                    "tts_base_url": "https://api.openai.com/v1",
+                    "tts_api_key": "test-key",
+                }
+            )
+            time.sleep(0.001)
+            settings_path.write_text(
+                '{"tts_enabled_for_narration": true, "tts_enabled_for_final_response": false, "tts_base_url": "https://api.openai.com/v1", "tts_api_key": "test-key"}\n',
+                encoding="utf-8",
+            )
+            coord.listener_heartbeat(client_id="listener-1", enabled=True)
+            coord.observe_messages(
+                session_id="sid-1",
+                session_display_name="Repo",
+                messages=_extract_delivery_messages(
+                    [
+                        {
+                            "type": "event_msg",
+                            "payload": {"type": "agent_message", "message": "working on it"},
+                            "ts": 2.0,
+                        }
+                    ]
+                ),
+            )
+            with coord._lock:
+                self.assertEqual(len(coord._queue), 1)
+
+    def test_subscriptions_snapshot_reloads_records_written_from_disk(self) -> None:
+        with TemporaryDirectory() as td:
+            stop_event = threading.Event()
+            stop_event.set()
+            subscriptions_path = Path(td) / "push_subscriptions.json"
+            coord = VoicePushCoordinator(
+                app_dir=Path(td),
+                stop_event=stop_event,
+                settings_path=Path(td) / "voice_settings.json",
+                subscriptions_path=subscriptions_path,
+                delivery_ledger_path=Path(td) / "voice_delivery_ledger.json",
+                vapid_private_key_path=Path(td) / "vapid.pem",
+            )
+            time.sleep(0.001)
+            subscriptions_path.write_text(
+                '[{"subscription":{"endpoint":"https://push.example.test/device/2","keys":{"p256dh":"abc","auth":"def"}},"notifications_enabled":false,"created_ts":1.0,"updated_ts":2.0,"user_agent":"Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X)","device_label":"phone","device_class":""}]\n',
+                encoding="utf-8",
+            )
+            snapshot = coord.subscriptions_snapshot()
+            self.assertEqual(len(snapshot["subscriptions"]), 1)
+            self.assertFalse(snapshot["subscriptions"][0]["notifications_enabled"])
+            self.assertEqual(snapshot["subscriptions"][0]["device_class"], "mobile")
 
     def test_narration_is_dropped_immediately_without_listener(self) -> None:
         with TemporaryDirectory() as td:

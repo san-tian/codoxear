@@ -53,6 +53,7 @@ const SIDEBAR_RESIZER_WIDTH_PX = 10;
 const MAIN_MIN_WIDTH_PX = 320;
 const DETAIL_RAIL_WIDTH_PX = 360;
 const DETAIL_RAIL_STACK_BREAKPOINT_PX = 1080;
+const MOBILE_SIDEBAR_BREAKPOINT_PX = 860;
 const IMPORTANT_PRIORITY_OFFSET = 0.85;
 
 type BusySubmitMode = "queue" | "interrupt";
@@ -113,6 +114,10 @@ function readBusySubmitMode(): BusySubmitMode {
 
 function readThemeMode(): ThemeMode {
   return readLocalStorage(THEME_MODE_KEY) === "light" ? "light" : "dark";
+}
+
+function isMobileViewportWidth(width = window.innerWidth) {
+  return width <= MOBILE_SIDEBAR_BREAKPOINT_PX;
 }
 
 function clampSidebarWidth(width: number, viewportWidth = window.innerWidth) {
@@ -363,10 +368,14 @@ function sessionIsQueuedWaiting(session: SessionSummary | null) {
   return Boolean(session && session.queue_len && !session.busy && !sessionIsStarting(session));
 }
 
-function sessionStatusText(session: SessionSummary) {
+function sessionIsRunning(session: SessionSummary | null, awaitingReply = false) {
+  return Boolean(session && (session.busy || sessionIsStarting(session) || awaitingReply));
+}
+
+function sessionStatusText(session: SessionSummary, awaitingReply = false) {
   if (session.queue_len) return `queue ${session.queue_len}`;
   if (sessionIsStarting(session)) return "starting";
-  if (session.busy) return "working";
+  if (sessionIsRunning(session, awaitingReply)) return "working";
   return "idle";
 }
 
@@ -590,6 +599,13 @@ function icon(name: string) {
           <path d="M3 4.5h10" />
           <path d="M3 8h10" />
           <path d="M3 11.5h10" />
+        </svg>
+      );
+    case "close":
+      return (
+        <svg {...common}>
+          <path d="M4 4 12 12" />
+          <path d="M12 4 4 12" />
         </svg>
       );
     case "terminal":
@@ -854,6 +870,8 @@ export function App() {
   const [loginPassword, setLoginPassword] = useState("");
   const [showTools, setShowTools] = useState(() => readLocalStorage(SHOW_TOOL_CALLS_KEY) !== "0");
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [mobileViewport, setMobileViewport] = useState(() => isMobileViewportWidth());
+  const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
   const [sidebarWidth, setSidebarWidth] = useState<number | null>(() => readStoredSidebarWidth());
   const [sidebarResizing, setSidebarResizing] = useState(false);
   const [workspaceOrder, setWorkspaceOrder] = useState<string[]>(() => readStoredStringList(SIDEBAR_WORKSPACE_ORDER_KEY));
@@ -963,6 +981,19 @@ export function App() {
     () => sessionById(sessions, renameSessionId) || selectedSession,
     [renameSessionId, selectedSession, sessions],
   );
+  const awaitingAssistantReply = useMemo(() => {
+    if (!selectedSession || queueLen) return false;
+    let latestUserTs = 0;
+    let latestAssistantTs = 0;
+    for (const event of transcript) {
+      const ts = Number(event.ts || 0);
+      if (!Number.isFinite(ts) || ts <= 0) continue;
+      if (event.kind === "user") latestUserTs = Math.max(latestUserTs, ts);
+      if (event.kind === "assistant") latestAssistantTs = Math.max(latestAssistantTs, ts);
+    }
+    return latestUserTs > latestAssistantTs;
+  }, [queueLen, selectedSession, transcript]);
+  const selectedSessionAwaitingReplyId = awaitingAssistantReply && selectedSessionId ? selectedSessionId : "";
   const workspaceGroups = useMemo(() => {
     const groups = new Map<
       string,
@@ -971,9 +1002,10 @@ export function App() {
     for (const session of sessions) {
       const key = workspaceKeyForSession(session);
       const group = groups.get(key) || { key, cwd: key, sessions: [], queueLen: 0, busyCount: 0, updatedTs: 0 };
+      const awaitingReply = session.session_id === selectedSessionAwaitingReplyId;
       group.sessions.push(session);
       group.queueLen += Number(session.queue_len || 0);
-      if (session.busy || sessionIsStarting(session)) group.busyCount += 1;
+      if (sessionIsRunning(session, awaitingReply)) group.busyCount += 1;
       group.updatedTs = Math.max(group.updatedTs, Number(session.updated_ts || session.start_ts || 0));
       groups.set(key, group);
     }
@@ -992,7 +1024,7 @@ export function App() {
       ),
     }));
     return partitionImportantFirst(orderedGroups, (group) => group.sessions.some((session) => sessionIsImportant(session)));
-  }, [selectedSessionId, sessionOrderByWorkspace, sessions, workspaceOrder]);
+  }, [selectedSessionAwaitingReplyId, selectedSessionId, sessionOrderByWorkspace, sessions, workspaceOrder]);
   const groupedSessions = workspaceGroups;
   const currentNewSessionDefaults = useMemo(
     () => defaultsForBackend(newSessionDefaults, newSessionBackend),
@@ -1030,18 +1062,6 @@ export function App() {
   );
   const tmuxCommand = useMemo(() => tmuxAttachCommandForSession(selectedSession), [selectedSession]);
   const queuePreviewItems = useMemo(() => queueItems.slice(0, 3), [queueItems]);
-  const awaitingAssistantReply = useMemo(() => {
-    if (!selectedSession || queueLen) return false;
-    let latestUserTs = 0;
-    let latestAssistantTs = 0;
-    for (const event of transcript) {
-      const ts = Number(event.ts || 0);
-      if (!Number.isFinite(ts) || ts <= 0) continue;
-      if (event.kind === "user") latestUserTs = Math.max(latestUserTs, ts);
-      if (event.kind === "assistant") latestAssistantTs = Math.max(latestAssistantTs, ts);
-    }
-    return latestUserTs > latestAssistantTs;
-  }, [queueLen, selectedSession, transcript]);
   const composerSessionBusy = Boolean(awaitingAssistantReply || busy || selectedSession?.busy);
   const displayedVoiceSettings = voiceSettings || EMPTY_VOICE_SETTINGS;
   const settingsInitialLoading = voiceSettingsLoading && !voiceSettings && !codexConfig;
@@ -1069,6 +1089,15 @@ export function App() {
     () => (sidebarWidth == null ? undefined : ({ "--sidebar-w": `${sidebarWidth}px` } as JSX.CSSProperties)),
     [sidebarWidth],
   );
+  const sidebarToggleTitle = mobileViewport
+    ? mobileSidebarOpen
+      ? "Hide sidebar"
+      : "Show sidebar"
+    : sidebarCollapsed
+      ? "Show sidebar"
+      : "Hide sidebar";
+  const sidebarTogglePressed = mobileViewport ? mobileSidebarOpen : sidebarCollapsed;
+  const mobileSidebarToggleLabel = mobileSidebarOpen ? "Close" : "Sessions";
 
   function sidebarRailWidth(viewportWidth = window.innerWidth) {
     return showFilesPanel || showDetailsPanel ? (viewportWidth > DETAIL_RAIL_STACK_BREAKPOINT_PX ? DETAIL_RAIL_WIDTH_PX : 0) : 0;
@@ -1120,6 +1149,18 @@ export function App() {
 
   function toggleWorkspaceGroup(workspaceKey: string) {
     setCollapsedWorkspaces((current) => ({ ...current, [workspaceKey]: !current[workspaceKey] }));
+  }
+
+  function closeMobileSidebar() {
+    setMobileSidebarOpen(false);
+  }
+
+  function toggleSidebarVisibility() {
+    if (mobileViewport) {
+      setMobileSidebarOpen((current) => !current);
+      return;
+    }
+    setSidebarCollapsed((current) => !current);
   }
 
   function handleSidebarResizeStart(event: SidebarPointerEvent) {
@@ -1223,6 +1264,7 @@ export function App() {
       stickToBottomRef.current = true;
       lastAutoScrollKeyRef.current = "";
     }
+    if (mobileViewport) closeMobileSidebar();
     setSelectedSessionId(sessionId);
     if (sessionId) {
       writeLocalStorage(SELECTED_SESSION_KEY, sessionId);
@@ -1973,7 +2015,7 @@ export function App() {
     const defaults = defaultsForBackend(newSessionDefaults, newSessionBackend) || defaultsForBackend(newSessionDefaults, "codex");
     setNewSessionCwd(selectedSession?.cwd || recentCwds[0] || "");
     setNewSessionCwdSuggestions([]);
-    setNewSessionCwdSuggestionsOpen(true);
+    setNewSessionCwdSuggestionsOpen(false);
     setNewSessionCwdSuggestionIndex(-1);
     setNewSessionCwdSuggestionError("");
     setNewSessionProvider(String(defaults?.provider_choice || ""));
@@ -2307,6 +2349,26 @@ export function App() {
   }, [themeMode]);
 
   useEffect(() => {
+    const syncViewport = () => setMobileViewport(isMobileViewportWidth());
+    syncViewport();
+    window.addEventListener("resize", syncViewport);
+    return () => window.removeEventListener("resize", syncViewport);
+  }, []);
+
+  useEffect(() => {
+    if (!mobileViewport) setMobileSidebarOpen(false);
+  }, [mobileViewport]);
+
+  useEffect(() => {
+    if (!mobileSidebarOpen) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") closeMobileSidebar();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [mobileSidebarOpen]);
+
+  useEffect(() => {
     writeLocalStorage(SIDEBAR_WORKSPACE_ORDER_KEY, JSON.stringify(workspaceOrder));
   }, [workspaceOrder]);
 
@@ -2506,18 +2568,31 @@ export function App() {
     <>
       <div
         ref={appRef}
-        className={`app${showFilesPanel || showDetailsPanel ? " withRail" : ""}${sidebarCollapsed ? " sidebarCollapsed" : ""}${sidebarResizing ? " sidebarResizing" : ""}`}
+        className={`app${showFilesPanel || showDetailsPanel ? " withRail" : ""}${sidebarCollapsed ? " sidebarCollapsed" : ""}${sidebarResizing ? " sidebarResizing" : ""}${mobileViewport ? " mobileLayout" : ""}${mobileSidebarOpen ? " mobileSidebarOpen" : ""}`}
         style={appStyle}
         onClick={() => setSessionContextMenu(null)}
       >
-        <aside className="sidebar" ref={sidebarRef}>
+        <aside className="sidebar" ref={sidebarRef} id="nova-sidebar">
           <header>
             <div className="title">
               <span className="sidebarLogoDot" />
               Codoxear Nova
             </div>
             <div className="actions">
-              <button className="icon-btn" type="button" title="New session" onClick={() => openNewSessionDialog()}>
+              {mobileViewport ? (
+                <button className="icon-btn mobileSidebarCloseBtn" type="button" title="Close sidebar" aria-label="Close sidebar" onClick={closeMobileSidebar}>
+                  {icon("close")}
+                </button>
+              ) : null}
+              <button
+                className="icon-btn"
+                type="button"
+                title="New session"
+                onClick={() => {
+                  closeMobileSidebar();
+                  openNewSessionDialog();
+                }}
+              >
                 {icon("plus")}
               </button>
               <button
@@ -2542,7 +2617,15 @@ export function App() {
               >
                 {icon("bell")}
               </button>
-              <button className="icon-btn" type="button" title="Voice settings" onClick={() => setSettingsOpen(true)}>
+              <button
+                className="icon-btn"
+                type="button"
+                title="Voice settings"
+                onClick={() => {
+                  closeMobileSidebar();
+                  setSettingsOpen(true);
+                }}
+              >
                 {icon("volume")}
               </button>
             </div>
@@ -2585,6 +2668,7 @@ export function App() {
                         const importantMarked = markerState === "important";
                         const hasDraft = Boolean((sessionDrafts[session.session_id] || "").trim());
                         const markerBusy = sessionMarkerBusyId === session.session_id;
+                        const sessionAwaitingReply = session.session_id === selectedSessionAwaitingReplyId;
                         const sessionDropClass =
                           sidebarDropIndicator?.kind === "session" && sidebarDropIndicator.key === session.session_id
                             ? ` is-drop-${sidebarDropIndicator.position}`
@@ -2608,11 +2692,11 @@ export function App() {
                                 <div className="workspaceTitleRow">
                                   <div className="workspaceTitle">{sessionDisplayName(session)}</div>
                                   {hasDraft ? <span className="workspaceDraftMark" title="Draft saved" aria-label="Draft saved" /> : null}
-                                  <div className={`status-dot ${sessionIsQueuedWaiting(session) ? "waiting" : session.busy || sessionIsStarting(session) ? "running" : "idle"}`} />
+                                  <div className={`status-dot ${sessionIsQueuedWaiting(session) ? "waiting" : sessionIsRunning(session, sessionAwaitingReply) ? "running" : "idle"}`} />
                                 </div>
                                 <div className="workspacePath">{session.git_branch ? session.git_branch : String(session.agent_backend || "codex").toUpperCase()}</div>
                                 <div className="workspaceMeta">
-                                  {String(session.agent_backend || "codex").toUpperCase()} · {sessionStatusText(session)} ·{" "}
+                                  {String(session.agent_backend || "codex").toUpperCase()} · {sessionStatusText(session, sessionAwaitingReply)} ·{" "}
                                   {relativeAge(session.updated_ts)}
                                 </div>
                               </div>
@@ -2645,16 +2729,32 @@ export function App() {
             })}
           </div>
           <footer>
-            <button type="button" onClick={() => setSettingsOpen(true)}>
+            <button
+              type="button"
+              onClick={() => {
+                closeMobileSidebar();
+                setSettingsOpen(true);
+              }}
+            >
               {icon("settings")}
               Settings
             </button>
-            <button type="button" onClick={() => void handleLogout()}>
+            <button
+              type="button"
+              onClick={() => {
+                closeMobileSidebar();
+                void handleLogout();
+              }}
+            >
               {icon("logout")}
               Log out
             </button>
           </footer>
         </aside>
+
+        {mobileViewport && mobileSidebarOpen ? (
+          <button className="sidebarBackdrop" type="button" aria-label="Close sidebar" onClick={closeMobileSidebar} />
+        ) : null}
 
         <div
           className="sidebarResizer"
@@ -2668,13 +2768,16 @@ export function App() {
           <div className="topbar">
             <div className="pill">
               <button
-                className="icon-btn"
+                className={mobileViewport ? "actionBtn topbarSidebarBtn" : "icon-btn"}
                 type="button"
-                title={sidebarCollapsed ? "Show sidebar" : "Hide sidebar"}
-                aria-pressed={sidebarCollapsed}
-                onClick={() => setSidebarCollapsed((current) => !current)}
+                title={sidebarToggleTitle}
+                aria-controls="nova-sidebar"
+                aria-expanded={mobileViewport ? mobileSidebarOpen : !sidebarCollapsed}
+                aria-pressed={sidebarTogglePressed}
+                onClick={toggleSidebarVisibility}
               >
                 {icon("menu")}
+                {mobileViewport ? <span>{mobileSidebarToggleLabel}</span> : null}
               </button>
               <div className="titleWrap">
                 <div className="titleRow">
@@ -2689,61 +2792,68 @@ export function App() {
             </div>
             <div className="actions topActions">
               <button
-                className="icon-btn"
+                className={mobileViewport ? "actionBtn mobileActionBtn" : "icon-btn"}
                 type="button"
                 title={selectedSession ? "Rename session" : "No session selected"}
                 disabled={!selectedSession}
                 onClick={() => openRenameDialog()}
               >
                 {icon("edit")}
+                {mobileViewport ? <span>Rename</span> : null}
               </button>
               <button
-                className={`icon-btn${showTools ? " active" : ""}`}
+                className={mobileViewport ? `actionBtn mobileActionBtn${showTools ? " active" : ""}` : `icon-btn${showTools ? " active" : ""}`}
                 type="button"
                 title={showTools ? "Hide tool calls" : "Show tool calls"}
                 onClick={() => setShowTools((current) => !current)}
               >
                 {icon("wrench")}
+                {mobileViewport ? <span>Tools</span> : null}
               </button>
               <button
-                className="icon-btn danger"
+                className={mobileViewport ? "actionBtn mobileActionBtn danger" : "icon-btn danger"}
                 type="button"
                 title={selectedSession ? "Close session" : "No session selected"}
                 disabled={!selectedSession || closingSession}
                 onClick={() => void handleCloseSession()}
               >
                 {icon("trash")}
+                {mobileViewport ? <span>Close</span> : null}
               </button>
               <button
-                className={`icon-btn${tmuxCommand ? " active" : ""}`}
+                className={mobileViewport ? `actionBtn mobileActionBtn${tmuxCommand ? " active" : ""}` : `icon-btn${tmuxCommand ? " active" : ""}`}
                 type="button"
                 title={tmuxCommand || "No tmux attach command for this session"}
                 disabled={!tmuxCommand}
                 onClick={() => void copyTmuxAttachCommand()}
               >
                 {icon("terminal")}
+                {mobileViewport ? <span>Tmux</span> : null}
               </button>
               <button
-                className={`icon-btn${showFilesPanel ? " active" : ""}`}
+                className={mobileViewport ? `actionBtn mobileActionBtn${showFilesPanel ? " active" : ""}` : `icon-btn${showFilesPanel ? " active" : ""}`}
                 type="button"
                 title="Files"
                 onClick={() => setShowFilesPanel((current) => !current)}
               >
                 {icon("file")}
+                {mobileViewport ? <span>Files</span> : null}
               </button>
               <button
-                className={`icon-btn${showDetailsPanel ? " active" : ""}`}
+                className={mobileViewport ? `actionBtn mobileActionBtn${showDetailsPanel ? " active" : ""}` : `icon-btn${showDetailsPanel ? " active" : ""}`}
                 type="button"
                 title="Details"
                 onClick={() => setShowDetailsPanel((current) => !current)}
               >
                 {icon("info")}
+                {mobileViewport ? <span>Details</span> : null}
               </button>
-              <button className="icon-btn" type="button" title="Interrupt" onClick={() => void handleInterrupt()}>
+              <button className={mobileViewport ? "actionBtn mobileActionBtn" : "icon-btn"} type="button" title="Interrupt" onClick={() => void handleInterrupt()}>
                 {icon("stop")}
+                {mobileViewport ? <span>Stop</span> : null}
               </button>
               <button
-                className={`icon-btn${selectedSession?.harness_enabled ? " active" : ""}`}
+                className={mobileViewport ? `actionBtn mobileActionBtn${selectedSession?.harness_enabled ? " active" : ""}` : `icon-btn${selectedSession?.harness_enabled ? " active" : ""}`}
                 type="button"
                 title="Harness mode"
                 onClick={() => {
@@ -2752,6 +2862,7 @@ export function App() {
                 }}
               >
                 {icon("harness")}
+                {mobileViewport ? <span>Harness</span> : null}
               </button>
             </div>
           </div>

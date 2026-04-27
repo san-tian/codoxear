@@ -109,6 +109,10 @@ def _match_session_route(path: str, *suffix: str) -> str | None:
 def _nova_incremental_v1_path(path: str, method: str) -> str | None:
     method_upper = str(method).upper()
     if method_upper == "GET":
+        if path in ("/api/me", "/api/session_resume_candidates", "/api/cwd_suggestions"):
+            return f"/api/v1{path[4:]}"
+        if path in ("/api/settings/codex_config", "/api/notifications/subscription"):
+            return f"/api/v1{path[4:]}"
         if path == "/api/sessions":
             return "/api/v1/sessions"
         for suffix in (
@@ -132,6 +136,10 @@ def _nova_incremental_v1_path(path: str, method: str) -> str | None:
             return f"/api/v1/sessions/{quoted_sid}/{'/'.join(suffix)}"
         return None
     if method_upper == "POST":
+        if path in ("/api/login", "/api/logout"):
+            return f"/api/v1{path[4:]}"
+        if path in ("/api/settings/codex_config", "/api/settings/restart_service", "/api/notifications/subscription", "/api/notifications/subscription/toggle"):
+            return f"/api/v1{path[4:]}"
         if path == "/api/sessions":
             return "/api/v1/sessions"
         for suffix in (("rename",), ("delete",), ("edit",), ("send",), ("interrupt",), ("enqueue",), ("harness",), ("inject_file",), ("inject_image",), ("queue", "delete"), ("queue", "update"), ("queue", "move")):
@@ -3674,6 +3682,7 @@ class SessionManager:
     def _queue_sweep(self) -> None:
         self._discover_existing_if_stale()
         self._prune_dead_sessions()
+        self._load_queues()
         with self._lock:
             # Drop queues for sessions that no longer exist.
             drop = [sid for sid in self._queues.keys() if sid not in self._sessions]
@@ -4931,7 +4940,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         incremental_v1_path = _nova_incremental_v1_path(path, self.command)
         if incremental_v1_path is not None:
             request_path = incremental_v1_path + (("?" + u.query) if u.query else "")
-            self._proxy_request(target_base=NOVA_API_BASE, request_path=request_path, body=body, require_auth=True)
+            self._proxy_request(
+                target_base=NOVA_API_BASE,
+                request_path=request_path,
+                body=body,
+                require_auth=(path != "/api/login"),
+            )
             return True
         request_path = path + (("?" + u.query) if u.query else "")
         if path.startswith("/api/v1/"):
@@ -5015,32 +5029,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._send_static(path[len("/static/") :])
                 return
 
-            if path == "/api/me":
-                if not _require_auth(self):
-                    self._unauthorized()
-                    return
-                _json_response(self, 200, {"ok": True, "server_pid": int(os.getpid())})
-                return
-
             if path == "/api/settings/voice":
                 if not _require_auth(self):
                     self._unauthorized()
                     return
                 _json_response(self, 200, {"ok": True, **MANAGER._voice_push.settings_snapshot()})
-                return
-
-            if path == "/api/settings/codex_config":
-                if not _require_auth(self):
-                    self._unauthorized()
-                    return
-                _json_response(self, 200, {"ok": True, **_read_codex_config_for_settings()})
-                return
-
-            if path == "/api/notifications/subscription":
-                if not _require_auth(self):
-                    self._unauthorized()
-                    return
-                _json_response(self, 200, {"ok": True, **MANAGER._voice_push.subscriptions_snapshot()})
                 return
 
             if path == "/api/notifications/message":
@@ -5132,56 +5125,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         "tmux_session_name": TMUX_SESSION_NAME,
                     },
                 )
-                return
-
-            if path == "/api/session_resume_candidates":
-                if not _require_auth(self):
-                    self._unauthorized()
-                    return
-                qs = urllib.parse.parse_qs(u.query)
-                cwd_raw = qs.get("cwd", [""])[0]
-                try:
-                    agent_backend = normalize_agent_backend(qs.get("agent_backend", [""])[0], default=DEFAULT_AGENT_BACKEND)
-                except ValueError as e:
-                    _json_response(self, 400, {"error": str(e)})
-                    return
-                try:
-                    cwd_path = _resolve_dir_target(str(cwd_raw), field_name="cwd")
-                except ValueError as e:
-                    _json_response(self, 400, {"error": str(e), "field": "cwd"})
-                    return
-                info = _describe_session_cwd(cwd_path)
-                rows = _list_resume_candidates_for_cwd(info["cwd"], agent_backend=agent_backend) if info["exists"] else []
-                for row in rows:
-                    sid = row.get("session_id")
-                    log_path_raw = row.get("log_path")
-                    alias = MANAGER.alias_get(sid) if isinstance(sid, str) and sid else ""
-                    preview = ""
-                    if isinstance(log_path_raw, str) and log_path_raw:
-                        preview = _last_user_message_preview_from_log(Path(log_path_raw))
-                    row["alias"] = alias
-                    row["last_user_message"] = preview
-                _json_response(self, 200, {"ok": True, **info, "sessions": rows})
-                return
-
-            if path == "/api/cwd_suggestions":
-                if not _require_auth(self):
-                    self._unauthorized()
-                    return
-                qs = urllib.parse.parse_qs(u.query)
-                raw_query = qs.get("q", [""])[0]
-                limit_raw = qs.get("limit", ["12"])[0]
-                try:
-                    limit = int(limit_raw)
-                except ValueError:
-                    _json_response(self, 400, {"error": "limit must be an integer", "field": "limit"})
-                    return
-                try:
-                    payload = _list_directory_suggestions(raw_query, recent_cwds=MANAGER.recent_cwds(limit=limit * 2), limit=limit)
-                except (ValueError, OSError) as e:
-                    _json_response(self, 400, {"error": str(e), "field": "cwd"})
-                    return
-                _json_response(self, 200, payload)
                 return
 
             if path == "/api/metrics":
@@ -5906,39 +5849,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     return
             path = self._strip_alt_shell_prefix(path)
 
-            if path == "/api/login":
-                body = _read_body(self)
-                body_text = body.decode("utf-8")
-                if not body_text.strip():
-                    raise ValueError("empty request body")
-                obj = json.loads(body_text)
-                if not isinstance(obj, dict):
-                    raise ValueError("invalid json body (expected object)")
-                pw = obj.get("password")
-                if not isinstance(pw, str) or not _is_same_password(pw):
-                    _json_response(self, 403, {"error": "bad password"})
-                    return
-                self.send_response(200)
-                _set_auth_cookie(self)
-                self.send_header("Content-Type", "application/json; charset=utf-8")
-                self.end_headers()
-                self.wfile.write(b'{"ok":true}')
-                return
-
-            if path == "/api/logout":
-                if not _require_auth(self):
-                    self._unauthorized()
-                    return
-                self.send_response(200)
-                self.send_header(
-                    "Set-Cookie",
-                    f"{COOKIE_NAME}=deleted; Path={COOKIE_PATH}; Max-Age=0; HttpOnly; SameSite=Strict",
-                )
-                self.send_header("Content-Type", "application/json; charset=utf-8")
-                self.end_headers()
-                self.wfile.write(b'{"ok":true}')
-                return
-
             if path == "/api/settings/voice":
                 if not _require_auth(self):
                     self._unauthorized()
@@ -5952,95 +5862,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     raise ValueError("invalid json body (expected object)")
                 try:
                     payload = MANAGER._voice_push.set_settings(obj)
-                except ValueError as e:
-                    _json_response(self, 400, {"error": str(e)})
-                    return
-                _json_response(self, 200, {"ok": True, **payload})
-                return
-
-            if path == "/api/settings/codex_config":
-                if not _require_auth(self):
-                    self._unauthorized()
-                    return
-                body = _read_body(self)
-                body_text = body.decode("utf-8")
-                if not body_text.strip():
-                    raise ValueError("empty request body")
-                obj = json.loads(body_text)
-                if not isinstance(obj, dict):
-                    raise ValueError("invalid json body (expected object)")
-                text = obj.get("text")
-                if not isinstance(text, str):
-                    _json_response(self, 400, {"error": "text required"})
-                    return
-                try:
-                    payload = _write_codex_config_for_settings(text)
-                except tomllib.TOMLDecodeError as e:
-                    _json_response(self, 400, {"error": str(e)})
-                    return
-                _json_response(self, 200, {"ok": True, **payload})
-                return
-
-            if path == "/api/settings/restart_service":
-                if not _require_auth(self):
-                    self._unauthorized()
-                    return
-                try:
-                    payload = _schedule_local_service_restart()
-                except (FileNotFoundError, PermissionError, OSError) as e:
-                    _json_response(self, 500, {"error": str(e)})
-                    return
-                _json_response(self, 200, {"ok": True, **payload})
-                return
-
-            if path == "/api/notifications/subscription":
-                if not _require_auth(self):
-                    self._unauthorized()
-                    return
-                body = _read_body(self)
-                body_text = body.decode("utf-8")
-                if not body_text.strip():
-                    raise ValueError("empty request body")
-                obj = json.loads(body_text)
-                if not isinstance(obj, dict):
-                    raise ValueError("invalid json body (expected object)")
-                try:
-                    payload = MANAGER._voice_push.upsert_subscription(
-                        subscription=obj.get("subscription"),
-                        user_agent=str(obj.get("user_agent") or ""),
-                        device_label=str(obj.get("device_label") or ""),
-                        device_class=str(obj.get("device_class") or ""),
-                    )
-                except ValueError as e:
-                    _json_response(self, 400, {"error": str(e)})
-                    return
-                _json_response(self, 200, {"ok": True, **payload})
-                return
-
-            if path == "/api/notifications/subscription/toggle":
-                if not _require_auth(self):
-                    self._unauthorized()
-                    return
-                body = _read_body(self)
-                body_text = body.decode("utf-8")
-                if not body_text.strip():
-                    raise ValueError("empty request body")
-                obj = json.loads(body_text)
-                if not isinstance(obj, dict):
-                    raise ValueError("invalid json body (expected object)")
-                endpoint = obj.get("endpoint")
-                enabled = obj.get("enabled")
-                if not isinstance(endpoint, str) or not endpoint.strip():
-                    _json_response(self, 400, {"error": "endpoint required"})
-                    return
-                if not isinstance(enabled, bool):
-                    _json_response(self, 400, {"error": "enabled must be a boolean"})
-                    return
-                try:
-                    payload = MANAGER._voice_push.toggle_subscription(endpoint=endpoint, enabled=enabled)
-                except KeyError:
-                    _json_response(self, 404, {"error": "unknown subscription"})
-                    return
                 except ValueError as e:
                     _json_response(self, 400, {"error": str(e)})
                     return

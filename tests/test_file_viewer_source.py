@@ -213,6 +213,13 @@ class TestFileViewerSource(unittest.TestCase):
         self.assertIn(".filePdf {", css_source)
         self.assertIn(".fileBlockedNotice {", css_source)
 
+    def test_legacy_file_editor_saves_through_python_file_write_route(self) -> None:
+        source = APP_JS.read_text(encoding="utf-8")
+        self.assertIn('api(`/api/sessions/${fileViewerSessionId}/file/write`, {', source)
+        self.assertIn('? { path: activeFilePath, text, create: true }', source)
+        self.assertIn(': { path: activeFilePath, text, version: activeFileVersion };', source)
+        self.assertIn('fileStatus.textContent = `${activeFilePath} - save conflict:', source)
+
     def test_attach_limit_comes_from_server_constant(self) -> None:
         source = APP_JS.read_text(encoding="utf-8")
         self.assertIn("window.CODOXEAR_ATTACH_MAX_BYTES", source)

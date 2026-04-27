@@ -179,6 +179,10 @@ function numberOrUndefined(value: unknown) {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
+function uniqueMetaParts(...values: Array<string | undefined>) {
+  return values.filter((value, index, items) => Boolean(value) && items.indexOf(value) === index) as string[];
+}
+
 function toolEventMeta(toolCallId: string, isError: boolean) {
   return [toolCallId, isError ? "error" : ""].filter(Boolean).join(" · ");
 }
@@ -334,7 +338,27 @@ export function normalizeEvents(events: RawChatEvent[]) {
 function joinAssistantBodies(left: string, right: string) {
   if (!left) return right;
   if (!right) return left;
+  if (left === right) return right;
+  if (left.endsWith(right)) return left;
+  if (right.startsWith(left)) return right;
+  const maxOverlap = Math.min(left.length, right.length);
+  for (let size = maxOverlap; size >= 8; size -= 1) {
+    if (left.slice(-size) === right.slice(0, size)) return `${left}${right.slice(size)}`;
+  }
   return `${left}${right}`;
+}
+
+function mergeAssistantEvents(existing: UiTranscriptEvent, incoming: UiTranscriptEvent, nextId = incoming.id) {
+  if (existing.kind !== "assistant" || incoming.kind !== "assistant") return null;
+  const mergedBody = joinAssistantBodies(existing.body, incoming.body);
+  if (mergedBody === `${existing.body}${incoming.body}`) return null;
+  return {
+    ...incoming,
+    id: nextId,
+    ts: incoming.ts ?? existing.ts,
+    body: mergedBody,
+    meta: uniqueMetaParts(existing.meta, incoming.meta).join(" · "),
+  };
 }
 
 export function coalesceAdjacentAssistantEvents(events: UiTranscriptEvent[]) {
@@ -342,13 +366,15 @@ export function coalesceAdjacentAssistantEvents(events: UiTranscriptEvent[]) {
   for (const event of events) {
     const previous = out[out.length - 1];
     if (previous && previous.kind === "assistant" && event.kind === "assistant") {
-      const metaParts = [previous.meta, event.meta].filter((value, index, arr) => value && arr.indexOf(value) === index);
+      const mergedAssistant = mergeAssistantEvents(previous, event, `${previous.id}+${event.id}`);
       out[out.length - 1] = {
-        ...previous,
-        id: `${previous.id}+${event.id}`,
-        ts: previous.ts ?? event.ts,
-        body: joinAssistantBodies(previous.body, event.body),
-        meta: metaParts.join(" · "),
+        ...(mergedAssistant || {
+          ...previous,
+          id: `${previous.id}+${event.id}`,
+          ts: previous.ts ?? event.ts,
+          body: joinAssistantBodies(previous.body, event.body),
+          meta: uniqueMetaParts(previous.meta, event.meta).join(" · "),
+        }),
       };
       continue;
     }
@@ -393,7 +419,18 @@ export function mergeTranscriptEvents(current: UiTranscriptEvent[], incoming: Ui
   incoming.forEach((event) => {
     const existingIndex = next.findIndex((currentEvent) => currentEvent.id === event.id);
     if (existingIndex < 0) {
+      const previous = next[next.length - 1];
+      const mergedAssistant = previous ? mergeAssistantEvents(previous, event) : null;
+      if (mergedAssistant) {
+        next[next.length - 1] = mergedAssistant;
+        return;
+      }
       next.push(event);
+      return;
+    }
+    const mergedAssistant = mergeAssistantEvents(next[existingIndex], event);
+    if (mergedAssistant) {
+      next[existingIndex] = mergedAssistant;
       return;
     }
     const merged = mergeToolPair(next[existingIndex], event);

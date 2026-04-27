@@ -213,6 +213,13 @@ def _b64u(raw: bytes) -> str:
     return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
 
 
+def _path_mtime_ns(path: Path) -> int | None:
+    try:
+        return path.stat().st_mtime_ns
+    except FileNotFoundError:
+        return None
+
+
 @dataclass(frozen=True)
 class ClassifiedAssistantMessage:
     message_id: str
@@ -643,6 +650,8 @@ class VoicePushCoordinator:
         self._delivery_ledger: dict[str, dict[str, Any]] = {}
         self._vapid_public_key = ""
         self._vapid_subject = _default_vapid_subject()
+        self._settings_mtime_ns: int | None = None
+        self._subscriptions_mtime_ns: int | None = None
         self._load_settings()
         self._load_subscriptions()
         self._load_delivery_ledger()
@@ -653,6 +662,8 @@ class VoicePushCoordinator:
         self._keepalive.start()
 
     def settings_snapshot(self) -> dict[str, Any]:
+        self._reload_settings_if_changed()
+        self._reload_subscriptions_if_changed()
         with self._lock:
             settings = dict(self._voice_settings)
             queue_depth = len(self._queue)
@@ -715,6 +726,7 @@ class VoicePushCoordinator:
         return {"active_listener_count": count}
 
     def set_settings(self, raw: Any) -> dict[str, Any]:
+        self._reload_settings_if_changed()
         settings = _clean_voice_settings(raw)
         with self._lock:
             self._voice_settings = settings
@@ -723,6 +735,7 @@ class VoicePushCoordinator:
         return self.settings_snapshot()
 
     def subscriptions_snapshot(self) -> dict[str, Any]:
+        self._reload_subscriptions_if_changed()
         with self._lock:
             items = [
                 {
@@ -751,6 +764,7 @@ class VoicePushCoordinator:
         device_label: str | None = None,
         device_class: str | None = None,
     ) -> dict[str, Any]:
+        self._reload_subscriptions_if_changed()
         cleaned = _clean_subscription(subscription)
         now_ts = float(time.time())
         sid = _subscription_id(cleaned)
@@ -776,6 +790,7 @@ class VoicePushCoordinator:
         return self.subscriptions_snapshot()
 
     def toggle_subscription(self, *, endpoint: str, enabled: bool) -> dict[str, Any]:
+        self._reload_subscriptions_if_changed()
         endpoint_clean = str(endpoint or "").strip()
         if not endpoint_clean:
             raise ValueError("endpoint required")
@@ -797,6 +812,7 @@ class VoicePushCoordinator:
         session_display_name: str,
         messages: list[ClassifiedAssistantMessage],
     ) -> None:
+        self._reload_settings_if_changed()
         for msg in messages:
             task: AnnouncementTask | None = None
             now_ts = float(time.time())
@@ -891,6 +907,7 @@ class VoicePushCoordinator:
             return text or None
 
     def notification_state_for_message(self, message_id: str) -> dict[str, Any] | None:
+        self._reload_subscriptions_if_changed()
         with self._lock:
             row = self._delivery_ledger.get(message_id)
             if not isinstance(row, dict):
@@ -1170,6 +1187,7 @@ class VoicePushCoordinator:
         )
 
     def _send_push_notifications(self, *, session_id: str, session_display_name: str, message_id: str, notification_text: str, timestamp: float | None) -> None:
+        self._reload_subscriptions_if_changed()
         with self._lock:
             subscriptions = [
                 dict(item)
@@ -1397,6 +1415,7 @@ class VoicePushCoordinator:
         except FileNotFoundError:
             raw = {}
         self._voice_settings = _clean_voice_settings(raw)
+        self._settings_mtime_ns = _path_mtime_ns(self._settings_path)
 
     def _save_settings(self) -> None:
         os.makedirs(self._settings_path.parent, exist_ok=True)
@@ -1406,6 +1425,7 @@ class VoicePushCoordinator:
             tmp.write(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
             tmp_path = Path(tmp.name)
         os.replace(tmp_path, self._settings_path)
+        self._settings_mtime_ns = _path_mtime_ns(self._settings_path)
 
     def _load_subscriptions(self) -> None:
         try:
@@ -1419,6 +1439,7 @@ class VoicePushCoordinator:
                 if record is not None:
                     cleaned[record["id"]] = record
         self._subscriptions = cleaned
+        self._subscriptions_mtime_ns = _path_mtime_ns(self._subscriptions_path)
 
     def _save_subscriptions(self) -> None:
         os.makedirs(self._subscriptions_path.parent, exist_ok=True)
@@ -1428,6 +1449,43 @@ class VoicePushCoordinator:
             tmp.write(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
             tmp_path = Path(tmp.name)
         os.replace(tmp_path, self._subscriptions_path)
+        self._subscriptions_mtime_ns = _path_mtime_ns(self._subscriptions_path)
+
+    def _reload_settings_if_changed(self) -> None:
+        mtime_ns = _path_mtime_ns(self._settings_path)
+        with self._lock:
+            if mtime_ns == self._settings_mtime_ns:
+                return
+        try:
+            raw = json.loads(self._settings_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            raw = {}
+        settings = _clean_voice_settings(raw)
+        with self._lock:
+            if mtime_ns != self._settings_mtime_ns:
+                self._voice_settings = settings
+                self._settings_mtime_ns = mtime_ns
+                self._queue_ready.notify_all()
+
+    def _reload_subscriptions_if_changed(self) -> None:
+        mtime_ns = _path_mtime_ns(self._subscriptions_path)
+        with self._lock:
+            if mtime_ns == self._subscriptions_mtime_ns:
+                return
+        try:
+            raw = json.loads(self._subscriptions_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            raw = []
+        cleaned: dict[str, dict[str, Any]] = {}
+        if isinstance(raw, list):
+            for item in raw:
+                record = _clean_subscription_record(item)
+                if record is not None:
+                    cleaned[record["id"]] = record
+        with self._lock:
+            if mtime_ns != self._subscriptions_mtime_ns:
+                self._subscriptions = cleaned
+                self._subscriptions_mtime_ns = mtime_ns
 
     def _load_delivery_ledger(self) -> None:
         try:

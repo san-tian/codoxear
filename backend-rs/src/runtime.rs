@@ -6,22 +6,25 @@ use crate::models::{
     ApiNewSessionDefaults, ApiQueueItem, ApiQueueResponse, ApiSessionSummary,
     ApiSessionsResponse, SessionDetail, SessionSummary,
 };
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use std::cmp::Reverse;
 use std::collections::{hash_map::DefaultHasher, BinaryHeap, HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::hash::{Hash, Hasher};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixStream;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{self, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+use sha2::{Digest, Sha256};
 use toml::Value as TomlValue;
 
 const APP_VERSION: &str = "0.1.0";
@@ -36,12 +39,16 @@ const FILE_SEARCH_MAX_CANDIDATES: usize = 200000;
 const GIT_DIFF_MAX_BYTES: usize = 800 * 1024;
 const GIT_DIFF_TIMEOUT_SECONDS: f64 = 4.0;
 const GIT_CHANGED_FILES_MAX: usize = 400;
+const LOCAL_SERVICE_RESTART_DELAY_SECONDS: f64 = 0.75;
 const SIDEBAR_PRIORITY_HALF_LIFE_SECONDS: f64 = 8.0 * 3600.0;
 const SIDEBAR_PRIORITY_LAMBDA: f64 = std::f64::consts::LN_2 / SIDEBAR_PRIORITY_HALF_LIFE_SECONDS;
 const SUPPORTED_REASONING_EFFORTS: &[&str] = &["xhigh", "high", "medium", "low"];
 const SUPPORTED_PI_REASONING_EFFORTS: &[&str] = &["off", "minimal", "low", "medium", "high", "xhigh"];
 const TMUX_META_WAIT_SECONDS: f64 = 10.0;
 static QUEUE_ITEM_COUNTER: AtomicU64 = AtomicU64::new(0);
+const ASK_USER_TOOL_NAMES: &[&str] = &["ask_user", "AskUserQuestion"];
+const EXTENSION_DISPLAY_KEY: &str = "codoxear_display";
+const EXTENSION_DISPLAY_TOOL_NAMES: &[&str] = &["codoxear_display", "codoxear.display"];
 const FILE_LIST_IGNORED_DIRS: &[&str] = &[
     ".git",
     ".hg",
@@ -264,6 +271,622 @@ pub fn load_sessions_response(config: &RuntimeConfig) -> Result<ApiSessionsRespo
     })
 }
 
+pub fn load_resume_candidates_response(
+    config: &RuntimeConfig,
+    cwd: &Path,
+    agent_backend: &str,
+) -> Result<Value, String> {
+    let info = describe_session_cwd(cwd);
+    let mut payload = info.as_object().cloned().unwrap_or_default();
+    let aliases = read_string_map(&config.app_dir.join("session_aliases.json"))?;
+    let sessions = if info.get("exists").and_then(Value::as_bool) == Some(true) {
+        list_resume_candidates_for_cwd(cwd, agent_backend, 12, &aliases)
+    } else {
+        Vec::new()
+    };
+    payload.insert("ok".to_string(), Value::Bool(true));
+    payload.insert("sessions".to_string(), Value::Array(sessions));
+    Ok(Value::Object(payload))
+}
+
+pub fn load_cwd_suggestions_response(config: &RuntimeConfig, raw: &str, limit: usize) -> Result<Value, String> {
+    let recent_cwds = read_recent_cwds(&config.app_dir.join("recent_cwds.json"))?;
+    list_directory_suggestions(raw, &recent_cwds, limit)
+}
+
+pub fn repo_root_dir() -> Result<PathBuf, String> {
+    repo_root()
+}
+
+pub fn load_nova_shell_file(path: &str) -> Result<(Vec<u8>, String), String> {
+    let repo_root = repo_root()?;
+    let normalized = normalize_nova_shell_path(path)?;
+    let dist_dir = repo_root.join("frontend").join("dist");
+    let target = dist_dir.join(&normalized);
+    let raw = fs::read(&target).map_err(|err| format!("read {}: {err}", target.display()))?;
+    Ok((raw, content_type_for_static_path(&normalized).to_string()))
+}
+
+pub fn load_legacy_static_file(path: &str) -> Result<(Vec<u8>, String), String> {
+    let repo_root = repo_root()?;
+    let normalized = normalize_legacy_static_path(path)?;
+    let static_dir = repo_root.join("codoxear").join("static");
+    let target = static_dir.join(&normalized);
+    let raw = fs::read(&target).map_err(|err| format!("read {}: {err}", target.display()))?;
+    Ok((raw, content_type_for_static_path(&normalized).to_string()))
+}
+
+pub fn load_codex_config_response() -> Result<Value, String> {
+    let path = codex_config_path();
+    let exists = path.exists();
+    let text = if exists {
+        fs::read_to_string(&path).map_err(|err| format!("read {}: {err}", path.display()))?
+    } else {
+        String::new()
+    };
+    Ok(json!({
+        "ok": true,
+        "path": path.display().to_string(),
+        "exists": exists,
+        "text": text,
+    }))
+}
+
+pub fn save_codex_config_response(text: &str) -> Result<Value, String> {
+    text.parse::<TomlValue>()
+        .map_err(|err| format!("invalid TOML: {err}"))?;
+    let path = codex_config_path();
+    write_text_file_atomic(&path, text)?;
+    load_codex_config_response()
+}
+
+pub fn schedule_local_service_restart_response() -> Result<Value, String> {
+    let repo_root = repo_root()?;
+    let script = repo_root.join("scripts").join("codoxear-local");
+    if !script.exists() {
+        return Err(format!("missing {}", script.display()));
+    }
+    let metadata = fs::metadata(&script).map_err(|err| format!("stat {}: {err}", script.display()))?;
+    if metadata.permissions().mode() & 0o111 == 0 {
+        return Err(format!("{} is not executable", script.display()));
+    }
+    let command = format!(
+        "sleep {:.2}; exec {} restart",
+        LOCAL_SERVICE_RESTART_DELAY_SECONDS,
+        shell_quote(&script.display().to_string())
+    );
+    let mut child = Command::new("/bin/bash");
+    child
+        .arg("-lc")
+        .arg(command)
+        .current_dir(&repo_root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    child.process_group(0);
+    let proc = child
+        .spawn()
+        .map_err(|err| format!("spawn restart shell: {err}"))?;
+    Ok(json!({
+        "ok": true,
+        "scheduled": true,
+        "restart_pid": proc.id(),
+        "script": script.display().to_string(),
+        "server_pid": process::id(),
+    }))
+}
+
+pub fn load_notification_subscriptions_response(config: &RuntimeConfig) -> Result<Value, String> {
+    let records = read_notification_subscription_records(&push_subscriptions_path(config))?;
+    let vapid_public_key = ensure_vapid_public_key(config)?;
+    Ok(notification_subscriptions_snapshot_value(&records, &vapid_public_key))
+}
+
+pub fn upsert_notification_subscription_response(
+    config: &RuntimeConfig,
+    subscription: &Value,
+    user_agent: &str,
+    device_label: &str,
+    device_class: &str,
+) -> Result<Value, String> {
+    let path = push_subscriptions_path(config);
+    let mut records = read_notification_subscription_records(&path)?;
+    let cleaned = clean_notification_subscription(subscription)?;
+    let now_ts = epoch_now();
+    let endpoint = cleaned
+        .get("endpoint")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "subscription endpoint required".to_string())?;
+    let record_id = notification_subscription_id(endpoint);
+    let previous = records.get(&record_id).cloned();
+    let created_ts = previous
+        .as_ref()
+        .and_then(|value| value.get("created_ts"))
+        .and_then(Value::as_f64)
+        .unwrap_or(now_ts);
+    let last_success_ts = previous
+        .as_ref()
+        .and_then(|value| value.get("last_success_ts"))
+        .and_then(Value::as_f64);
+    let last_failure_ts = previous
+        .as_ref()
+        .and_then(|value| value.get("last_failure_ts"))
+        .and_then(Value::as_f64);
+    let last_error = previous
+        .as_ref()
+        .and_then(|value| value.get("last_error"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let user_agent_clean = user_agent.trim().to_string();
+    let device_class_clean = clean_notification_device_class(device_class, &user_agent_clean);
+    let record = json!({
+        "id": record_id,
+        "subscription": cleaned,
+        "notifications_enabled": true,
+        "created_ts": created_ts,
+        "updated_ts": now_ts,
+        "last_success_ts": last_success_ts,
+        "last_failure_ts": last_failure_ts,
+        "last_error": last_error,
+        "user_agent": user_agent_clean,
+        "device_label": device_label.trim(),
+        "device_class": device_class_clean,
+    });
+    records.insert(record_id, record);
+    write_notification_subscription_records(&path, &records)?;
+    load_notification_subscriptions_response(config)
+}
+
+pub fn toggle_notification_subscription_response(
+    config: &RuntimeConfig,
+    endpoint: &str,
+    enabled: bool,
+) -> Result<Value, String> {
+    let endpoint_clean = endpoint.trim();
+    if endpoint_clean.is_empty() {
+        return Err("endpoint required".to_string());
+    }
+    let path = push_subscriptions_path(config);
+    let mut records = read_notification_subscription_records(&path)?;
+    let record_id = notification_subscription_id(endpoint_clean);
+    let Some(record) = records.get_mut(&record_id) else {
+        return Err("unknown subscription".to_string());
+    };
+    if record
+        .get("subscription")
+        .and_then(Value::as_object)
+        .and_then(|item| item.get("endpoint"))
+        .and_then(Value::as_str)
+        != Some(endpoint_clean)
+    {
+        return Err("unknown subscription".to_string());
+    }
+    let object = record
+        .as_object_mut()
+        .ok_or_else(|| "unknown subscription".to_string())?;
+    object.insert("notifications_enabled".to_string(), Value::Bool(enabled));
+    object.insert("updated_ts".to_string(), json!(epoch_now()));
+    write_notification_subscription_records(&path, &records)?;
+    load_notification_subscriptions_response(config)
+}
+
+fn describe_session_cwd(cwd: &Path) -> Value {
+    let exists = cwd.exists();
+    let repo_root = exists.then(|| git_repo_root(cwd)).flatten();
+    let git_branch = if exists {
+        current_git_branch(cwd).unwrap_or_default()
+    } else {
+        String::new()
+    };
+    json!({
+        "cwd": cwd.display().to_string(),
+        "exists": exists,
+        "will_create": !exists,
+        "git_repo": repo_root.is_some(),
+        "git_root": repo_root.map(|path| path.display().to_string()).unwrap_or_default(),
+        "git_branch": git_branch,
+    })
+}
+
+fn normalize_nova_shell_path(path: &str) -> Result<String, String> {
+    let trimmed = path.trim().trim_start_matches('/');
+    if trimmed.is_empty() {
+        return Err("empty path".to_string());
+    }
+    if trimmed.split('/').any(|segment| segment.is_empty() || segment == "." || segment == "..") {
+        return Err("invalid static path".to_string());
+    }
+    Ok(trimmed.to_string())
+}
+
+fn normalize_legacy_static_path(path: &str) -> Result<String, String> {
+    normalize_nova_shell_path(path)
+}
+
+fn content_type_for_static_path(path: &str) -> &'static str {
+    match Path::new(path).extension().and_then(|ext| ext.to_str()).unwrap_or_default() {
+        "css" => "text/css; charset=utf-8",
+        "html" => "text/html; charset=utf-8",
+        "ico" => "image/x-icon",
+        "js" => "text/javascript; charset=utf-8",
+        "json" => "application/json; charset=utf-8",
+        "mjs" => "text/javascript; charset=utf-8",
+        "png" => "image/png",
+        "svg" => "image/svg+xml",
+        "txt" => "text/plain; charset=utf-8",
+        "webmanifest" => "application/manifest+json; charset=utf-8",
+        "woff" => "font/woff",
+        "woff2" => "font/woff2",
+        _ => "application/octet-stream",
+    }
+}
+
+fn list_resume_candidates_for_cwd(
+    cwd: &Path,
+    agent_backend: &str,
+    limit: usize,
+    aliases: &HashMap<String, String>,
+) -> Vec<Value> {
+    let cwd_text = cwd.display().to_string();
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for log_path in iter_session_logs_for_backend(agent_backend) {
+        let Some(mut row) = resume_candidate_from_log(&log_path, agent_backend) else {
+            continue;
+        };
+        let session_id = row.get("session_id").and_then(Value::as_str).unwrap_or_default();
+        let row_cwd = row.get("cwd").and_then(Value::as_str).unwrap_or_default();
+        if session_id.is_empty() || row_cwd != cwd_text || !seen.insert(session_id.to_string()) {
+            continue;
+        }
+        let alias = aliases.get(session_id).cloned().unwrap_or_default();
+        let preview = last_user_message_preview_from_log(&log_path, 256 * 1024);
+        if let Some(object) = row.as_object_mut() {
+            object.insert("alias".to_string(), Value::String(alias));
+            object.insert("last_user_message".to_string(), Value::String(preview));
+        }
+        out.push(row);
+        if out.len() >= limit {
+            break;
+        }
+    }
+    out
+}
+
+fn resume_candidate_from_log(log_path: &Path, agent_backend: &str) -> Option<Value> {
+    let payload = read_session_log_header(log_path, agent_backend)?;
+    if agent_backend == "codex" && is_subagent_session_payload(&payload) {
+        return None;
+    }
+    let session_id = payload.get("id").and_then(Value::as_str)?;
+    let cwd = payload.get("cwd").and_then(Value::as_str)?;
+    let mut out = serde_json::Map::new();
+    out.insert("session_id".to_string(), Value::String(session_id.to_string()));
+    out.insert("cwd".to_string(), Value::String(cwd.to_string()));
+    out.insert(
+        "log_path".to_string(),
+        Value::String(log_path.display().to_string()),
+    );
+    out.insert("updated_ts".to_string(), json!(file_mtime(log_path)));
+    out.insert(
+        "timestamp".to_string(),
+        payload.get("timestamp").cloned().unwrap_or(Value::Null),
+    );
+    out.insert(
+        "git_branch".to_string(),
+        payload
+            .get("git")
+            .and_then(Value::as_object)
+            .and_then(|git| git.get("branch"))
+            .and_then(Value::as_str)
+            .map(|text| Value::String(text.to_string()))
+            .unwrap_or_else(|| Value::String(String::new())),
+    );
+    out.insert(
+        "agent_backend".to_string(),
+        Value::String(agent_backend.to_string()),
+    );
+    Some(Value::Object(out))
+}
+
+fn last_user_message_preview_from_log(log_path: &Path, max_scan_bytes: usize) -> String {
+    let size = match fs::metadata(log_path) {
+        Ok(meta) => meta.len() as usize,
+        Err(_) => return String::new(),
+    };
+    let start = size.saturating_sub(max_scan_bytes.max(1));
+    let mut preview = String::new();
+    for obj in read_jsonl_slice(log_path, start as u64, max_scan_bytes).unwrap_or_default() {
+        let text = if obj.get("type").and_then(Value::as_str) == Some("message") {
+            pi_user_text_value(&obj).unwrap_or_default()
+        } else if obj.get("type").and_then(Value::as_str) == Some("response_item") {
+            let Some(payload) = obj.get("payload").and_then(Value::as_object) else {
+                continue;
+            };
+            if payload.get("type").and_then(Value::as_str) != Some("message")
+                || payload.get("role").and_then(Value::as_str) != Some("user")
+            {
+                continue;
+            }
+            user_message_text(payload)
+        } else {
+            continue;
+        };
+        if text.trim().is_empty() || is_scaffold_user_text(&text) {
+            continue;
+        }
+        preview = resume_preview_from_text(&text, 120);
+    }
+    if !preview.is_empty() {
+        return preview;
+    }
+    for obj in read_jsonl_slice(log_path, 0, max_scan_bytes).unwrap_or_default() {
+        let text = if obj.get("type").and_then(Value::as_str) == Some("message") {
+            pi_user_text_value(&obj).unwrap_or_default()
+        } else if obj.get("type").and_then(Value::as_str) == Some("response_item") {
+            let Some(payload) = obj.get("payload").and_then(Value::as_object) else {
+                continue;
+            };
+            if payload.get("type").and_then(Value::as_str) != Some("message")
+                || payload.get("role").and_then(Value::as_str) != Some("user")
+            {
+                continue;
+            }
+            user_message_text(payload)
+        } else {
+            continue;
+        };
+        if text.trim().is_empty() || is_scaffold_user_text(&text) {
+            continue;
+        }
+        return resume_preview_from_text(&text, 120);
+    }
+    String::new()
+}
+
+fn read_jsonl_slice(path: &Path, start: u64, max_bytes: usize) -> Result<Vec<Value>, String> {
+    let mut file = fs::File::open(path).map_err(map_io_error)?;
+    file.seek(SeekFrom::Start(start)).map_err(map_io_error)?;
+    let mut raw = vec![0_u8; max_bytes];
+    let read = file.read(&mut raw).map_err(map_io_error)?;
+    raw.truncate(read);
+    if start > 0 {
+        if let Some(idx) = raw.iter().position(|byte| *byte == b'\n') {
+            raw.drain(..=idx);
+        } else {
+            raw.clear();
+        }
+    }
+    let mut out = Vec::new();
+    for line in raw.split(|byte| *byte == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_slice::<Value>(line) else {
+            continue;
+        };
+        out.push(value);
+    }
+    Ok(out)
+}
+
+fn user_message_text(payload: &Map<String, Value>) -> String {
+    payload
+        .get("content")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    let kind = item.get("type").and_then(Value::as_str);
+                    if matches!(kind, Some("input_text") | Some("output_text") | Some("text")) {
+                        item.get("text").and_then(Value::as_str).map(str::trim).filter(|text| !text.is_empty())
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default()
+}
+
+fn is_scaffold_user_text(text: &str) -> bool {
+    let trimmed = text.trim();
+    trimmed.starts_with("# AGENTS.md instructions") || trimmed.starts_with("<environment_context>")
+}
+
+fn resume_preview_from_text(text: &str, max_chars: usize) -> String {
+    let compact = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let compact = compact.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.chars().count() <= max_chars {
+        return compact;
+    }
+    let mut head = compact.chars().take(max_chars.saturating_sub(1)).collect::<String>();
+    if let Some(cut) = head.rfind(' ') {
+        if cut >= max_chars.saturating_mul(3) / 5 {
+            head.truncate(cut);
+        }
+    }
+    format!("{}...", head.trim_end())
+}
+
+fn list_directory_suggestions(raw: &str, recent_cwds: &[String], limit: usize) -> Result<Value, String> {
+    let query = raw.trim().to_string();
+    let cap = limit.clamp(1, 48);
+    let mut suggestions = Vec::new();
+    let mut seen = HashSet::new();
+
+    let mut resolved_query = String::new();
+    if query.is_empty() {
+        for recent in recent_cwds {
+            push_cwd_suggestion(&mut suggestions, &mut seen, cap, PathBuf::from(recent), "recent");
+        }
+        if suggestions.len() < cap {
+            if let Some(home) = home_dir().map(|path| fs::canonicalize(&path).unwrap_or(path)) {
+                for child in iter_matching_directories(&home, "", cap.saturating_sub(suggestions.len())) {
+                    push_cwd_suggestion(&mut suggestions, &mut seen, cap, child, "directory");
+                }
+            }
+        }
+    } else {
+        let expanded = expand_home(&query);
+        let joined = if expanded.is_absolute() {
+            expanded
+        } else {
+            env::current_dir().map_err(map_io_error)?.join(expanded)
+        };
+        let target = fs::canonicalize(&joined).unwrap_or(joined);
+        resolved_query = target.display().to_string();
+        let mut search_root = if query.ends_with('/') || target.is_dir() {
+            Some(target.clone())
+        } else {
+            Some(target.parent().map(Path::to_path_buf).unwrap_or_else(|| target.clone()))
+        };
+        let mut prefix = if query.ends_with('/') || target.is_dir() {
+            String::new()
+        } else {
+            target
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default()
+                .to_string()
+        };
+        while let Some(root) = search_root.clone() {
+            if root.exists() && root.is_dir() {
+                for child in iter_matching_directories(&root, &prefix, cap) {
+                    push_cwd_suggestion(&mut suggestions, &mut seen, cap, child, "directory");
+                }
+                break;
+            }
+            let next_prefix = root
+                .file_name()
+                .and_then(|name| name.to_str())
+                .filter(|name| !name.is_empty())
+                .map(|name| name.to_string());
+            let parent = root.parent().map(Path::to_path_buf);
+            match parent {
+                Some(parent_path) if parent_path != root => {
+                    if let Some(next) = next_prefix {
+                        prefix = next;
+                    }
+                    search_root = Some(parent_path);
+                }
+                _ => {
+                    search_root = None;
+                }
+            }
+        }
+    }
+
+    if suggestions.len() < cap {
+        for recent in recent_cwds {
+            let Some(row) = cwd_suggestion_entry(Path::new(recent), "recent") else {
+                continue;
+            };
+            let value = row.get("value").and_then(Value::as_str).unwrap_or_default();
+            if !resolved_query.is_empty() && !value.starts_with(&resolved_query) {
+                continue;
+            }
+            if !seen.insert(value.to_string()) {
+                continue;
+            }
+            suggestions.push(row);
+            if suggestions.len() >= cap {
+                break;
+            }
+        }
+    }
+
+    Ok(json!({
+        "ok": true,
+        "query": query,
+        "suggestions": suggestions,
+    }))
+}
+
+fn push_cwd_suggestion(
+    suggestions: &mut Vec<Value>,
+    seen: &mut HashSet<String>,
+    cap: usize,
+    path: PathBuf,
+    kind: &str,
+) {
+    if suggestions.len() >= cap {
+        return;
+    }
+    let Some(row) = cwd_suggestion_entry(&path, kind) else {
+        return;
+    };
+    let value = row.get("value").and_then(Value::as_str).unwrap_or_default().to_string();
+    if !seen.insert(value) {
+        return;
+    }
+    suggestions.push(row);
+}
+
+fn iter_matching_directories(base_dir: &Path, prefix: &str, limit: usize) -> Vec<PathBuf> {
+    let wanted = prefix.trim().to_ascii_lowercase();
+    let mut rows = Vec::new();
+    let Ok(entries) = fs::read_dir(base_dir) else {
+        return rows;
+    };
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().trim().to_string();
+        if !wanted.is_empty() && !name.to_ascii_lowercase().starts_with(&wanted) {
+            continue;
+        }
+        rows.push(fs::canonicalize(entry.path()).unwrap_or_else(|_| entry.path()));
+    }
+    rows.sort_by(|left, right| {
+        left.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .cmp(
+                &right
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or_default()
+                    .to_ascii_lowercase(),
+            )
+            .then_with(|| left.display().to_string().cmp(&right.display().to_string()))
+    });
+    rows.truncate(limit);
+    rows
+}
+
+fn cwd_suggestion_entry(path: &Path, kind: &str) -> Option<Value> {
+    let resolved = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    if !resolved.is_dir() {
+        return None;
+    }
+    let value = resolved.display().to_string();
+    let label = resolved
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| name.to_string())
+        .unwrap_or_else(|| value.clone());
+    Some(json!({
+        "value": value,
+        "label": label,
+        "kind": kind,
+    }))
+}
+
 pub fn load_messages_tail(
     config: &RuntimeConfig,
     session_id: &str,
@@ -368,27 +991,22 @@ pub fn load_messages_live(
     };
     let after = parse_cursor(after_cursor)?;
     let records = read_positioned_records(Path::new(log_path))?;
-    let mut turn_start = false;
-    let mut turn_end = false;
-    let mut turn_aborted = false;
-    let events = records
+    let selected = records
         .into_iter()
         .filter(|record| record.start >= after)
-        .filter_map(|record| {
-            update_turn_flags(&record.obj, &mut turn_start, &mut turn_end, &mut turn_aborted);
-            chat_event_from_obj(&record.obj)
-        })
+        .map(|record| record.obj)
         .collect::<Vec<_>>();
+    let extracted = extract_chat_events(&selected);
     Ok(ApiMessagesLiveResponse {
         thread_id: session.thread_id,
         log_path: Some(log_path.to_string()),
         live_cursor: Some(file_len(Path::new(log_path))?.to_string()),
-        events,
-        meta_delta: json!({"thinking": 0, "tool": 0, "system": 0}),
-        turn_start,
-        turn_end,
-        turn_aborted,
-        diag: json!({}),
+        events: extracted.events,
+        meta_delta: extracted.meta,
+        turn_start: extracted.turn_start,
+        turn_end: extracted.turn_end,
+        turn_aborted: extracted.turn_aborted,
+        diag: extracted.diag,
         busy: session.busy,
         queue_len: session.queue_len,
         token: session.token,
@@ -1268,6 +1886,18 @@ fn write_json_value(path: &Path, value: &Value) -> Result<(), String> {
     fs::rename(&tmp, path).map_err(|err| format!("rename {} -> {}: {err}", tmp.display(), path.display()))
 }
 
+fn write_text_file_atomic(path: &Path, text: &str) -> Result<(), String> {
+    let parent = path.parent().ok_or_else(|| format!("missing parent for {}", path.display()))?;
+    fs::create_dir_all(parent).map_err(|err| format!("create {}: {err}", parent.display()))?;
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| format!("invalid filename for {}", path.display()))?;
+    let tmp = path.with_file_name(format!("{file_name}.tmp"));
+    fs::write(&tmp, text).map_err(|err| format!("write {}: {err}", tmp.display()))?;
+    fs::rename(&tmp, path).map_err(|err| format!("rename {} -> {}: {err}", tmp.display(), path.display()))
+}
+
 fn write_string_map(path: &Path, values: &HashMap<String, String>) -> Result<(), String> {
     let mut keys = values.keys().cloned().collect::<Vec<_>>();
     keys.sort();
@@ -1351,6 +1981,183 @@ fn json_truthy(value: &Value) -> bool {
         Value::Array(items) => !items.is_empty(),
         Value::Object(map) => !map.is_empty(),
     }
+}
+
+fn notification_subscription_id(endpoint: &str) -> String {
+    let digest = Sha256::digest(endpoint.as_bytes());
+    digest
+        .iter()
+        .take(12)
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>()
+}
+
+fn notification_device_class_from_user_agent(user_agent: &str) -> String {
+    let ua = user_agent.trim().to_ascii_lowercase();
+    if ua.contains("mobile") || ua.contains("android") || ua.contains("iphone") || ua.contains("ipad") || ua.contains("ipod") {
+        "mobile".to_string()
+    } else {
+        "desktop".to_string()
+    }
+}
+
+fn clean_notification_device_class(raw: &str, user_agent: &str) -> String {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "mobile" => "mobile".to_string(),
+        "desktop" => "desktop".to_string(),
+        _ => notification_device_class_from_user_agent(user_agent),
+    }
+}
+
+fn clean_notification_subscription(raw: &Value) -> Result<Value, String> {
+    let object = raw
+        .as_object()
+        .ok_or_else(|| "subscription must be an object".to_string())?;
+    let endpoint = object
+        .get("endpoint")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "subscription endpoint required".to_string())?;
+    let keys = object
+        .get("keys")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "subscription keys required".to_string())?;
+    let p256dh = keys
+        .get("p256dh")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "subscription keys.p256dh and keys.auth required".to_string())?;
+    let auth = keys
+        .get("auth")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "subscription keys.p256dh and keys.auth required".to_string())?;
+    Ok(json!({
+        "endpoint": endpoint,
+        "keys": {
+            "p256dh": p256dh,
+            "auth": auth,
+        }
+    }))
+}
+
+fn clean_notification_subscription_record(raw: &Value, now_ts: f64) -> Option<Value> {
+    let object = raw.as_object()?;
+    let subscription = clean_notification_subscription(object.get("subscription")?).ok()?;
+    let endpoint = subscription.get("endpoint").and_then(Value::as_str)?;
+    let created_ts = object
+        .get("created_ts")
+        .and_then(Value::as_f64)
+        .filter(|value| value.is_finite())
+        .unwrap_or(now_ts);
+    let updated_ts = object
+        .get("updated_ts")
+        .and_then(Value::as_f64)
+        .filter(|value| value.is_finite())
+        .unwrap_or(created_ts);
+    let user_agent = object
+        .get("user_agent")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let device_class = clean_notification_device_class(
+        object.get("device_class").and_then(Value::as_str).unwrap_or_default(),
+        &user_agent,
+    );
+    Some(json!({
+        "id": notification_subscription_id(endpoint),
+        "subscription": subscription,
+        "notifications_enabled": object.get("notifications_enabled").map(json_truthy).unwrap_or(true),
+        "created_ts": created_ts,
+        "updated_ts": updated_ts,
+        "last_success_ts": object.get("last_success_ts").and_then(Value::as_f64),
+        "last_failure_ts": object.get("last_failure_ts").and_then(Value::as_f64),
+        "last_error": object
+            .get("last_error")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim(),
+        "user_agent": user_agent,
+        "device_label": object
+            .get("device_label")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim(),
+        "device_class": device_class,
+    }))
+}
+
+fn read_notification_subscription_records(path: &Path) -> Result<HashMap<String, Value>, String> {
+    let Some(Value::Array(items)) = read_optional_value(path)? else {
+        return Ok(HashMap::new());
+    };
+    let now_ts = epoch_now();
+    let mut out = HashMap::new();
+    for item in items {
+        let Some(record) = clean_notification_subscription_record(&item, now_ts) else {
+            continue;
+        };
+        let Some(record_id) = record.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        out.insert(record_id.to_string(), record);
+    }
+    Ok(out)
+}
+
+fn write_notification_subscription_records(path: &Path, records: &HashMap<String, Value>) -> Result<(), String> {
+    let mut ids = records.keys().cloned().collect::<Vec<_>>();
+    ids.sort();
+    let items = ids
+        .into_iter()
+        .filter_map(|record_id| records.get(&record_id).cloned())
+        .collect::<Vec<_>>();
+    write_json_value(path, &Value::Array(items))
+}
+
+fn notification_subscriptions_snapshot_value(
+    records: &HashMap<String, Value>,
+    vapid_public_key: &str,
+) -> Value {
+    let mut items = records
+        .values()
+        .filter_map(|record| {
+            let endpoint = record
+                .get("subscription")
+                .and_then(Value::as_object)
+                .and_then(|subscription| subscription.get("endpoint"))
+                .and_then(Value::as_str)?;
+            Some(json!({
+                "id": record.get("id").and_then(Value::as_str).unwrap_or_default(),
+                "endpoint": endpoint,
+                "notifications_enabled": record.get("notifications_enabled").map(json_truthy).unwrap_or(false),
+                "device_class": record.get("device_class").and_then(Value::as_str).unwrap_or("desktop"),
+                "created_ts": record.get("created_ts").and_then(Value::as_f64),
+                "updated_ts": record.get("updated_ts").and_then(Value::as_f64),
+                "last_success_ts": record.get("last_success_ts").and_then(Value::as_f64),
+                "last_failure_ts": record.get("last_failure_ts").and_then(Value::as_f64),
+                "last_error": record.get("last_error").and_then(Value::as_str).unwrap_or_default(),
+                "user_agent": record.get("user_agent").and_then(Value::as_str).unwrap_or_default(),
+                "device_label": record.get("device_label").and_then(Value::as_str).unwrap_or_default(),
+            }))
+        })
+        .collect::<Vec<_>>();
+    items.sort_by(|left, right| {
+        let left_ts = left.get("updated_ts").and_then(Value::as_f64).unwrap_or(0.0);
+        let right_ts = right.get("updated_ts").and_then(Value::as_f64).unwrap_or(0.0);
+        right_ts
+            .partial_cmp(&left_ts)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    json!({
+        "ok": true,
+        "vapid_public_key": vapid_public_key,
+        "subscriptions": items,
+    })
 }
 
 fn clean_harness_cooldown_minutes_value(value: &Value) -> Result<i64, String> {
@@ -2299,19 +3106,391 @@ fn chat_records(records: Vec<PositionedRecord>) -> Vec<PositionedChatRecord> {
 }
 
 fn chat_event_from_obj(obj: &Value) -> Option<Value> {
-    let typ = obj.get("type")?.as_str()?;
-    match typ {
+    single_chat_event(obj)
+}
+
+struct ExtractedChatBatch {
+    events: Vec<Value>,
+    meta: Value,
+    turn_start: bool,
+    turn_end: bool,
+    turn_aborted: bool,
+    diag: Value,
+}
+
+fn extract_chat_events(objs: &[Value]) -> ExtractedChatBatch {
+    let mut events = Vec::new();
+    let mut total_thinking = 0_i64;
+    let mut total_tools = 0_i64;
+    let mut total_system = 0_i64;
+    let mut turn_start = false;
+    let mut turn_end = false;
+    let mut turn_aborted = false;
+    let mut tool_names = HashSet::new();
+    let mut last_tool: Option<String> = None;
+    let mut known_tool_names: HashMap<String, String> = HashMap::new();
+    let mut pending_ask_user_calls: HashMap<String, Value> = HashMap::new();
+
+    for obj in objs {
+        match obj.get("type").and_then(Value::as_str) {
+            Some("message") => {
+                if let Some(user_text) = pi_user_text_value(obj) {
+                    turn_start = true;
+                    events.push(json_text_event("user", &user_text, event_ts(obj), None));
+                    continue;
+                }
+
+                let assistant_text = pi_assistant_text_value(obj);
+                let tool_count = pi_assistant_tool_use_count(obj) as i64;
+                let thinking_count = pi_assistant_thinking_count(obj) as i64;
+                total_thinking += thinking_count;
+                if tool_count > 0 {
+                    total_tools += tool_count;
+                    tool_names.insert("pi_tool".to_string());
+                    last_tool = Some("pi_tool".to_string());
+                }
+
+                let payload = match obj.get("message").and_then(Value::as_object) {
+                    Some(payload) => payload,
+                    None => continue,
+                };
+                let ets = event_ts(obj);
+                match payload.get("role").and_then(Value::as_str) {
+                    Some("assistant") => {
+                        if let Some(content) = payload.get("content").and_then(Value::as_array) {
+                            for item in content {
+                                let Some(item) = item.as_object() else {
+                                    continue;
+                                };
+                                if item.get("type").and_then(Value::as_str) != Some("toolCall") {
+                                    continue;
+                                }
+                                let name = non_empty_string(item.get("name")).unwrap_or_else(|| "tool".to_string());
+                                let call_id = non_empty_string(item.get("id"));
+                                let args = coerce_tool_arguments(item.get("arguments"));
+                                tool_names.insert("pi_tool".to_string());
+                                if let Some(call_id) = call_id.as_ref() {
+                                    known_tool_names.insert(call_id.clone(), name.clone());
+                                }
+                                let Some(ts) = ets else {
+                                    continue;
+                                };
+                                if is_ask_user_tool(&name) {
+                                    let event = ask_user_event(&args, call_id.as_deref(), ts, false);
+                                    if let Some(call_id) = call_id.as_ref() {
+                                        pending_ask_user_calls.insert(call_id.clone(), event.clone());
+                                    }
+                                    events.push(event);
+                                    continue;
+                                }
+                                if let Some(event) = extension_event_from_tool(&name, &args, call_id.as_deref(), ts) {
+                                    events.push(event);
+                                    continue;
+                                }
+                                events.push(tool_event(&name, call_id.as_deref(), tool_call_summary(&name, &args), ts));
+                            }
+                        }
+                    }
+                    Some("toolResult") => {
+                        total_tools += 1;
+                        tool_names.insert("pi_tool".to_string());
+                        last_tool = Some("pi_tool".to_string());
+                        let call_id = non_empty_string(payload.get("toolCallId"));
+                        let name = non_empty_string(payload.get("toolName"))
+                            .or_else(|| call_id.as_ref().and_then(|id| known_tool_names.get(id).cloned()))
+                            .unwrap_or_else(|| "tool".to_string());
+                        let details = payload.get("details").and_then(Value::as_object);
+                        let text = tool_result_text(payload);
+                        if let Some(ts) = ets {
+                            if let Some(event) = extension_event_from_tool_result(&name, payload, call_id.as_deref(), ts) {
+                                events.push(event);
+                                continue;
+                            }
+                            if is_ask_user_tool(&name) || call_id.as_ref().map(|id| pending_ask_user_calls.contains_key(id)).unwrap_or(false) {
+                                let base = ask_user_base_event(
+                                    call_id.as_deref(),
+                                    ts,
+                                    &pending_ask_user_calls,
+                                );
+                                events.push(resolve_ask_user_event(
+                                    base,
+                                    call_id.as_deref(),
+                                    ts,
+                                    details,
+                                    text.as_deref(),
+                                ));
+                            } else if text.is_some() || payload.get("isError").and_then(Value::as_bool) == Some(true) {
+                                events.push(tool_result_event(
+                                    &name,
+                                    call_id.as_deref(),
+                                    text,
+                                    payload.get("isError").and_then(Value::as_bool) == Some(true),
+                                    ts,
+                                ));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+
+                if let Some(text) = assistant_text {
+                    let message_class = if pi_assistant_is_final_turn_end(obj) {
+                        turn_end = true;
+                        Some("final_response")
+                    } else {
+                        Some("narration")
+                    };
+                    events.push(json_text_event("assistant", &text, ets, message_class));
+                }
+            }
+            Some("event_msg") => {
+                let Some(payload) = obj.get("payload").and_then(Value::as_object) else {
+                    continue;
+                };
+                match payload.get("type").and_then(Value::as_str) {
+                    Some("user_message") => {
+                        if let Some(message) = payload.get("message").and_then(Value::as_str) {
+                            turn_start = true;
+                            events.push(json_text_event("user", message, event_ts(obj), None));
+                        }
+                    }
+                    Some("agent_reasoning") => total_thinking += 1,
+                    Some("turn_aborted") => turn_aborted = true,
+                    Some("task_complete") | Some("turn_complete") => turn_end = true,
+                    Some("token_count") => {}
+                    _ => {}
+                }
+            }
+            Some("response_item") => {
+                let Some(payload) = obj.get("payload").and_then(Value::as_object) else {
+                    continue;
+                };
+                let pt = payload.get("type").and_then(Value::as_str);
+                if pt == Some("message") {
+                    match payload.get("role").and_then(Value::as_str) {
+                        Some("developer") | Some("system") => {
+                            total_system += 1;
+                            continue;
+                        }
+                        Some("assistant") => {
+                            let Some(text) = payload.get("content").and_then(output_text) else {
+                                continue;
+                            };
+                            let message_class = if payload.get("phase").and_then(Value::as_str) == Some("final_answer")
+                                || payload.get("end_turn").and_then(Value::as_bool) == Some(true)
+                            {
+                                Some("final_response")
+                            } else {
+                                Some("narration")
+                            };
+                            events.push(json_text_event("assistant", &text, event_ts(obj), message_class));
+                            continue;
+                        }
+                        _ => {}
+                    }
+                }
+
+                match pt {
+                    Some("reasoning") => total_thinking += 1,
+                    Some("function_call") => {
+                        let name = non_empty_string(payload.get("name")).unwrap_or_else(|| "tool".to_string());
+                        let call_id = non_empty_string(payload.get("call_id"));
+                        let args = coerce_tool_arguments(payload.get("arguments"));
+                        tool_names.insert(name.clone());
+                        last_tool = Some(name.clone());
+                        total_tools += 1;
+                        if let Some(call_id) = call_id.as_ref() {
+                            known_tool_names.insert(call_id.clone(), name.clone());
+                        }
+                        if let Some(ts) = event_ts(obj) {
+                            if is_ask_user_tool(&name) {
+                                let event = ask_user_event(&args, call_id.as_deref(), ts, false);
+                                if let Some(call_id) = call_id.as_ref() {
+                                    pending_ask_user_calls.insert(call_id.clone(), event.clone());
+                                }
+                                events.push(event);
+                            } else if let Some(event) = extension_event_from_tool(&name, &args, call_id.as_deref(), ts) {
+                                events.push(event);
+                            } else {
+                                events.push(tool_event(&name, call_id.as_deref(), tool_call_summary(&name, &args), ts));
+                            }
+                        }
+                    }
+                    Some("custom_tool_call") | Some("web_search_call") | Some("local_shell_call") => {
+                        total_tools += 1;
+                        let name = match pt {
+                            Some("web_search_call") => "web_search".to_string(),
+                            Some("local_shell_call") => "local_shell".to_string(),
+                            _ => non_empty_string(payload.get("name")).unwrap_or_else(|| "tool".to_string()),
+                        };
+                        let call_id = non_empty_string(payload.get("call_id"));
+                        if let Some(call_id) = call_id.as_ref() {
+                            known_tool_names.insert(call_id.clone(), name.clone());
+                        }
+                        tool_names.insert(name.clone());
+                        last_tool = Some(name.clone());
+                        if let Some(ts) = event_ts(obj) {
+                            let mut args = coerce_tool_arguments(payload.get("arguments"));
+                            if args.is_empty() {
+                                args = payload.clone();
+                            }
+                            if let Some(event) = extension_event_from_tool(&name, &args, call_id.as_deref(), ts) {
+                                events.push(event);
+                            } else {
+                                events.push(tool_event(&name, call_id.as_deref(), tool_call_summary(&name, &args), ts));
+                            }
+                        }
+                    }
+                    Some("function_call_output") | Some("custom_tool_call_output") => {
+                        total_tools += 1;
+                        let call_id = non_empty_string(payload.get("call_id"));
+                        let name = non_empty_string(payload.get("name"))
+                            .or_else(|| call_id.as_ref().and_then(|id| known_tool_names.get(id).cloned()))
+                            .unwrap_or_else(|| "tool".to_string());
+                        tool_names.insert(name.clone());
+                        last_tool = Some(name.clone());
+                        let details = payload.get("details").and_then(Value::as_object);
+                        let text = tool_result_text(payload);
+                        if let Some(ts) = event_ts(obj) {
+                            if let Some(event) = extension_event_from_tool_result(&name, payload, call_id.as_deref(), ts) {
+                                events.push(event);
+                            } else if is_ask_user_tool(&name)
+                                || call_id.as_ref().map(|id| pending_ask_user_calls.contains_key(id)).unwrap_or(false)
+                            {
+                                let base = ask_user_base_event(
+                                    call_id.as_deref(),
+                                    ts,
+                                    &pending_ask_user_calls,
+                                );
+                                events.push(resolve_ask_user_event(
+                                    base,
+                                    call_id.as_deref(),
+                                    ts,
+                                    details,
+                                    text.as_deref(),
+                                ));
+                            } else if text.is_some() || payload.get("is_error").and_then(Value::as_bool) == Some(true) {
+                                events.push(tool_result_event(
+                                    &name,
+                                    call_id.as_deref(),
+                                    text,
+                                    payload.get("is_error").and_then(Value::as_bool) == Some(true),
+                                    ts,
+                                ));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut tool_names = tool_names.into_iter().collect::<Vec<_>>();
+    tool_names.sort();
+    ExtractedChatBatch {
+        events,
+        meta: json!({
+            "thinking": total_thinking,
+            "tool": total_tools,
+            "system": total_system,
+        }),
+        turn_start,
+        turn_end,
+        turn_aborted,
+        diag: json!({
+            "tool_names": tool_names,
+            "last_tool": last_tool,
+        }),
+    }
+}
+
+fn single_chat_event(obj: &Value) -> Option<Value> {
+    match obj.get("type").and_then(Value::as_str)? {
+        "message" => pi_single_chat_event(obj),
         "event_msg" => event_msg_chat_event(obj),
         "response_item" => response_item_chat_event(obj),
-        "message" => pi_message_chat_event(obj),
+        _ => None,
+    }
+}
+
+fn pi_single_chat_event(obj: &Value) -> Option<Value> {
+    if let Some(user_text) = pi_user_text_value(obj) {
+        return Some(json_text_event("user", &user_text, event_ts(obj), None));
+    }
+    if let Some(assistant_text) = pi_assistant_text_value(obj) {
+        let class = if pi_assistant_is_final_turn_end(obj) {
+            Some("final_response")
+        } else {
+            Some("narration")
+        };
+        return Some(json_text_event("assistant", &assistant_text, event_ts(obj), class));
+    }
+    let payload = obj.get("message")?.as_object()?;
+    let role = payload.get("role")?.as_str()?;
+    let ets = event_ts(obj);
+    match role {
+        "assistant" => {
+            let content = payload.get("content")?.as_array()?;
+            for item in content {
+                let Some(item) = item.as_object() else {
+                    continue;
+                };
+                if item.get("type").and_then(Value::as_str) != Some("toolCall") {
+                    continue;
+                }
+                let name = non_empty_string(item.get("name")).unwrap_or_else(|| "tool".to_string());
+                let call_id = non_empty_string(item.get("id"));
+                let args = coerce_tool_arguments(item.get("arguments"));
+                if is_ask_user_tool(&name) {
+                    return ets.map(|ts| ask_user_event(&args, call_id.as_deref(), ts, false));
+                }
+                if let Some(ts) = ets {
+                    if let Some(event) = extension_event_from_tool(&name, &args, call_id.as_deref(), ts) {
+                        return Some(event);
+                    }
+                    return Some(tool_event(&name, call_id.as_deref(), tool_call_summary(&name, &args), ts));
+                }
+            }
+            None
+        }
+        "toolResult" => {
+            let call_id = non_empty_string(payload.get("toolCallId"));
+            let name = non_empty_string(payload.get("toolName")).unwrap_or_else(|| "tool".to_string());
+            let text = tool_result_text(payload);
+            if let Some(ts) = ets {
+                if let Some(event) = extension_event_from_tool_result(&name, payload, call_id.as_deref(), ts) {
+                    return Some(event);
+                }
+                if is_ask_user_tool(&name) {
+                    return Some(resolve_ask_user_event(
+                        ask_user_event(&Map::new(), call_id.as_deref(), ts, true),
+                        call_id.as_deref(),
+                        ts,
+                        payload.get("details").and_then(Value::as_object),
+                        text.as_deref(),
+                    ));
+                }
+                if text.is_some() || payload.get("isError").and_then(Value::as_bool) == Some(true) {
+                    return Some(tool_result_event(
+                        &name,
+                        call_id.as_deref(),
+                        text,
+                        payload.get("isError").and_then(Value::as_bool) == Some(true),
+                        ts,
+                    ));
+                }
+            }
+            None
+        }
         _ => None,
     }
 }
 
 fn event_msg_chat_event(obj: &Value) -> Option<Value> {
     let payload = obj.get("payload")?.as_object()?;
-    let payload_type = payload.get("type")?.as_str()?;
-    match payload_type {
+    match payload.get("type")?.as_str()? {
         "user_message" => Some(json_text_event("user", payload.get("message")?.as_str()?, event_ts(obj), None)),
         "agent_message" => {
             let class = if payload.get("phase").and_then(Value::as_str) == Some("final_answer") {
@@ -2327,36 +3506,84 @@ fn event_msg_chat_event(obj: &Value) -> Option<Value> {
 
 fn response_item_chat_event(obj: &Value) -> Option<Value> {
     let payload = obj.get("payload")?.as_object()?;
-    if payload.get("type")?.as_str()? != "message" {
-        return None;
-    }
-    if payload.get("role")?.as_str()? != "assistant" {
-        return None;
-    }
-    let text = output_text(payload.get("content")?)?;
-    let class = if payload.get("phase").and_then(Value::as_str) == Some("final_answer")
-        || payload.get("end_turn").and_then(Value::as_bool) == Some(true)
-    {
-        Some("final_response")
-    } else {
-        Some("narration")
-    };
-    Some(json_text_event("assistant", &text, event_ts(obj), class))
-}
-
-fn pi_message_chat_event(obj: &Value) -> Option<Value> {
-    let message = obj.get("message")?.as_object()?;
-    let role = message.get("role")?.as_str()?;
-    match role {
-        "user" => Some(json_text_event("user", &content_text(message.get("content")?)?, event_ts(obj), None)),
-        "assistant" => {
-            let text = content_text(message.get("content")?)?;
-            let class = if message.get("stopReason").is_some() {
+    let ets = event_ts(obj);
+    match payload.get("type")?.as_str()? {
+        "function_call" => {
+            let name = non_empty_string(payload.get("name")).unwrap_or_else(|| "tool".to_string());
+            let call_id = non_empty_string(payload.get("call_id"));
+            let args = coerce_tool_arguments(payload.get("arguments"));
+            if is_ask_user_tool(&name) {
+                return ets.map(|ts| ask_user_event(&args, call_id.as_deref(), ts, false));
+            }
+            if let Some(ts) = ets {
+                if let Some(event) = extension_event_from_tool(&name, &args, call_id.as_deref(), ts) {
+                    return Some(event);
+                }
+                return Some(tool_event(&name, call_id.as_deref(), tool_call_summary(&name, &args), ts));
+            }
+            None
+        }
+        "custom_tool_call" | "web_search_call" | "local_shell_call" => {
+            let name = match payload.get("type").and_then(Value::as_str) {
+                Some("web_search_call") => "web_search".to_string(),
+                Some("local_shell_call") => "local_shell".to_string(),
+                _ => non_empty_string(payload.get("name")).unwrap_or_else(|| "tool".to_string()),
+            };
+            let call_id = non_empty_string(payload.get("call_id"));
+            let mut args = coerce_tool_arguments(payload.get("arguments"));
+            if args.is_empty() {
+                args = payload.clone();
+            }
+            if let Some(ts) = ets {
+                if let Some(event) = extension_event_from_tool(&name, &args, call_id.as_deref(), ts) {
+                    return Some(event);
+                }
+                return Some(tool_event(&name, call_id.as_deref(), tool_call_summary(&name, &args), ts));
+            }
+            None
+        }
+        "function_call_output" | "custom_tool_call_output" => {
+            let call_id = non_empty_string(payload.get("call_id"));
+            let name = non_empty_string(payload.get("name")).unwrap_or_else(|| "tool".to_string());
+            let text = tool_result_text(payload);
+            if let Some(ts) = ets {
+                if let Some(event) = extension_event_from_tool_result(&name, payload, call_id.as_deref(), ts) {
+                    return Some(event);
+                }
+                if is_ask_user_tool(&name) {
+                    return Some(resolve_ask_user_event(
+                        ask_user_event(&Map::new(), call_id.as_deref(), ts, true),
+                        call_id.as_deref(),
+                        ts,
+                        payload.get("details").and_then(Value::as_object),
+                        text.as_deref(),
+                    ));
+                }
+                if text.is_some() || payload.get("is_error").and_then(Value::as_bool) == Some(true) {
+                    return Some(tool_result_event(
+                        &name,
+                        call_id.as_deref(),
+                        text,
+                        payload.get("is_error").and_then(Value::as_bool) == Some(true),
+                        ts,
+                    ));
+                }
+            }
+            None
+        }
+        "message" => {
+            if payload.get("role")?.as_str()? != "assistant" {
+                return None;
+            }
+            let text = output_text(payload.get("content")?)?;
+            let class = if payload.get("phase").and_then(Value::as_str) == Some("final_answer")
+                || payload.get("end_turn").and_then(Value::as_bool) == Some(true)
+            {
                 Some("final_response")
             } else {
                 Some("narration")
             };
-            Some(json_text_event("assistant", &text, event_ts(obj), class))
+            Some(json_text_event("assistant", &text, ets, class))
         }
         _ => None,
     }
@@ -2371,6 +3598,451 @@ fn json_text_event(role: &str, text: &str, ts: Option<f64>, message_class: Optio
         event["message_class"] = json!(class);
     }
     event
+}
+
+fn tool_event(name: &str, call_id: Option<&str>, text: Option<String>, ts: f64) -> Value {
+    let mut event = json!({"type": "tool", "name": name, "ts": ts});
+    if let Some(call_id) = call_id {
+        event["tool_call_id"] = json!(call_id);
+    }
+    if let Some(text) = text {
+        event["text"] = json!(text);
+    }
+    event
+}
+
+fn tool_result_event(name: &str, call_id: Option<&str>, text: Option<String>, is_error: bool, ts: f64) -> Value {
+    let mut event = json!({"type": "tool_result", "name": name, "ts": ts});
+    if let Some(call_id) = call_id {
+        event["tool_call_id"] = json!(call_id);
+    }
+    if let Some(text) = text {
+        event["text"] = json!(text);
+    }
+    if is_error {
+        event["is_error"] = json!(true);
+    }
+    event
+}
+
+fn is_ask_user_tool(name: &str) -> bool {
+    ASK_USER_TOOL_NAMES.contains(&name)
+}
+
+fn non_empty_string(value: Option<&Value>) -> Option<String> {
+    let value = value?.as_str()?.trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
+fn coerce_tool_arguments(value: Option<&Value>) -> Map<String, Value> {
+    match value {
+        Some(Value::Object(map)) => map.clone(),
+        Some(Value::String(raw)) => serde_json::from_str::<Value>(raw)
+            .ok()
+            .and_then(|value| value.as_object().cloned())
+            .unwrap_or_default(),
+        _ => Map::new(),
+    }
+}
+
+fn tool_text_from_content(value: &Value) -> Option<String> {
+    if let Some(text) = value.as_str() {
+        let trimmed = text.trim();
+        if !trimmed.is_empty() {
+            return Some(text.to_string());
+        }
+    }
+    let parts = value.as_array()?;
+    let text = parts
+        .iter()
+        .filter_map(|item| {
+            let item = item.as_object()?;
+            let kind = item.get("type").and_then(Value::as_str);
+            if matches!(kind, Some("text") | Some("output_text") | Some("input_text")) {
+                item.get("text").and_then(Value::as_str)
+            } else {
+                None
+            }
+        })
+        .collect::<String>();
+    if text.is_empty() { None } else { Some(text) }
+}
+
+fn tool_result_text(payload: &Map<String, Value>) -> Option<String> {
+    for key in ["content", "output", "text", "result"] {
+        let Some(value) = payload.get(key) else {
+            continue;
+        };
+        if let Some(text) = tool_text_from_content(value) {
+            return Some(text);
+        }
+        if matches!(value, Value::Object(map) if !map.is_empty()) || matches!(value, Value::Array(items) if !items.is_empty()) {
+            return serde_json::to_string(value).ok();
+        }
+    }
+    None
+}
+
+fn tool_call_summary(name: &str, args: &Map<String, Value>) -> Option<String> {
+    if is_ask_user_tool(name) {
+        if let Some(question) = non_empty_string(args.get("question")) {
+            return Some(question);
+        }
+        if let Some(questions) = args.get("questions").and_then(Value::as_array) {
+            for item in questions {
+                let Some(item) = item.as_object() else {
+                    continue;
+                };
+                if let Some(question) = non_empty_string(item.get("question")) {
+                    return Some(question);
+                }
+            }
+        }
+        return None;
+    }
+    for key in ["cmd", "command", "query", "prompt", "path", "file_path", "url", "subject"] {
+        if let Some(value) = non_empty_string(args.get(key)) {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn normalize_bool_arg(args: &Map<String, Value>, keys: &[&str], default: bool) -> bool {
+    keys.iter()
+        .find_map(|key| args.get(*key).and_then(Value::as_bool))
+        .unwrap_or(default)
+}
+
+fn normalize_ask_user_questions(value: Option<&Value>) -> Vec<Value> {
+    let Some(items) = value.and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|item| {
+            let item = item.as_object()?;
+            let question = item.get("question").and_then(Value::as_str)?.trim().to_string();
+            if question.is_empty() {
+                return None;
+            }
+            let header = item.get("header").and_then(Value::as_str).unwrap_or("").to_string();
+            let options = item
+                .get("options")
+                .and_then(Value::as_array)
+                .map(|options| options.iter().filter_map(|option| option.as_str().map(|s| s.to_string())).collect::<Vec<_>>())
+                .unwrap_or_default();
+            Some(json!({
+                "header": header,
+                "question": question,
+                "options": options,
+                "multiSelect": normalize_bool_arg(item, &["allow_multiple", "allowMultiple", "multiSelect"], false),
+            }))
+        })
+        .collect()
+}
+
+fn ask_user_event(args: &Map<String, Value>, call_id: Option<&str>, ts: f64, resolved: bool) -> Value {
+    let mut question = args.get("question").and_then(Value::as_str).unwrap_or("").to_string();
+    let mut context = args.get("context").and_then(Value::as_str).unwrap_or("").to_string();
+    let mut options = args
+        .get("options")
+        .and_then(Value::as_array)
+        .map(|options| options.iter().filter_map(|option| option.as_str().map(|s| s.to_string())).collect::<Vec<_>>())
+        .unwrap_or_default();
+    let mut allow_freeform = normalize_bool_arg(args, &["allow_freeform", "allowFreeform"], true);
+    let mut allow_multiple = normalize_bool_arg(args, &["allow_multiple", "allowMultiple"], false);
+    let timeout_ms = args
+        .get("timeout_ms")
+        .or_else(|| args.get("timeoutMs"))
+        .or_else(|| args.get("timeout"))
+        .and_then(Value::as_i64);
+    let questions = normalize_ask_user_questions(args.get("questions"));
+    let mut header = None;
+    if let Some(first) = questions.first().and_then(Value::as_object) {
+        if let Some(value) = first.get("question").and_then(Value::as_str) {
+            question = value.to_string();
+        }
+        if let Some(value) = first.get("header").and_then(Value::as_str) {
+            header = Some(value.to_string());
+            if context.is_empty() && !value.is_empty() {
+                context = value.to_string();
+            }
+        }
+        if let Some(values) = first.get("options").and_then(Value::as_array) {
+            options = values.iter().filter_map(|option| option.as_str().map(|s| s.to_string())).collect();
+        }
+        allow_freeform = first.get("allowFreeform").and_then(Value::as_bool).unwrap_or(allow_freeform);
+        allow_multiple = first.get("multiSelect").and_then(Value::as_bool).unwrap_or(allow_multiple);
+    }
+    let mut event = json!({
+        "type": "ask_user",
+        "question": question,
+        "context": context,
+        "options": options,
+        "allow_freeform": allow_freeform,
+        "allow_multiple": allow_multiple,
+        "timeout_ms": timeout_ms,
+        "resolved": resolved,
+        "ts": ts,
+    });
+    if let Some(call_id) = call_id {
+        event["tool_call_id"] = json!(call_id);
+    }
+    if let Some(header) = header {
+        event["header"] = json!(header);
+    }
+    if !questions.is_empty() {
+        event["questions"] = Value::Array(questions);
+    }
+    event
+}
+
+fn ask_user_base_event(call_id: Option<&str>, ts: f64, pending: &HashMap<String, Value>) -> Value {
+    call_id
+        .and_then(|call_id| pending.get(call_id).cloned())
+        .unwrap_or_else(|| ask_user_event(&Map::new(), call_id, ts, true))
+}
+
+fn normalize_ask_user_answer(value: Option<&Value>, allow_multiple: bool) -> Option<Value> {
+    if let Some(answer) = value.and_then(Value::as_str) {
+        return Some(json!(answer));
+    }
+    if allow_multiple {
+        if let Some(values) = value.and_then(Value::as_array) {
+            let items = values.iter().filter_map(|item| item.as_str().map(|s| s.to_string())).collect::<Vec<_>>();
+            if !items.is_empty() {
+                return Some(json!(items));
+            }
+        }
+    }
+    None
+}
+
+fn normalize_ask_user_result(
+    details: Option<&Map<String, Value>>,
+    allow_multiple: bool,
+    question: &str,
+) -> (Option<Value>, bool) {
+    let Some(details) = details else {
+        return (None, false);
+    };
+    if let Some(answers) = details.get("answers").and_then(Value::as_object) {
+        if !question.is_empty() {
+            if let Some(answer) = normalize_ask_user_answer(answers.get(question), allow_multiple) {
+                return (Some(answer), false);
+            }
+        }
+    }
+    let was_custom = details.get("wasCustom").and_then(Value::as_bool).unwrap_or(false);
+    if let Some(answer) = normalize_ask_user_answer(details.get("answer"), allow_multiple) {
+        return (Some(answer), was_custom);
+    }
+    if let Some(response) = details.get("response").and_then(Value::as_object) {
+        let kind = response.get("kind").and_then(Value::as_str).unwrap_or("");
+        if let Some(selections) = response.get("selections").and_then(Value::as_array) {
+            let normalized = selections.iter().filter_map(|item| item.as_str().map(|s| s.to_string())).collect::<Vec<_>>();
+            if !normalized.is_empty() {
+                if allow_multiple || normalized.len() > 1 {
+                    return (Some(json!(normalized)), was_custom || kind == "custom");
+                }
+                return (Some(json!(normalized[0])), was_custom || kind == "custom");
+            }
+        }
+        if let Some(value) = response.get("value").and_then(Value::as_str) {
+            if !value.is_empty() {
+                return (Some(json!(value)), was_custom || kind == "custom");
+            }
+        }
+        if let Some(comment) = response.get("comment").and_then(Value::as_str) {
+            if !comment.trim().is_empty() {
+                return (Some(json!(comment.trim())), true);
+            }
+        }
+    }
+    (None, was_custom)
+}
+
+fn resolve_ask_user_event(
+    mut event: Value,
+    call_id: Option<&str>,
+    ts: f64,
+    details: Option<&Map<String, Value>>,
+    _content_text: Option<&str>,
+) -> Value {
+    event["resolved"] = json!(true);
+    event["ts"] = json!(ts);
+    if let Some(call_id) = call_id {
+        event["tool_call_id"] = json!(call_id);
+    }
+    let allow_multiple = event.get("allow_multiple").and_then(Value::as_bool).unwrap_or(false);
+    let question = event.get("question").and_then(Value::as_str).unwrap_or("");
+    let (answer, was_custom) = normalize_ask_user_result(details, allow_multiple, question);
+    if let Some(answer) = answer {
+        event["answer"] = answer;
+    }
+    if let Some(cancelled) = details.and_then(|details| details.get("cancelled")).and_then(Value::as_bool) {
+        event["cancelled"] = json!(cancelled);
+    }
+    event["was_custom"] = json!(was_custom);
+    event
+}
+
+fn extension_item(value: &Value) -> Option<Value> {
+    if let Some(label) = value.as_str().map(str::trim).filter(|label| !label.is_empty()) {
+        return Some(json!({ "label": label }));
+    }
+    let object = value.as_object()?;
+    let label = non_empty_string(object.get("label"))
+        .or_else(|| non_empty_string(object.get("step")))
+        .or_else(|| non_empty_string(object.get("title")))?;
+    let mut item = json!({ "label": label });
+    if let Some(status) = non_empty_string(object.get("status")) {
+        item["status"] = json!(status);
+    }
+    if let Some(detail) = non_empty_string(object.get("detail")).or_else(|| non_empty_string(object.get("summary"))) {
+        item["detail"] = json!(detail);
+    }
+    Some(item)
+}
+
+fn normalize_extension_items(value: Option<&Value>) -> Vec<Value> {
+    value
+        .and_then(Value::as_array)
+        .map(|items| items.iter().filter_map(extension_item).collect::<Vec<_>>())
+        .unwrap_or_default()
+}
+
+fn extension_display_event(
+    payload: &Map<String, Value>,
+    call_id: Option<&str>,
+    ts: f64,
+    default_source: &str,
+    default_title: &str,
+) -> Value {
+    let progress = payload.get("progress").and_then(Value::as_object);
+    let mut event = json!({
+        "type": "extension",
+        "extension_kind": non_empty_string(payload.get("kind")).unwrap_or_else(|| "status".to_string()),
+        "source": non_empty_string(payload.get("source")).unwrap_or_else(|| default_source.to_string()),
+        "title": non_empty_string(payload.get("title")).unwrap_or_else(|| default_title.to_string()),
+        "ts": ts,
+    });
+    if let Some(call_id) = call_id {
+        event["tool_call_id"] = json!(call_id);
+    }
+    for (source_key, event_key) in [("status", "status"), ("summary", "summary"), ("text", "text")] {
+        if let Some(value) = non_empty_string(payload.get(source_key)) {
+            event[event_key] = json!(value);
+        }
+    }
+    if let Some(current) = progress.and_then(|progress| progress.get("current")).or_else(|| payload.get("progress_current")).and_then(number_json) {
+        event["progress_current"] = current;
+    }
+    if let Some(total) = progress.and_then(|progress| progress.get("total")).or_else(|| payload.get("progress_total")).and_then(number_json) {
+        event["progress_total"] = total;
+    }
+    if let Some(label) = progress
+        .and_then(|progress| non_empty_string(progress.get("label")))
+        .or_else(|| non_empty_string(payload.get("progress_label")))
+    {
+        event["progress_label"] = json!(label);
+    }
+    let items = normalize_extension_items(payload.get("items"));
+    if !items.is_empty() {
+        event["items"] = Value::Array(items);
+    }
+    event
+}
+
+fn number_json(value: &Value) -> Option<Value> {
+    match value {
+        Value::Number(number) => Some(Value::Number(number.clone())),
+        _ => None,
+    }
+}
+
+fn plan_status(items: &[Value]) -> &'static str {
+    let statuses = items.iter().filter_map(|item| item.get("status").and_then(Value::as_str)).collect::<Vec<_>>();
+    if statuses.iter().any(|status| *status == "in_progress") {
+        "running"
+    } else if !statuses.is_empty() && statuses.iter().all(|status| *status == "completed") {
+        "completed"
+    } else {
+        "pending"
+    }
+}
+
+fn update_plan_event(args: &Map<String, Value>, call_id: Option<&str>, ts: f64) -> Option<Value> {
+    let items = normalize_extension_items(args.get("plan"));
+    if items.is_empty() {
+        return None;
+    }
+    let completed = items
+        .iter()
+        .filter(|item| item.get("status").and_then(Value::as_str) == Some("completed"))
+        .count();
+    Some(extension_display_event(
+        &json!({
+            "kind": "progress",
+            "source": "codex",
+            "title": "Todo",
+            "status": plan_status(&items),
+            "summary": format!("{completed}/{} completed", items.len()),
+            "progress": { "current": completed, "total": items.len(), "label": "items" },
+            "items": items,
+        })
+        .as_object()
+        .cloned()
+        .unwrap_or_default(),
+        call_id,
+        ts,
+        "codex",
+        "Todo",
+    ))
+}
+
+fn extension_event_from_tool(name: &str, args: &Map<String, Value>, call_id: Option<&str>, ts: f64) -> Option<Value> {
+    if name == "update_plan" {
+        return update_plan_event(args, call_id, ts);
+    }
+    let payload = if EXTENSION_DISPLAY_TOOL_NAMES.contains(&name) {
+        Some(args)
+    } else {
+        args.get(EXTENSION_DISPLAY_KEY).and_then(Value::as_object)
+    }?;
+    Some(extension_display_event(payload, call_id, ts, name, name))
+}
+
+fn extension_payload_from_result<'a>(name: &str, payload: &'a Map<String, Value>) -> Option<&'a Map<String, Value>> {
+    for key in [
+        EXTENSION_DISPLAY_KEY,
+        "structuredContent",
+        "structured_content",
+        "details",
+        "result",
+        "output",
+    ] {
+        let Some(candidate) = payload.get(key).and_then(Value::as_object) else {
+            continue;
+        };
+        if let Some(nested) = candidate.get(EXTENSION_DISPLAY_KEY).and_then(Value::as_object) {
+            return Some(nested);
+        }
+        if EXTENSION_DISPLAY_TOOL_NAMES.contains(&name) {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn extension_event_from_tool_result(name: &str, payload: &Map<String, Value>, call_id: Option<&str>, ts: f64) -> Option<Value> {
+    let extension_payload = extension_payload_from_result(name, payload)?;
+    Some(extension_display_event(extension_payload, call_id, ts, name, name))
 }
 
 fn output_text(value: &Value) -> Option<String> {
@@ -2407,21 +4079,73 @@ fn content_text(value: &Value) -> Option<String> {
     if text.is_empty() { None } else { Some(text) }
 }
 
-fn update_turn_flags(obj: &Value, turn_start: &mut bool, turn_end: &mut bool, turn_aborted: &mut bool) {
-    if let Some(payload) = obj.get("payload").and_then(Value::as_object) {
-        match payload.get("type").and_then(Value::as_str) {
-            Some("user_message") => *turn_start = true,
-            Some("task_complete") | Some("turn_complete") => *turn_end = true,
-            Some("turn_aborted") => *turn_aborted = true,
-            _ => {}
-        }
+fn parse_iso8601_to_epoch(ts: &str) -> Option<f64> {
+    let raw = ts.trim();
+    let (date, time_and_zone) = raw.split_once('T')?;
+    let mut date_parts = date.split('-');
+    let year = date_parts.next()?.parse::<i32>().ok()?;
+    let month = date_parts.next()?.parse::<u32>().ok()?;
+    let day = date_parts.next()?.parse::<u32>().ok()?;
+    if date_parts.next().is_some() {
+        return None;
     }
+
+    let (time_part, offset_seconds) = if let Some(time_part) = time_and_zone.strip_suffix('Z') {
+        (time_part, 0_i32)
+    } else if let Some((time_part, offset_part)) = time_and_zone.rsplit_once(['+', '-']) {
+        let sign = if time_and_zone.as_bytes().get(time_part.len()) == Some(&b'+') { 1_i32 } else { -1_i32 };
+        let (offset_hour, offset_minute) = offset_part.split_once(':')?;
+        let hours = offset_hour.parse::<i32>().ok()?;
+        let minutes = offset_minute.parse::<i32>().ok()?;
+        (time_part, sign * (hours * 3600 + minutes * 60))
+    } else {
+        return None;
+    };
+
+    let mut time_parts = time_part.split(':');
+    let hour = time_parts.next()?.parse::<u32>().ok()?;
+    let minute = time_parts.next()?.parse::<u32>().ok()?;
+    let second_part = time_parts.next()?;
+    if time_parts.next().is_some() {
+        return None;
+    }
+    let (second_raw, fractional_raw) = second_part.split_once('.').unwrap_or((second_part, ""));
+    let second = second_raw.parse::<u32>().ok()?;
+    let fractional = if fractional_raw.is_empty() {
+        0.0
+    } else {
+        format!("0.{fractional_raw}").parse::<f64>().ok()?
+    };
+
+    let days = days_from_civil(year, month, day)?;
+    Some(
+        days as f64 * 86_400.0
+            + hour as f64 * 3_600.0
+            + minute as f64 * 60.0
+            + second as f64
+            + fractional
+            - offset_seconds as f64,
+    )
+}
+
+fn days_from_civil(year: i32, month: u32, day: u32) -> Option<i64> {
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    let adjusted_year = year - i32::from(month <= 2);
+    let era = if adjusted_year >= 0 { adjusted_year } else { adjusted_year - 399 } / 400;
+    let yoe = adjusted_year - era * 400;
+    let month_prime = month as i32 + if month > 2 { -3 } else { 9 };
+    let doy = (153 * month_prime + 2) / 5 + day as i32 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    Some((era as i64) * 146_097 + doe as i64 - 719_468)
 }
 
 fn event_ts(obj: &Value) -> Option<f64> {
     obj.get("ts")
         .and_then(Value::as_f64)
         .or_else(|| obj.get("timestamp").and_then(Value::as_f64))
+        .or_else(|| obj.get("timestamp").and_then(Value::as_str).and_then(parse_iso8601_to_epoch))
 }
 
 fn parse_cursor(raw: &str) -> Result<u64, String> {
@@ -2527,7 +4251,7 @@ fn clean_optional(value: Option<String>) -> Option<String> {
     })
 }
 
-fn normalize_backend(value: Option<&str>) -> Result<String, String> {
+pub(crate) fn normalize_backend(value: Option<&str>) -> Result<String, String> {
     let raw = value.unwrap_or("codex").trim().to_ascii_lowercase();
     match raw.as_str() {
         "" => Ok("codex".to_string()),
@@ -2951,7 +4675,7 @@ fn expand_user_and_vars(raw: &str) -> PathBuf {
     expand_home(&expanded)
 }
 
-fn resolve_dir_target(raw: &str) -> Result<PathBuf, String> {
+pub(crate) fn resolve_dir_target(raw: &str) -> Result<PathBuf, String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Err("cwd required".to_string());
@@ -4393,6 +6117,14 @@ fn codex_config_path() -> PathBuf {
     codex_home().join("config.toml")
 }
 
+fn push_subscriptions_path(config: &RuntimeConfig) -> PathBuf {
+    config.app_dir.join("push_subscriptions.json")
+}
+
+fn vapid_private_key_path(config: &RuntimeConfig) -> PathBuf {
+    config.app_dir.join("webpush_vapid_private.pem")
+}
+
 fn models_cache_path() -> PathBuf {
     codex_home().join("models_cache.json")
 }
@@ -4407,6 +6139,125 @@ fn pi_models_path() -> PathBuf {
 
 fn pi_auth_path() -> PathBuf {
     pi_home().join("agent").join("auth.json")
+}
+
+fn ensure_vapid_public_key(config: &RuntimeConfig) -> Result<String, String> {
+    let path = vapid_private_key_path(config);
+    if !path.exists() {
+        let parent = path.parent().ok_or_else(|| format!("missing parent for {}", path.display()))?;
+        fs::create_dir_all(parent).map_err(|err| format!("create {}: {err}", parent.display()))?;
+        let output = Command::new("openssl")
+            .arg("genpkey")
+            .arg("-algorithm")
+            .arg("EC")
+            .arg("-pkeyopt")
+            .arg("ec_paramgen_curve:P-256")
+            .arg("-out")
+            .arg(&path)
+            .output()
+            .map_err(|err| format!("spawn openssl genpkey: {err}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "openssl genpkey failed for {}: {}",
+                path.display(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        #[allow(clippy::permissions_set_readonly_false)]
+        {
+            let mut permissions = fs::metadata(&path)
+                .map_err(|err| format!("stat {}: {err}", path.display()))?
+                .permissions();
+            permissions.set_mode(0o600);
+            fs::set_permissions(&path, permissions).map_err(|err| format!("chmod {}: {err}", path.display()))?;
+        }
+    }
+    let output = Command::new("openssl")
+        .arg("pkey")
+        .arg("-in")
+        .arg(&path)
+        .arg("-pubout")
+        .arg("-outform")
+        .arg("DER")
+        .output()
+        .map_err(|err| format!("spawn openssl pkey: {err}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "openssl pkey failed for {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let public_key = extract_ec_public_key_from_spki_der(&output.stdout)?;
+    Ok(URL_SAFE_NO_PAD.encode(public_key))
+}
+
+fn extract_ec_public_key_from_spki_der(raw: &[u8]) -> Result<Vec<u8>, String> {
+    let mut idx = 0_usize;
+    let outer_end = der_expect_tag(raw, &mut idx, 0x30)?;
+    let algorithm_end = der_expect_tag(raw, &mut idx, 0x30)?;
+    idx = algorithm_end;
+    if raw.get(idx) != Some(&0x03) {
+        return Err("invalid DER public key: missing BIT STRING".to_string());
+    }
+    idx += 1;
+    let bit_string_len = der_read_length(raw, &mut idx)?;
+    let bit_string_end = idx
+        .checked_add(bit_string_len)
+        .ok_or_else(|| "invalid DER public key length".to_string())?;
+    if bit_string_end > raw.len() || bit_string_end > outer_end {
+        return Err("invalid DER public key: truncated BIT STRING".to_string());
+    }
+    if raw.get(idx) != Some(&0x00) {
+        return Err("invalid DER public key: unsupported unused bits".to_string());
+    }
+    idx += 1;
+    let point = raw[idx..bit_string_end].to_vec();
+    if point.len() != 65 || point.first().copied() != Some(0x04) {
+        return Err("invalid DER public key: expected uncompressed P-256 point".to_string());
+    }
+    Ok(point)
+}
+
+fn der_expect_tag(raw: &[u8], idx: &mut usize, tag: u8) -> Result<usize, String> {
+    if raw.get(*idx) != Some(&tag) {
+        return Err(format!("invalid DER tag: expected 0x{tag:02x}"));
+    }
+    *idx += 1;
+    let len = der_read_length(raw, idx)?;
+    let end = idx
+        .checked_add(len)
+        .ok_or_else(|| "invalid DER length overflow".to_string())?;
+    if end > raw.len() {
+        return Err("invalid DER length: truncated value".to_string());
+    }
+    Ok(end)
+}
+
+fn der_read_length(raw: &[u8], idx: &mut usize) -> Result<usize, String> {
+    let Some(first) = raw.get(*idx).copied() else {
+        return Err("invalid DER length: missing byte".to_string());
+    };
+    *idx += 1;
+    if first & 0x80 == 0 {
+        return Ok(first as usize);
+    }
+    let count = (first & 0x7f) as usize;
+    if count == 0 || count > 4 {
+        return Err("invalid DER length encoding".to_string());
+    }
+    let end = idx
+        .checked_add(count)
+        .ok_or_else(|| "invalid DER length overflow".to_string())?;
+    if end > raw.len() {
+        return Err("invalid DER length: truncated".to_string());
+    }
+    let mut len = 0_usize;
+    for byte in &raw[*idx..end] {
+        len = (len << 8) | usize::from(*byte);
+    }
+    *idx = end;
+    Ok(len)
 }
 
 fn toml_string(value: &TomlValue) -> Option<String> {
@@ -5153,5 +7004,129 @@ name = "CRS"
         let live = load_messages_live(&config, "sid-msg", "0").unwrap();
         assert_eq!(live.events.len(), 3);
         assert_eq!(live.live_cursor, tail.live_cursor);
+    }
+
+    #[test]
+    fn message_live_normalizes_codex_tool_extension_and_ask_user_events() {
+        let app_dir = temp_app_dir("message-live-tools");
+        let log_path = app_dir.join("rollout.jsonl");
+        fs::write(
+            &log_path,
+            [
+                r#"{"type":"response_item","payload":{"type":"function_call","name":"bash","call_id":"tool-1","arguments":{"command":"pwd"}},"ts":1.0}"#,
+                r#"{"type":"response_item","payload":{"type":"function_call_output","name":"bash","call_id":"tool-1","output":"\/work"},"ts":2.0}"#,
+                r#"{"type":"response_item","payload":{"type":"function_call","name":"update_plan","call_id":"plan-1","arguments":{"plan":[{"step":"Inspect logs","status":"completed"},{"step":"Patch parser","status":"in_progress"}]}},"ts":3.0}"#,
+                r#"{"type":"response_item","payload":{"type":"function_call","name":"ask_user","call_id":"ask-1","arguments":{"question":"Proceed?","options":["Yes","No"]}},"ts":4.0}"#,
+                r#"{"type":"response_item","payload":{"type":"function_call_output","name":"ask_user","call_id":"ask-1","details":{"answer":"Yes","wasCustom":false}},"ts":5.0}"#,
+            ]
+            .join("\n")
+                + "\n",
+        )
+        .unwrap();
+        fs::write(app_dir.join("socks").join("sid-tools.sock"), "").unwrap();
+        fs::write(
+            app_dir.join("socks").join("sid-tools.json"),
+            format!(
+                r#"{{"session_id":"thread-tools","codex_pid":1,"broker_pid":2,"cwd":"/work","log_path":"{}","start_ts":1.0}}"#,
+                log_path.display()
+            ),
+        )
+        .unwrap();
+        let config = RuntimeConfig { app_dir };
+
+        let live = load_messages_live(&config, "sid-tools", "0").unwrap();
+        assert_eq!(live.events.len(), 5);
+        assert_eq!(live.events[0]["type"], "tool");
+        assert_eq!(live.events[0]["text"], "pwd");
+        assert_eq!(live.events[1]["type"], "tool_result");
+        assert_eq!(live.events[1]["text"], "/work");
+        assert_eq!(live.events[2]["type"], "extension");
+        assert_eq!(live.events[2]["title"], "Todo");
+        assert_eq!(live.events[2]["summary"], "1/2 completed");
+        assert_eq!(live.events[3]["type"], "ask_user");
+        assert_eq!(live.events[3]["resolved"], false);
+        assert_eq!(live.events[4]["type"], "ask_user");
+        assert_eq!(live.events[4]["resolved"], true);
+        assert_eq!(live.events[4]["answer"], "Yes");
+        assert_eq!(live.meta_delta["tool"], 5);
+        assert_eq!(live.diag["last_tool"], "ask_user");
+    }
+
+    #[test]
+    fn message_tail_and_history_keep_single_event_tool_pages() {
+        let app_dir = temp_app_dir("message-tail-tools");
+        let log_path = app_dir.join("rollout.jsonl");
+        fs::write(
+            &log_path,
+            [
+                r#"{"type":"response_item","payload":{"type":"function_call","name":"bash","call_id":"tool-1","arguments":{"command":"pwd"}},"ts":1.0}"#,
+                r#"{"type":"response_item","payload":{"type":"function_call_output","name":"bash","call_id":"tool-1","output":"\/work"},"ts":2.0}"#,
+                r#"{"type":"response_item","payload":{"type":"function_call","name":"update_plan","call_id":"plan-1","arguments":{"plan":[{"step":"Inspect logs","status":"completed"},{"step":"Patch parser","status":"in_progress"}]}},"ts":3.0}"#,
+                r#"{"type":"response_item","payload":{"type":"function_call","name":"ask_user","call_id":"ask-1","arguments":{"question":"Proceed?","options":["Yes","No"]}},"ts":4.0}"#,
+                r#"{"type":"response_item","payload":{"type":"function_call_output","name":"ask_user","call_id":"ask-1","details":{"answer":"Yes","wasCustom":false}},"ts":5.0}"#,
+            ]
+            .join("\n")
+                + "\n",
+        )
+        .unwrap();
+        fs::write(app_dir.join("socks").join("sid-tail.sock"), "").unwrap();
+        fs::write(
+            app_dir.join("socks").join("sid-tail.json"),
+            format!(
+                r#"{{"session_id":"thread-tail","codex_pid":1,"broker_pid":2,"cwd":"/work","log_path":"{}","start_ts":1.0}}"#,
+                log_path.display()
+            ),
+        )
+        .unwrap();
+        let config = RuntimeConfig { app_dir };
+
+        let tail = load_messages_tail(&config, "sid-tail", 3).unwrap();
+        assert_eq!(tail.events.len(), 3);
+        assert_eq!(tail.events[0]["type"], "extension");
+        assert_eq!(tail.events[1]["type"], "ask_user");
+        assert_eq!(tail.events[2]["type"], "ask_user");
+        assert!(tail.has_older);
+
+        let history = load_messages_history(&config, "sid-tail", tail.history_cursor.as_deref().unwrap(), 10).unwrap();
+        assert_eq!(history.events.len(), 2);
+        assert_eq!(history.events[0]["type"], "tool");
+        assert_eq!(history.events[1]["type"], "tool_result");
+    }
+
+    #[test]
+    fn message_live_normalizes_pi_ask_user_events_with_iso_timestamps() {
+        let app_dir = temp_app_dir("message-live-pi");
+        let log_path = app_dir.join("pi.jsonl");
+        fs::write(
+            &log_path,
+            [
+                r#"{"type":"message","timestamp":"2026-04-24T10:00:00Z","message":{"role":"assistant","content":[{"type":"toolCall","id":"ask-4","name":"AskUserQuestion","arguments":{"questions":[{"header":"Testing","question":"How should we test this?","options":["Single","Freeform","Multiple"]}]}}]}}"#,
+                r#"{"type":"message","timestamp":"2026-04-24T10:00:01Z","message":{"role":"toolResult","toolCallId":"ask-4","toolName":"AskUserQuestion","details":{"answer":"Single","wasCustom":false}}}"#,
+            ]
+            .join("\n")
+                + "\n",
+        )
+        .unwrap();
+        fs::write(app_dir.join("socks").join("sid-pi.sock"), "").unwrap();
+        fs::write(
+            app_dir.join("socks").join("sid-pi.json"),
+            format!(
+                r#"{{"session_id":"thread-pi","codex_pid":1,"broker_pid":2,"cwd":"/work","log_path":"{}","start_ts":1.0,"agent_backend":"pi"}}"#,
+                log_path.display()
+            ),
+        )
+        .unwrap();
+        let config = RuntimeConfig { app_dir };
+
+        let live = load_messages_live(&config, "sid-pi", "0").unwrap();
+        assert_eq!(live.events.len(), 2);
+        assert_eq!(live.events[0]["type"], "ask_user");
+        assert_eq!(live.events[0]["question"], "How should we test this?");
+        assert!(live.events[0]["ts"].as_f64().unwrap() > 0.0);
+        assert_eq!(live.events[1]["type"], "ask_user");
+        assert_eq!(live.events[1]["resolved"], true);
+        assert_eq!(live.events[1]["answer"], "Single");
+        assert_eq!(live.meta_delta["tool"], 2);
+        assert_eq!(live.diag["last_tool"], "pi_tool");
     }
 }

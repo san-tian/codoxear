@@ -68,21 +68,30 @@ start_server() {
   source "$ROOT_DIR/.env"
   set +a
 
-  setsid env \
-    CODOXEAR_BIND_HOST=127.0.0.1 \
-    CODOXEAR_BIND_PORT=8787 \
-    "$NOVA_BIN" >>"$RUST_LOG_FILE" 2>&1 < /dev/null &
-  rust_pid=$!
-  echo "$rust_pid" > "$RUST_PID_FILE"
+  local app_dir
+  app_dir="${CODOXEAR_APP_DIR:-$HOME/.local/share/codoxear}"
 
   setsid env \
-    CODEX_WEB_HOST=0.0.0.0 \
-    CODEX_WEB_PORT=8743 \
-    CODEX_WEB_NOVA=1 \
-    CODEX_WEB_NOVA_API_BASE=http://127.0.0.1:8787 \
+    CODEX_WEB_HOST=127.0.0.1 \
+    CODEX_WEB_PORT=8744 \
+    CODEX_WEB_NOVA=0 \
     "$PYTHON_BIN" -m codoxear.server >>"$WEB_LOG_FILE" 2>&1 < /dev/null &
   web_pid=$!
   echo "$web_pid" > "$WEB_PID_FILE"
+  for _ in {1..50}; do
+    if [[ -f "$app_dir/hmac_secret" ]]; then
+      break
+    fi
+    sleep 0.1
+  done
+
+  setsid env \
+    CODOXEAR_BIND_HOST=127.0.0.1 \
+    CODOXEAR_BIND_PORT=8743 \
+    CODEX_WEB_NOVA_LEGACY_BASE=http://127.0.0.1:8744 \
+    "$NOVA_BIN" >>"$RUST_LOG_FILE" 2>&1 < /dev/null &
+  rust_pid=$!
+  echo "$rust_pid" > "$RUST_PID_FILE"
   sleep 2
   if ! kill -0 "$rust_pid" 2>/dev/null || ! kill -0 "$web_pid" 2>/dev/null; then
     rm -f "$WEB_PID_FILE" "$RUST_PID_FILE"
@@ -91,8 +100,8 @@ start_server() {
   fi
 
   echo "started Codoxear Nova"
-  echo "web pid: $web_pid"
-  echo "rust pid: $rust_pid"
+  echo "public rust pid: $rust_pid"
+  echo "legacy python pid: $web_pid"
   echo "web log: $WEB_LOG_FILE"
   echo "rust log: $RUST_LOG_FILE"
 }
@@ -131,8 +140,8 @@ status_server() {
   local web_pid rust_pid
   if web_pid="$(running_pid "$WEB_PID_FILE")" && rust_pid="$(running_pid "$RUST_PID_FILE")"; then
     echo "running"
-    echo "web pid: $web_pid"
-    echo "rust pid: $rust_pid"
+    echo "public rust pid: $rust_pid"
+    echo "legacy python pid: $web_pid"
     echo "web log: $WEB_LOG_FILE"
     echo "rust log: $RUST_LOG_FILE"
     exit 0

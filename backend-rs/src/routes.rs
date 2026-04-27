@@ -7,25 +7,42 @@ use crate::models::{
 use crate::runtime::{
     create_session, create_session_request_from_payload,
     default_file_search_limit, load_changed_files_response, load_diagnostics_response,
+    load_codex_config_response, load_notification_subscriptions_response,
+    load_cwd_suggestions_response,
     load_file_blob, load_file_read_response, load_file_search_response, load_git_diff_response,
     load_git_file_versions_response, load_harness_response, load_messages_history,
-    load_messages_live, load_messages_tail, load_queue_response, load_sessions_response,
+    load_messages_live, load_messages_tail, load_queue_response,
+    load_legacy_static_file, load_nova_shell_file,
+    load_resume_candidates_response, load_sessions_response, normalize_backend, resolve_dir_target,
     delete_queue_item, delete_session, edit_session, enqueue_session_message,
     inject_session_attachment, interrupt_session, move_queue_item, rename_session,
-    set_harness_config,
+    save_codex_config_response, schedule_local_service_restart_response, set_harness_config,
     send_session_message, update_queue_item,
+    toggle_notification_subscription_response, upsert_notification_subscription_response,
 };
 use axum::extract::{Path, Query, State};
-use axum::body::Body;
-use axum::http::{header, HeaderValue, StatusCode};
-use axum::response::Response;
+use axum::body::{to_bytes, Body};
+use axum::http::{header, HeaderMap, HeaderValue, Request, StatusCode};
+use axum::middleware::{self, Next};
+use axum::response::{Redirect, Response};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
+use bytes::Bytes;
 use futures_util::stream::{self, Stream};
+use hmac::{Hmac, Mac};
+use http_body_util::{BodyExt, Full};
+use hyper_util::client::legacy::Client;
+use hyper_util::rt::TokioExecutor;
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{json, Value};
+use sha2::Sha256;
 use std::convert::Infallible;
+use std::env;
+use std::fs;
+use std::process;
 use std::time::Duration;
 use tokio::time::sleep;
 use tokio_stream::wrappers::BroadcastStream;
@@ -33,9 +50,37 @@ use tokio_stream::StreamExt;
 
 pub fn router(state: AppState) -> Router {
     Router::new()
+        .route("/", get(root_redirect))
+        .route("/nova", get(nova_redirect))
+        .route("/nova/", get(nova_redirect))
+        .route("/nova/*path", get(nova_redirect_nested))
+        .route("/nova-preview", get(nova_preview_index))
+        .route("/nova-preview/", get(nova_preview_index))
+        .route("/nova-preview/assets/*path", get(nova_preview_asset))
+        .route("/nova-preview/*path", get(nova_preview_spa))
+        .route("/service-worker.js", get(service_worker))
+        .route("/manifest.webmanifest", get(legacy_manifest))
+        .route("/favicon.ico", get(legacy_favicon))
+        .route("/favicon.png", get(legacy_favicon_png))
+        .merge(legacy_router(state.clone()))
         .route("/api/v1/health", get(health))
         .route("/api/v1/bootstrap", get(bootstrap))
+        .route("/api/v1/me", get(me))
+        .route("/api/v1/session_resume_candidates", get(session_resume_candidates))
+        .route("/api/v1/cwd_suggestions", get(cwd_suggestions))
+        .route("/api/v1/settings/codex_config", get(settings_codex_config).post(settings_codex_config_save))
+        .route("/api/v1/settings/restart_service", post(settings_restart_service))
+        .route(
+            "/api/v1/notifications/subscription",
+            get(notification_subscriptions).post(notification_subscriptions_upsert),
+        )
+        .route(
+            "/api/v1/notifications/subscription/toggle",
+            post(notification_subscriptions_toggle),
+        )
         .route("/api/v1/sessions", get(sessions).post(session_create))
+        .route("/api/v1/login", post(login))
+        .route("/api/v1/logout", post(logout))
         .route("/api/v1/sessions/:session_id/diagnostics", get(diagnostics))
         .route("/api/v1/sessions/:session_id/queue", get(queue))
         .route("/api/v1/sessions/:session_id/enqueue", post(session_enqueue))
@@ -61,7 +106,294 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/sessions/:session_id/interrupt", post(session_interrupt))
         .route("/api/v1/messages/send", post(send_message))
         .route("/api/v1/events/stream", get(events))
+        .nest("/api", public_api_router(state.clone()))
         .with_state(state)
+}
+
+fn legacy_router(state: AppState) -> Router<AppState> {
+    Router::new()
+        .route("/legacy", get(legacy_entry_proxy).post(legacy_entry_proxy))
+        .route("/legacy/", get(legacy_entry_proxy).post(legacy_entry_proxy))
+        .route("/legacy/*path", get(legacy_entry_proxy).post(legacy_entry_proxy))
+        .route_layer(middleware::from_fn_with_state(
+            state,
+            require_public_api_auth,
+        ))
+}
+
+fn public_api_router(state: AppState) -> Router<AppState> {
+    let protected = Router::new()
+        .route("/bootstrap", get(bootstrap))
+        .route("/me", get(me))
+        .route("/session_resume_candidates", get(session_resume_candidates))
+        .route("/cwd_suggestions", get(cwd_suggestions))
+        .route("/settings/codex_config", get(settings_codex_config).post(settings_codex_config_save))
+        .route("/settings/restart_service", post(settings_restart_service))
+        .route("/settings/voice", get(legacy_settings_voice_proxy).post(legacy_settings_voice_proxy))
+        .route(
+            "/notifications/subscription",
+            get(notification_subscriptions).post(notification_subscriptions_upsert),
+        )
+        .route(
+            "/notifications/subscription/toggle",
+            post(notification_subscriptions_toggle),
+        )
+        .route("/notifications/message", get(legacy_notification_message_proxy))
+        .route("/notifications/feed", get(legacy_notification_feed_proxy))
+        .route("/audio/live.m3u8", get(legacy_audio_playlist_proxy))
+        .route("/audio/listener", post(legacy_audio_listener_proxy))
+        .route("/audio/segments/*path", get(legacy_audio_segment_proxy))
+        .route("/sessions", get(sessions).post(session_create))
+        .route("/sessions/:session_id/diagnostics", get(diagnostics))
+        .route("/sessions/:session_id/queue", get(queue))
+        .route("/sessions/:session_id/enqueue", post(session_enqueue))
+        .route("/sessions/:session_id/queue/delete", post(queue_delete))
+        .route("/sessions/:session_id/queue/update", post(queue_update))
+        .route("/sessions/:session_id/queue/move", post(queue_move))
+        .route("/sessions/:session_id/rename", post(session_rename))
+        .route("/sessions/:session_id/edit", post(session_edit))
+        .route("/sessions/:session_id/delete", post(session_delete))
+        .route("/sessions/:session_id/inject_file", post(session_inject_attachment))
+        .route("/sessions/:session_id/inject_image", post(session_inject_attachment))
+        .route("/sessions/:session_id/harness", get(harness).post(session_harness))
+        .route("/sessions/:session_id/git/changed_files", get(changed_files))
+        .route("/sessions/:session_id/git/diff", get(git_diff))
+        .route("/sessions/:session_id/git/file_versions", get(git_file_versions))
+        .route("/sessions/:session_id/file/read", get(file_read))
+        .route("/sessions/:session_id/file/search", get(file_search))
+        .route("/sessions/:session_id/file/blob", get(file_blob))
+        .route("/sessions/:session_id/messages/tail", get(messages_tail))
+        .route("/sessions/:session_id/messages/history", get(messages_history))
+        .route("/sessions/:session_id/messages/live", get(messages_live))
+        .route("/sessions/:session_id/send", post(session_send))
+        .route("/sessions/:session_id/interrupt", post(session_interrupt))
+        .route("/messages/send", post(send_message))
+        .route("/events/stream", get(events))
+        .route_layer(middleware::from_fn_with_state(
+            state,
+            require_public_api_auth,
+        ));
+    Router::new()
+        .route("/health", get(health))
+        .route("/login", post(login))
+        .route("/logout", post(logout))
+        .merge(protected)
+}
+
+async fn root_redirect() -> Redirect {
+    Redirect::permanent("/nova-preview/")
+}
+
+async fn nova_redirect() -> Redirect {
+    Redirect::permanent("/nova-preview/")
+}
+
+async fn nova_redirect_nested(Path(path): Path<String>) -> Redirect {
+    let trimmed = path.trim_start_matches('/');
+    if trimmed.is_empty() {
+        Redirect::permanent("/nova-preview/")
+    } else {
+        Redirect::permanent(&format!("/nova-preview/{trimmed}"))
+    }
+}
+
+async fn nova_preview_index() -> Result<Response, (StatusCode, String)> {
+    static_file_response(load_nova_shell_file("index.html"), true)
+}
+
+async fn nova_preview_asset(Path(path): Path<String>) -> Result<Response, (StatusCode, String)> {
+    static_file_response(load_nova_shell_file(&path), false)
+}
+
+async fn nova_preview_spa(Path(path): Path<String>) -> Result<Response, (StatusCode, String)> {
+    let last = path.rsplit('/').next().unwrap_or_default();
+    if last.contains('.') {
+        return Err((StatusCode::NOT_FOUND, format!("static file not found: {path}")));
+    }
+    static_file_response(load_nova_shell_file("index.html"), true)
+}
+
+async fn service_worker() -> Result<Response, (StatusCode, String)> {
+    static_file_response(load_legacy_static_file("service-worker.js"), true)
+}
+
+async fn legacy_entry_proxy(request: Request<Body>) -> Result<Response, (StatusCode, String)> {
+    let request_path = rewrite_legacy_path(request.uri());
+    proxy_legacy_request(request, Some(request_path)).await
+}
+
+async fn legacy_settings_voice_proxy(request: Request<Body>) -> Result<Response, (StatusCode, String)> {
+    let request_path = rewrite_public_api_path(request.uri());
+    proxy_legacy_request(request, Some(request_path)).await
+}
+
+async fn legacy_notification_message_proxy(request: Request<Body>) -> Result<Response, (StatusCode, String)> {
+    let request_path = rewrite_public_api_path(request.uri());
+    proxy_legacy_request(request, Some(request_path)).await
+}
+
+async fn legacy_notification_feed_proxy(request: Request<Body>) -> Result<Response, (StatusCode, String)> {
+    let request_path = rewrite_public_api_path(request.uri());
+    proxy_legacy_request(request, Some(request_path)).await
+}
+
+async fn legacy_audio_playlist_proxy(request: Request<Body>) -> Result<Response, (StatusCode, String)> {
+    let request_path = rewrite_public_api_path(request.uri());
+    proxy_legacy_request(request, Some(request_path)).await
+}
+
+async fn legacy_audio_listener_proxy(request: Request<Body>) -> Result<Response, (StatusCode, String)> {
+    let request_path = rewrite_public_api_path(request.uri());
+    proxy_legacy_request(request, Some(request_path)).await
+}
+
+async fn legacy_audio_segment_proxy(request: Request<Body>) -> Result<Response, (StatusCode, String)> {
+    let request_path = rewrite_public_api_path(request.uri());
+    proxy_legacy_request(request, Some(request_path)).await
+}
+
+async fn legacy_manifest() -> Result<Response, (StatusCode, String)> {
+    static_file_response(load_legacy_static_file("manifest.webmanifest"), false)
+}
+
+async fn legacy_favicon() -> Result<Response, (StatusCode, String)> {
+    static_file_response(load_legacy_static_file("favicon.png"), false)
+}
+
+async fn legacy_favicon_png() -> Result<Response, (StatusCode, String)> {
+    static_file_response(load_legacy_static_file("favicon.png"), false)
+}
+
+fn static_file_response(
+    file_result: Result<(Vec<u8>, String), String>,
+    no_cache: bool,
+) -> Result<Response, (StatusCode, String)> {
+    let (raw, content_type) = file_result.map_err(|message| {
+        if message.starts_with("read ") {
+            (StatusCode::NOT_FOUND, message)
+        } else {
+            (StatusCode::INTERNAL_SERVER_ERROR, message)
+        }
+    })?;
+    let mut response = Response::new(Body::from(raw.clone()));
+    *response.status_mut() = StatusCode::OK;
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_str(&content_type)
+            .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?,
+    );
+    headers.insert(
+        header::CONTENT_LENGTH,
+        HeaderValue::from_str(&raw.len().to_string())
+            .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?,
+    );
+    if no_cache {
+        headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        headers.insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
+        headers.insert(header::EXPIRES, HeaderValue::from_static("0"));
+    }
+    Ok(response)
+}
+
+async fn proxy_legacy_request(
+    request: Request<Body>,
+    rewrite_path: Option<String>,
+) -> Result<Response, (StatusCode, String)> {
+    let target_base = legacy_backend_base();
+    proxy_request_to_base(&target_base, request, rewrite_path).await
+}
+
+async fn proxy_request_to_base(
+    target_base: &str,
+    request: Request<Body>,
+    rewrite_path: Option<String>,
+) -> Result<Response, (StatusCode, String)> {
+    let (parts, body) = request.into_parts();
+    let request_path = rewrite_path.unwrap_or_else(|| request_path_with_query(&parts.uri));
+    let url = format!("{target_base}{request_path}");
+    let request_body = to_bytes(body, usize::MAX)
+        .await
+        .map_err(|err| (StatusCode::BAD_GATEWAY, format!("proxy body read error: {err}")))?;
+    let client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
+    let mut upstream_request = Request::builder().method(parts.method).uri(&url);
+    for (name, value) in &parts.headers {
+        if should_skip_proxy_request_header(name.as_str()) {
+            continue;
+        }
+        upstream_request = upstream_request.header(name, value);
+    }
+    let upstream_request = upstream_request
+        .body(Full::new(request_body))
+        .map_err(|err| (StatusCode::BAD_GATEWAY, format!("proxy request build error: {err}")))?;
+    let upstream_response = tokio::time::timeout(Duration::from_secs(600), client.request(upstream_request))
+        .await
+        .map_err(|_| (StatusCode::BAD_GATEWAY, "proxy timeout".to_string()))?
+        .map_err(|err| (StatusCode::BAD_GATEWAY, format!("proxy error: {err}")))?;
+    let (upstream_parts, upstream_body) = upstream_response.into_parts();
+    let status = StatusCode::from_u16(upstream_parts.status.as_u16())
+        .map_err(|err| (StatusCode::BAD_GATEWAY, format!("invalid proxy status: {err}")))?;
+    let upstream_body = tokio::time::timeout(Duration::from_secs(600), upstream_body.collect())
+        .await
+        .map_err(|_| (StatusCode::BAD_GATEWAY, "proxy timeout".to_string()))?
+        .map_err(|err| (StatusCode::BAD_GATEWAY, format!("proxy error: {err}")))?
+        .to_bytes();
+    let mut response = Response::new(Body::from(upstream_body));
+    *response.status_mut() = status;
+    for (name, value) in &upstream_parts.headers {
+        if should_skip_proxy_response_header(name.as_str()) {
+            continue;
+        }
+        response.headers_mut().append(name, value.clone());
+    }
+    Ok(response)
+}
+
+fn legacy_backend_base() -> String {
+    env::var("CODEX_WEB_NOVA_LEGACY_BASE")
+        .ok()
+        .map(|value| value.trim().trim_end_matches('/').to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "http://127.0.0.1:8744".to_string())
+}
+
+fn request_path_with_query(uri: &axum::http::Uri) -> String {
+    match uri.query() {
+        Some(query) => format!("{}?{query}", uri.path()),
+        None => uri.path().to_string(),
+    }
+}
+
+fn rewrite_legacy_path(uri: &axum::http::Uri) -> String {
+    let rewritten = uri.path().strip_prefix("/legacy").unwrap_or(uri.path());
+    let rewritten = if rewritten.is_empty() { "/" } else { rewritten };
+    match uri.query() {
+        Some(query) => format!("{rewritten}?{query}"),
+        None => rewritten.to_string(),
+    }
+}
+
+fn rewrite_public_api_path(uri: &axum::http::Uri) -> String {
+    let path = if uri.path().starts_with("/api/") {
+        uri.path().to_string()
+    } else {
+        format!("/api{}", uri.path())
+    };
+    match uri.query() {
+        Some(query) => format!("{path}?{query}"),
+        None => path,
+    }
+}
+
+fn should_skip_proxy_request_header(name: &str) -> bool {
+    matches!(name.to_ascii_lowercase().as_str(), "host" | "content-length" | "connection")
+}
+
+fn should_skip_proxy_response_header(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "transfer-encoding" | "connection" | "server" | "date"
+    )
 }
 
 async fn health() -> Json<serde_json::Value> {
@@ -71,6 +403,10 @@ async fn health() -> Json<serde_json::Value> {
 async fn bootstrap(State(state): State<AppState>) -> Json<crate::models::BootstrapPayload> {
     let store = state.store.read().await;
     Json(store.bootstrap())
+}
+
+async fn me() -> Json<Value> {
+    Json(json!({ "ok": true, "server_pid": i64::from(process::id()) }))
 }
 
 async fn sessions(State(state): State<AppState>) -> Result<Json<crate::models::ApiSessionsResponse>, (StatusCode, String)> {
@@ -180,6 +516,18 @@ struct LiveQuery {
 }
 
 #[derive(Deserialize)]
+struct ResumeCandidatesQuery {
+    cwd: String,
+    agent_backend: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct CwdSuggestionsQuery {
+    q: Option<String>,
+    limit: Option<String>,
+}
+
+#[derive(Deserialize)]
 struct TextPayload {
     text: String,
 }
@@ -189,6 +537,129 @@ struct InjectAttachmentPayload {
     filename: String,
     data_b64: String,
     attachment_index: i64,
+}
+
+async fn session_resume_candidates(
+    State(state): State<AppState>,
+    Query(query): Query<ResumeCandidatesQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let agent_backend = normalize_backend(query.agent_backend.as_deref())
+        .map_err(|message| json_error(StatusCode::BAD_REQUEST, &message, None))?;
+    let cwd = resolve_dir_target(&query.cwd)
+        .map_err(|message| json_error(StatusCode::BAD_REQUEST, &message, Some("cwd")))?;
+    load_resume_candidates_response(&state.config, &cwd, &agent_backend)
+        .map(Json)
+        .map_err(|message| json_error(StatusCode::INTERNAL_SERVER_ERROR, &message, None))
+}
+
+async fn cwd_suggestions(
+    State(state): State<AppState>,
+    Query(query): Query<CwdSuggestionsQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let raw_query = query.q.unwrap_or_default();
+    let limit = match query.limit.as_deref() {
+        None => 12,
+        Some(raw) => raw
+            .trim()
+            .parse::<usize>()
+            .map_err(|_| json_error(StatusCode::BAD_REQUEST, "limit must be an integer", Some("limit")))?,
+    };
+    load_cwd_suggestions_response(&state.config, &raw_query, limit)
+        .map(Json)
+        .map_err(|message| json_error(StatusCode::BAD_REQUEST, &message, Some("cwd")))
+}
+
+async fn settings_codex_config() -> Result<Json<Value>, (StatusCode, String)> {
+    load_codex_config_response()
+        .map(Json)
+        .map_err(settings_route_error)
+}
+
+async fn settings_codex_config_save(
+    Json(payload): Json<Value>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    if !payload.is_object() {
+        return Err((StatusCode::BAD_REQUEST, "invalid json body (expected object)".to_string()));
+    }
+    let Some(text) = payload.get("text").and_then(Value::as_str) else {
+        return Err((StatusCode::BAD_REQUEST, "text required".to_string()));
+    };
+    save_codex_config_response(text)
+        .map(Json)
+        .map_err(settings_route_error)
+}
+
+async fn settings_restart_service() -> Result<Json<Value>, (StatusCode, String)> {
+    schedule_local_service_restart_response()
+        .map(Json)
+        .map_err(restart_route_error)
+}
+
+async fn notification_subscriptions(
+    State(state): State<AppState>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    load_notification_subscriptions_response(&state.config)
+        .map(Json)
+        .map_err(notification_route_error)
+}
+
+async fn notification_subscriptions_upsert(
+    State(state): State<AppState>,
+    Json(payload): Json<Value>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    if !payload.is_object() {
+        return Err((StatusCode::BAD_REQUEST, "invalid json body (expected object)".to_string()));
+    }
+    upsert_notification_subscription_response(
+        &state.config,
+        payload.get("subscription").unwrap_or(&Value::Null),
+        payload.get("user_agent").and_then(Value::as_str).unwrap_or_default(),
+        payload.get("device_label").and_then(Value::as_str).unwrap_or_default(),
+        payload.get("device_class").and_then(Value::as_str).unwrap_or_default(),
+    )
+    .map(Json)
+    .map_err(notification_route_error)
+}
+
+async fn notification_subscriptions_toggle(
+    State(state): State<AppState>,
+    Json(payload): Json<Value>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    if !payload.is_object() {
+        return Err((StatusCode::BAD_REQUEST, "invalid json body (expected object)".to_string()));
+    }
+    let Some(endpoint) = payload.get("endpoint").and_then(Value::as_str) else {
+        return Err((StatusCode::BAD_REQUEST, "endpoint required".to_string()));
+    };
+    let Some(enabled) = payload.get("enabled").and_then(Value::as_bool) else {
+        return Err((StatusCode::BAD_REQUEST, "enabled must be a boolean".to_string()));
+    };
+    toggle_notification_subscription_response(&state.config, endpoint, enabled)
+        .map(Json)
+        .map_err(notification_route_error)
+}
+
+async fn login(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<Value>,
+) -> Result<Response, (StatusCode, Json<Value>)> {
+    let password = payload.get("password").and_then(Value::as_str);
+    let same = is_same_password(password).map_err(|message| json_error(StatusCode::INTERNAL_SERVER_ERROR, &message, None))?;
+    if !same {
+        return Err(json_error(StatusCode::FORBIDDEN, "bad password", None));
+    }
+    let forwarded_proto = headers.get("X-Forwarded-Proto").and_then(|value| value.to_str().ok());
+    let cookie = auth_cookie_header(&state.config.app_dir, forwarded_proto)
+        .map_err(|message| json_error(StatusCode::INTERNAL_SERVER_ERROR, &message, None))?;
+    json_response_with_cookie(json!({ "ok": true }), &cookie)
+        .map_err(|message| json_error(StatusCode::INTERNAL_SERVER_ERROR, &message, None))
+}
+
+async fn logout() -> Result<Response, (StatusCode, Json<Value>)> {
+    let cookie = logout_cookie_header().map_err(|message| json_error(StatusCode::INTERNAL_SERVER_ERROR, &message, None))?;
+    json_response_with_cookie(json!({ "ok": true }), &cookie)
+        .map_err(|message| json_error(StatusCode::INTERNAL_SERVER_ERROR, &message, None))
 }
 
 async fn messages_tail(
@@ -512,6 +983,37 @@ fn route_error(message: String) -> (StatusCode, String) {
     (StatusCode::INTERNAL_SERVER_ERROR, message)
 }
 
+fn settings_route_error(message: String) -> (StatusCode, String) {
+    if message == "text required" || message == "invalid json body (expected object)" || message.starts_with("invalid TOML:") {
+        return (StatusCode::BAD_REQUEST, message);
+    }
+    (StatusCode::INTERNAL_SERVER_ERROR, message)
+}
+
+fn restart_route_error(message: String) -> (StatusCode, String) {
+    if message.starts_with("missing ") || message.contains(" is not executable") {
+        return (StatusCode::INTERNAL_SERVER_ERROR, message);
+    }
+    (StatusCode::INTERNAL_SERVER_ERROR, message)
+}
+
+fn notification_route_error(message: String) -> (StatusCode, String) {
+    if message == "unknown subscription" {
+        return (StatusCode::NOT_FOUND, message);
+    }
+    if message == "invalid json body (expected object)"
+        || message == "subscription must be an object"
+        || message == "subscription endpoint required"
+        || message == "subscription keys required"
+        || message == "subscription keys.p256dh and keys.auth required"
+        || message == "endpoint required"
+        || message == "enabled must be a boolean"
+    {
+        return (StatusCode::BAD_REQUEST, message);
+    }
+    (StatusCode::INTERNAL_SERVER_ERROR, message)
+}
+
 fn git_route_error(message: String) -> (StatusCode, String) {
     if message.contains("not a git repository") {
         return (StatusCode::CONFLICT, message);
@@ -540,6 +1042,228 @@ fn create_session_error_response(error: crate::runtime::CreateSessionError) -> (
         payload["field"] = json!(field);
     }
     (status, Json(payload))
+}
+
+fn json_error(status: StatusCode, message: &str, field: Option<&str>) -> (StatusCode, Json<Value>) {
+    let mut payload = json!({ "error": message });
+    if let Some(field_name) = field {
+        payload["field"] = json!(field_name);
+    }
+    (status, Json(payload))
+}
+
+fn json_response_with_cookie(payload: Value, set_cookie: &str) -> Result<Response, String> {
+    let raw = serde_json::to_vec(&payload).map_err(|err| err.to_string())?;
+    let mut response = Response::new(Body::from(raw.clone()));
+    *response.status_mut() = StatusCode::OK;
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json; charset=utf-8"),
+    );
+    headers.insert(
+        header::CONTENT_LENGTH,
+        HeaderValue::from_str(&raw.len().to_string()).map_err(|err| err.to_string())?,
+    );
+    headers.insert(
+        header::SET_COOKIE,
+        HeaderValue::from_str(set_cookie).map_err(|err| err.to_string())?,
+    );
+    Ok(response)
+}
+
+fn json_response(status: StatusCode, payload: Value) -> Response {
+    let raw = serde_json::to_vec(&payload).unwrap_or_else(|_| b"{\"error\":\"internal server error\"}".to_vec());
+    let mut response = Response::new(Body::from(raw.clone()));
+    *response.status_mut() = status;
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json; charset=utf-8"),
+    );
+    if let Ok(value) = HeaderValue::from_str(&raw.len().to_string()) {
+        headers.insert(header::CONTENT_LENGTH, value);
+    }
+    response
+}
+
+async fn require_public_api_auth(
+    State(state): State<AppState>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    match request_is_authenticated(request.headers(), &state.config.app_dir) {
+        Ok(true) => next.run(request).await,
+        Ok(false) => json_response(StatusCode::UNAUTHORIZED, json!({ "error": "unauthorized" })),
+        Err(message) => json_response(StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": message })),
+    }
+}
+
+fn is_same_password(raw: Option<&str>) -> Result<bool, String> {
+    let Some(password) = raw else {
+        return Ok(false);
+    };
+    let expected = env::var("CODEX_WEB_PASSWORD")
+        .map_err(|_| "CODEX_WEB_PASSWORD is required (set it in .env)".to_string())?
+        .trim()
+        .to_string();
+    if expected.is_empty() {
+        return Err("CODEX_WEB_PASSWORD is required (set it in .env)".to_string());
+    }
+    Ok(password == expected)
+}
+
+fn request_is_authenticated(headers: &HeaderMap, app_dir: &std::path::Path) -> Result<bool, String> {
+    let Some(cookie_header) = headers.get(header::COOKIE).and_then(|value| value.to_str().ok()) else {
+        return Ok(false);
+    };
+    let Some(token) = cookie_value(cookie_header, cookie_name()) else {
+        return Ok(false);
+    };
+    verify_auth_cookie(&token, app_dir)
+}
+
+fn cookie_value(raw: &str, name: &str) -> Option<String> {
+    raw.split(';').find_map(|part| {
+        let trimmed = part.trim();
+        let (key, value) = trimmed.split_once('=')?;
+        if key.trim() == name {
+            Some(value.trim().to_string())
+        } else {
+            None
+        }
+    })
+}
+
+fn verify_auth_cookie(value: &str, app_dir: &std::path::Path) -> Result<bool, String> {
+    let Some((payload_b64, sig_b64)) = value.split_once('.') else {
+        return Ok(false);
+    };
+    let Ok(raw_payload) = URL_SAFE_NO_PAD.decode(payload_b64.as_bytes()) else {
+        return Ok(false);
+    };
+    let Ok(signature) = URL_SAFE_NO_PAD.decode(sig_b64.as_bytes()) else {
+        return Ok(false);
+    };
+    let secret = load_or_create_hmac_secret(app_dir)?;
+    let mut mac = Hmac::<Sha256>::new_from_slice(&secret).map_err(|err| err.to_string())?;
+    mac.update(&raw_payload);
+    if mac.verify_slice(&signature).is_err() {
+        return Ok(false);
+    }
+    let Ok(payload) = serde_json::from_slice::<Value>(&raw_payload) else {
+        return Ok(false);
+    };
+    let Some(exp) = payload.get("exp").and_then(Value::as_i64) else {
+        return Ok(false);
+    };
+    Ok(exp > epoch_now() as i64)
+}
+
+fn auth_cookie_header(app_dir: &std::path::Path, forwarded_proto: Option<&str>) -> Result<String, String> {
+    let exp = epoch_now() as i64 + cookie_ttl_seconds();
+    let raw = serde_json::to_vec(&json!({ "exp": exp })).map_err(|err| err.to_string())?;
+    let secret = load_or_create_hmac_secret(app_dir)?;
+    let mut mac = Hmac::<Sha256>::new_from_slice(&secret).map_err(|err| err.to_string())?;
+    mac.update(&raw);
+    let sig = mac.finalize().into_bytes();
+    let mut attrs = vec![
+        format!("{}={}.{}", cookie_name(), URL_SAFE_NO_PAD.encode(raw), URL_SAFE_NO_PAD.encode(sig)),
+        format!("Path={}", cookie_path()?),
+        "HttpOnly".to_string(),
+        "SameSite=Strict".to_string(),
+        format!("Max-Age={}", cookie_ttl_seconds()),
+    ];
+    let proto = forwarded_proto.unwrap_or_default().to_ascii_lowercase();
+    if cookie_secure() || proto == "https" {
+        attrs.push("Secure".to_string());
+    }
+    Ok(attrs.join("; "))
+}
+
+fn logout_cookie_header() -> Result<String, String> {
+    Ok(format!(
+        "{}=deleted; Path={}; Max-Age=0; HttpOnly; SameSite=Strict",
+        cookie_name(),
+        cookie_path()?
+    ))
+}
+
+fn load_or_create_hmac_secret(app_dir: &std::path::Path) -> Result<Vec<u8>, String> {
+    let path = app_dir.join("hmac_secret");
+    fs::create_dir_all(app_dir).map_err(|err| format!("create {}: {err}", app_dir.display()))?;
+    if path.exists() {
+        let bytes = fs::read(&path).map_err(|err| format!("read {}: {err}", path.display()))?;
+        if bytes.len() < 32 {
+            return Err(format!("invalid hmac secret (too short): {}", path.display()));
+        }
+        return Ok(bytes.into_iter().take(64).collect());
+    }
+    let mut secret = vec![0_u8; 64];
+    fs::File::open("/dev/urandom")
+        .and_then(|mut file| std::io::Read::read_exact(&mut file, &mut secret))
+        .map_err(|err| format!("read /dev/urandom: {err}"))?;
+    fs::write(&path, &secret).map_err(|err| format!("write {}: {err}", path.display()))?;
+    #[allow(clippy::permissions_set_readonly_false)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(&path)
+            .map_err(|err| format!("stat {}: {err}", path.display()))?
+            .permissions();
+        permissions.set_mode(0o600);
+        fs::set_permissions(&path, permissions).map_err(|err| format!("chmod {}: {err}", path.display()))?;
+    }
+    Ok(secret)
+}
+
+fn cookie_name() -> &'static str {
+    "codoxear_auth"
+}
+
+fn cookie_ttl_seconds() -> i64 {
+    env::var("CODEX_WEB_COOKIE_TTL_SECONDS")
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(30 * 24 * 3600)
+}
+
+fn cookie_secure() -> bool {
+    env::var("CODEX_WEB_COOKIE_SECURE").ok().as_deref() == Some("1")
+}
+
+fn cookie_path() -> Result<String, String> {
+    let prefix = normalize_url_prefix(env::var("CODEX_WEB_URL_PREFIX").ok().as_deref())?;
+    Ok(if prefix.is_empty() {
+        "/".to_string()
+    } else {
+        format!("{prefix}/")
+    })
+}
+
+fn normalize_url_prefix(raw: Option<&str>) -> Result<String, String> {
+    let Some(value) = raw else {
+        return Ok(String::new());
+    };
+    let mut prefix = value.trim().to_string();
+    if prefix.is_empty() || prefix == "/" {
+        return Ok(String::new());
+    }
+    if prefix.contains("://") {
+        return Err("CODEX_WEB_URL_PREFIX must be a path prefix (not a URL)".to_string());
+    }
+    if prefix.contains('?') || prefix.contains('#') {
+        return Err("CODEX_WEB_URL_PREFIX must not include '?' or '#'".to_string());
+    }
+    if !prefix.starts_with('/') {
+        return Err("CODEX_WEB_URL_PREFIX must start with '/'".to_string());
+    }
+    while prefix.len() > 1 && prefix.ends_with('/') {
+        prefix.pop();
+    }
+    if prefix == "/" {
+        return Ok(String::new());
+    }
+    Ok(prefix)
 }
 
 async fn send_message(
@@ -650,11 +1374,13 @@ async fn events(
 
 #[cfg(test)]
 mod tests {
-    use super::router;
+    use super::{json_response, router};
     use crate::app_state::{build_state, build_state_from_config};
     use crate::runtime::RuntimeConfig;
     use axum::body::{to_bytes, Body};
     use axum::http::{header, Request, StatusCode};
+    use axum::response::Response;
+    use axum::routing::{get, post};
     use serde_json::Value;
     use std::env;
     use std::fs;
@@ -674,6 +1400,583 @@ mod tests {
           .await
           .unwrap();
       assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn root_and_nova_routes_redirect_to_nova_preview() {
+        let _guard = env_lock().lock().unwrap();
+        let app = router(build_state());
+        for path in ["/", "/nova", "/nova/extra/path"] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::PERMANENT_REDIRECT);
+            let location = response.headers().get(header::LOCATION).unwrap().to_str().unwrap();
+            assert!(location.starts_with("/nova-preview/"));
+        }
+    }
+
+    #[tokio::test]
+    async fn nova_preview_index_route_serves_html() {
+        let _guard = env_lock().lock().unwrap();
+        let app = router(build_state());
+        let response = app
+            .oneshot(Request::builder().uri("/nova-preview/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers().get(header::CONTENT_TYPE).unwrap(), "text/html; charset=utf-8");
+        assert_eq!(response.headers().get(header::CACHE_CONTROL).unwrap(), "no-store");
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert!(std::str::from_utf8(&body).unwrap().contains("<html"));
+    }
+
+    #[tokio::test]
+    async fn service_worker_route_serves_javascript() {
+        let _guard = env_lock().lock().unwrap();
+        let app = router(build_state());
+        let response = app
+            .oneshot(Request::builder().uri("/service-worker.js").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers().get(header::CONTENT_TYPE).unwrap(), "text/javascript; charset=utf-8");
+        assert_eq!(response.headers().get(header::CACHE_CONTROL).unwrap(), "no-store");
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+        assert!(text.contains("self.addEventListener") || text.contains("addEventListener("));
+    }
+
+    #[tokio::test]
+    async fn me_route_returns_server_pid() {
+        let app = router(build_state_from_config(RuntimeConfig {
+            app_dir: temp_app_dir("me"),
+        })
+        .unwrap());
+        let response = app
+            .oneshot(Request::builder().uri("/api/v1/me").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["ok"], true);
+        assert!(payload["server_pid"].as_i64().unwrap() > 0);
+    }
+
+    #[tokio::test]
+    async fn login_and_logout_routes_manage_auth_cookie() {
+        let _guard = env_lock().lock().unwrap();
+        let app_dir = temp_app_dir("auth-cookie");
+        let _password = EnvGuard::set("CODEX_WEB_PASSWORD", "topsecret");
+        let app = router(build_state_from_config(RuntimeConfig { app_dir }).unwrap());
+
+        let login = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/login")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"password":"topsecret"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(login.status(), StatusCode::OK);
+        let login_cookie = login.headers().get(header::SET_COOKIE).unwrap().to_str().unwrap().to_string();
+        assert!(login_cookie.starts_with("codoxear_auth="));
+        assert!(login_cookie.contains("HttpOnly"));
+        assert!(login_cookie.contains("SameSite=Strict"));
+        let login_body = to_bytes(login.into_body(), usize::MAX).await.unwrap();
+        let login_payload: Value = serde_json::from_slice(&login_body).unwrap();
+        assert_eq!(login_payload["ok"], true);
+
+        let logout = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/logout")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(logout.status(), StatusCode::OK);
+        let logout_cookie = logout.headers().get(header::SET_COOKIE).unwrap().to_str().unwrap();
+        assert!(logout_cookie.contains("codoxear_auth=deleted"));
+        assert!(logout_cookie.contains("Max-Age=0"));
+    }
+
+    #[tokio::test]
+    async fn public_api_routes_require_auth_and_accept_rust_cookie() {
+        let _guard = env_lock().lock().unwrap();
+        let app_dir = temp_app_dir("public-api-auth");
+        let codex_home = temp_dir("public-api-auth-home");
+        let _password = EnvGuard::set("CODEX_WEB_PASSWORD", "topsecret");
+        let _codex_home = EnvGuard::set("CODEX_HOME", codex_home.display().to_string());
+        let app = router(build_state_from_config(RuntimeConfig { app_dir }).unwrap());
+
+        let unauthorized = app
+            .clone()
+            .oneshot(Request::builder().uri("/api/me").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+        let unauthorized_body = to_bytes(unauthorized.into_body(), usize::MAX).await.unwrap();
+        let unauthorized_payload: Value = serde_json::from_slice(&unauthorized_body).unwrap();
+        assert_eq!(unauthorized_payload["error"], "unauthorized");
+
+        let login = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/login")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"password":"topsecret"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(login.status(), StatusCode::OK);
+        let cookie = login
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        let me = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/me")
+                    .header(header::COOKIE, cookie.clone())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(me.status(), StatusCode::OK);
+        let me_body = to_bytes(me.into_body(), usize::MAX).await.unwrap();
+        let me_payload: Value = serde_json::from_slice(&me_body).unwrap();
+        assert_eq!(me_payload["ok"], true);
+
+        let sessions = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/sessions")
+                    .header(header::COOKIE, cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(sessions.status(), StatusCode::OK);
+        let sessions_body = to_bytes(sessions.into_body(), usize::MAX).await.unwrap();
+        let sessions_payload: Value = serde_json::from_slice(&sessions_body).unwrap();
+        assert_eq!(sessions_payload["sessions"], Value::Array(vec![]));
+        assert!(sessions_payload.get("new_session_defaults").is_some());
+    }
+
+    #[tokio::test]
+    async fn public_legacy_api_routes_proxy_to_python_backend() {
+        let _guard = env_lock().lock().unwrap();
+        let app_dir = temp_app_dir("legacy-api-proxy");
+        let _password = EnvGuard::set("CODEX_WEB_PASSWORD", "topsecret");
+        let _legacy_base = EnvGuard::set("CODEX_WEB_NOVA_LEGACY_BASE", spawn_mock_legacy_backend());
+        let app = router(build_state_from_config(RuntimeConfig { app_dir }).unwrap());
+        let cookie = login_cookie(&app).await;
+
+        let unauthorized = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/settings/voice")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let settings = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/settings/voice?tab=tts")
+                    .header(header::COOKIE, cookie.clone())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(settings.status(), StatusCode::OK);
+        let settings_body = to_bytes(settings.into_body(), usize::MAX).await.unwrap();
+        let settings_payload: Value = serde_json::from_slice(&settings_body).unwrap();
+        assert_eq!(settings_payload["path"], "/api/settings/voice");
+        assert_eq!(settings_payload["query"], "tab=tts");
+        assert!(settings_payload["cookie"].as_str().unwrap().contains("codoxear_auth="));
+
+        let listener = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/audio/listener")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, cookie.clone())
+                    .body(Body::from(r#"{"client_id":"listener-a","enabled":true}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(listener.status(), StatusCode::OK);
+        let listener_body = to_bytes(listener.into_body(), usize::MAX).await.unwrap();
+        let listener_payload: Value = serde_json::from_slice(&listener_body).unwrap();
+        assert_eq!(listener_payload["path"], "/api/audio/listener");
+        assert!(listener_payload["body"]
+            .as_str()
+            .unwrap()
+            .contains("listener-a"));
+
+        let playlist = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/audio/live.m3u8")
+                    .header(header::COOKIE, cookie.clone())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(playlist.status(), StatusCode::OK);
+        assert_eq!(
+            playlist.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/vnd.apple.mpegurl"
+        );
+        let playlist_body = to_bytes(playlist.into_body(), usize::MAX).await.unwrap();
+        let playlist_text = std::str::from_utf8(&playlist_body).unwrap();
+        assert!(playlist_text.contains("#EXTM3U"));
+        assert!(playlist_text.contains("codoxear_auth="));
+
+        let segment = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/audio/segments/clip-a.ts")
+                    .header(header::COOKIE, cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(segment.status(), StatusCode::OK);
+        let segment_body = to_bytes(segment.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(std::str::from_utf8(&segment_body).unwrap(), "segment:clip-a.ts");
+    }
+
+    #[tokio::test]
+    async fn legacy_prefix_routes_strip_prefix_before_proxying() {
+        let _guard = env_lock().lock().unwrap();
+        let app_dir = temp_app_dir("legacy-prefix-proxy");
+        let _password = EnvGuard::set("CODEX_WEB_PASSWORD", "topsecret");
+        let _legacy_base = EnvGuard::set("CODEX_WEB_NOVA_LEGACY_BASE", spawn_mock_legacy_backend());
+        let app = router(build_state_from_config(RuntimeConfig { app_dir }).unwrap());
+        let cookie = login_cookie(&app).await;
+
+        let unauthorized = app
+            .clone()
+            .oneshot(Request::builder().uri("/legacy").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let nested = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/legacy/files/view?tab=diff")
+                    .header(header::COOKIE, cookie.clone())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(nested.status(), StatusCode::OK);
+        let nested_body = to_bytes(nested.into_body(), usize::MAX).await.unwrap();
+        let nested_payload: Value = serde_json::from_slice(&nested_body).unwrap();
+        assert_eq!(nested_payload["path"], "/files/view");
+        assert_eq!(nested_payload["query"], "tab=diff");
+
+        let root = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/legacy?source=rust")
+                    .header(header::CONTENT_TYPE, "text/plain")
+                    .header(header::COOKIE, cookie)
+                    .body(Body::from("legacy-body"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(root.status(), StatusCode::OK);
+        let root_body = to_bytes(root.into_body(), usize::MAX).await.unwrap();
+        let root_payload: Value = serde_json::from_slice(&root_body).unwrap();
+        assert_eq!(root_payload["path"], "/");
+        assert_eq!(root_payload["query"], "source=rust");
+        assert_eq!(root_payload["body"], "legacy-body");
+    }
+
+    #[tokio::test]
+    async fn session_resume_candidates_route_returns_alias_and_last_user_message() {
+        let _guard = env_lock().lock().unwrap();
+        let app_dir = temp_app_dir("resume-candidates");
+        let codex_home = temp_dir("resume-candidates-home");
+        let workspace = temp_dir("resume-candidates-workspace");
+        let sessions_dir = codex_home.join("sessions").join("2026").join("04").join("26");
+        fs::create_dir_all(&sessions_dir).unwrap();
+        let log_path = sessions_dir.join("rollout-2026-04-26T01-00-00-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa.jsonl");
+        fs::write(
+            &log_path,
+            format!(
+                concat!(
+                    "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"resume-a\",\"cwd\":\"{}\",\"timestamp\":\"2026-04-26T01:00:00Z\",\"source\":\"cli\"}}}}\n",
+                    "{{\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"# AGENTS.md instructions for /repo\\n...\"}}]}}}}\n",
+                    "{{\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"latest prompt from resume route\"}}]}}}}\n"
+                ),
+                workspace.display()
+            ),
+        )
+        .unwrap();
+        fs::write(app_dir.join("session_aliases.json"), r#"{"resume-a":"Alias A"}"#).unwrap();
+        let _codex_home = EnvGuard::set("CODEX_HOME", codex_home.display().to_string());
+        let app = router(build_state_from_config(RuntimeConfig { app_dir }).unwrap());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/v1/session_resume_candidates?cwd={}&agent_backend=codex",
+                        workspace.display()
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["ok"], true);
+        assert_eq!(payload["exists"], true);
+        assert_eq!(payload["sessions"][0]["session_id"], "resume-a");
+        assert_eq!(payload["sessions"][0]["alias"], "Alias A");
+        assert_eq!(payload["sessions"][0]["last_user_message"], "latest prompt from resume route");
+    }
+
+    #[tokio::test]
+    async fn cwd_suggestions_route_returns_directory_matches() {
+        let app_dir = temp_app_dir("cwd-suggestions");
+        let root = temp_dir("cwd-suggestion-root");
+        let alpha = root.join("alpha");
+        let alpine = root.join("alpine");
+        fs::create_dir_all(&alpha).unwrap();
+        fs::create_dir_all(&alpine).unwrap();
+        let app = router(build_state_from_config(RuntimeConfig { app_dir }).unwrap());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/v1/cwd_suggestions?q={}&limit=5",
+                        root.join("al").display()
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: Value = serde_json::from_slice(&body).unwrap();
+        let suggestions = payload["suggestions"].as_array().unwrap();
+        let values = suggestions
+            .iter()
+            .filter_map(|entry| entry.get("value").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        assert!(values.iter().any(|value| *value == alpha.display().to_string()));
+        assert!(values.iter().any(|value| *value == alpine.display().to_string()));
+    }
+
+    #[tokio::test]
+    async fn settings_codex_config_routes_round_trip_toml() {
+        let _guard = env_lock().lock().unwrap();
+        let app_dir = temp_app_dir("settings-codex-config");
+        let codex_home = temp_dir("settings-codex-home");
+        let _codex_home = EnvGuard::set("CODEX_HOME", codex_home.display().to_string());
+        let app = router(build_state_from_config(RuntimeConfig { app_dir }).unwrap());
+
+        let get_missing = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/settings/codex_config")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(get_missing.status(), StatusCode::OK);
+        let get_missing_body = to_bytes(get_missing.into_body(), usize::MAX).await.unwrap();
+        let get_missing_payload: Value = serde_json::from_slice(&get_missing_body).unwrap();
+        assert_eq!(get_missing_payload["exists"], false);
+        assert_eq!(get_missing_payload["text"], "");
+
+        let save = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/settings/codex_config")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"text":"model = \"gpt-5.4\"\n"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(save.status(), StatusCode::OK);
+        let save_body = to_bytes(save.into_body(), usize::MAX).await.unwrap();
+        let save_payload: Value = serde_json::from_slice(&save_body).unwrap();
+        assert_eq!(save_payload["exists"], true);
+        assert_eq!(save_payload["text"], "model = \"gpt-5.4\"\n");
+        assert_eq!(
+            fs::read_to_string(codex_home.join("config.toml")).unwrap(),
+            "model = \"gpt-5.4\"\n"
+        );
+
+        let invalid = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/settings/codex_config")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"text":"model = [\n"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn settings_restart_service_route_schedules_local_daemon_restart() {
+        let _guard = env_lock().lock().unwrap();
+        let app_dir = temp_app_dir("settings-restart-service");
+        let repo_root = temp_dir("settings-restart-repo");
+        let script_path = repo_root.join("scripts").join("codoxear-local");
+        fs::create_dir_all(script_path.parent().unwrap()).unwrap();
+        write_executable(
+            &script_path,
+            "#!/usr/bin/env bash\nset -euo pipefail\nsleep 30\n",
+        );
+        let _repo_root = EnvGuard::set("CODOXEAR_REPO_ROOT", repo_root.display().to_string());
+        let app = router(build_state_from_config(RuntimeConfig { app_dir }).unwrap());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/settings/restart_service")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["scheduled"], true);
+        assert_eq!(payload["script"], script_path.display().to_string());
+        let restart_pid = payload["restart_pid"].as_i64().unwrap();
+        assert!(restart_pid > 0);
+        kill_pid(restart_pid);
+    }
+
+    #[tokio::test]
+    async fn notification_subscription_routes_manage_records() {
+        let app_dir = temp_app_dir("notification-subscriptions");
+        let app = router(build_state_from_config(RuntimeConfig { app_dir: app_dir.clone() }).unwrap());
+
+        let initial = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/notifications/subscription")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(initial.status(), StatusCode::OK);
+        let initial_body = to_bytes(initial.into_body(), usize::MAX).await.unwrap();
+        let initial_payload: Value = serde_json::from_slice(&initial_body).unwrap();
+        assert_eq!(initial_payload["ok"], true);
+        assert!(initial_payload["vapid_public_key"].as_str().unwrap().len() > 10);
+        assert_eq!(initial_payload["subscriptions"].as_array().unwrap().len(), 0);
+        assert!(app_dir.join("webpush_vapid_private.pem").exists());
+
+        let endpoint = "https://push.example.test/sub/abc";
+        let upsert = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/notifications/subscription")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(format!(
+                        r#"{{"subscription":{{"endpoint":"{endpoint}","keys":{{"p256dh":"p-key","auth":"a-key"}}}},"user_agent":"Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) Mobile","device_label":"current-device","device_class":""}}"#
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(upsert.status(), StatusCode::OK);
+        let upsert_body = to_bytes(upsert.into_body(), usize::MAX).await.unwrap();
+        let upsert_payload: Value = serde_json::from_slice(&upsert_body).unwrap();
+        let subscriptions = upsert_payload["subscriptions"].as_array().unwrap();
+        assert_eq!(subscriptions.len(), 1);
+        assert_eq!(subscriptions[0]["endpoint"], endpoint);
+        assert_eq!(subscriptions[0]["notifications_enabled"], true);
+        assert_eq!(subscriptions[0]["device_class"], "mobile");
+
+        let toggle = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/notifications/subscription/toggle")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(format!(
+                        r#"{{"endpoint":"{endpoint}","enabled":false}}"#
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(toggle.status(), StatusCode::OK);
+        let toggle_body = to_bytes(toggle.into_body(), usize::MAX).await.unwrap();
+        let toggle_payload: Value = serde_json::from_slice(&toggle_body).unwrap();
+        assert_eq!(toggle_payload["subscriptions"][0]["notifications_enabled"], false);
+        let saved = fs::read_to_string(app_dir.join("push_subscriptions.json")).unwrap();
+        assert!(saved.contains(endpoint));
+        assert!(saved.contains("\"notifications_enabled\": false"));
     }
 
     fn temp_app_dir(name: &str) -> PathBuf {
@@ -742,6 +2045,95 @@ mod tests {
         let _ = std::process::Command::new("kill")
             .arg(pid.to_string())
             .status();
+    }
+
+    async fn login_cookie(app: &axum::Router) -> String {
+        let login = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/login")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"password":"topsecret"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(login.status(), StatusCode::OK);
+        login
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string()
+    }
+
+    fn spawn_mock_legacy_backend() -> String {
+        async fn echo_request(request: Request<Body>) -> Response {
+            let (parts, body) = request.into_parts();
+            let body = to_bytes(body, usize::MAX).await.unwrap();
+            json_response(
+                StatusCode::OK,
+                serde_json::json!({
+                    "method": parts.method.as_str(),
+                    "path": parts.uri.path(),
+                    "query": parts.uri.query().unwrap_or_default(),
+                    "cookie": parts
+                        .headers
+                        .get(header::COOKIE)
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or_default(),
+                    "body": String::from_utf8_lossy(&body).to_string(),
+                }),
+            )
+        }
+
+        async fn playlist_request(request: Request<Body>) -> Response {
+            let cookie = request
+                .headers()
+                .get(header::COOKIE)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default();
+            let raw = format!("#EXTM3U\n# cookie:{cookie}\n");
+            let mut response = Response::new(Body::from(raw));
+            *response.status_mut() = StatusCode::OK;
+            response.headers_mut().insert(
+                header::CONTENT_TYPE,
+                header::HeaderValue::from_static("application/vnd.apple.mpegurl"),
+            );
+            response
+        }
+
+        async fn segment_request(request: Request<Body>) -> Response {
+            let segment = request
+                .uri()
+                .path()
+                .split("/api/audio/segments/")
+                .nth(1)
+                .unwrap_or_default();
+            Response::new(Body::from(format!("segment:{segment}")))
+        }
+
+        let router = axum::Router::new()
+            .route("/api/settings/voice", get(echo_request).post(echo_request))
+            .route("/api/notifications/message", get(echo_request))
+            .route("/api/notifications/feed", get(echo_request))
+            .route("/api/audio/live.m3u8", get(playlist_request))
+            .route("/api/audio/listener", post(echo_request))
+            .route("/api/audio/segments/*path", get(segment_request))
+            .route("/", get(echo_request).post(echo_request))
+            .route("/*path", get(echo_request).post(echo_request));
+
+        let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = std_listener.local_addr().unwrap();
+        std_listener.set_nonblocking(true).unwrap();
+        let listener = tokio::net::TcpListener::from_std(std_listener).unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        format!("http://{addr}")
     }
 
     #[tokio::test]

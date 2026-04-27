@@ -1,9 +1,10 @@
 import threading
 import unittest
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
-from codoxear.server import QUEUE_IDLE_GRACE_SECONDS, Session, SessionManager
+from codoxear.server import QUEUE_IDLE_GRACE_SECONDS, QUEUE_PATH, Session, SessionManager
 
 
 def _queue_item(item_id: str, text: str) -> dict[str, object]:
@@ -16,6 +17,7 @@ class TestQueueSweepIdleGuard(unittest.TestCase):
         mgr._lock = threading.Lock()
         mgr._sessions = {}
         mgr._queues = {}
+        mgr._load_queues = lambda: None
         mgr._save_queues = lambda: None
         mgr._discover_existing_if_stale = lambda: None
         mgr._prune_dead_sessions = lambda: None
@@ -162,6 +164,43 @@ class TestQueueSweepIdleGuard(unittest.TestCase):
 
         self.assertEqual(sent, [(sid, "dup")])
         self.assertEqual([item["id"] for item in mgr._queues[sid]], ["q2"])
+
+    def test_queue_sweep_reloads_persisted_queue_items_before_idle_drain(self) -> None:
+        mgr = self._mgr()
+        sid = "s1"
+        lp = Path("/tmp/codoxear-test-rollout5.jsonl")
+        lp.write_text('{"type":"event_msg","payload":{"type":"task_complete"},"timestamp":"2026-03-06T00:00:00Z"}\n', encoding="utf-8")
+        self.addCleanup(lambda: lp.unlink(missing_ok=True))
+        mgr._sessions[sid] = Session(
+            session_id=sid,
+            thread_id="t1",
+            broker_pid=1,
+            codex_pid=1,
+            agent_backend="codex",
+            owned=False,
+            start_ts=0.0,
+            cwd="/tmp",
+            log_path=lp,
+            sock_path=Path("/tmp/s1.sock"),
+        )
+        mgr.get_state = lambda _sid: {"busy": False, "queue_len": 0}
+        mgr.idle_from_log = lambda _sid: True
+        sent = []
+        mgr.send = lambda _sid, text: sent.append((_sid, text)) or {"queued": False, "queue_len": 0}
+        mgr._load_queues = SessionManager._load_queues.__get__(mgr, SessionManager)
+
+        with TemporaryDirectory() as td:
+            queue_path = Path(td) / QUEUE_PATH.name
+            queue_path.write_text('{"s1":[{"id":"q1","text":"from rust","created_ts":1.0}]}', encoding="utf-8")
+            with patch("codoxear.server.QUEUE_PATH", queue_path):
+                with patch("codoxear.server.time.time", return_value=400.0):
+                    SessionManager._queue_sweep(mgr)
+                self.assertEqual(mgr._sessions[sid].queue_idle_since, 400.0)
+                with patch("codoxear.server.time.time", return_value=400.0 + QUEUE_IDLE_GRACE_SECONDS + 0.1):
+                    SessionManager._queue_sweep(mgr)
+
+        self.assertEqual(sent, [(sid, "from rust")])
+        self.assertNotIn(sid, mgr._queues)
 
 
 if __name__ == "__main__":

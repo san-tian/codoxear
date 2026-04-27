@@ -50,8 +50,52 @@ class TestServerQueuePersistence(unittest.TestCase):
 
     def test_nova_incremental_v1_path_only_rewrites_selected_routes(self) -> None:
         self.assertEqual(
+            _nova_incremental_v1_path("/api/me", "GET"),
+            "/api/v1/me",
+        )
+        self.assertEqual(
+            _nova_incremental_v1_path("/api/session_resume_candidates", "GET"),
+            "/api/v1/session_resume_candidates",
+        )
+        self.assertEqual(
+            _nova_incremental_v1_path("/api/cwd_suggestions", "GET"),
+            "/api/v1/cwd_suggestions",
+        )
+        self.assertEqual(
+            _nova_incremental_v1_path("/api/settings/codex_config", "GET"),
+            "/api/v1/settings/codex_config",
+        )
+        self.assertEqual(
+            _nova_incremental_v1_path("/api/notifications/subscription", "GET"),
+            "/api/v1/notifications/subscription",
+        )
+        self.assertEqual(
             _nova_incremental_v1_path("/api/sessions", "GET"),
             "/api/v1/sessions",
+        )
+        self.assertEqual(
+            _nova_incremental_v1_path("/api/login", "POST"),
+            "/api/v1/login",
+        )
+        self.assertEqual(
+            _nova_incremental_v1_path("/api/logout", "POST"),
+            "/api/v1/logout",
+        )
+        self.assertEqual(
+            _nova_incremental_v1_path("/api/settings/codex_config", "POST"),
+            "/api/v1/settings/codex_config",
+        )
+        self.assertEqual(
+            _nova_incremental_v1_path("/api/settings/restart_service", "POST"),
+            "/api/v1/settings/restart_service",
+        )
+        self.assertEqual(
+            _nova_incremental_v1_path("/api/notifications/subscription", "POST"),
+            "/api/v1/notifications/subscription",
+        )
+        self.assertEqual(
+            _nova_incremental_v1_path("/api/notifications/subscription/toggle", "POST"),
+            "/api/v1/notifications/subscription/toggle",
         )
         self.assertEqual(
             _nova_incremental_v1_path("/api/sessions", "POST"),
@@ -153,6 +197,8 @@ class TestServerQueuePersistence(unittest.TestCase):
             _nova_incremental_v1_path("/api/sessions/s1/queue/move", "POST"),
             "/api/v1/sessions/s1/queue/move",
         )
+        self.assertIsNone(_nova_incremental_v1_path("/api/sessions/s1/file/write", "POST"))
+
     def test_do_post_proxies_incremental_routes_before_python_fallbacks(self) -> None:
         source = SERVER_PY.read_text(encoding="utf-8")
         self.assertIn('incremental_v1_path = _nova_incremental_v1_path(path, self.command)', source)
@@ -163,6 +209,15 @@ class TestServerQueuePersistence(unittest.TestCase):
         source = SERVER_PY.read_text(encoding="utf-8")
         self.assertNotIn('res = MANAGER.spawn_web_session(', source)
         self.assertNotIn('resume_session_id_raw = obj.get("resume_session_id")', source)
+        self.assertEqual(source.count('if path == "/api/me":'), 0)
+        self.assertEqual(source.count('if path == "/api/session_resume_candidates":'), 0)
+        self.assertEqual(source.count('if path == "/api/cwd_suggestions":'), 0)
+        self.assertEqual(source.count('if path == "/api/login":'), 0)
+        self.assertEqual(source.count('if path == "/api/logout":'), 0)
+        self.assertEqual(source.count('if path == "/api/settings/codex_config":'), 0)
+        self.assertEqual(source.count('if path == "/api/notifications/subscription":'), 0)
+        self.assertEqual(source.count('if path == "/api/settings/restart_service":'), 0)
+        self.assertEqual(source.count('if path == "/api/notifications/subscription/toggle":'), 0)
         self.assertEqual(source.count('if path.startswith("/api/sessions/") and path.endswith("/rename"):'), 0)
         self.assertNotIn('session_id = _match_session_route(path, "delete")', source)
         self.assertEqual(source.count('if path.startswith("/api/sessions/") and path.endswith("/edit"):'), 0)
