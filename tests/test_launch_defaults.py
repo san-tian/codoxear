@@ -75,6 +75,8 @@ class TestLaunchDefaults(unittest.TestCase):
         source = script_path.read_text(encoding="utf-8")
 
         self.assertIn('"$PYTHON_BIN" -m codoxear.server --runtime-only', source)
+        self.assertIn('CODEX_WEB_DISABLE_QUEUE_SWEEP=1', source)
+        self.assertIn('CODOXEAR_ENABLE_QUEUE_SWEEP=1', source)
         self.assertNotIn('CODEX_WEB_PORT=8744', source)
         self.assertNotIn('CODEX_WEB_NOVA_LEGACY_BASE=http://127.0.0.1:8744', source)
         self.assertIn('runtime python pid', source)

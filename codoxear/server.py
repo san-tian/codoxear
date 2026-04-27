@@ -243,6 +243,7 @@ HARNESS_DEFAULT_IDLE_MINUTES = 5
 HARNESS_DEFAULT_MAX_INJECTIONS = 10
 HARNESS_SWEEP_SECONDS = float(os.environ.get("CODEX_WEB_HARNESS_SWEEP_SECONDS", "2.5"))
 QUEUE_SWEEP_SECONDS = float(os.environ.get("CODEX_WEB_QUEUE_SWEEP_SECONDS", "1.0"))
+QUEUE_SWEEP_ENABLED = os.environ.get("CODEX_WEB_DISABLE_QUEUE_SWEEP", "0") != "1"
 VOICE_PUSH_SWEEP_SECONDS = float(os.environ.get("CODEX_WEB_VOICE_PUSH_SWEEP_SECONDS", "1.0"))
 QUEUE_IDLE_GRACE_SECONDS = float(os.environ.get("CODEX_WEB_QUEUE_IDLE_GRACE_SECONDS", "10.0"))
 HARNESS_MAX_SCAN_BYTES = int(os.environ.get("CODEX_WEB_HARNESS_MAX_SCAN_BYTES", str(8 * 1024 * 1024)))
@@ -2635,8 +2636,9 @@ class SessionManager:
         self._discover_existing(force=True)
         self._harness_thr = threading.Thread(target=self._harness_loop, name="harness", daemon=True)
         self._harness_thr.start()
-        self._queue_thr = threading.Thread(target=self._queue_loop, name="queue", daemon=True)
-        self._queue_thr.start()
+        if QUEUE_SWEEP_ENABLED:
+            self._queue_thr = threading.Thread(target=self._queue_loop, name="queue", daemon=True)
+            self._queue_thr.start()
         self._voice_push_scan_thr = threading.Thread(target=self._voice_push_scan_loop, name="voice-push-scan", daemon=True)
         self._voice_push_scan_thr.start()
 

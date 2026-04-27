@@ -26,6 +26,8 @@ use std::path::{Path, PathBuf};
 use std::process::{self, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+use tokio::task;
+use tokio::time::{self, MissedTickBehavior};
 use sha2::{Digest, Sha256};
 use toml::Value as TomlValue;
 
@@ -49,6 +51,8 @@ const GIT_DIFF_MAX_BYTES: usize = 800 * 1024;
 const GIT_DIFF_TIMEOUT_SECONDS: f64 = 4.0;
 const GIT_CHANGED_FILES_MAX: usize = 400;
 const LOCAL_SERVICE_RESTART_DELAY_SECONDS: f64 = 0.75;
+const DEFAULT_QUEUE_SWEEP_SECONDS: f64 = 1.0;
+const DEFAULT_QUEUE_IDLE_GRACE_SECONDS: f64 = 10.0;
 const SIDEBAR_PRIORITY_HALF_LIFE_SECONDS: f64 = 8.0 * 3600.0;
 const SIDEBAR_PRIORITY_LAMBDA: f64 = std::f64::consts::LN_2 / SIDEBAR_PRIORITY_HALF_LIFE_SECONDS;
 const SUPPORTED_REASONING_EFFORTS: &[&str] = &["xhigh", "high", "medium", "low"];
@@ -1477,6 +1481,177 @@ pub fn move_queue_item(config: &RuntimeConfig, session_id: &str, item_id: &str, 
     set_normalized_queue_values(&mut queues, session_id, items);
     write_queue_map(&queue_path, &queues)?;
     Ok(json!({"ok": true, "queue_len": queue_len}))
+}
+
+pub fn rust_queue_sweep_enabled() -> bool {
+    env::var("CODOXEAR_ENABLE_QUEUE_SWEEP")
+        .ok()
+        .map(|value| value.trim() == "1")
+        .unwrap_or(false)
+}
+
+pub fn spawn_queue_sweep_worker(config: RuntimeConfig) {
+    tokio::spawn(async move {
+        let mut idle_since: HashMap<String, f64> = HashMap::new();
+        let mut interval = time::interval(queue_sweep_interval());
+        interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            let sweep_config = config.clone();
+            let prior_idle_since = std::mem::take(&mut idle_since);
+            match task::spawn_blocking(move || {
+                let mut next_idle_since = prior_idle_since;
+                let result = run_queue_sweep_once(&sweep_config, &mut next_idle_since, epoch_now());
+                (next_idle_since, result)
+            })
+            .await
+            {
+                Ok((next_idle_since, Ok(_did_send))) => {
+                    idle_since = next_idle_since;
+                }
+                Ok((next_idle_since, Err(err))) => {
+                    idle_since = next_idle_since;
+                    tracing::warn!("rust queue sweep failed: {err}");
+                }
+                Err(err) => {
+                    tracing::warn!("rust queue sweep task join failed: {err}");
+                }
+            }
+        }
+    });
+}
+
+fn run_queue_sweep_once(
+    config: &RuntimeConfig,
+    idle_since: &mut HashMap<String, f64>,
+    now_ts: f64,
+) -> Result<bool, String> {
+    let queue_path = config.app_dir.join("session_queues.json");
+    let mut queues = read_array_map(&queue_path)?;
+    let sessions = load_sessions_response(config)?;
+    let session_by_id = sessions
+        .sessions
+        .into_iter()
+        .map(|session| (session.session_id.clone(), session))
+        .collect::<HashMap<_, _>>();
+
+    let mut dirty = false;
+    let stale_ids = queues
+        .keys()
+        .filter(|session_id| !session_by_id.contains_key(*session_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    for session_id in stale_ids {
+        queues.remove(&session_id);
+        idle_since.remove(&session_id);
+        dirty = true;
+    }
+
+    let mut session_ids = queues.keys().cloned().collect::<Vec<_>>();
+    session_ids.sort();
+
+    for session_id in session_ids {
+        let Some(session) = session_by_id.get(&session_id) else {
+            continue;
+        };
+        let mut items = normalized_queue_values(queues.get(&session_id).map(Vec::as_slice).unwrap_or(&[]));
+        if items.is_empty() {
+            queues.remove(&session_id);
+            idle_since.remove(&session_id);
+            dirty = true;
+            continue;
+        }
+        if items
+            .first()
+            .and_then(|value| value.get("sending"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            idle_since.remove(&session_id);
+            continue;
+        }
+        let ready = match queue_remote_ready(config, session) {
+            Ok(ready) => ready,
+            Err(_) => {
+                idle_since.remove(&session_id);
+                continue;
+            }
+        };
+        if !ready {
+            idle_since.remove(&session_id);
+            continue;
+        }
+
+        let start_ts = idle_since.entry(session_id.clone()).or_insert(now_ts);
+        if (now_ts - *start_ts) < queue_idle_grace_seconds() {
+            continue;
+        }
+        idle_since.remove(&session_id);
+
+        let item_id = items
+            .first()
+            .and_then(|value| value.get("id"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let text = items
+            .first()
+            .and_then(|value| value.get("text"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if let Some(first) = items.first_mut() {
+            first["sending"] = Value::Bool(true);
+        }
+        set_normalized_queue_values(&mut queues, &session_id, items.clone());
+        write_queue_map(&queue_path, &queues)?;
+
+        let send_result = broker_request_for_session(
+            config,
+            session,
+            &json!({"cmd": "send", "text": text}),
+            Duration::from_secs_f64(3.0),
+        )
+        .and_then(|response| {
+            if !response.is_object() || response.get("queue_len").and_then(Value::as_u64).is_none() {
+                return Err("invalid broker send response".to_string());
+            }
+            Ok(response)
+        });
+
+        match send_result {
+            Ok(_) => {
+                let mut remaining = normalized_queue_values(queues.get(&session_id).map(Vec::as_slice).unwrap_or(&[]));
+                if let Some(index) = remaining
+                    .iter()
+                    .position(|entry| entry.get("id").and_then(Value::as_str) == Some(item_id.as_str()))
+                {
+                    remaining.remove(index);
+                }
+                set_normalized_queue_values(&mut queues, &session_id, remaining);
+                write_queue_map(&queue_path, &queues)?;
+                return Ok(true);
+            }
+            Err(_) => {
+                let mut reverted = normalized_queue_values(queues.get(&session_id).map(Vec::as_slice).unwrap_or(&[]));
+                if let Some(entry) = reverted
+                    .iter_mut()
+                    .find(|entry| entry.get("id").and_then(Value::as_str) == Some(item_id.as_str()))
+                {
+                    if let Some(object) = entry.as_object_mut() {
+                        object.remove("sending");
+                    }
+                }
+                set_normalized_queue_values(&mut queues, &session_id, reverted);
+                write_queue_map(&queue_path, &queues)?;
+            }
+        }
+    }
+
+    if dirty {
+        write_queue_map(&queue_path, &queues)?;
+    }
+    Ok(false)
 }
 
 pub fn load_harness_response(config: &RuntimeConfig, session_id: &str) -> Result<ApiHarnessResponse, String> {
@@ -3018,6 +3193,23 @@ fn queue_remote_ready(config: &RuntimeConfig, session: &ApiSessionSummary) -> Re
         }
     }
     Ok(true)
+}
+
+fn queue_sweep_interval() -> Duration {
+    let seconds = env::var("CODEX_WEB_QUEUE_SWEEP_SECONDS")
+        .ok()
+        .and_then(|value| value.trim().parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .unwrap_or(DEFAULT_QUEUE_SWEEP_SECONDS);
+    Duration::from_secs_f64(seconds)
+}
+
+fn queue_idle_grace_seconds() -> f64 {
+    env::var("CODEX_WEB_QUEUE_IDLE_GRACE_SECONDS")
+        .ok()
+        .and_then(|value| value.trim().parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .unwrap_or(DEFAULT_QUEUE_IDLE_GRACE_SECONDS)
 }
 
 fn map_io_error(err: std::io::Error) -> String {
@@ -7099,8 +7291,9 @@ mod tests {
     use super::{
         load_changed_files_response, load_file_search_response, load_git_diff_response,
         load_git_file_versions_response, load_messages_history, load_messages_live,
-        load_messages_tail, load_sessions_response, RuntimeConfig,
+        load_messages_tail, load_sessions_response, run_queue_sweep_once, RuntimeConfig,
     };
+    use serde_json::Value;
     use std::env;
     use std::fs;
     use std::io::{BufRead, BufReader, Write};
@@ -7852,5 +8045,66 @@ name = "CRS"
         assert_eq!(live.events[1]["answer"], "Single");
         assert_eq!(live.meta_delta["tool"], 2);
         assert_eq!(live.diag["last_tool"], "pi_tool");
+    }
+
+    #[test]
+    fn run_queue_sweep_once_waits_for_idle_grace_and_sends_head() {
+        let _guard = env_lock().lock().unwrap();
+        let previous_grace = env::var("CODEX_WEB_QUEUE_IDLE_GRACE_SECONDS").ok();
+        env::set_var("CODEX_WEB_QUEUE_IDLE_GRACE_SECONDS", "5");
+
+        let app_dir = temp_app_dir("queue-worker");
+        let sock_path = app_dir.join("socks").join("sid-queue.sock");
+        let listener = UnixListener::bind(&sock_path).unwrap();
+        let listener_thread = thread::spawn(move || {
+            for _ in 0..5 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut line = String::new();
+                BufReader::new(stream.try_clone().unwrap()).read_line(&mut line).unwrap();
+                if line.contains("\"cmd\":\"send\"") {
+                    assert!(line.contains("queued from rust"));
+                    stream.write_all(b"{\"queued\":false,\"queue_len\":0}\n").unwrap();
+                    return;
+                }
+                stream.write_all(b"{\"busy\":false,\"queue_len\":0}\n").unwrap();
+            }
+            panic!("queue worker never sent queued head");
+        });
+
+        fs::write(
+            app_dir.join("socks").join("sid-queue.json"),
+            format!(
+                r#"{{"session_id":"thread-queue","codex_pid":{},"broker_pid":{},"cwd":"{}","start_ts":11.0}}"#,
+                std::process::id(),
+                std::process::id(),
+                app_dir.display(),
+            ),
+        )
+        .unwrap();
+        fs::write(
+            app_dir.join("session_queues.json"),
+            r#"{"sid-queue":[{"id":"q1","text":"queued from rust","created_ts":1.0}]}"#,
+        )
+        .unwrap();
+
+        let config = RuntimeConfig { app_dir: app_dir.clone() };
+        let mut idle_since = std::collections::HashMap::new();
+        assert!(!run_queue_sweep_once(&config, &mut idle_since, 10.0).unwrap());
+        assert_eq!(idle_since.get("sid-queue").copied(), Some(10.0));
+
+        let queued: Value = serde_json::from_str(&fs::read_to_string(app_dir.join("session_queues.json")).unwrap()).unwrap();
+        assert_eq!(queued["sid-queue"][0]["text"], "queued from rust");
+        assert!(queued["sid-queue"][0].get("sending").is_none());
+
+        assert!(run_queue_sweep_once(&config, &mut idle_since, 15.1).unwrap());
+        assert!(idle_since.get("sid-queue").is_none());
+        let queues_after_send: Value = serde_json::from_str(&fs::read_to_string(app_dir.join("session_queues.json")).unwrap()).unwrap();
+        assert!(queues_after_send.get("sid-queue").is_none());
+
+        listener_thread.join().unwrap();
+        match previous_grace {
+            Some(value) => env::set_var("CODEX_WEB_QUEUE_IDLE_GRACE_SECONDS", value),
+            None => env::remove_var("CODEX_WEB_QUEUE_IDLE_GRACE_SECONDS"),
+        }
     }
 }
