@@ -47,6 +47,7 @@ const SIDEBAR_PRIORITY_HALF_LIFE_SECONDS: f64 = 8.0 * 3600.0;
 const SIDEBAR_PRIORITY_LAMBDA: f64 = std::f64::consts::LN_2 / SIDEBAR_PRIORITY_HALF_LIFE_SECONDS;
 const SUPPORTED_REASONING_EFFORTS: &[&str] = &["xhigh", "high", "medium", "low"];
 const SUPPORTED_PI_REASONING_EFFORTS: &[&str] = &["off", "minimal", "low", "medium", "high", "xhigh"];
+const BUILTIN_PI_PROVIDER_CHOICES: &[&str] = &["anthropic", "openai-codex", "github-copilot", "google-gemini-cli", "google-antigravity"];
 const TMUX_META_WAIT_SECONDS: f64 = 10.0;
 static QUEUE_ITEM_COUNTER: AtomicU64 = AtomicU64::new(0);
 const ASK_USER_TOOL_NAMES: &[&str] = &["ask_user", "AskUserQuestion"];
@@ -6348,6 +6349,12 @@ fn read_pi_launch_defaults() -> Result<ApiBackendDefaults, String> {
     }
 
     let auth_path = pi_auth_path();
+    for provider in BUILTIN_PI_PROVIDER_CHOICES {
+        if !provider_choices.iter().any(|item| item == provider) {
+            provider_choices.push((*provider).to_string());
+        }
+    }
+
     if auth_path.exists() {
         let data: Value = read_json_file(&auth_path)?;
         if let Some(entries) = data.as_object() {
@@ -6915,7 +6922,17 @@ name = "CRS"
         assert_eq!(response.new_session_defaults.backends["codex"].provider_choice.as_deref(), Some("crs"));
         assert_eq!(response.new_session_defaults.backends["codex"].reasoning_effort, "medium");
         assert_eq!(response.new_session_defaults.backends["pi"].provider_choice.as_deref(), Some("macaron"));
-        assert_eq!(response.new_session_defaults.backends["pi"].provider_choices, vec!["macaron".to_string(), "openai-codex".to_string()]);
+        assert_eq!(
+            response.new_session_defaults.backends["pi"].provider_choices,
+            vec![
+                "macaron".to_string(),
+                "anthropic".to_string(),
+                "openai-codex".to_string(),
+                "github-copilot".to_string(),
+                "google-gemini-cli".to_string(),
+                "google-antigravity".to_string(),
+            ],
+        );
     }
 
     #[test]

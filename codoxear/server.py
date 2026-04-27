@@ -231,6 +231,7 @@ PI_AUTH_PATH = PI_HOME / "agent" / "auth.json"
 DEFAULT_AGENT_BACKEND = normalize_agent_backend(os.environ.get("CODEX_WEB_DEFAULT_AGENT_BACKEND"), default="codex")
 SUPPORTED_REASONING_EFFORTS = ("xhigh", "high", "medium", "low")
 SUPPORTED_PI_REASONING_EFFORTS = ("off", "minimal", "low", "medium", "high", "xhigh")
+BUILTIN_PI_PROVIDER_CHOICES = ("anthropic", "openai-codex", "github-copilot", "google-gemini-cli", "google-antigravity")
 
 DEFAULT_HOST = os.environ.get("CODEX_WEB_HOST", "::")
 DEFAULT_PORT = int(os.environ.get("CODEX_WEB_PORT", "8743"))
@@ -2246,6 +2247,10 @@ def _read_pi_launch_defaults() -> dict[str, Any]:
                     if model_id is None or model_id in model_choices:
                         continue
                     model_choices.append(model_id)
+
+    for name in BUILTIN_PI_PROVIDER_CHOICES:
+        if name not in provider_choices:
+            provider_choices.append(name)
 
     if PI_AUTH_PATH.exists():
         data = json.loads(PI_AUTH_PATH.read_text(encoding="utf-8"))

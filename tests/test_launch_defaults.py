@@ -325,7 +325,10 @@ base_url = "https://example.invalid/crs"
         self.assertEqual(defaults["provider_choice"], "macaron")
         self.assertEqual(defaults["model"], "gpt-5.4")
         self.assertEqual(defaults["reasoning_effort"], "high")
-        self.assertEqual(defaults["provider_choices"], ["macaron"])
+        self.assertEqual(
+            defaults["provider_choices"],
+            ["macaron", "anthropic", "openai-codex", "github-copilot", "google-gemini-cli", "google-antigravity"],
+        )
         self.assertEqual(defaults["models"], ["gpt-5.4", "gpt-5.4-mini"])
         self.assertFalse(defaults["supports_fast"])
 
@@ -359,7 +362,10 @@ base_url = "https://example.invalid/crs"
             ):
                 defaults = _read_pi_launch_defaults()
 
-        self.assertEqual(defaults["provider_choices"], ["macaron", "openai-codex"])
+        self.assertEqual(
+            defaults["provider_choices"],
+            ["macaron", "anthropic", "openai-codex", "github-copilot", "google-gemini-cli", "google-antigravity"],
+        )
 
 
 if __name__ == "__main__":
