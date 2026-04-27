@@ -21,6 +21,7 @@ use crate::runtime::{
     save_codex_config_response, save_voice_settings_response,
     schedule_local_service_restart_response, set_harness_config,
     send_session_message, update_queue_item,
+    update_audio_listener_heartbeat_response,
     toggle_notification_subscription_response, upsert_notification_subscription_response,
 };
 use axum::extract::{Path, Query, State};
@@ -85,6 +86,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/notifications/message", get(notification_message))
         .route("/api/v1/notifications/feed", get(notification_feed))
         .route("/api/v1/audio/live.m3u8", get(audio_playlist))
+        .route("/api/v1/audio/listener", post(audio_listener))
         .route("/api/v1/audio/segments/*path", get(audio_segment))
         .route("/api/v1/sessions", get(sessions).post(session_create))
         .route("/api/v1/login", post(login))
@@ -149,7 +151,7 @@ fn public_api_router(state: AppState) -> Router<AppState> {
         .route("/notifications/message", get(notification_message))
         .route("/notifications/feed", get(notification_feed))
         .route("/audio/live.m3u8", get(audio_playlist))
-        .route("/audio/listener", post(legacy_audio_listener_proxy))
+        .route("/audio/listener", post(audio_listener))
         .route("/audio/segments/*path", get(audio_segment))
         .route("/sessions", get(sessions).post(session_create))
         .route("/sessions/:session_id/diagnostics", get(diagnostics))
@@ -227,11 +229,6 @@ async fn service_worker() -> Result<Response, (StatusCode, String)> {
 
 async fn legacy_entry_proxy(request: Request<Body>) -> Result<Response, (StatusCode, String)> {
     let request_path = rewrite_legacy_path(request.uri());
-    proxy_legacy_request(request, Some(request_path)).await
-}
-
-async fn legacy_audio_listener_proxy(request: Request<Body>) -> Result<Response, (StatusCode, String)> {
-    let request_path = rewrite_public_api_path(request.uri());
     proxy_legacy_request(request, Some(request_path)).await
 }
 
@@ -353,18 +350,6 @@ fn rewrite_legacy_path(uri: &axum::http::Uri) -> String {
     match uri.query() {
         Some(query) => format!("{rewritten}?{query}"),
         None => rewritten.to_string(),
-    }
-}
-
-fn rewrite_public_api_path(uri: &axum::http::Uri) -> String {
-    let path = if uri.path().starts_with("/api/") {
-        uri.path().to_string()
-    } else {
-        format!("/api{}", uri.path())
-    };
-    match uri.query() {
-        Some(query) => format!("{path}?{query}"),
-        None => path,
     }
 }
 
@@ -698,6 +683,24 @@ async fn audio_segment(
         load_audio_segment_bytes(&state.config, &path).map_err(audio_route_error)?,
         "video/mp2t",
     )
+}
+
+async fn audio_listener(
+    State(state): State<AppState>,
+    Json(payload): Json<Value>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    if !payload.is_object() {
+        return Err((StatusCode::BAD_REQUEST, "invalid json body (expected object)".to_string()));
+    }
+    let Some(client_id) = payload.get("client_id").and_then(Value::as_str) else {
+        return Err((StatusCode::BAD_REQUEST, "client_id required".to_string()));
+    };
+    let Some(enabled) = payload.get("enabled").and_then(Value::as_bool) else {
+        return Err((StatusCode::BAD_REQUEST, "enabled must be a boolean".to_string()));
+    };
+    update_audio_listener_heartbeat_response(&state.config, client_id, enabled)
+        .map(Json)
+        .map_err(audio_listener_route_error)
 }
 
 async fn login(
@@ -1095,6 +1098,16 @@ fn notification_message_route_error(message: String) -> (StatusCode, String) {
 fn audio_route_error(message: String) -> (StatusCode, String) {
     if message == "unknown audio segment" {
         return (StatusCode::NOT_FOUND, message);
+    }
+    (StatusCode::INTERNAL_SERVER_ERROR, message)
+}
+
+fn audio_listener_route_error(message: String) -> (StatusCode, String) {
+    if message == "client_id required"
+        || message == "enabled must be a boolean"
+        || message == "invalid json body (expected object)"
+    {
+        return (StatusCode::BAD_REQUEST, message);
     }
     (StatusCode::INTERNAL_SERVER_ERROR, message)
 }
@@ -1716,9 +1729,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn public_voice_and_audio_routes_use_rust_runtime_except_listener_proxy() {
+    async fn public_voice_and_audio_routes_use_rust_runtime_including_listener_heartbeat() {
         let _guard = env_lock().lock().unwrap();
         let app_dir = temp_app_dir("legacy-api-proxy");
+        let listeners_path = app_dir.join("voice_listeners.json");
         fs::create_dir_all(app_dir.join("audio").join("segments")).unwrap();
         fs::write(
             app_dir.join("voice_settings.json"),
@@ -1799,7 +1813,6 @@ mod tests {
         fs::write(app_dir.join("audio").join("live.m3u8"), b"#EXTM3U\n# rust playlist\n").unwrap();
         fs::write(app_dir.join("audio").join("segments").join("clip-a.ts"), b"segment:clip-a").unwrap();
         let _password = EnvGuard::set("CODEX_WEB_PASSWORD", "topsecret");
-        let _legacy_base = EnvGuard::set("CODEX_WEB_NOVA_LEGACY_BASE", spawn_mock_legacy_backend());
         let app = router(build_state_from_config(RuntimeConfig { app_dir }).unwrap());
         let cookie = login_cookie(&app).await;
 
@@ -1887,11 +1900,32 @@ mod tests {
         assert_eq!(listener.status(), StatusCode::OK);
         let listener_body = to_bytes(listener.into_body(), usize::MAX).await.unwrap();
         let listener_payload: Value = serde_json::from_slice(&listener_body).unwrap();
-        assert_eq!(listener_payload["path"], "/api/audio/listener");
-        assert!(listener_payload["body"]
-            .as_str()
+        assert_eq!(listener_payload["ok"], true);
+        assert_eq!(listener_payload["active_listener_count"], 1);
+
+        let listeners_text = fs::read_to_string(&listeners_path).unwrap();
+        let listeners_payload: Value = serde_json::from_str(&listeners_text).unwrap();
+        assert!(listeners_payload
+            .get("listener-a")
+            .and_then(Value::as_f64)
             .unwrap()
-            .contains("listener-a"));
+            > 0.0);
+
+        let settings_after_listener = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/settings/voice")
+                    .header(header::COOKIE, cookie.clone())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(settings_after_listener.status(), StatusCode::OK);
+        let settings_after_listener_body = to_bytes(settings_after_listener.into_body(), usize::MAX).await.unwrap();
+        let settings_after_listener_payload: Value = serde_json::from_slice(&settings_after_listener_body).unwrap();
+        assert_eq!(settings_after_listener_payload["audio"]["active_listener_count"], 1);
 
         let playlist = app
             .clone()

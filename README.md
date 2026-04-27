@@ -193,8 +193,8 @@ These do not replace the existing Python server yet. They are the new shell and 
 Current route split:
 
 - `/` and `/nova/` — redirect to `/nova-preview/`, so the replatformed shell is the active browser entry
-- `/nova-preview/` — new `Preact + Pretext` shell, now wired to the real Python `/api/*` endpoints for sessions, transcript polling, diagnostics, queue, harness, interrupt, file viewing, new-session creation, voice settings, and desktop notification polling
-- `/api/v1/*` — still reserved for the Rust preview backend
+- `/nova-preview/` — new `Preact + Pretext` shell, now wired to the live same-origin Rust `/api/*` browser contract for sessions, transcript polling, diagnostics, queue, harness, interrupt, file viewing, new-session creation, voice settings, notifications, and audio listener heartbeats
+- `/api/v1/*` — Rust backend routes mirroring the same browser contract during the replatform transition
 
 Frontend dev:
 
@@ -214,8 +214,8 @@ cargo run
 The Nova preview frontend uses same-origin `/api` by default in production. For standalone local dev against a different server, set `VITE_CODOXEAR_API_BASE=http://127.0.0.1:13780`.
 
 The local deploy helper `./scripts/codoxear-local` now runs two processes:
-- public Python web entry on `:8743` redirecting `/` and `/nova/` to `/nova-preview/`, serving the custom Nova preview at `/nova-preview/`, and proxying `/api/v1` to Rust
-- Rust Nova preview API on `127.0.0.1:8787`
+- public Rust web entry on `:8743` redirecting `/` and `/nova/` to `/nova-preview/`, serving the Nova preview shell plus the migrated `/api/*` routes, and proxying only `/legacy/*` to Python
+- legacy Python backend on `127.0.0.1:8744` for `/legacy/*` plus the broker/runtime worker implementation still shared by the Rust front door
 - `CODEX_WEB_QUEUE_SWEEP_SECONDS` (default `1.0`)
 - `CODEX_WEB_QUEUE_IDLE_GRACE_SECONDS` (default `10.0`)
 - `CODEX_WEB_DISCOVER_MIN_INTERVAL_SECONDS` (default `1.0`)

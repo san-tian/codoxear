@@ -209,6 +209,24 @@ def _clean_ledger(raw: Any) -> dict[str, dict[str, Any]]:
     return cleaned
 
 
+def _clean_listener_records(raw: Any) -> dict[str, float]:
+    if not isinstance(raw, dict):
+        return {}
+    now_ts = time.time()
+    cleaned: dict[str, float] = {}
+    for client_id, seen_at in raw.items():
+        cid = str(client_id or "").strip()
+        if not cid or not isinstance(seen_at, (int, float)):
+            continue
+        seen_ts = float(seen_at)
+        if not math.isfinite(seen_ts):
+            continue
+        if (now_ts - seen_ts) > LISTENER_TTL_SECONDS:
+            continue
+        cleaned[cid] = seen_ts
+    return cleaned
+
+
 def _b64u(raw: bytes) -> str:
     return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
 
@@ -628,6 +646,7 @@ class VoicePushCoordinator:
     ) -> None:
         self._app_dir = Path(app_dir)
         self._runtime_path = self._app_dir / "voice_runtime.json"
+        self._listeners_path = self._app_dir / "voice_listeners.json"
         self._stop = stop_event
         self._settings_path = Path(settings_path)
         self._subscriptions_path = Path(subscriptions_path)
@@ -653,8 +672,10 @@ class VoicePushCoordinator:
         self._vapid_subject = _default_vapid_subject()
         self._settings_mtime_ns: int | None = None
         self._subscriptions_mtime_ns: int | None = None
+        self._listeners_mtime_ns: int | None = None
         self._load_settings()
         self._load_subscriptions()
+        self._load_listeners()
         self._load_delivery_ledger()
         self._ensure_vapid_keys()
         self._worker = threading.Thread(target=self._worker_loop, name="voice-push", daemon=True)
@@ -666,6 +687,7 @@ class VoicePushCoordinator:
     def settings_snapshot(self) -> dict[str, Any]:
         self._reload_settings_if_changed()
         self._reload_subscriptions_if_changed()
+        self._reload_listeners_if_changed()
         with self._lock:
             settings = dict(self._voice_settings)
             enabled_devices = sum(
@@ -689,40 +711,44 @@ class VoicePushCoordinator:
         }
 
     def listener_heartbeat(self, *, client_id: str, enabled: bool) -> dict[str, Any]:
+        self._reload_listeners_if_changed()
         cid = str(client_id or "").strip()
         if not cid:
             raise ValueError("client_id required")
         now_ts = time.time()
-        dropped_tasks: list[AnnouncementTask] = []
-        should_reset_hls = False
         with self._lock:
             self._prune_listeners_locked(now_ts=now_ts)
-            previous_count = len(self._listeners)
+            listeners = dict(self._listeners)
             if enabled:
-                self._listeners[cid] = now_ts
+                listeners[cid] = now_ts
             else:
-                self._listeners.pop(cid, None)
-            count = self._active_listener_count_locked(now_ts=now_ts)
-            if previous_count > 0 and count == 0:
-                self._listener_epoch += 1
-                dropped_tasks.extend(self._queue)
-                self._queue = []
-                if self._prepared is not None:
-                    dropped_tasks.append(self._prepared.task)
-                    self._prepared = None
-                if self._generating_task is not None:
-                    dropped_tasks.append(self._generating_task)
-                    self._generating_task = None
-                self._playing_task = None
-                self._playing_until_monotonic = 0.0
-                should_reset_hls = True
-            self._queue_ready.notify_all()
+                listeners.pop(cid, None)
+            dropped_tasks, should_reset_hls, count, changed = self._replace_listeners_locked(listeners, now_ts=now_ts)
+            if changed:
+                self._queue_ready.notify_all()
+        if changed:
+            self._save_listeners()
         if dropped_tasks:
             self._mark_tasks_skipped_no_listener(dropped_tasks)
         if should_reset_hls:
             self._hls.reset()
         self._save_runtime_snapshot()
         return {"active_listener_count": count}
+
+    def _reload_listeners_if_changed(self) -> None:
+        dropped_tasks: list[AnnouncementTask] = []
+        should_reset_hls = False
+        changed = False
+        with self._lock:
+            dropped_tasks, should_reset_hls, changed = self._reload_listeners_if_changed_locked(now_ts=time.time())
+            if changed:
+                self._queue_ready.notify_all()
+        if dropped_tasks:
+            self._mark_tasks_skipped_no_listener(dropped_tasks)
+        if should_reset_hls:
+            self._hls.reset()
+        if changed or dropped_tasks or should_reset_hls:
+            self._save_runtime_snapshot()
 
     def set_settings(self, raw: Any) -> dict[str, Any]:
         self._reload_settings_if_changed()
@@ -812,6 +838,7 @@ class VoicePushCoordinator:
         messages: list[ClassifiedAssistantMessage],
     ) -> None:
         self._reload_settings_if_changed()
+        self._reload_listeners_if_changed()
         for msg in messages:
             task: AnnouncementTask | None = None
             now_ts = float(time.time())
@@ -960,6 +987,7 @@ class VoicePushCoordinator:
             self._stop.wait(1.0)
 
     def _keepalive_sweep(self) -> None:
+        self._reload_listeners_if_changed()
         with self._lock:
             listener_count = self._active_listener_count_locked(now_ts=time.time())
             should_keepalive = (
@@ -980,10 +1008,18 @@ class VoicePushCoordinator:
             task: AnnouncementTask | None = None
             prepared: GeneratedAnnouncement | None = None
             stale_task: AnnouncementTask | None = None
+            dropped_tasks: list[AnnouncementTask] = []
+            should_reset_hls = False
+            listeners_changed = False
             with self._lock:
                 while not self._stop.is_set():
                     now_wall = time.time()
                     now_mono = time.monotonic()
+                    dropped_tasks, should_reset_hls, listeners_changed = self._reload_listeners_if_changed_locked(now_ts=now_wall)
+                    if listeners_changed:
+                        self._queue_ready.notify_all()
+                    if dropped_tasks or should_reset_hls:
+                        break
                     listener_count = self._active_listener_count_locked(now_ts=now_wall)
                     if self._playing_task is not None and now_mono >= self._playing_until_monotonic:
                         self._playing_task = None
@@ -1014,8 +1050,14 @@ class VoicePushCoordinator:
                     self._queue_ready.wait(timeout=timeout)
                 if self._stop.is_set():
                     return
-            if action or stale_task is not None:
+            if listeners_changed or action or stale_task is not None or dropped_tasks or should_reset_hls:
                 self._save_runtime_snapshot()
+            if dropped_tasks:
+                self._mark_tasks_skipped_no_listener(dropped_tasks)
+            if should_reset_hls:
+                self._hls.reset()
+            if dropped_tasks or should_reset_hls:
+                continue
             if action == "append" and prepared is not None:
                 self._append_prepared(prepared)
                 continue
@@ -1037,6 +1079,7 @@ class VoicePushCoordinator:
                     self._queue_ready.notify_all()
 
     def _process_task(self, task: AnnouncementTask) -> None:
+        self._reload_listeners_if_changed()
         settings = self.settings_snapshot()
         self._set_task_ledger_fields(task, {"voice": task.voice})
         spoken_text = task.spoken_text
@@ -1087,6 +1130,7 @@ class VoicePushCoordinator:
             return
 
     def _append_prepared(self, prepared: GeneratedAnnouncement) -> None:
+        self._reload_listeners_if_changed()
         with self._lock:
             if prepared.task.listener_epoch != self._listener_epoch or self._active_listener_count_locked(now_ts=time.time()) <= 0:
                 stale = True
@@ -1390,6 +1434,39 @@ class VoicePushCoordinator:
         self._prune_listeners_locked(now_ts=now_ts)
         return len(self._listeners)
 
+    def _replace_listeners_locked(
+        self,
+        listeners: dict[str, float],
+        *,
+        now_ts: float,
+    ) -> tuple[list[AnnouncementTask], bool, int, bool]:
+        cleaned = {
+            cid: float(seen_at)
+            for cid, seen_at in _clean_listener_records(listeners).items()
+            if (now_ts - float(seen_at)) <= LISTENER_TTL_SECONDS
+        }
+        previous_count = len(self._listeners)
+        changed = cleaned != self._listeners
+        self._listeners = cleaned
+        count = self._active_listener_count_locked(now_ts=now_ts)
+        dropped_tasks: list[AnnouncementTask] = []
+        should_reset_hls = False
+        if previous_count > 0 and count == 0:
+            self._listener_epoch += 1
+            dropped_tasks.extend(self._queue)
+            self._queue = []
+            if self._prepared is not None:
+                dropped_tasks.append(self._prepared.task)
+                self._prepared = None
+            if self._generating_task is not None:
+                dropped_tasks.append(self._generating_task)
+                self._generating_task = None
+            self._playing_task = None
+            self._playing_until_monotonic = 0.0
+            should_reset_hls = True
+            changed = True
+        return dropped_tasks, should_reset_hls, count, changed
+
     def _ensure_vapid_keys(self) -> None:
         if self._vapid_private_key_path.exists():
             vapid = Vapid.from_file(str(self._vapid_private_key_path))
@@ -1477,6 +1554,14 @@ class VoicePushCoordinator:
         self._subscriptions = cleaned
         self._subscriptions_mtime_ns = _path_mtime_ns(self._subscriptions_path)
 
+    def _load_listeners(self) -> None:
+        try:
+            raw = json.loads(self._listeners_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            raw = {}
+        self._listeners = _clean_listener_records(raw)
+        self._listeners_mtime_ns = _path_mtime_ns(self._listeners_path)
+
     def _save_subscriptions(self) -> None:
         os.makedirs(self._subscriptions_path.parent, exist_ok=True)
         with self._lock:
@@ -1486,6 +1571,16 @@ class VoicePushCoordinator:
             tmp_path = Path(tmp.name)
         os.replace(tmp_path, self._subscriptions_path)
         self._subscriptions_mtime_ns = _path_mtime_ns(self._subscriptions_path)
+
+    def _save_listeners(self) -> None:
+        os.makedirs(self._listeners_path.parent, exist_ok=True)
+        with self._lock:
+            payload = dict(self._listeners)
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=self._listeners_path.parent, prefix=self._listeners_path.name + ".", suffix=".tmp", delete=False) as tmp:
+            tmp.write(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+            tmp_path = Path(tmp.name)
+        os.replace(tmp_path, self._listeners_path)
+        self._listeners_mtime_ns = _path_mtime_ns(self._listeners_path)
 
     def _reload_settings_if_changed(self) -> None:
         mtime_ns = _path_mtime_ns(self._settings_path)
@@ -1522,6 +1617,21 @@ class VoicePushCoordinator:
             if mtime_ns != self._subscriptions_mtime_ns:
                 self._subscriptions = cleaned
                 self._subscriptions_mtime_ns = mtime_ns
+
+    def _reload_listeners_if_changed_locked(self, *, now_ts: float) -> tuple[list[AnnouncementTask], bool, bool]:
+        mtime_ns = _path_mtime_ns(self._listeners_path)
+        if mtime_ns == self._listeners_mtime_ns:
+            return [], False, False
+        try:
+            raw = json.loads(self._listeners_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            raw = {}
+        dropped_tasks, should_reset_hls, _count, changed = self._replace_listeners_locked(
+            _clean_listener_records(raw),
+            now_ts=now_ts,
+        )
+        self._listeners_mtime_ns = mtime_ns
+        return dropped_tasks, should_reset_hls, changed
 
     def _load_delivery_ledger(self) -> None:
         try:

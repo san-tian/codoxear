@@ -32,6 +32,7 @@ const CONTEXT_WINDOW_BASELINE_TOKENS: i64 = 12000;
 const DEFAULT_SUMMARIZATION_MODEL: &str = "gpt-4.1-mini";
 const DEFAULT_TTS_MODEL: &str = "gpt-4o-mini-tts";
 const DEFAULT_TTS_BASE_URL: &str = "https://api.openai.com/v1";
+const LISTENER_TTL_SECONDS: f64 = 45.0;
 const HARNESS_DEFAULT_IDLE_MINUTES: f64 = 15.0;
 const HARNESS_DEFAULT_MAX_INJECTIONS: i64 = 1;
 const ATTACH_UPLOAD_MAX_BYTES: usize = 16 * 1024 * 1024;
@@ -476,11 +477,39 @@ pub fn toggle_notification_subscription_response(
     load_notification_subscriptions_response(config)
 }
 
+pub fn update_audio_listener_heartbeat_response(
+    config: &RuntimeConfig,
+    client_id: &str,
+    enabled: bool,
+) -> Result<Value, String> {
+    let client_id = client_id.trim();
+    if client_id.is_empty() {
+        return Err("client_id required".to_string());
+    }
+    let now_ts = epoch_now();
+    let path = voice_listeners_path(config);
+    let mut listeners = read_voice_listener_records(&path, now_ts)?;
+    if enabled {
+        listeners.insert(client_id.to_string(), now_ts);
+    } else {
+        listeners.remove(client_id);
+    }
+    write_voice_listener_records(&path, &listeners)?;
+    Ok(json!({
+        "ok": true,
+        "active_listener_count": listeners.len(),
+    }))
+}
+
 pub fn load_voice_settings_response(config: &RuntimeConfig) -> Result<Value, String> {
     let settings = read_clean_voice_settings(&voice_settings_path(config))?;
     let audio = read_voice_runtime_audio_snapshot(&voice_runtime_path(config))?;
     let records = read_notification_subscription_records(&push_subscriptions_path(config))?;
     let vapid_public_key = ensure_vapid_public_key(config)?;
+    let active_listener_count = current_voice_listener_count(
+        config,
+        audio.get("active_listener_count").and_then(Value::as_i64).unwrap_or(0),
+    )?;
     let (enabled_devices, total_devices) = notification_mobile_device_counts(&records);
     Ok(json!({
         "ok": true,
@@ -492,7 +521,7 @@ pub fn load_voice_settings_response(config: &RuntimeConfig) -> Result<Value, Str
         "tts_model": settings.get("tts_model").and_then(Value::as_str).unwrap_or(DEFAULT_TTS_MODEL),
         "audio": {
             "queue_depth": audio.get("queue_depth").and_then(Value::as_i64).unwrap_or(0),
-            "active_listener_count": audio.get("active_listener_count").and_then(Value::as_i64).unwrap_or(0),
+            "active_listener_count": active_listener_count,
             "stream_url": "/api/audio/live.m3u8",
             "segment_count": audio.get("segment_count").and_then(Value::as_i64).unwrap_or(0),
             "last_error": audio.get("last_error").and_then(Value::as_str).unwrap_or_default(),
@@ -4461,6 +4490,48 @@ fn read_optional_value(path: &Path) -> Result<Option<Value>, String> {
     }
 }
 
+fn read_voice_listener_records(path: &Path, now_ts: f64) -> Result<HashMap<String, f64>, String> {
+    let Some(Value::Object(object)) = read_optional_value(path)? else {
+        return Ok(HashMap::new());
+    };
+    let mut listeners = HashMap::new();
+    for (client_id, value) in object {
+        let client_id = client_id.trim();
+        if client_id.is_empty() {
+            continue;
+        }
+        let Some(seen_ts) = value.as_f64() else {
+            continue;
+        };
+        if !seen_ts.is_finite() || (now_ts - seen_ts) > LISTENER_TTL_SECONDS {
+            continue;
+        }
+        listeners.insert(client_id.to_string(), seen_ts);
+    }
+    Ok(listeners)
+}
+
+fn write_voice_listener_records(path: &Path, listeners: &HashMap<String, f64>) -> Result<(), String> {
+    let mut keys = listeners.keys().cloned().collect::<Vec<_>>();
+    keys.sort();
+    let mut object = serde_json::Map::new();
+    for key in keys {
+        let Some(seen_ts) = listeners.get(&key) else {
+            continue;
+        };
+        object.insert(key, json!(seen_ts));
+    }
+    write_json_value(path, &Value::Object(object))
+}
+
+fn current_voice_listener_count(config: &RuntimeConfig, fallback_count: i64) -> Result<i64, String> {
+    let path = voice_listeners_path(config);
+    if !path.exists() {
+        return Ok(fallback_count.max(0));
+    }
+    Ok(read_voice_listener_records(&path, epoch_now())?.len() as i64)
+}
+
 fn read_string_map(path: &Path) -> Result<HashMap<String, String>, String> {
     let Some(Value::Object(object)) = read_optional_value(path)? else {
         return Ok(HashMap::new());
@@ -6429,6 +6500,10 @@ fn voice_delivery_ledger_path(config: &RuntimeConfig) -> PathBuf {
 
 fn voice_runtime_path(config: &RuntimeConfig) -> PathBuf {
     config.app_dir.join("voice_runtime.json")
+}
+
+fn voice_listeners_path(config: &RuntimeConfig) -> PathBuf {
+    config.app_dir.join("voice_listeners.json")
 }
 
 fn audio_root_dir(config: &RuntimeConfig) -> PathBuf {
