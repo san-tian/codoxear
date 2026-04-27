@@ -210,7 +210,7 @@ async fn nova_preview_index() -> Result<Response, (StatusCode, String)> {
 }
 
 async fn nova_preview_asset(Path(path): Path<String>) -> Result<Response, (StatusCode, String)> {
-    static_file_response(load_nova_shell_file(&path), false)
+    static_file_response(load_nova_shell_file(&format!("assets/{path}")), false)
 }
 
 async fn nova_preview_spa(Path(path): Path<String>) -> Result<Response, (StatusCode, String)> {
@@ -1532,6 +1532,37 @@ mod tests {
         assert_eq!(response.headers().get(header::CACHE_CONTROL).unwrap(), "no-store");
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         assert!(std::str::from_utf8(&body).unwrap().contains("<html"));
+    }
+
+    #[tokio::test]
+    async fn nova_preview_asset_route_serves_bundle_file() {
+        let _guard = env_lock().lock().unwrap();
+        let app = router(build_state());
+        let index_response = app
+            .clone()
+            .oneshot(Request::builder().uri("/nova-preview/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(index_response.status(), StatusCode::OK);
+        let index_body = to_bytes(index_response.into_body(), usize::MAX).await.unwrap();
+        let index_text = std::str::from_utf8(&index_body).unwrap();
+        let script_marker = "<script type=\"module\" crossorigin src=\"";
+        let script_path = index_text
+            .split(script_marker)
+            .nth(1)
+            .and_then(|tail| tail.split('"').next())
+            .expect("index.html should reference a nova-preview script bundle");
+        assert!(script_path.starts_with("/nova-preview/assets/"));
+
+        let response = app
+            .oneshot(Request::builder().uri(script_path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers().get(header::CONTENT_TYPE).unwrap(), "text/javascript; charset=utf-8");
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+        assert!(text.contains("function") || text.contains("=>") || text.contains("import"));
     }
 
     #[tokio::test]
