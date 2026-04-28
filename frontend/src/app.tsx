@@ -48,6 +48,7 @@ const SIDEBAR_WIDTH_KEY = "codoxear.nova.sidebar.width";
 const CHAT_BOTTOM_FOLLOW_THRESHOLD_PX = 96;
 const CHAT_HISTORY_TOP_THRESHOLD_PX = 16;
 const CHAT_HISTORY_JUMP_OFFSET_PX = 24;
+const STOPPING_FEEDBACK_MS = 2500;
 const SIDEBAR_MIN_WIDTH_PX = 240;
 const SIDEBAR_MAX_WIDTH_PX = 520;
 const SIDEBAR_RESIZER_WIDTH_PX = 10;
@@ -414,14 +415,14 @@ function sessionIsQueuedWaiting(session: SessionSummary | null) {
   return Boolean(session && session.queue_len && !session.busy && !sessionIsStarting(session));
 }
 
-function sessionIsRunning(session: SessionSummary | null, awaitingReply = false) {
-  return Boolean(session && (session.busy || sessionIsStarting(session) || awaitingReply));
+function sessionIsRunning(session: SessionSummary | null, awaitingReply = false, stopSuppressed = false) {
+  return Boolean(session && ((session.busy && !stopSuppressed) || sessionIsStarting(session) || awaitingReply));
 }
 
-function sessionStatusText(session: SessionSummary, awaitingReply = false) {
+function sessionStatusText(session: SessionSummary, awaitingReply = false, stopSuppressed = false) {
   if (session.queue_len) return `queue ${session.queue_len}`;
   if (sessionIsStarting(session)) return "starting";
-  if (sessionIsRunning(session, awaitingReply)) return "working";
+  if (sessionIsRunning(session, awaitingReply, stopSuppressed)) return "working";
   return "idle";
 }
 
@@ -929,6 +930,7 @@ export function App() {
   const [sending, setSending] = useState(false);
   const [closingSession, setClosingSession] = useState(false);
   const [interruptingSessionId, setInterruptingSessionId] = useState("");
+  const [interruptingFeedbackUntil, setInterruptingFeedbackUntil] = useState(0);
   const [sessionMarkerBusyId, setSessionMarkerBusyId] = useState("");
   const [queueLen, setQueueLen] = useState(0);
   const [tokenSummary, setTokenSummary] = useState<{ label: string; title: string } | null>(null);
@@ -1068,7 +1070,8 @@ export function App() {
     }
     return latestUserTs > latestAssistantTs;
   }, [queueLen, selectedSession, transcript]);
-  const selectedSessionAwaitingReplyId = awaitingAssistantReply && selectedSessionId ? selectedSessionId : "";
+  const selectedSessionAwaitingReplyId =
+    awaitingAssistantReply && selectedSessionId && interruptingSessionId !== selectedSessionId ? selectedSessionId : "";
   const workspaceGroups = useMemo(() => {
     const groups = new Map<
       string,
@@ -1078,9 +1081,10 @@ export function App() {
       const key = workspaceKeyForSession(session);
       const group = groups.get(key) || { key, cwd: key, sessions: [], queueLen: 0, busyCount: 0, updatedTs: 0 };
       const awaitingReply = session.session_id === selectedSessionAwaitingReplyId;
+      const stopSuppressed = session.session_id === interruptingSessionId;
       group.sessions.push(session);
       group.queueLen += Number(session.queue_len || 0);
-      if (sessionIsRunning(session, awaitingReply)) group.busyCount += 1;
+      if (sessionIsRunning(session, awaitingReply, stopSuppressed)) group.busyCount += 1;
       group.updatedTs = Math.max(group.updatedTs, Number(session.updated_ts || session.start_ts || 0));
       groups.set(key, group);
     }
@@ -1099,7 +1103,7 @@ export function App() {
       ),
     }));
     return partitionImportantFirst(orderedGroups, (group) => group.sessions.some((session) => sessionIsImportant(session)));
-  }, [selectedSessionAwaitingReplyId, selectedSessionId, sessionOrderByWorkspace, sessions, workspaceOrder]);
+  }, [interruptingSessionId, selectedSessionAwaitingReplyId, selectedSessionId, sessionOrderByWorkspace, sessions, workspaceOrder]);
   const groupedSessions = workspaceGroups;
   const currentNewSessionDefaults = useMemo(
     () => defaultsForBackend(newSessionDefaults, newSessionBackend),
@@ -1138,22 +1142,31 @@ export function App() {
   const tmuxCommand = useMemo(() => tmuxAttachCommandForSession(selectedSession), [selectedSession]);
   const queuePreviewItems = useMemo(() => queueItems.slice(0, 3), [queueItems]);
   const selectedSessionInterrupting = Boolean(selectedSessionId && interruptingSessionId === selectedSessionId);
+  const selectedSessionStoppingFeedback = Boolean(selectedSessionInterrupting && Date.now() < interruptingFeedbackUntil);
   const effectiveAwaitingAssistantReply = selectedSessionInterrupting ? false : awaitingAssistantReply;
   const selectedSessionBusy = Boolean(busy || selectedSession?.busy);
-  const composerSessionBusy = Boolean(effectiveAwaitingAssistantReply || (selectedSessionBusy && !selectedSessionInterrupting));
+  const effectiveSelectedSessionBusy = selectedSessionInterrupting ? false : selectedSessionBusy;
+  const composerSessionBusy = Boolean(effectiveAwaitingAssistantReply || effectiveSelectedSessionBusy);
   const displayedVoiceSettings = voiceSettings || EMPTY_VOICE_SETTINGS;
   const settingsInitialLoading = voiceSettingsLoading && !voiceSettings && !codexConfig;
-  const queuedWaitingStatus = Boolean(selectedSession && queueLen && !closingSession && !sending && sessionIsQueuedWaiting(selectedSession) && !(effectiveAwaitingAssistantReply || selectedSessionBusy));
+  const queuedWaitingStatus = Boolean(
+    selectedSession &&
+      queueLen &&
+      !closingSession &&
+      !sending &&
+      sessionIsQueuedWaiting(selectedSession) &&
+      !(effectiveAwaitingAssistantReply || effectiveSelectedSessionBusy),
+  );
   const topSessionStatus = useMemo(() => {
     if (!selectedSession) return "No session";
     if (closingSession) return "closing";
-    if (selectedSessionInterrupting && selectedSessionBusy) return "stopping";
+    if (selectedSessionStoppingFeedback) return "stopping";
     if (sending) return "sending";
-    if (effectiveAwaitingAssistantReply || selectedSessionBusy) return "working";
+    if (effectiveAwaitingAssistantReply || effectiveSelectedSessionBusy) return "working";
     if (queueLen) return `queue ${queueLen}`;
     if (sessionIsStarting(selectedSession)) return "starting";
     return "idle";
-  }, [closingSession, effectiveAwaitingAssistantReply, queueLen, selectedSession, selectedSessionBusy, selectedSessionInterrupting, sending]);
+  }, [closingSession, effectiveAwaitingAssistantReply, effectiveSelectedSessionBusy, queueLen, selectedSession, selectedSessionStoppingFeedback, sending]);
   const topSessionStatusClass =
     topSessionStatus === "stopping"
       ? "status-chip stopping"
@@ -1354,6 +1367,16 @@ export function App() {
     if (changed) {
       stickToBottomRef.current = true;
       lastAutoScrollKeyRef.current = "";
+      liveCursorRef.current = null;
+      historyCursorRef.current = null;
+      setLiveCursor(null);
+      setHistoryCursor(null);
+      setHasOlder(false);
+      setHistoryTopBoundaryReached(true);
+      setTranscript([]);
+      setBusy(false);
+      setQueueLen(Number(sessions.find((session) => session.session_id === sessionId)?.queue_len || 0));
+      setTokenSummary(null);
     }
     if (mobileViewport) closeMobileSidebar();
     setSelectedSessionId(sessionId);
@@ -1420,8 +1443,9 @@ export function App() {
     has_older?: boolean;
     busy: boolean;
     queue_len: number;
+    turn_aborted?: boolean;
     token?: Record<string, unknown> | null;
-  }) {
+  }, sessionId = selectedSessionRef.current) {
     liveCursorRef.current = data.live_cursor ?? null;
     setLiveCursor(liveCursorRef.current);
     if (Object.prototype.hasOwnProperty.call(data, "history_cursor")) {
@@ -1434,6 +1458,10 @@ export function App() {
     setBusy(Boolean(data.busy));
     setQueueLen(Number.isFinite(Number(data.queue_len)) ? Number(data.queue_len) : 0);
     setTokenSummary(renderTokenSummary(data.token));
+    if (sessionId && (!data.busy || data.turn_aborted)) {
+      setInterruptingSessionId((current) => (current === sessionId ? "" : current));
+      setInterruptingFeedbackUntil(0);
+    }
   }
 
   async function refreshSessions({ preserveSelection = true }: { preserveSelection?: boolean } = {}) {
@@ -1485,7 +1513,7 @@ export function App() {
       const nextEvents = normalizeEvents(data.events || []);
       setTranscript(nextEvents);
       setSessionLastLines((current) => ({ ...current, [sessionId]: previewFromEvents(nextEvents) || current[sessionId] || "" }));
-      applyRuntime(data);
+      applyRuntime(data, sessionId);
       if (showDetailsPanel) void loadDiagnostics(sessionId);
       if (showFilesPanel) void loadFiles(sessionId);
       schedulePoll(0);
@@ -1518,7 +1546,7 @@ export function App() {
           return merged;
         });
       }
-      applyRuntime(data);
+      applyRuntime(data, sessionId);
       if (nextEvents.length || data.turn_end || data.turn_start || data.turn_aborted) {
         void refreshSessions();
       }
@@ -1781,6 +1809,7 @@ export function App() {
     setSending(true);
     setErrorText("");
     setInterruptingSessionId((current) => (current === sessionId ? "" : current));
+    setInterruptingFeedbackUntil(0);
     if (!shouldQueue) {
       localEvent = {
         id: `local-user-${Date.now()}`,
@@ -1887,9 +1916,14 @@ export function App() {
 
   async function handleInterrupt(targetSession = selectedSession) {
     const sessionId = targetSession?.session_id || selectedSessionRef.current;
-    if (!sessionId || interruptingSessionId === sessionId) return;
+    if (!sessionId || (interruptingSessionId === sessionId && Date.now() < interruptingFeedbackUntil)) return;
     setSessionContextMenu(null);
     setInterruptingSessionId(sessionId);
+    const feedbackUntil = Date.now() + STOPPING_FEEDBACK_MS;
+    setInterruptingFeedbackUntil(feedbackUntil);
+    window.setTimeout(() => {
+      setInterruptingFeedbackUntil((current) => (current === feedbackUntil ? 0 : current));
+    }, STOPPING_FEEDBACK_MS + 100);
     try {
       await api.interrupt(sessionId);
       fastPollUntilRef.current = Date.now() + 4000;
@@ -1898,6 +1932,7 @@ export function App() {
     } catch (error) {
       setErrorText(error instanceof Error ? error.message : "Unable to interrupt session");
       setInterruptingSessionId((current) => (current === sessionId ? "" : current));
+      setInterruptingFeedbackUntil(0);
       return;
     }
   }
@@ -2787,6 +2822,7 @@ export function App() {
                         const hasDraft = Boolean((sessionDrafts[session.session_id] || "").trim());
                         const markerBusy = sessionMarkerBusyId === session.session_id;
                         const sessionAwaitingReply = session.session_id === selectedSessionAwaitingReplyId;
+                        const sessionStopSuppressed = session.session_id === interruptingSessionId;
                         const sessionDropClass =
                           sidebarDropIndicator?.kind === "session" && sidebarDropIndicator.key === session.session_id
                             ? ` is-drop-${sidebarDropIndicator.position}`
@@ -2810,11 +2846,20 @@ export function App() {
                                 <div className="workspaceTitleRow">
                                   <div className="workspaceTitle">{sessionDisplayName(session)}</div>
                                   {hasDraft ? <span className="workspaceDraftMark" title="Draft saved" aria-label="Draft saved" /> : null}
-                                  <div className={`status-dot ${sessionIsQueuedWaiting(session) ? "waiting" : sessionIsRunning(session, sessionAwaitingReply) ? "running" : "idle"}`} />
+                                  <div
+                                    className={`status-dot ${
+                                      sessionIsQueuedWaiting(session)
+                                        ? "waiting"
+                                        : sessionIsRunning(session, sessionAwaitingReply, sessionStopSuppressed)
+                                          ? "running"
+                                          : "idle"
+                                    }`}
+                                  />
                                 </div>
                                 <div className="workspacePath">{session.git_branch ? session.git_branch : String(session.agent_backend || "codex").toUpperCase()}</div>
                                 <div className="workspaceMeta">
-                                  {String(session.agent_backend || "codex").toUpperCase()} · {sessionStatusText(session, sessionAwaitingReply)} ·{" "}
+                                  {String(session.agent_backend || "codex").toUpperCase()} ·{" "}
+                                  {sessionStatusText(session, sessionAwaitingReply, sessionStopSuppressed)} ·{" "}
                                   {relativeAge(session.updated_ts)}
                                 </div>
                               </div>
@@ -2970,11 +3015,11 @@ export function App() {
                 className={mobileViewport ? "actionBtn mobileActionBtn danger" : "actionBtn danger stopActionBtn"}
                 type="button"
                 title={selectedSession ? "Stop current run" : "No session selected"}
-                disabled={!selectedSession || selectedSessionInterrupting}
+                disabled={!selectedSession || selectedSessionStoppingFeedback}
                 onClick={() => void handleInterrupt()}
               >
                 {icon("stop")}
-                <span>{selectedSessionInterrupting ? "Stopping" : "Stop"}</span>
+                <span>{selectedSessionStoppingFeedback ? "Stopping" : "Stop"}</span>
               </button>
               <button
                 className={mobileViewport ? `actionBtn mobileActionBtn${selectedSession?.harness_enabled ? " active" : ""}` : `icon-btn${selectedSession?.harness_enabled ? " active" : ""}`}
