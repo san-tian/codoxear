@@ -68,21 +68,10 @@ start_server() {
   source "$ROOT_DIR/.env"
   set +a
 
-  local app_dir
-  app_dir="${CODOXEAR_APP_DIR:-$HOME/.local/share/codoxear}"
-
   setsid env \
-    CODEX_WEB_DISABLE_HARNESS_SWEEP=1 \
-    CODEX_WEB_DISABLE_QUEUE_SWEEP=1 \
-    "$PYTHON_BIN" -m codoxear.server --runtime-only >>"$WEB_LOG_FILE" 2>&1 < /dev/null &
+    "$PYTHON_BIN" -m codoxear.voice_runtime >>"$WEB_LOG_FILE" 2>&1 < /dev/null &
   web_pid=$!
   echo "$web_pid" > "$WEB_PID_FILE"
-  for _ in {1..50}; do
-    if [[ -f "$app_dir/hmac_secret" ]]; then
-      break
-    fi
-    sleep 0.1
-  done
 
   setsid env \
     CODOXEAR_BIND_HOST=127.0.0.1 \

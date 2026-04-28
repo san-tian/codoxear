@@ -69,14 +69,15 @@ class TestLaunchDefaults(unittest.TestCase):
             [server_module.signal.SIGTERM, server_module.signal.SIGINT],
         )
 
-    def test_local_daemon_uses_runtime_only_python_companion(self) -> None:
+    def test_local_daemon_uses_voice_runtime_python_companion(self) -> None:
         repo_root = Path(__file__).resolve().parents[1]
         script_path = repo_root / "scripts" / "codoxear-local"
         source = script_path.read_text(encoding="utf-8")
 
-        self.assertIn('"$PYTHON_BIN" -m codoxear.server --runtime-only', source)
-        self.assertIn('CODEX_WEB_DISABLE_HARNESS_SWEEP=1', source)
-        self.assertIn('CODEX_WEB_DISABLE_QUEUE_SWEEP=1', source)
+        self.assertIn('"$PYTHON_BIN" -m codoxear.voice_runtime', source)
+        self.assertNotIn('"$PYTHON_BIN" -m codoxear.server --runtime-only', source)
+        self.assertNotIn('CODEX_WEB_DISABLE_HARNESS_SWEEP=1', source)
+        self.assertNotIn('CODEX_WEB_DISABLE_QUEUE_SWEEP=1', source)
         self.assertIn('CODOXEAR_ENABLE_HARNESS_SWEEP=1', source)
         self.assertIn('CODOXEAR_ENABLE_QUEUE_SWEEP=1', source)
         self.assertNotIn('CODEX_WEB_PORT=8744', source)
