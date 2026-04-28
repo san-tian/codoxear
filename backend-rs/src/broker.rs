@@ -20,6 +20,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const BRACKETED_PASTE_START: &[u8] = b"\x1b[200~";
 const BRACKETED_PASTE_END: &[u8] = b"\x1b[201~";
 const OUTPUT_TAIL_MAX: usize = 256 * 1024;
+static SIGWINCH_PENDING: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug)]
 pub struct BrokerState {
@@ -224,6 +225,8 @@ fn run_broker(mut config: BrokerConfig) -> Result<(), String> {
     if config.mirror_input {
         spawn_stdin_thread(runtime.clone());
     }
+    install_sigwinch_handler();
+    spawn_resize_thread(runtime.clone());
     spawn_log_discovery_thread(runtime.clone());
     spawn_log_idle_thread(runtime.clone());
     let mut child = child;
@@ -265,6 +268,30 @@ fn spawn_stdin_thread(runtime: BrokerRuntime) {
         if reached_eof {
             runtime.stop.store(true, Ordering::Relaxed);
         }
+    });
+}
+
+fn spawn_resize_thread(runtime: BrokerRuntime) {
+    thread::spawn(move || {
+        let fd = match runtime.state.lock() {
+            Ok(state) => state.pty_master_fd,
+            Err(_) => return,
+        };
+        let pty_fd = unsafe { libc::dup(fd) };
+        if pty_fd < 0 {
+            return;
+        }
+        while !runtime.stop.load(Ordering::Relaxed) {
+            if SIGWINCH_PENDING.swap(false, Ordering::Relaxed) {
+                if let Some((rows, cols)) = terminal_size_from_fd(libc::STDIN_FILENO, (40, 120))
+                    .or_else(|| terminal_size_from_fd(libc::STDOUT_FILENO, (40, 120)))
+                {
+                    let _ = set_pty_winsize(pty_fd, rows, cols);
+                }
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        let _ = unsafe { libc::close(pty_fd) };
     });
 }
 
@@ -817,6 +844,19 @@ fn open_pty(rows: u16, cols: u16) -> Result<(RawFd, RawFd), String> {
     Ok((master, slave))
 }
 
+fn set_pty_winsize(fd: RawFd, rows: u16, cols: u16) -> Result<(), String> {
+    let mut winsize = libc::winsize {
+        ws_row: rows,
+        ws_col: cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    if unsafe { libc::ioctl(fd, libc::TIOCSWINSZ, &mut winsize) } != 0 {
+        return Err(format!("set pty winsize: {}", std::io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
 fn terminal_size() -> (u16, u16) {
     terminal_size_from_fd(libc::STDIN_FILENO, (40, 120))
         .or_else(|| terminal_size_from_fd(libc::STDOUT_FILENO, (40, 120)))
@@ -836,6 +876,16 @@ fn terminal_size_from_fd(fd: RawFd, fallback: (u16, u16)) -> Option<(u16, u16)> 
     let rows = if winsize.ws_row > 0 { winsize.ws_row } else { fallback.0 };
     let cols = if winsize.ws_col > 0 { winsize.ws_col } else { fallback.1 };
     Some((rows, cols))
+}
+
+extern "C" fn handle_sigwinch(_signal: libc::c_int) {
+    SIGWINCH_PENDING.store(true, Ordering::Relaxed);
+}
+
+fn install_sigwinch_handler() {
+    unsafe {
+        libc::signal(libc::SIGWINCH, handle_sigwinch as libc::sighandler_t);
+    }
 }
 
 fn terminate_process_group(pid: i64) {
@@ -1017,7 +1067,7 @@ mod tests {
     use super::{
         copy_fd_to_pty, ensure_pi_session_arg, is_uuid_like, resume_session_id_from_args,
         open_pty, run_broker, scan_token_updates_from_log, seq_bytes, session_id_from_log,
-        session_id_from_rollout_path, session_log_path_from_args, shell_quote,
+        session_id_from_rollout_path, session_log_path_from_args, set_pty_winsize, shell_quote,
         terminal_size_from_fd, trim_utf8_tail, write_all_fd, BrokerConfig,
     };
     use serde_json::{json, Value};
@@ -1117,6 +1167,16 @@ mod tests {
         let _ = unsafe { libc::close(master_fd) };
         let _ = unsafe { libc::close(slave_fd) };
         assert_eq!(terminal_size_from_fd(-1, (40, 120)), None);
+    }
+
+    #[test]
+    fn rust_broker_updates_pty_winsize_after_start() {
+        let (master_fd, slave_fd) = open_pty(33, 101).unwrap();
+        set_pty_winsize(master_fd, 44, 132).unwrap();
+        assert_eq!(terminal_size_from_fd(master_fd, (40, 120)), Some((44, 132)));
+        assert_eq!(terminal_size_from_fd(slave_fd, (40, 120)), Some((44, 132)));
+        let _ = unsafe { libc::close(master_fd) };
+        let _ = unsafe { libc::close(slave_fd) };
     }
 
     #[test]

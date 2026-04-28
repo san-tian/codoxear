@@ -217,7 +217,7 @@ The Nova preview frontend uses same-origin `/api` by default in production. For 
 The local deploy helper `./scripts/codoxear-local` now runs two processes:
 - public Rust web entry on `:8743` redirecting `/` and `/nova/` to `/nova-preview/`, serving the Nova preview shell, the legacy shell at `/legacy/*`, and the migrated public `/api/*` routes
 - voice-runtime Python companion process (no HTTP listen socket) for the remaining live push/TTS/audio worker; delayed queue draining, harness sweep, and live assistant-message voice scanning now run in Rust daemon workers, with voice delivery handed to Python through `APP_DIR/voice_inbox/*.json`
-- native Rust Codex broker binary at `backend-rs/src/bin/codoxear-broker-rs.rs`; the local daemon enables it for new web-owned Codex session creation with `CODOXEAR_ENABLE_RUST_BROKER=1`, while Pi and standalone Python serving paths still use the Python broker
+- native Rust broker binary at `backend-rs/src/bin/codoxear-broker-rs.rs`; the local daemon enables it for new web-owned Codex and Pi session creation with `CODOXEAR_ENABLE_RUST_BROKER=1`, while standalone Python serving paths can opt into the same broker with `CODOXEAR_RUST_BROKER_BIN`
 - `CODEX_WEB_HARNESS_SWEEP_SECONDS` (default `2.5`)
 - `CODEX_WEB_QUEUE_SWEEP_SECONDS` (default `1.0`)
 - `CODEX_WEB_QUEUE_IDLE_GRACE_SECONDS` (default `10.0`)
