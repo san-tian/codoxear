@@ -20,6 +20,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const BRACKETED_PASTE_START: &[u8] = b"\x1b[200~";
 const BRACKETED_PASTE_END: &[u8] = b"\x1b[201~";
 const OUTPUT_TAIL_MAX: usize = 256 * 1024;
+const BUSY_HINT_TAIL_MAX: usize = 4096;
 static SIGWINCH_PENDING: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug)]
@@ -48,6 +49,7 @@ pub struct BrokerState {
     pub spawn_nonce: Option<String>,
     mirror_output: bool,
     term_query_buf: Vec<u8>,
+    busy_hint_tail: String,
 }
 
 impl BrokerState {
@@ -223,6 +225,7 @@ fn run_broker(mut config: BrokerConfig) -> Result<(), String> {
         spawn_nonce: clean_env("CODEX_WEB_SPAWN_NONCE"),
         mirror_output: config.mirror_output,
         term_query_buf: Vec::new(),
+        busy_hint_tail: String::new(),
     };
     write_metadata(&state)?;
     let runtime = BrokerRuntime {
@@ -506,6 +509,7 @@ fn spawn_pty_reader_thread(runtime: BrokerRuntime) {
             let text = String::from_utf8_lossy(bytes);
             state.output_tail.push_str(&text);
             trim_utf8_tail(&mut state.output_tail, OUTPUT_TAIL_MAX);
+            update_busy_from_pty_text(&mut state, &text);
         }
         runtime.stop.store(true, Ordering::Relaxed);
     });
@@ -520,6 +524,104 @@ fn trim_utf8_tail(text: &mut String, max_bytes: usize) {
         start += 1;
     }
     text.drain(..start);
+}
+
+fn update_busy_from_pty_text(state: &mut BrokerState, text: &str) {
+    let cleaned = strip_ansi(text);
+    if cleaned.is_empty() {
+        return;
+    }
+    let previous_tail = state.busy_hint_tail.clone();
+    state.busy_hint_tail.push_str(&cleaned);
+    trim_utf8_tail(&mut state.busy_hint_tail, BUSY_HINT_TAIL_MAX);
+    if pty_busy_hint_seen(&previous_tail, &cleaned) {
+        state.busy = true;
+    }
+}
+
+fn pty_busy_hint_seen(tail: &str, cleaned: &str) -> bool {
+    ["esc to interrupt", "compacting context", "compacting conversation"]
+        .iter()
+        .any(|phrase| hint_seen_in_new_text(tail, cleaned, phrase))
+}
+
+fn hint_seen_in_new_text(tail: &str, cleaned: &str, phrase: &str) -> bool {
+    let cleaned_lower = cleaned.to_ascii_lowercase();
+    let phrase_lower = phrase.to_ascii_lowercase();
+    if cleaned_lower.contains(&phrase_lower) {
+        return true;
+    }
+    let overlap = phrase_lower.len().saturating_sub(1);
+    if overlap == 0 {
+        return false;
+    }
+    let stitched = format!("{}{}", utf8_suffix(tail, overlap).to_ascii_lowercase(), cleaned_lower);
+    stitched
+        .find(&phrase_lower)
+        .map(|pos| pos + phrase_lower.len() > overlap)
+        .unwrap_or(false)
+}
+
+fn utf8_suffix(text: &str, max_bytes: usize) -> &str {
+    if text.len() <= max_bytes {
+        return text;
+    }
+    let mut start = text.len().saturating_sub(max_bytes);
+    while start < text.len() && !text.is_char_boundary(start) {
+        start += 1;
+    }
+    &text[start..]
+}
+
+fn strip_ansi(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut idx = 0usize;
+    while idx < bytes.len() {
+        if bytes[idx] != 0x1b {
+            if let Some(ch) = text[idx..].chars().next() {
+                out.push(ch);
+                idx += ch.len_utf8();
+            } else {
+                break;
+            }
+            continue;
+        }
+        idx += 1;
+        if idx >= bytes.len() {
+            break;
+        }
+        match bytes[idx] {
+            b']' => {
+                idx += 1;
+                while idx < bytes.len() {
+                    if bytes[idx] == 0x07 {
+                        idx += 1;
+                        break;
+                    }
+                    if bytes[idx] == 0x1b && idx + 1 < bytes.len() && bytes[idx + 1] == b'\\' {
+                        idx += 2;
+                        break;
+                    }
+                    idx += 1;
+                }
+            }
+            b'[' => {
+                idx += 1;
+                while idx < bytes.len() {
+                    let byte = bytes[idx];
+                    idx += 1;
+                    if (0x40..=0x7e).contains(&byte) {
+                        break;
+                    }
+                }
+            }
+            _ => {
+                idx += 1;
+            }
+        }
+    }
+    out
 }
 
 fn spawn_log_discovery_thread(runtime: BrokerRuntime) {
@@ -1083,7 +1185,8 @@ mod tests {
         copy_fd_to_pty, ensure_pi_session_arg, is_uuid_like, resume_session_id_from_args,
         open_pty, run_broker, scan_token_updates_from_log, seq_bytes, session_id_from_log,
         session_id_from_rollout_path, session_log_path_from_args, set_pty_winsize, shell_quote,
-        terminal_size_from_fd, trim_utf8_tail, web_owned_codex_args, write_all_fd, BrokerConfig,
+        strip_ansi, terminal_size_from_fd, trim_utf8_tail, update_busy_from_pty_text,
+        web_owned_codex_args, write_all_fd, BrokerConfig, BrokerState,
     };
     use serde_json::{json, Value};
     use std::fs;
@@ -1191,6 +1294,27 @@ mod tests {
         assert!(tail.len() <= 159);
         assert!(tail.is_char_boundary(0));
         assert!(tail.chars().all(|ch| ch == '─'));
+    }
+
+    #[test]
+    fn rust_broker_strips_terminal_ansi_for_busy_hints() {
+        assert_eq!(
+            strip_ansi("\x1b[?25lEsc to interrupt\x1b[0m\x1b]11;?\x1b\\"),
+            "Esc to interrupt"
+        );
+    }
+
+    #[test]
+    fn rust_broker_marks_busy_from_split_pty_hints() {
+        let mut state = test_broker_state();
+        update_busy_from_pty_text(&mut state, "Esc to ");
+        assert!(!state.busy);
+        update_busy_from_pty_text(&mut state, "interrupt");
+        assert!(state.busy);
+
+        state.busy = false;
+        update_busy_from_pty_text(&mut state, "\x1b[2KCompacting conversation");
+        assert!(state.busy);
     }
 
     #[test]
@@ -1397,6 +1521,37 @@ mod tests {
         ));
         fs::create_dir_all(path.join("socks")).unwrap();
         path
+    }
+
+    fn test_broker_state() -> BrokerState {
+        let app_dir = temp_app_dir("broker-state");
+        BrokerState {
+            agent_pid: 1,
+            pty_master_fd: -1,
+            cwd: app_dir.display().to_string(),
+            start_ts: 0.0,
+            sock_path: app_dir.join("socks").join("broker.sock"),
+            agent_backend: "codex".to_string(),
+            owner: None,
+            log_path: None,
+            session_id: None,
+            busy: false,
+            output_tail: String::new(),
+            token: None,
+            resume_session_id: None,
+            model_provider: None,
+            preferred_auth_method: None,
+            model: None,
+            reasoning_effort: None,
+            service_tier: None,
+            transport: None,
+            tmux_session: None,
+            tmux_window: None,
+            spawn_nonce: None,
+            mirror_output: false,
+            term_query_buf: Vec::new(),
+            busy_hint_tail: String::new(),
+        }
     }
 
     fn wait_for_sock(app_dir: &Path) -> PathBuf {
