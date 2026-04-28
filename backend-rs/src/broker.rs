@@ -147,10 +147,11 @@ fn parse_args(args: Vec<String>) -> Result<BrokerConfig, String> {
         )
     };
     let sessions_dir = agent_sessions_dir(&agent_backend, &agent_home);
+    let owner = clean_env("CODEX_WEB_OWNER");
     if agent_backend == "pi" {
         agent_args = ensure_pi_session_arg(&agent_args, &cwd, &sessions_dir)?;
     }
-    let owner = clean_env("CODEX_WEB_OWNER");
+    agent_args = web_owned_codex_args(&agent_backend, owner.as_deref(), &agent_args);
     Ok(BrokerConfig {
         cwd,
         agent_args,
@@ -163,6 +164,20 @@ fn parse_args(args: Vec<String>) -> Result<BrokerConfig, String> {
         mirror_output: true,
         mirror_input: should_mirror_stdin(),
     })
+}
+
+fn web_owned_codex_args(agent_backend: &str, owner: Option<&str>, args: &[String]) -> Vec<String> {
+    if agent_backend != "codex" || owner != Some("web") {
+        return args.to_vec();
+    }
+    let mut out = vec![
+        "-c".to_string(),
+        "disable_response_storage=false".to_string(),
+        "-c".to_string(),
+        "disable_paste_burst=true".to_string(),
+    ];
+    out.extend(args.iter().cloned());
+    out
 }
 
 fn run_broker(mut config: BrokerConfig) -> Result<(), String> {
@@ -1068,7 +1083,7 @@ mod tests {
         copy_fd_to_pty, ensure_pi_session_arg, is_uuid_like, resume_session_id_from_args,
         open_pty, run_broker, scan_token_updates_from_log, seq_bytes, session_id_from_log,
         session_id_from_rollout_path, session_log_path_from_args, set_pty_winsize, shell_quote,
-        terminal_size_from_fd, trim_utf8_tail, write_all_fd, BrokerConfig,
+        terminal_size_from_fd, trim_utf8_tail, web_owned_codex_args, write_all_fd, BrokerConfig,
     };
     use serde_json::{json, Value};
     use std::fs;
@@ -1087,6 +1102,25 @@ mod tests {
         assert_eq!(seq_bytes("\\x1b"), vec![0x1b]);
         assert_eq!(seq_bytes("hi\\r"), b"hi\r".to_vec());
         assert_eq!(seq_bytes("\\n\\t\\\\"), b"\n\t\\".to_vec());
+    }
+
+    #[test]
+    fn rust_broker_prepends_headless_web_codex_config_args() {
+        let args = vec!["--model".to_string(), "gpt-5.4".to_string()];
+        let normalized = web_owned_codex_args("codex", Some("web"), &args);
+        assert_eq!(
+            normalized,
+            vec![
+                "-c",
+                "disable_response_storage=false",
+                "-c",
+                "disable_paste_burst=true",
+                "--model",
+                "gpt-5.4",
+            ]
+        );
+        assert_eq!(web_owned_codex_args("codex", None, &args), args);
+        assert_eq!(web_owned_codex_args("pi", Some("web"), &args), args);
     }
 
     #[test]
