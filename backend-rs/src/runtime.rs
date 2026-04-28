@@ -6928,43 +6928,6 @@ fn looks_like_repo_root(path: &Path) -> bool {
     path.join("pyproject.toml").is_file() && path.join("codoxear").is_dir()
 }
 
-fn python_bin(repo_root: &Path) -> PathBuf {
-    if let Some(path) = env::var("CODOXEAR_PYTHON_BIN")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-    {
-        return PathBuf::from(path);
-    }
-    let venv_python = repo_root.join(".venv").join("bin").join("python");
-    if venv_python.exists() {
-        return venv_python;
-    }
-    if let Some(path) = env::var("VIRTUAL_ENV")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-    {
-        let candidate = PathBuf::from(path).join("bin").join("python");
-        if candidate.exists() {
-            return candidate;
-        }
-    }
-    PathBuf::from("python3")
-}
-
-fn rust_broker_enabled() -> bool {
-    env::var("CODOXEAR_ENABLE_RUST_BROKER")
-        .ok()
-        .map(|value| {
-            !matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "0" | "false" | "no" | "off"
-            )
-        })
-        .unwrap_or(true)
-}
-
 fn rust_broker_bin(repo_root: &Path) -> PathBuf {
     if let Some(path) = env::var("CODOXEAR_RUST_BROKER_BIN")
         .ok()
@@ -7562,27 +7525,13 @@ pub fn create_session(
     );
 
     let repo_root = repo_root().map_err(CreateSessionError::internal)?;
-    let python_bin = python_bin(&repo_root);
-    let use_rust_broker = rust_broker_enabled();
-    let (broker_program, broker_args) = if use_rust_broker {
-        let mut args = vec![
-            "--cwd".to_string(),
-            spawn_cwd.display().to_string(),
-            "--".to_string(),
-        ];
-        args.extend(agent_args.iter().cloned());
-        (rust_broker_bin(&repo_root), args)
-    } else {
-        let mut args = vec![
-            "-m".to_string(),
-            "codoxear.broker".to_string(),
-            "--cwd".to_string(),
-            spawn_cwd.display().to_string(),
-            "--".to_string(),
-        ];
-        args.extend(agent_args.iter().cloned());
-        (python_bin.clone(), args)
-    };
+    let broker_program = rust_broker_bin(&repo_root);
+    let mut broker_args = vec![
+        "--cwd".to_string(),
+        spawn_cwd.display().to_string(),
+        "--".to_string(),
+    ];
+    broker_args.extend(agent_args.iter().cloned());
     let tmux_session = tmux_session_name();
     let mut env_overrides = base_spawn_env_overrides(&backend_name, resume_id);
     if let Some(model_provider) = request.model_provider.as_deref() {
@@ -9180,8 +9129,8 @@ mod tests {
         load_changed_files_response, load_file_search_response, load_git_diff_response,
         load_git_file_versions_response, load_harness_response, load_messages_history,
         load_messages_live, load_messages_tail, load_sessions_response, run_harness_sweep_once,
-        run_queue_sweep_once, run_voice_scan_once, rust_broker_bin, rust_broker_enabled,
-        voice_text_message_id, RuntimeConfig,
+        run_queue_sweep_once, run_voice_scan_once, rust_broker_bin, voice_text_message_id,
+        RuntimeConfig,
     };
     use serde_json::Value;
     use std::collections::HashMap;
@@ -9547,21 +9496,9 @@ mod tests {
     }
 
     #[test]
-    fn rust_broker_launch_defaults_to_rust_with_explicit_legacy_disable() {
+    fn rust_broker_bin_uses_explicit_path_and_ignores_legacy_disable_flag() {
         let _guard = env_lock().lock().unwrap();
-        env::remove_var("CODOXEAR_ENABLE_RUST_BROKER");
-        env::remove_var("CODOXEAR_RUST_BROKER_BIN");
-        assert!(rust_broker_enabled());
         env::set_var("CODOXEAR_ENABLE_RUST_BROKER", "0");
-        assert!(!rust_broker_enabled());
-        env::set_var("CODOXEAR_ENABLE_RUST_BROKER", "false");
-        assert!(!rust_broker_enabled());
-        env::set_var("CODOXEAR_ENABLE_RUST_BROKER", "no");
-        assert!(!rust_broker_enabled());
-        env::set_var("CODOXEAR_ENABLE_RUST_BROKER", "off");
-        assert!(!rust_broker_enabled());
-        env::set_var("CODOXEAR_ENABLE_RUST_BROKER", "1");
-        assert!(rust_broker_enabled());
         env::set_var("CODOXEAR_RUST_BROKER_BIN", "/tmp/custom-codoxear-broker-rs");
         assert_eq!(
             rust_broker_bin(Path::new("/repo")),

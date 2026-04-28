@@ -296,7 +296,7 @@ class TestSpawnWebSessionResume(unittest.TestCase):
         self.assertEqual(result, {"broker_pid": 3211})
         self.assertEqual(thread_calls, ["start"])
 
-    def test_spawn_web_session_can_use_legacy_python_broker_when_disabled(self) -> None:
+    def test_spawn_web_session_ignores_legacy_rust_broker_disable(self) -> None:
         manager = SessionManager.__new__(SessionManager)
         thread_calls: list[str] = []
 
@@ -307,15 +307,17 @@ class TestSpawnWebSessionResume(unittest.TestCase):
             def wait(self) -> int:
                 return 0
 
-        with TemporaryDirectory() as td, patch.dict(os.environ, {"CODOXEAR_ENABLE_RUST_BROKER": "0"}), patch(
-            "codoxear.server._wait_or_raise", return_value=None
-        ), patch("codoxear.server.subprocess.Popen", return_value=_Proc()) as popen_mock, patch.object(
-            threading.Thread, "start", lambda self: thread_calls.append("start")
-        ):
-            result = SessionManager.spawn_web_session(manager, cwd=td, args=["--search"])
+        with TemporaryDirectory() as td:
+            with _rust_broker_env(td) as broker_bin, patch.dict(
+                os.environ,
+                {"CODOXEAR_ENABLE_RUST_BROKER": "0", "CODOXEAR_RUST_BROKER_BIN": str(broker_bin)},
+            ), patch("codoxear.server._wait_or_raise", return_value=None), patch(
+                "codoxear.server.subprocess.Popen", return_value=_Proc()
+            ) as popen_mock, patch.object(threading.Thread, "start", lambda self: thread_calls.append("start")):
+                result = SessionManager.spawn_web_session(manager, cwd=td, args=["--search"])
 
         argv = popen_mock.call_args.args[0]
-        self.assertEqual(argv[:5], [ANY, "-m", "codoxear.broker", "--cwd", td])
+        self.assertEqual(argv[:4], [str(broker_bin), "--cwd", td, "--"])
         self.assertIn("--search", argv)
         self.assertEqual(result, {"broker_pid": 3212})
         self.assertEqual(thread_calls, ["start"])

@@ -84,7 +84,7 @@ class TestLaunchDefaults(unittest.TestCase):
         self.assertIn('CODOXEAR_ENABLE_VOICE_SCAN=1', source)
         self.assertIn('CODOXEAR_ENABLE_VOICE_WORKER=1', source)
         self.assertIn('BROKER_BIN="$ROOT_DIR/backend-rs/target/release/codoxear-broker-rs"', source)
-        self.assertIn('CODOXEAR_ENABLE_RUST_BROKER=1', source)
+        self.assertNotIn('CODOXEAR_ENABLE_RUST_BROKER', source)
         self.assertIn('CODOXEAR_RUST_BROKER_BIN="$BROKER_BIN"', source)
         self.assertIn('cargo build --release --bins', source)
         self.assertNotIn('CODEX_WEB_PORT=8744', source)

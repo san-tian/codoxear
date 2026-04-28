@@ -30,9 +30,9 @@ Not supported:
 
 ## Quick start
 
-Requires Python 3.10+.
+Requires Python 3.10+ for the legacy standalone helper package. The local daemon and broker are Rust binaries.
 
-Install Codoxear (installs `codoxear-server` and `codoxear-broker`):
+Install Codoxear (installs the legacy `codoxear-server` helper):
 
 - `python3 -m pip install .`
 
@@ -50,17 +50,17 @@ Install Codoxear (installs `codoxear-server` and `codoxear-broker`):
 
 3. Add separate wrappers for terminal-owned brokered sessions (zsh/bash function, not an alias):
 
-   Never wrap or replace `codex()` or `pi()` themselves. Web-owned sessions launch the underlying CLI directly, so wrapping the original command to call `codoxear-broker` can recurse back into the broker and create an unbounded session-spawn loop.
+   Never wrap or replace `codex()` or `pi()` themselves. Web-owned sessions launch the underlying CLI directly, so wrapping the original command to call the broker can recurse back into the broker and create an unbounded session-spawn loop.
 
    Add to `~/.zshrc` or `~/.bashrc`:
 
    ```sh
    codox() {
-     codoxear-broker -- "$@"
+     /path/to/codoxear/backend-rs/target/release/codoxear-broker-rs -- "$@"
    }
 
    piox() {
-     CODEX_WEB_AGENT_BACKEND=pi codoxear-broker -- "$@"
+     CODEX_WEB_AGENT_BACKEND=pi /path/to/codoxear/backend-rs/target/release/codoxear-broker-rs -- "$@"
    }
    ```
 
@@ -217,7 +217,7 @@ The Nova preview frontend uses same-origin `/api` by default in production. For 
 The local deploy helper `./scripts/codoxear-local` now runs the Rust backend as the public/runtime process:
 - public Rust web entry on `:8743` redirecting `/` and `/nova/` to `/nova-preview/`, serving the Nova preview shell, the legacy shell at `/legacy/*`, and the migrated public `/api/*` routes
 - Rust daemon workers for delayed queue draining, harness sweep, live assistant-message voice scanning, OpenAI-compatible summary/TTS, Web Push delivery, and ffmpeg/HLS audio merging; `APP_DIR/voice_inbox/*.json` is now a Rust-internal handoff queue instead of a Python companion boundary
-- native Rust broker binary at `backend-rs/src/bin/codoxear-broker-rs.rs`; new web-owned Codex and Pi session creation defaults to this broker in the Rust server and standalone Python serving paths, `CODOXEAR_RUST_BROKER_BIN` selects the binary, and `CODOXEAR_ENABLE_RUST_BROKER=0|false|no|off` is the legacy Python-broker escape hatch
+- native Rust broker binary at `backend-rs/src/bin/codoxear-broker-rs.rs`; new web-owned Codex and Pi session creation uses this broker in the Rust server and standalone Python serving paths, and `CODOXEAR_RUST_BROKER_BIN` selects the binary
 - `CODEX_WEB_HARNESS_SWEEP_SECONDS` (default `2.5`)
 - `CODEX_WEB_QUEUE_SWEEP_SECONDS` (default `1.0`)
 - `CODEX_WEB_QUEUE_IDLE_GRACE_SECONDS` (default `10.0`)

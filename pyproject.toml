@@ -13,7 +13,6 @@ dependencies = ["Pillow>=9.0"]
 
 [project.scripts]
 codoxear-server = "codoxear.server:main"
-codoxear-broker = "codoxear.broker:main"
 
 [tool.setuptools]
 packages = ["codoxear"]
