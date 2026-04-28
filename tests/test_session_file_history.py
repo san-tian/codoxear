@@ -10,11 +10,6 @@ from codoxear.server import Session
 from codoxear.server import SessionManager
 
 
-class _FakeVoicePushCoordinator:
-    def __init__(self, *args, **kwargs) -> None:
-        pass
-
-
 def _make_session(session_id: str, cwd: str) -> Session:
     return Session(
         session_id=session_id,
@@ -41,7 +36,6 @@ class TestSessionFileHistory(unittest.TestCase):
             patch.object(SessionManager, "_load_recent_cwds", lambda self: None), \
             patch.object(SessionManager, "_backfill_recent_cwds_from_logs", lambda self: None), \
             patch.object(SessionManager, "_discover_existing", lambda self, force=True: None), \
-            patch.object(server, "VoicePushCoordinator", _FakeVoicePushCoordinator), \
             patch("threading.Thread.start", lambda self: None):
             return SessionManager()
 

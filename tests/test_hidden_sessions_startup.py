@@ -56,7 +56,6 @@ class TestHiddenSessionsStartup(unittest.TestCase):
             SessionManager()
 
         self.assertIn("harness", started)
-        self.assertIn("voice-push-scan", started)
         self.assertNotIn("queue", started)
 
     def test_disable_harness_sweep_skips_harness_thread_start(self) -> None:
@@ -83,7 +82,6 @@ class TestHiddenSessionsStartup(unittest.TestCase):
             SessionManager()
 
         self.assertIn("queue", started)
-        self.assertIn("voice-push-scan", started)
         self.assertNotIn("harness", started)
 
 

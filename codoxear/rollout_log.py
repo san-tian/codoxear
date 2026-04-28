@@ -18,7 +18,6 @@ from .pi_log import pi_assistant_is_final_turn_end
 from .pi_log import pi_message_role
 from .pi_log import pi_token_update
 from .pi_log import pi_user_text
-from .voice_push import ClassifiedAssistantMessage
 
 
 _OAI_MEM_CITATION_TAIL_RE = re.compile(r"\s*<oai-mem-citation>\s*.*?</oai-mem-citation>\s*\Z", re.DOTALL)
@@ -1410,74 +1409,6 @@ def _extract_chat_events(
         {"turn_start": turn_start, "turn_end": turn_end, "turn_aborted": turn_aborted},
         {"tool_names": sorted(tool_names), "last_tool": last_tool},
     )
-
-
-def _extract_delivery_messages(objs: list[dict[str, Any]]) -> list[ClassifiedAssistantMessage]:
-    out: list[ClassifiedAssistantMessage] = []
-    seen: set[str] = set()
-    last_text_key: tuple[str, str] | None = None
-
-    def _text_message_id(*, message_class: str, text: str, ts: float | None) -> str:
-        ts_ms = int(round(ts * 1000.0)) if isinstance(ts, (int, float)) else None
-        payload = json.dumps({"class": message_class, "text": " ".join(text.split()), "ts_ms": ts_ms}, ensure_ascii=False, sort_keys=True)
-        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
-
-    for obj in objs:
-        if not isinstance(obj, dict):
-            continue
-        typ = obj.get("type")
-        message_class: str | None = None
-        text = ""
-        if typ == "message":
-            text = pi_assistant_text(obj) or ""
-            if not text.strip():
-                continue
-            message_class = "final_response" if pi_assistant_is_final_turn_end(obj) else "narration"
-        elif typ == "event_msg":
-            payload = obj.get("payload")
-            if not isinstance(payload, dict):
-                raise ValueError("invalid event_msg payload")
-            if payload.get("type") != "agent_message":
-                continue
-            message = payload.get("message")
-            if not isinstance(message, str) or not message.strip():
-                continue
-            text = message
-            message_class = "final_response" if payload.get("phase") == "final_answer" else "narration"
-        elif typ == "response_item":
-            payload = obj.get("payload")
-            if not isinstance(payload, dict):
-                raise ValueError("invalid response_item payload")
-            if payload.get("type") != "message" or payload.get("role") != "assistant":
-                continue
-            content = payload.get("content")
-            if not isinstance(content, list):
-                raise ValueError("invalid assistant message content")
-            text_parts: list[str] = []
-            for part in content:
-                if isinstance(part, dict) and part.get("type") == "output_text" and isinstance(part.get("text"), str):
-                    text_parts.append(part["text"])
-            text = "".join(text_parts)
-            if not text.strip():
-                continue
-            message_class = "final_response" if (payload.get("phase") == "final_answer" or payload.get("end_turn") is True) else "narration"
-        else:
-            continue
-        text = _strip_oai_mem_citation_tail(text)
-        if not text.strip():
-            continue
-        ts = _event_ts(obj)
-        normalized_text = " ".join(text.split())
-        text_key = (str(message_class), normalized_text)
-        if last_text_key == text_key:
-            continue
-        message_id = _text_message_id(message_class=message_class, text=text, ts=ts)
-        if message_id in seen:
-            continue
-        seen.add(message_id)
-        last_text_key = text_key
-        out.append(ClassifiedAssistantMessage(message_id=message_id, message_class=message_class, text=text, ts=ts))
-    return out
 
 
 def _read_chat_tail_snapshot(
