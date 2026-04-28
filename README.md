@@ -30,11 +30,7 @@ Not supported:
 
 ## Quick start
 
-Requires Python 3.10+ for the legacy standalone helper package. The local daemon and broker are Rust binaries.
-
-Install Codoxear (installs the legacy `codoxear-server` helper):
-
-- `python3 -m pip install .`
+Requires Rust, Node.js for frontend builds, and the Codex or Pi CLI you want to control.
 
 1. Create `.env`:
 
@@ -42,11 +38,17 @@ Install Codoxear (installs the legacy `codoxear-server` helper):
    - Set `CODEX_WEB_PASSWORD`
    - Codoxear reads `.env` from your current working directory
 
-2. Start the server:
+2. Build and start the local daemon:
 
-   - `codoxear-server`
-    - Default bind: `::` (IPv6, usually reachable on LAN)
-    - Default port: `8743`
+   ```sh
+   cd backend-rs
+   cargo build --release --bins
+   cd ..
+   ./scripts/codoxear-local start
+   ```
+
+   - Default bind: `127.0.0.1`
+   - Default port: `8743`
 
 3. Add separate wrappers for terminal-owned brokered sessions (zsh/bash function, not an alias):
 
@@ -116,7 +118,7 @@ Then reload and restart:
 
 ```sh
 systemctl --user daemon-reload
-systemctl --user restart codoxear-server.service
+./scripts/codoxear-local restart
 tailscale serve status
 ```
 
@@ -184,18 +186,16 @@ Set these in `.env` (or in the process environment):
 
 ## Replatforming preview
 
-This repository now also contains an in-progress replatforming spike:
+This repository contains the Rust backend and Nova frontend:
 
 - `frontend/` — `Preact + TypeScript + Vite + Pretext`
 - `backend-rs/` — `Rust + Axum + SSE`
-
-These do not replace the existing Python server yet. They are the new shell and API spine for the next generation UI.
 
 Current route split:
 
 - `/` and `/nova/` — redirect to `/nova-preview/`, so the replatformed shell is the active browser entry
 - `/nova-preview/` — new `Preact + Pretext` shell, now wired to the live same-origin Rust `/api/*` browser contract for sessions, transcript polling, diagnostics, queue, harness, interrupt, file viewing, new-session creation, voice settings, notifications, and audio listener heartbeats
-- `/api/v1/*` — Rust backend routes mirroring the same browser contract during the replatform transition
+- `/api/v1/*` — Rust backend routes backing the same browser contract
 
 Frontend dev:
 
@@ -217,7 +217,7 @@ The Nova preview frontend uses same-origin `/api` by default in production. For 
 The local deploy helper `./scripts/codoxear-local` now runs the Rust backend as the public/runtime process:
 - public Rust web entry on `:8743` redirecting `/` and `/nova/` to `/nova-preview/`, serving the Nova preview shell, the legacy shell at `/legacy/*`, and the migrated public `/api/*` routes
 - Rust daemon workers for delayed queue draining, harness sweep, live assistant-message voice scanning, OpenAI-compatible summary/TTS, Web Push delivery, and ffmpeg/HLS audio merging; `APP_DIR/voice_inbox/*.json` is now a Rust-internal handoff queue instead of a Python companion boundary
-- native Rust broker binary at `backend-rs/src/bin/codoxear-broker-rs.rs`; new web-owned Codex and Pi session creation uses this broker in the Rust server and standalone Python serving paths, and `CODOXEAR_RUST_BROKER_BIN` selects the binary
+- native Rust broker binary at `backend-rs/src/bin/codoxear-broker-rs.rs`; new web-owned Codex and Pi session creation uses this broker, and `CODOXEAR_RUST_BROKER_BIN` selects the binary
 - `CODEX_WEB_HARNESS_SWEEP_SECONDS` (default `2.5`)
 - `CODEX_WEB_QUEUE_SWEEP_SECONDS` (default `1.0`)
 - `CODEX_WEB_QUEUE_IDLE_GRACE_SECONDS` (default `10.0`)

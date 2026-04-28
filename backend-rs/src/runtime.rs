@@ -109,7 +109,6 @@ const FILE_LIST_IGNORED_DIRS: &[&str] = &[
     ".git",
     ".hg",
     ".mypy_cache",
-    ".pytest_cache",
     ".svn",
     "__pycache__",
     "build",
@@ -6925,7 +6924,8 @@ fn repo_root() -> Result<PathBuf, String> {
 }
 
 fn looks_like_repo_root(path: &Path) -> bool {
-    path.join("pyproject.toml").is_file() && path.join("codoxear").is_dir()
+    path.join("backend-rs").join("Cargo.toml").is_file()
+        && path.join("codoxear").join("static").is_dir()
 }
 
 fn rust_broker_bin(repo_root: &Path) -> PathBuf {
