@@ -20,6 +20,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const BRACKETED_PASTE_START: &[u8] = b"\x1b[200~";
 const BRACKETED_PASTE_END: &[u8] = b"\x1b[201~";
+const PASTE_SUFFIX_DELAY_MILLIS: u64 = 50;
 const OUTPUT_TAIL_MAX: usize = 256 * 1024;
 const BUSY_HINT_TAIL_MAX: usize = 4096;
 const DETACH_TRIGGER_TAIL_MAX: usize = 8192;
@@ -850,12 +851,27 @@ fn write_metadata(state: &BrokerState) -> Result<(), String> {
 }
 
 fn inject_text(fd: RawFd, text: &str, suffix: &[u8]) -> Result<(), String> {
-    let mut payload = Vec::with_capacity(BRACKETED_PASTE_START.len() + text.len() + BRACKETED_PASTE_END.len() + suffix.len());
+    inject_text_with_suffix_delay(fd, text, suffix, Duration::from_millis(PASTE_SUFFIX_DELAY_MILLIS))
+}
+
+fn inject_text_with_suffix_delay(
+    fd: RawFd,
+    text: &str,
+    suffix: &[u8],
+    delay: Duration,
+) -> Result<(), String> {
+    let mut payload = Vec::with_capacity(BRACKETED_PASTE_START.len() + text.len() + BRACKETED_PASTE_END.len());
     payload.extend_from_slice(BRACKETED_PASTE_START);
     payload.extend_from_slice(text.as_bytes());
     payload.extend_from_slice(BRACKETED_PASTE_END);
-    payload.extend_from_slice(suffix);
-    write_all_fd(fd, &payload)
+    write_all_fd(fd, &payload)?;
+    if suffix.is_empty() {
+        return Ok(());
+    }
+    if !delay.is_zero() {
+        thread::sleep(delay);
+    }
+    write_all_fd(fd, suffix)
 }
 
 fn write_all_fd(fd: RawFd, mut data: &[u8]) -> Result<(), String> {
@@ -1292,11 +1308,11 @@ fn shell_join(items: &[String]) -> String {
 mod tests {
     use super::{
         copy_fd_to_pty, ensure_pi_session_arg, is_uuid_like, resume_session_id_from_args,
-        open_pty, run_broker, scan_token_updates_from_log, seq_bytes, session_id_from_log,
-        session_id_from_rollout_path, session_log_path_from_args, set_pty_winsize, shell_quote,
-        strip_ansi, terminal_size_from_fd, trim_utf8_tail, update_busy_from_pty_text,
-        clear_stale_pty_busy_hint, update_detach_from_pty_text, web_owned_codex_args, write_all_fd,
-        BrokerConfig, BrokerState,
+        inject_text_with_suffix_delay, open_pty, run_broker, scan_token_updates_from_log,
+        seq_bytes, session_id_from_log, session_id_from_rollout_path, session_log_path_from_args,
+        set_pty_winsize, shell_quote, strip_ansi, terminal_size_from_fd, trim_utf8_tail,
+        update_busy_from_pty_text, clear_stale_pty_busy_hint, update_detach_from_pty_text,
+        web_owned_codex_args, write_all_fd, BrokerConfig, BrokerState,
     };
     use serde_json::{json, Value};
     use std::collections::HashSet;
@@ -1316,6 +1332,34 @@ mod tests {
         assert_eq!(seq_bytes("\\x1b"), vec![0x1b]);
         assert_eq!(seq_bytes("hi\\r"), b"hi\r".to_vec());
         assert_eq!(seq_bytes("\\n\\t\\\\"), b"\n\t\\".to_vec());
+    }
+
+    #[test]
+    fn rust_broker_delays_suffix_after_bracketed_paste() {
+        let mut pipe = [0; 2];
+        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+        let read_fd = pipe[0];
+        let write_fd = pipe[1];
+        let handle = thread::spawn(move || {
+            let result =
+                inject_text_with_suffix_delay(write_fd, "hello", b"\r", Duration::from_millis(200));
+            let _ = unsafe { libc::close(write_fd) };
+            result
+        });
+
+        let expected_paste = b"\x1b[200~hello\x1b[201~";
+        assert_eq!(read_fd_exact(read_fd, expected_paste.len()), expected_paste);
+
+        set_nonblocking(read_fd, true);
+        let mut byte = [0u8; 1];
+        let n = unsafe { libc::read(read_fd, byte.as_mut_ptr().cast(), byte.len()) };
+        assert_eq!(n, -1);
+        assert_eq!(std::io::Error::last_os_error().kind(), std::io::ErrorKind::WouldBlock);
+        set_nonblocking(read_fd, false);
+
+        assert!(handle.join().unwrap().is_ok());
+        assert_eq!(read_fd_exact(read_fd, 1), b"\r");
+        let _ = unsafe { libc::close(read_fd) };
     }
 
     #[test]
@@ -1783,6 +1827,38 @@ mod tests {
         let mut line = String::new();
         reader.read_line(&mut line).unwrap();
         serde_json::from_str(line.trim()).unwrap()
+    }
+
+    fn set_nonblocking(fd: RawFd, enabled: bool) {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        assert!(flags >= 0);
+        let next = if enabled {
+            flags | libc::O_NONBLOCK
+        } else {
+            flags & !libc::O_NONBLOCK
+        };
+        assert_eq!(unsafe { libc::fcntl(fd, libc::F_SETFL, next) }, 0);
+    }
+
+    fn read_fd_exact(fd: RawFd, len: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(len);
+        while out.len() < len {
+            let mut buf = [0u8; 64];
+            let wanted = std::cmp::min(buf.len(), len - out.len());
+            let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), wanted) };
+            if n < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                panic!("read fd {fd}: {err}");
+            }
+            if n == 0 {
+                break;
+            }
+            out.extend_from_slice(&buf[..n as usize]);
+        }
+        out
     }
 
     fn read_fd_to_end(fd: RawFd) -> Vec<u8> {
