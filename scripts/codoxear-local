@@ -8,6 +8,7 @@ WEB_LOG_FILE="$ROOT_DIR/.tmp/codoxear-web.log"
 RUST_LOG_FILE="$ROOT_DIR/.tmp/codoxear-rust.log"
 PYTHON_BIN="$ROOT_DIR/.venv/bin/python"
 NOVA_BIN="$ROOT_DIR/backend-rs/target/release/codoxear-backend-rs"
+BROKER_BIN="$ROOT_DIR/backend-rs/target/release/codoxear-broker-rs"
 
 usage() {
   cat <<'USAGE'
@@ -25,7 +26,11 @@ require_runtime() {
     exit 1
   fi
   if [[ ! -x "$NOVA_BIN" ]]; then
-    echo "error: missing $NOVA_BIN (run: cd $ROOT_DIR/backend-rs && cargo build --release)" >&2
+    echo "error: missing $NOVA_BIN (run: cd $ROOT_DIR/backend-rs && cargo build --release --bins)" >&2
+    exit 1
+  fi
+  if [[ ! -x "$BROKER_BIN" ]]; then
+    echo "error: missing $BROKER_BIN (run: cd $ROOT_DIR/backend-rs && cargo build --release --bins)" >&2
     exit 1
   fi
   if [[ ! -f "$ROOT_DIR/frontend/dist/index.html" ]]; then
@@ -80,6 +85,8 @@ start_server() {
     CODOXEAR_ENABLE_HARNESS_SWEEP=1 \
     CODOXEAR_ENABLE_QUEUE_SWEEP=1 \
     CODOXEAR_ENABLE_VOICE_SCAN=1 \
+    CODOXEAR_ENABLE_RUST_BROKER=1 \
+    CODOXEAR_RUST_BROKER_BIN="$BROKER_BIN" \
     "$NOVA_BIN" >>"$RUST_LOG_FILE" 2>&1 < /dev/null &
   rust_pid=$!
   echo "$rust_pid" > "$RUST_PID_FILE"

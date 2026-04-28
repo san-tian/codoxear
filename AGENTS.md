@@ -19,7 +19,7 @@
 - Python tests: `.venv/bin/python -m pytest -q`
 - Frontend build: `cd frontend && npm run build`
 - Rust tests: `cd backend-rs && cargo test`
-- Rust release build: `cd backend-rs && cargo build --release`
+- Rust release build: `cd backend-rs && cargo build --release --bins`
 
 ## Default Workflow
 
