@@ -61,6 +61,48 @@ pub struct BrokerState {
 }
 
 impl BrokerState {
+    fn from_config(
+        agent_pid: i64,
+        pty_master_fd: RawFd,
+        sock_path: PathBuf,
+        config: &BrokerConfig,
+    ) -> Self {
+        let (initial_log_path, initial_session_id) = initial_session_binding(config);
+        BrokerState {
+            agent_pid,
+            pty_master_fd,
+            cwd: config.cwd.display().to_string(),
+            start_ts: epoch_now(),
+            sock_path,
+            agent_backend: config.agent_backend.clone(),
+            owner: config.owner.clone(),
+            log_path: initial_log_path,
+            session_id: initial_session_id,
+            busy: false,
+            output_tail: String::new(),
+            token: None,
+            resume_session_id: clean_env("CODEX_WEB_RESUME_SESSION_ID").or_else(|| {
+                resume_session_id_from_args(&config.agent_args, &config.agent_backend, &config.sessions_dir)
+            }),
+            model_provider: clean_env("CODEX_WEB_MODEL_PROVIDER"),
+            preferred_auth_method: clean_env("CODEX_WEB_PREFERRED_AUTH_METHOD"),
+            model: clean_env("CODEX_WEB_MODEL"),
+            reasoning_effort: clean_env("CODEX_WEB_REASONING_EFFORT"),
+            service_tier: clean_env("CODEX_WEB_SERVICE_TIER"),
+            transport: clean_env("CODEX_WEB_TRANSPORT"),
+            tmux_session: clean_env("CODEX_WEB_TMUX_SESSION"),
+            tmux_window: clean_env("CODEX_WEB_TMUX_WINDOW"),
+            spawn_nonce: clean_env("CODEX_WEB_SPAWN_NONCE"),
+            mirror_output: config.mirror_output,
+            term_query_buf: Vec::new(),
+            busy_hint_tail: String::new(),
+            busy_hint_last_seen: None,
+            busy_from_pty_hint: false,
+            detach_trigger_tail: String::new(),
+            ignored_log_paths: HashSet::new(),
+        }
+    }
+
     fn metadata_value(&self) -> Value {
         json!({
             "session_id": self.session_id,
@@ -106,6 +148,16 @@ struct BrokerRuntime {
     state: Arc<Mutex<BrokerState>>,
     stop: Arc<AtomicBool>,
     sessions_dir: PathBuf,
+}
+
+impl BrokerRuntime {
+    fn new(state: BrokerState, sessions_dir: PathBuf) -> Self {
+        BrokerRuntime {
+            state: Arc::new(Mutex::new(state)),
+            stop: Arc::new(AtomicBool::new(false)),
+            sessions_dir,
+        }
+    }
 }
 
 pub fn main_entry() -> Result<i32, String> {
@@ -190,6 +242,14 @@ fn web_owned_codex_args(agent_backend: &str, owner: Option<&str>, args: &[String
     out
 }
 
+fn initial_session_binding(config: &BrokerConfig) -> (Option<PathBuf>, Option<String>) {
+    session_log_path_from_args(&config.agent_args, &config.agent_backend, &config.sessions_dir)
+        .as_ref()
+        .filter(|path| path.exists())
+        .map(|path| (Some(path.clone()), session_id_from_log(path, &config.agent_backend)))
+        .unwrap_or((None, None))
+}
+
 fn run_broker(mut config: BrokerConfig) -> Result<i32, String> {
     if config.agent_backend == "pi" {
         config.agent_args = ensure_pi_session_arg(&config.agent_args, &config.cwd, &config.sessions_dir)?;
@@ -200,66 +260,15 @@ fn run_broker(mut config: BrokerConfig) -> Result<i32, String> {
     let sock_dir = config.app_dir.join("socks");
     fs::create_dir_all(&sock_dir).map_err(|err| format!("create {}: {err}", sock_dir.display()))?;
     let sock_path = sock_dir.join(format!("broker-{}.sock", std::process::id()));
-    let start_ts = epoch_now();
-    let declared_log_path = session_log_path_from_args(&config.agent_args, &config.agent_backend, &config.sessions_dir);
-    let (initial_log_path, initial_session_id) = declared_log_path
-        .as_ref()
-        .filter(|path| path.exists())
-        .map(|path| (Some(path.clone()), session_id_from_log(path, &config.agent_backend)))
-        .unwrap_or((None, None));
-    let state = BrokerState {
-        agent_pid: i64::from(child.id()),
-        pty_master_fd: master_fd,
-        cwd: config.cwd.display().to_string(),
-        start_ts,
-        sock_path,
-        agent_backend: config.agent_backend.clone(),
-        owner: config.owner.clone(),
-        log_path: initial_log_path,
-        session_id: initial_session_id,
-        busy: false,
-        output_tail: String::new(),
-        token: None,
-        resume_session_id: clean_env("CODEX_WEB_RESUME_SESSION_ID")
-            .or_else(|| resume_session_id_from_args(&config.agent_args, &config.agent_backend, &config.sessions_dir)),
-        model_provider: clean_env("CODEX_WEB_MODEL_PROVIDER"),
-        preferred_auth_method: clean_env("CODEX_WEB_PREFERRED_AUTH_METHOD"),
-        model: clean_env("CODEX_WEB_MODEL"),
-        reasoning_effort: clean_env("CODEX_WEB_REASONING_EFFORT"),
-        service_tier: clean_env("CODEX_WEB_SERVICE_TIER"),
-        transport: clean_env("CODEX_WEB_TRANSPORT"),
-        tmux_session: clean_env("CODEX_WEB_TMUX_SESSION"),
-        tmux_window: clean_env("CODEX_WEB_TMUX_WINDOW"),
-        spawn_nonce: clean_env("CODEX_WEB_SPAWN_NONCE"),
-        mirror_output: config.mirror_output,
-        term_query_buf: Vec::new(),
-        busy_hint_tail: String::new(),
-        busy_hint_last_seen: None,
-        busy_from_pty_hint: false,
-        detach_trigger_tail: String::new(),
-        ignored_log_paths: HashSet::new(),
-    };
+    let state = BrokerState::from_config(i64::from(child.id()), master_fd, sock_path, &config);
     write_metadata(&state)?;
-    let runtime = BrokerRuntime {
-        state: Arc::new(Mutex::new(state)),
-        stop: Arc::new(AtomicBool::new(false)),
-        sessions_dir: config.sessions_dir.clone(),
-    };
+    let runtime = BrokerRuntime::new(state, config.sessions_dir.clone());
     let stdin_termios = if config.mirror_input {
         enable_raw_stdin().ok()
     } else {
         None
     };
-    spawn_socket_thread(runtime.clone());
-    spawn_pty_reader_thread(runtime.clone());
-    if config.mirror_input {
-        spawn_stdin_thread(runtime.clone());
-    }
-    install_sigwinch_handler();
-    spawn_resize_thread(runtime.clone());
-    spawn_log_discovery_thread(runtime.clone());
-    spawn_log_idle_thread(runtime.clone());
-    spawn_busy_hint_idle_thread(runtime.clone());
+    spawn_runtime_threads(&runtime, config.mirror_input);
     let mut child = child;
     let mut exit_code = 0;
     loop {
@@ -278,7 +287,25 @@ fn run_broker(mut config: BrokerConfig) -> Result<i32, String> {
         thread::sleep(Duration::from_millis(100));
     }
     runtime.stop.store(true, Ordering::Relaxed);
-    if let Some(termios) = stdin_termios.as_ref() {
+    cleanup_runtime(&runtime, master_fd, stdin_termios.as_ref());
+    Ok(exit_code)
+}
+
+fn spawn_runtime_threads(runtime: &BrokerRuntime, mirror_input: bool) {
+    spawn_socket_thread(BrokerRuntime::clone(runtime));
+    spawn_pty_reader_thread(BrokerRuntime::clone(runtime));
+    if mirror_input {
+        spawn_stdin_thread(BrokerRuntime::clone(runtime));
+    }
+    install_sigwinch_handler();
+    spawn_resize_thread(BrokerRuntime::clone(runtime));
+    spawn_log_discovery_thread(BrokerRuntime::clone(runtime));
+    spawn_log_idle_thread(BrokerRuntime::clone(runtime));
+    spawn_busy_hint_idle_thread(BrokerRuntime::clone(runtime));
+}
+
+fn cleanup_runtime(runtime: &BrokerRuntime, master_fd: RawFd, stdin_termios: Option<&libc::termios>) {
+    if let Some(termios) = stdin_termios {
         let _ = restore_stdin(termios);
     }
     let _ = unsafe { libc::close(master_fd) };
@@ -286,7 +313,6 @@ fn run_broker(mut config: BrokerConfig) -> Result<i32, String> {
         let _ = fs::remove_file(&state.sock_path);
         let _ = fs::remove_file(state.sock_path.with_extension("json"));
     }
-    Ok(exit_code)
 }
 
 fn exit_status_code(status: std::process::ExitStatus) -> i32 {
