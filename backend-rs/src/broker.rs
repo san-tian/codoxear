@@ -409,13 +409,21 @@ fn spawn_pty_reader_thread(runtime: BrokerRuntime) {
             reply_to_terminal_queries(&mut state, bytes);
             let text = String::from_utf8_lossy(bytes);
             state.output_tail.push_str(&text);
-            if state.output_tail.len() > OUTPUT_TAIL_MAX {
-                let start = state.output_tail.len() - OUTPUT_TAIL_MAX;
-                state.output_tail = state.output_tail[start..].to_string();
-            }
+            trim_utf8_tail(&mut state.output_tail, OUTPUT_TAIL_MAX);
         }
         runtime.stop.store(true, Ordering::Relaxed);
     });
+}
+
+fn trim_utf8_tail(text: &mut String, max_bytes: usize) {
+    if text.len() <= max_bytes {
+        return;
+    }
+    let mut start = text.len().saturating_sub(max_bytes);
+    while start < text.len() && !text.is_char_boundary(start) {
+        start += 1;
+    }
+    text.drain(..start);
 }
 
 fn spawn_log_discovery_thread(runtime: BrokerRuntime) {
@@ -765,7 +773,10 @@ fn shell_join(items: &[String]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_uuid_like, run_broker, scan_token_updates_from_log, seq_bytes, session_id_from_rollout_path, BrokerConfig};
+    use super::{
+        is_uuid_like, run_broker, scan_token_updates_from_log, seq_bytes, session_id_from_rollout_path,
+        trim_utf8_tail, BrokerConfig,
+    };
     use serde_json::{json, Value};
     use std::fs;
     use std::io::{BufRead, BufReader, Write};
@@ -841,6 +852,15 @@ mod tests {
         assert_eq!(token["tokens_remaining"], 10000);
         assert_eq!(token["percent_remaining"], 9);
         assert_eq!(token["as_of"], "2026-04-28T00:00:01Z");
+    }
+
+    #[test]
+    fn rust_broker_trims_output_tail_on_utf8_boundary() {
+        let mut tail = format!("prefix {}", "─".repeat(80));
+        trim_utf8_tail(&mut tail, 159);
+        assert!(tail.len() <= 159);
+        assert!(tail.is_char_boundary(0));
+        assert!(tail.chars().all(|ch| ch == '─'));
     }
 
     #[test]
