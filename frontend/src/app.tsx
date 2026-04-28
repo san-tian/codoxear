@@ -928,6 +928,7 @@ export function App() {
   const [busy, setBusy] = useState(false);
   const [sending, setSending] = useState(false);
   const [closingSession, setClosingSession] = useState(false);
+  const [interruptingSessionId, setInterruptingSessionId] = useState("");
   const [sessionMarkerBusyId, setSessionMarkerBusyId] = useState("");
   const [queueLen, setQueueLen] = useState(0);
   const [tokenSummary, setTokenSummary] = useState<{ label: string; title: string } | null>(null);
@@ -1136,27 +1137,43 @@ export function App() {
   );
   const tmuxCommand = useMemo(() => tmuxAttachCommandForSession(selectedSession), [selectedSession]);
   const queuePreviewItems = useMemo(() => queueItems.slice(0, 3), [queueItems]);
-  const composerSessionBusy = Boolean(awaitingAssistantReply || busy || selectedSession?.busy);
+  const selectedSessionInterrupting = Boolean(selectedSessionId && interruptingSessionId === selectedSessionId);
+  const effectiveAwaitingAssistantReply = selectedSessionInterrupting ? false : awaitingAssistantReply;
+  const selectedSessionBusy = Boolean(busy || selectedSession?.busy);
+  const composerSessionBusy = Boolean(effectiveAwaitingAssistantReply || (selectedSessionBusy && !selectedSessionInterrupting));
   const displayedVoiceSettings = voiceSettings || EMPTY_VOICE_SETTINGS;
   const settingsInitialLoading = voiceSettingsLoading && !voiceSettings && !codexConfig;
-  const queuedWaitingStatus = Boolean(selectedSession && queueLen && !closingSession && !sending && sessionIsQueuedWaiting(selectedSession) && !(awaitingAssistantReply || busy || selectedSession.busy));
+  const queuedWaitingStatus = Boolean(selectedSession && queueLen && !closingSession && !sending && sessionIsQueuedWaiting(selectedSession) && !(effectiveAwaitingAssistantReply || selectedSessionBusy));
   const topSessionStatus = useMemo(() => {
     if (!selectedSession) return "No session";
     if (closingSession) return "closing";
+    if (selectedSessionInterrupting && selectedSessionBusy) return "stopping";
     if (sending) return "sending";
-    if (awaitingAssistantReply || busy || selectedSession.busy) return "working";
+    if (effectiveAwaitingAssistantReply || selectedSessionBusy) return "working";
     if (queueLen) return `queue ${queueLen}`;
     if (sessionIsStarting(selectedSession)) return "starting";
     return "idle";
-  }, [awaitingAssistantReply, busy, closingSession, queueLen, selectedSession, sending]);
+  }, [closingSession, effectiveAwaitingAssistantReply, queueLen, selectedSession, selectedSessionBusy, selectedSessionInterrupting, sending]);
   const topSessionStatusClass =
-    topSessionStatus === "working" || topSessionStatus === "starting"
+    topSessionStatus === "stopping"
+      ? "status-chip stopping"
+      : topSessionStatus === "working" || topSessionStatus === "starting"
       ? "status-chip working"
       : queuedWaitingStatus
         ? "status-chip waiting"
         : "status-chip";
   const workingIndicatorLabel =
-    topSessionStatus === "sending" ? "Sending" : topSessionStatus === "starting" ? "Starting" : topSessionStatus === "working" ? "Working" : queuedWaitingStatus ? "Waiting" : "";
+    topSessionStatus === "stopping"
+      ? "Stopping"
+      : topSessionStatus === "sending"
+        ? "Sending"
+        : topSessionStatus === "starting"
+          ? "Starting"
+          : topSessionStatus === "working"
+            ? "Working"
+            : queuedWaitingStatus
+              ? "Waiting"
+              : "";
   const workingIndicatorTone = queuedWaitingStatus ? "waiting" : "working";
   const composerText = selectedSessionId ? sessionDrafts[selectedSessionId] || "" : "";
   const appStyle = useMemo(
@@ -1763,6 +1780,7 @@ export function App() {
     setSessionDraft(sessionId, "");
     setSending(true);
     setErrorText("");
+    setInterruptingSessionId((current) => (current === sessionId ? "" : current));
     if (!shouldQueue) {
       localEvent = {
         id: `local-user-${Date.now()}`,
@@ -1869,15 +1887,18 @@ export function App() {
 
   async function handleInterrupt(targetSession = selectedSession) {
     const sessionId = targetSession?.session_id || selectedSessionRef.current;
-    if (!sessionId) return;
+    if (!sessionId || interruptingSessionId === sessionId) return;
     setSessionContextMenu(null);
+    setInterruptingSessionId(sessionId);
     try {
       await api.interrupt(sessionId);
       fastPollUntilRef.current = Date.now() + 4000;
-      pushToast("Interrupt sent");
+      pushToast("Stop signal sent");
       if (selectedSessionRef.current === sessionId) schedulePoll(0);
     } catch (error) {
       setErrorText(error instanceof Error ? error.message : "Unable to interrupt session");
+      setInterruptingSessionId((current) => (current === sessionId ? "" : current));
+      return;
     }
   }
 
@@ -2945,9 +2966,15 @@ export function App() {
                 {icon("info")}
                 {mobileViewport ? <span>Details</span> : null}
               </button>
-              <button className={mobileViewport ? "actionBtn mobileActionBtn" : "icon-btn"} type="button" title="Interrupt" onClick={() => void handleInterrupt()}>
+              <button
+                className={mobileViewport ? "actionBtn mobileActionBtn danger" : "actionBtn danger stopActionBtn"}
+                type="button"
+                title={selectedSession ? "Stop current run" : "No session selected"}
+                disabled={!selectedSession || selectedSessionInterrupting}
+                onClick={() => void handleInterrupt()}
+              >
                 {icon("stop")}
-                {mobileViewport ? <span>Stop</span> : null}
+                <span>{selectedSessionInterrupting ? "Stopping" : "Stop"}</span>
               </button>
               <button
                 className={mobileViewport ? `actionBtn mobileActionBtn${selectedSession?.harness_enabled ? " active" : ""}` : `icon-btn${selectedSession?.harness_enabled ? " active" : ""}`}
