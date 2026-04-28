@@ -818,7 +818,24 @@ fn open_pty(rows: u16, cols: u16) -> Result<(RawFd, RawFd), String> {
 }
 
 fn terminal_size() -> (u16, u16) {
-    (40, 120)
+    terminal_size_from_fd(libc::STDIN_FILENO, (40, 120))
+        .or_else(|| terminal_size_from_fd(libc::STDOUT_FILENO, (40, 120)))
+        .unwrap_or((40, 120))
+}
+
+fn terminal_size_from_fd(fd: RawFd, fallback: (u16, u16)) -> Option<(u16, u16)> {
+    let mut winsize = libc::winsize {
+        ws_row: 0,
+        ws_col: 0,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    if unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut winsize) } != 0 {
+        return None;
+    }
+    let rows = if winsize.ws_row > 0 { winsize.ws_row } else { fallback.0 };
+    let cols = if winsize.ws_col > 0 { winsize.ws_col } else { fallback.1 };
+    Some((rows, cols))
 }
 
 fn terminate_process_group(pid: i64) {
@@ -999,9 +1016,9 @@ fn shell_join(items: &[String]) -> String {
 mod tests {
     use super::{
         copy_fd_to_pty, ensure_pi_session_arg, is_uuid_like, resume_session_id_from_args,
-        run_broker, scan_token_updates_from_log, seq_bytes, session_id_from_log,
-        session_id_from_rollout_path, session_log_path_from_args, shell_quote, trim_utf8_tail,
-        write_all_fd, BrokerConfig,
+        open_pty, run_broker, scan_token_updates_from_log, seq_bytes, session_id_from_log,
+        session_id_from_rollout_path, session_log_path_from_args, shell_quote,
+        terminal_size_from_fd, trim_utf8_tail, write_all_fd, BrokerConfig,
     };
     use serde_json::{json, Value};
     use std::fs;
@@ -1090,6 +1107,16 @@ mod tests {
         assert!(tail.len() <= 159);
         assert!(tail.is_char_boundary(0));
         assert!(tail.chars().all(|ch| ch == '─'));
+    }
+
+    #[test]
+    fn rust_broker_reads_terminal_size_from_pty() {
+        let (master_fd, slave_fd) = open_pty(33, 101).unwrap();
+        assert_eq!(terminal_size_from_fd(master_fd, (40, 120)), Some((33, 101)));
+        assert_eq!(terminal_size_from_fd(slave_fd, (40, 120)), Some((33, 101)));
+        let _ = unsafe { libc::close(master_fd) };
+        let _ = unsafe { libc::close(slave_fd) };
+        assert_eq!(terminal_size_from_fd(-1, (40, 120)), None);
     }
 
     #[test]
