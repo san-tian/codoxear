@@ -3,6 +3,7 @@ import os
 import subprocess
 import threading
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import ANY
@@ -20,6 +21,21 @@ from codoxear.server import _list_resume_candidates_for_cwd
 def _write_jsonl(path: Path, objs: list[dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("".join(json.dumps(obj) + "\n" for obj in objs), encoding="utf-8")
+
+
+@contextmanager
+def _rust_broker_env(root: str | Path):
+    broker_bin = Path(root) / "codoxear-broker-rs"
+    broker_bin.write_text("#!/bin/sh\n", encoding="utf-8")
+    previous_flag = os.environ.pop("CODOXEAR_ENABLE_RUST_BROKER", None)
+    try:
+        with patch.dict(os.environ, {"CODOXEAR_RUST_BROKER_BIN": str(broker_bin)}):
+            yield broker_bin
+    finally:
+        if previous_flag is not None:
+            os.environ["CODOXEAR_ENABLE_RUST_BROKER"] = previous_flag
+        else:
+            os.environ.pop("CODOXEAR_ENABLE_RUST_BROKER", None)
 
 
 class TestSessionResumeCandidates(unittest.TestCase):
@@ -185,9 +201,11 @@ class TestSpawnWebSessionResume(unittest.TestCase):
             def wait(self) -> int:
                 return 0
 
-        with TemporaryDirectory() as td, patch("codoxear.server._wait_or_raise", return_value=None), patch(
-            "codoxear.server.subprocess.Popen", return_value=_Proc()
-        ) as popen_mock, patch.object(threading.Thread, "start", lambda self: thread_calls.append("start")):
+        with TemporaryDirectory() as td, _rust_broker_env(td) as broker_bin, patch(
+            "codoxear.server._wait_or_raise", return_value=None
+        ), patch("codoxear.server.subprocess.Popen", return_value=_Proc()) as popen_mock, patch.object(
+            threading.Thread, "start", lambda self: thread_calls.append("start")
+        ):
             target = Path(td) / "new" / "session"
             result = SessionManager.spawn_web_session(manager, cwd=str(target))
             self.assertTrue(target.is_dir())
@@ -197,9 +215,7 @@ class TestSpawnWebSessionResume(unittest.TestCase):
         self.assertEqual(
             argv,
             [
-                ANY,
-                "-m",
-                "codoxear.broker",
+                str(broker_bin),
                 "--cwd",
                 str(target.resolve()),
                 "--",
@@ -229,9 +245,11 @@ class TestSpawnWebSessionResume(unittest.TestCase):
             def wait(self) -> int:
                 return 0
 
-        with TemporaryDirectory() as td, patch("codoxear.server._wait_or_raise", return_value=None), patch(
-            "codoxear.server.subprocess.Popen", return_value=_Proc()
-        ) as popen_mock, patch.object(threading.Thread, "start", lambda self: thread_calls.append("start")):
+        with TemporaryDirectory() as td, _rust_broker_env(td) as broker_bin, patch(
+            "codoxear.server._wait_or_raise", return_value=None
+        ), patch("codoxear.server.subprocess.Popen", return_value=_Proc()) as popen_mock, patch.object(
+            threading.Thread, "start", lambda self: thread_calls.append("start")
+        ):
             result = SessionManager.spawn_web_session(manager, cwd=td, args=["--search"])
 
         argv = popen_mock.call_args.args[0]
@@ -240,9 +258,7 @@ class TestSpawnWebSessionResume(unittest.TestCase):
         self.assertEqual(
             argv,
             [
-                ANY,
-                "-m",
-                "codoxear.broker",
+                str(broker_bin),
                 "--cwd",
                 td,
                 "--",
@@ -255,7 +271,7 @@ class TestSpawnWebSessionResume(unittest.TestCase):
         self.assertEqual(result, {"broker_pid": 3210})
         self.assertEqual(thread_calls, ["start"])
 
-    def test_spawn_web_session_can_use_rust_broker_when_enabled(self) -> None:
+    def test_spawn_web_session_uses_rust_broker_by_default(self) -> None:
         manager = SessionManager.__new__(SessionManager)
         thread_calls: list[str] = []
 
@@ -267,15 +283,7 @@ class TestSpawnWebSessionResume(unittest.TestCase):
                 return 0
 
         with TemporaryDirectory() as td:
-            broker_bin = Path(td) / "codoxear-broker-rs"
-            broker_bin.write_text("#!/bin/sh\n", encoding="utf-8")
-            with patch.dict(
-                os.environ,
-                {
-                    "CODOXEAR_ENABLE_RUST_BROKER": "1",
-                    "CODOXEAR_RUST_BROKER_BIN": str(broker_bin),
-                },
-            ), patch("codoxear.server._wait_or_raise", return_value=None), patch(
+            with _rust_broker_env(td) as broker_bin, patch("codoxear.server._wait_or_raise", return_value=None), patch(
                 "codoxear.server.subprocess.Popen", return_value=_Proc()
             ) as popen_mock, patch.object(threading.Thread, "start", lambda self: thread_calls.append("start")):
                 result = SessionManager.spawn_web_session(manager, cwd=td, args=["--search"])
@@ -288,17 +296,43 @@ class TestSpawnWebSessionResume(unittest.TestCase):
         self.assertEqual(result, {"broker_pid": 3211})
         self.assertEqual(thread_calls, ["start"])
 
-    def test_spawn_web_session_requires_rust_broker_binary_when_enabled(self) -> None:
+    def test_spawn_web_session_can_use_legacy_python_broker_when_disabled(self) -> None:
         manager = SessionManager.__new__(SessionManager)
-        with TemporaryDirectory() as td, patch.dict(
-            os.environ,
-            {
-                "CODOXEAR_ENABLE_RUST_BROKER": "1",
-                "CODOXEAR_RUST_BROKER_BIN": str(Path(td) / "missing-broker"),
-            },
+        thread_calls: list[str] = []
+
+        class _Proc:
+            pid = 3212
+            stderr = None
+
+            def wait(self) -> int:
+                return 0
+
+        with TemporaryDirectory() as td, patch.dict(os.environ, {"CODOXEAR_ENABLE_RUST_BROKER": "0"}), patch(
+            "codoxear.server._wait_or_raise", return_value=None
+        ), patch("codoxear.server.subprocess.Popen", return_value=_Proc()) as popen_mock, patch.object(
+            threading.Thread, "start", lambda self: thread_calls.append("start")
         ):
-            with self.assertRaisesRegex(RuntimeError, "Rust broker binary not found"):
-                SessionManager.spawn_web_session(manager, cwd=td)
+            result = SessionManager.spawn_web_session(manager, cwd=td, args=["--search"])
+
+        argv = popen_mock.call_args.args[0]
+        self.assertEqual(argv[:5], [ANY, "-m", "codoxear.broker", "--cwd", td])
+        self.assertIn("--search", argv)
+        self.assertEqual(result, {"broker_pid": 3212})
+        self.assertEqual(thread_calls, ["start"])
+
+    def test_spawn_web_session_requires_rust_broker_binary_by_default(self) -> None:
+        manager = SessionManager.__new__(SessionManager)
+        previous_flag = os.environ.pop("CODOXEAR_ENABLE_RUST_BROKER", None)
+        try:
+            with TemporaryDirectory() as td, patch.dict(
+                os.environ,
+                {"CODOXEAR_RUST_BROKER_BIN": str(Path(td) / "missing-broker")},
+            ):
+                with self.assertRaisesRegex(RuntimeError, "Rust broker binary not found"):
+                    SessionManager.spawn_web_session(manager, cwd=td)
+        finally:
+            if previous_flag is not None:
+                os.environ["CODOXEAR_ENABLE_RUST_BROKER"] = previous_flag
 
     def test_spawn_web_session_passes_resume_id_to_broker(self) -> None:
         manager = SessionManager.__new__(SessionManager)
@@ -311,9 +345,11 @@ class TestSpawnWebSessionResume(unittest.TestCase):
             def wait(self) -> int:
                 return 0
 
-        with TemporaryDirectory() as td, patch("codoxear.server._list_resume_candidates_for_cwd", return_value=[{"session_id": "resume-a"}]), patch(
-            "codoxear.server._wait_or_raise", return_value=None
-        ), patch("codoxear.server.subprocess.Popen", return_value=_Proc()) as popen_mock, patch.object(threading.Thread, "start", lambda self: thread_calls.append("start")):
+        with TemporaryDirectory() as td, _rust_broker_env(td) as broker_bin, patch(
+            "codoxear.server._list_resume_candidates_for_cwd", return_value=[{"session_id": "resume-a"}]
+        ), patch("codoxear.server._wait_or_raise", return_value=None), patch(
+            "codoxear.server.subprocess.Popen", return_value=_Proc()
+        ) as popen_mock, patch.object(threading.Thread, "start", lambda self: thread_calls.append("start")):
             result = SessionManager.spawn_web_session(
                 manager,
                 cwd=td,
@@ -327,9 +363,7 @@ class TestSpawnWebSessionResume(unittest.TestCase):
         self.assertEqual(
             argv,
             [
-                ANY,
-                "-m",
-                "codoxear.broker",
+                str(broker_bin),
                 "--cwd",
                 td,
                 "--",
@@ -356,9 +390,11 @@ class TestSpawnWebSessionResume(unittest.TestCase):
             def wait(self) -> int:
                 return 0
 
-        with TemporaryDirectory() as td, patch("codoxear.server._wait_or_raise", return_value=None), patch(
-            "codoxear.server.subprocess.Popen", return_value=_Proc()
-        ) as popen_mock, patch.object(threading.Thread, "start", lambda self: thread_calls.append("start")):
+        with TemporaryDirectory() as td, _rust_broker_env(td) as broker_bin, patch(
+            "codoxear.server._wait_or_raise", return_value=None
+        ), patch("codoxear.server.subprocess.Popen", return_value=_Proc()) as popen_mock, patch.object(
+            threading.Thread, "start", lambda self: thread_calls.append("start")
+        ):
             result = SessionManager.spawn_web_session(
                 manager,
                 cwd=td,
@@ -375,9 +411,7 @@ class TestSpawnWebSessionResume(unittest.TestCase):
         self.assertEqual(
             argv,
             [
-                ANY,
-                "-m",
-                "codoxear.broker",
+                str(broker_bin),
                 "--cwd",
                 td,
                 "--",
@@ -407,7 +441,7 @@ class TestSpawnWebSessionResume(unittest.TestCase):
     def test_spawn_web_session_can_start_in_tmux(self) -> None:
         manager = SessionManager.__new__(SessionManager)
 
-        with TemporaryDirectory() as td, patch("codoxear.server.shutil.which", return_value="/usr/bin/tmux"), patch(
+        with TemporaryDirectory() as td, _rust_broker_env(td) as broker_bin, patch("codoxear.server.shutil.which", return_value="/usr/bin/tmux"), patch(
             "codoxear.server._wait_for_spawned_broker_meta", return_value={"broker_pid": 7777}
         ) as wait_mock, patch(
             "codoxear.server.subprocess.run",
@@ -429,7 +463,7 @@ class TestSpawnWebSessionResume(unittest.TestCase):
         self.assertIn("CODEX_WEB_PREFERRED_AUTH_METHOD=apikey", shell_cmd)
         self.assertIn("CODEX_WEB_MODEL=gpt-5.4", shell_cmd)
         self.assertIn("CODEX_WEB_SERVICE_TIER=fast", shell_cmd)
-        self.assertIn("codoxear.broker", shell_cmd)
+        self.assertIn(str(broker_bin), shell_cmd)
         wait_mock.assert_called_once()
 
     def test_spawn_web_session_surfaces_tmux_pane_output_on_metadata_timeout(self) -> None:
@@ -472,9 +506,11 @@ class TestSpawnWebSessionResume(unittest.TestCase):
             def wait(self) -> int:
                 return 0
 
-        with TemporaryDirectory() as td, patch("codoxear.server._wait_or_raise", return_value=None), patch(
-            "codoxear.server.subprocess.Popen", return_value=_Proc()
-        ) as popen_mock, patch.object(threading.Thread, "start", lambda self: thread_calls.append("start")):
+        with TemporaryDirectory() as td, _rust_broker_env(td) as broker_bin, patch(
+            "codoxear.server._wait_or_raise", return_value=None
+        ), patch("codoxear.server.subprocess.Popen", return_value=_Proc()) as popen_mock, patch.object(
+            threading.Thread, "start", lambda self: thread_calls.append("start")
+        ):
             result = SessionManager.spawn_web_session(
                 manager,
                 cwd=td,
@@ -489,9 +525,7 @@ class TestSpawnWebSessionResume(unittest.TestCase):
         self.assertEqual(
             argv,
             [
-                ANY,
-                "-m",
-                "codoxear.broker",
+                str(broker_bin),
                 "--cwd",
                 td,
                 "--",
@@ -522,9 +556,11 @@ class TestSpawnWebSessionResume(unittest.TestCase):
             def wait(self) -> int:
                 return 0
 
-        with TemporaryDirectory() as td, patch("codoxear.server._list_resume_candidates_for_cwd", return_value=[{"session_id": "resume-a", "log_path": "/tmp/pi-resume.jsonl"}]), patch(
-            "codoxear.server._wait_or_raise", return_value=None
-        ), patch("codoxear.server.subprocess.Popen", return_value=_Proc()) as popen_mock, patch.object(threading.Thread, "start", lambda self: thread_calls.append("start")):
+        with TemporaryDirectory() as td, _rust_broker_env(td) as broker_bin, patch(
+            "codoxear.server._list_resume_candidates_for_cwd", return_value=[{"session_id": "resume-a", "log_path": "/tmp/pi-resume.jsonl"}]
+        ), patch("codoxear.server._wait_or_raise", return_value=None), patch(
+            "codoxear.server.subprocess.Popen", return_value=_Proc()
+        ) as popen_mock, patch.object(threading.Thread, "start", lambda self: thread_calls.append("start")):
             result = SessionManager.spawn_web_session(
                 manager,
                 cwd=td,
@@ -537,9 +573,7 @@ class TestSpawnWebSessionResume(unittest.TestCase):
         self.assertEqual(
             argv,
             [
-                ANY,
-                "-m",
-                "codoxear.broker",
+                str(broker_bin),
                 "--cwd",
                 td,
                 "--",
@@ -589,9 +623,11 @@ class TestSpawnWebSessionResume(unittest.TestCase):
             def wait(self) -> int:
                 return 0
 
-        with TemporaryDirectory() as td, patch("codoxear.server._create_git_worktree", return_value=Path(td) / "repo-worktree"), patch(
-            "codoxear.server._wait_or_raise", return_value=None
-        ), patch("codoxear.server.subprocess.Popen", return_value=_Proc()) as popen_mock, patch.object(threading.Thread, "start", lambda self: thread_calls.append("start")):
+        with TemporaryDirectory() as td, _rust_broker_env(td) as broker_bin, patch(
+            "codoxear.server._create_git_worktree", return_value=Path(td) / "repo-worktree"
+        ), patch("codoxear.server._wait_or_raise", return_value=None), patch(
+            "codoxear.server.subprocess.Popen", return_value=_Proc()
+        ) as popen_mock, patch.object(threading.Thread, "start", lambda self: thread_calls.append("start")):
             result = SessionManager.spawn_web_session(manager, cwd=td, worktree_branch="feature/test-worktree")
 
         argv = popen_mock.call_args.args[0]
@@ -599,9 +635,7 @@ class TestSpawnWebSessionResume(unittest.TestCase):
         self.assertEqual(
             argv,
             [
-                ANY,
-                "-m",
-                "codoxear.broker",
+                str(broker_bin),
                 "--cwd",
                 str(Path(td) / "repo-worktree"),
                 "--",

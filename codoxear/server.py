@@ -462,8 +462,12 @@ def _env_flag_enabled(name: str) -> bool:
     return str(os.environ.get(name) or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _env_flag_disabled(name: str) -> bool:
+    return str(os.environ.get(name) or "").strip().lower() in {"0", "false", "no", "off"}
+
+
 def _broker_launch_argv(cwd: Path) -> list[str]:
-    if not _env_flag_enabled("CODOXEAR_ENABLE_RUST_BROKER"):
+    if _env_flag_disabled("CODOXEAR_ENABLE_RUST_BROKER"):
         return [sys.executable, "-m", "codoxear.broker", "--cwd", str(cwd), "--"]
     raw_bin = _clean_optional_text(os.environ.get("CODOXEAR_RUST_BROKER_BIN"))
     broker_bin = Path(raw_bin).expanduser() if raw_bin else REPO_ROOT / "backend-rs" / "target" / "release" / "codoxear-broker-rs"
