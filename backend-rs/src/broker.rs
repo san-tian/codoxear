@@ -1,8 +1,9 @@
 use crate::runtime::{
-    compute_idle_from_log, default_app_dir, discover_open_log_for_process_in_sessions,
+    compute_idle_from_log, default_app_dir, discover_open_log_for_process_in_sessions_excluding,
     token_update_from_obj,
 };
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use std::env;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
@@ -21,6 +22,7 @@ const BRACKETED_PASTE_START: &[u8] = b"\x1b[200~";
 const BRACKETED_PASTE_END: &[u8] = b"\x1b[201~";
 const OUTPUT_TAIL_MAX: usize = 256 * 1024;
 const BUSY_HINT_TAIL_MAX: usize = 4096;
+const DETACH_TRIGGER_TAIL_MAX: usize = 8192;
 const BUSY_QUIET_SECONDS_DEFAULT: f64 = 3.0;
 static SIGWINCH_PENDING: AtomicBool = AtomicBool::new(false);
 
@@ -53,6 +55,8 @@ pub struct BrokerState {
     busy_hint_tail: String,
     busy_hint_last_seen: Option<Instant>,
     busy_from_pty_hint: bool,
+    detach_trigger_tail: String,
+    ignored_log_paths: HashSet<PathBuf>,
 }
 
 impl BrokerState {
@@ -231,6 +235,8 @@ fn run_broker(mut config: BrokerConfig) -> Result<(), String> {
         busy_hint_tail: String::new(),
         busy_hint_last_seen: None,
         busy_from_pty_hint: false,
+        detach_trigger_tail: String::new(),
+        ignored_log_paths: HashSet::new(),
     };
     write_metadata(&state)?;
     let runtime = BrokerRuntime {
@@ -518,6 +524,9 @@ fn spawn_pty_reader_thread(runtime: BrokerRuntime) {
             state.output_tail.push_str(&text);
             trim_utf8_tail(&mut state.output_tail, OUTPUT_TAIL_MAX);
             update_busy_from_pty_text(&mut state, &text);
+            if update_detach_from_pty_text(&mut state, &text) {
+                let _ = write_metadata(&state);
+            }
         }
         runtime.stop.store(true, Ordering::Relaxed);
     });
@@ -570,6 +579,32 @@ fn clear_stale_pty_busy_hint(state: &mut BrokerState, now: Instant, quiet: Durat
     state.busy_from_pty_hint = false;
     state.busy_hint_last_seen = None;
     true
+}
+
+fn update_detach_from_pty_text(state: &mut BrokerState, text: &str) -> bool {
+    if state.agent_backend != "codex" {
+        return false;
+    }
+    let cleaned = strip_ansi(text);
+    if cleaned.is_empty() {
+        return false;
+    }
+    let previous_tail = state.detach_trigger_tail.clone();
+    state.detach_trigger_tail.push_str(&cleaned);
+    trim_utf8_tail(&mut state.detach_trigger_tail, DETACH_TRIGGER_TAIL_MAX);
+    if !hint_seen_in_new_text(&previous_tail, &cleaned, "to continue this session, run ") {
+        return false;
+    }
+    detach_current_session_binding(state);
+    true
+}
+
+fn detach_current_session_binding(state: &mut BrokerState) {
+    if let Some(path) = state.log_path.take() {
+        state.ignored_log_paths.insert(path.canonicalize().unwrap_or(path));
+    }
+    state.session_id = None;
+    state.detach_trigger_tail.clear();
 }
 
 fn pty_busy_hint_seen(tail: &str, cleaned: &str) -> bool {
@@ -660,12 +695,13 @@ fn strip_ansi(text: &str) -> String {
 fn spawn_log_discovery_thread(runtime: BrokerRuntime) {
     thread::spawn(move || {
         while !runtime.stop.load(Ordering::Relaxed) {
-            let (pid, cwd, backend, current) = match runtime.state.lock() {
+            let (pid, cwd, backend, current, ignored) = match runtime.state.lock() {
                 Ok(state) => (
                     state.agent_pid,
                     state.cwd.clone(),
                     state.agent_backend.clone(),
                     state.log_path.clone(),
+                    state.ignored_log_paths.clone(),
                 ),
                 Err(_) => return,
             };
@@ -673,8 +709,13 @@ fn spawn_log_discovery_thread(runtime: BrokerRuntime) {
                 thread::sleep(Duration::from_millis(250));
                 continue;
             }
-            if let Some(path) =
-                discover_open_log_for_process_in_sessions(pid, &cwd, &backend, &runtime.sessions_dir)
+            if let Some(path) = discover_open_log_for_process_in_sessions_excluding(
+                pid,
+                &cwd,
+                &backend,
+                &runtime.sessions_dir,
+                &ignored,
+            )
             {
                 if let Some(session_id) = session_id_from_log(&path, &backend) {
                     if let Ok(mut state) = runtime.state.lock() {
@@ -1242,9 +1283,11 @@ mod tests {
         open_pty, run_broker, scan_token_updates_from_log, seq_bytes, session_id_from_log,
         session_id_from_rollout_path, session_log_path_from_args, set_pty_winsize, shell_quote,
         strip_ansi, terminal_size_from_fd, trim_utf8_tail, update_busy_from_pty_text,
-        clear_stale_pty_busy_hint, web_owned_codex_args, write_all_fd, BrokerConfig, BrokerState,
+        clear_stale_pty_busy_hint, update_detach_from_pty_text, web_owned_codex_args, write_all_fd,
+        BrokerConfig, BrokerState,
     };
     use serde_json::{json, Value};
+    use std::collections::HashSet;
     use std::fs;
     use std::io::{BufRead, BufReader, Write};
     use std::os::fd::RawFd;
@@ -1391,6 +1434,26 @@ mod tests {
         state.busy_hint_last_seen = Some(now - Duration::from_secs(4));
         assert!(!clear_stale_pty_busy_hint(&mut state, now, Duration::from_secs(3)));
         assert!(state.busy);
+    }
+
+    #[test]
+    fn rust_broker_detaches_codex_log_binding_from_split_session_switch_hint() {
+        let mut state = test_broker_state();
+        let log_path = temp_app_dir("broker-detach").join("rollout-2026-04-28T00-00-00-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee.jsonl");
+        fs::write(&log_path, "{}\n").unwrap();
+        state.log_path = Some(log_path.clone());
+        state.session_id = Some("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".to_string());
+
+        assert!(!update_detach_from_pty_text(&mut state, "To continue this "));
+        assert!(state.log_path.is_some());
+        assert!(update_detach_from_pty_text(&mut state, "session, run codex resume ..."));
+
+        assert!(state.log_path.is_none());
+        assert!(state.session_id.is_none());
+        assert!(state.detach_trigger_tail.is_empty());
+        assert!(state
+            .ignored_log_paths
+            .contains(&log_path.canonicalize().unwrap_or(log_path)));
     }
 
     #[test]
@@ -1629,6 +1692,8 @@ mod tests {
             busy_hint_tail: String::new(),
             busy_hint_last_seen: None,
             busy_from_pty_hint: false,
+            detach_trigger_tail: String::new(),
+            ignored_log_paths: HashSet::new(),
         }
     }
 

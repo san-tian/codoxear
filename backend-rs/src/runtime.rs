@@ -6817,6 +6817,22 @@ pub(crate) fn discover_open_log_for_process_in_sessions(
     agent_backend: &str,
     sessions_dir: &Path,
 ) -> Option<PathBuf> {
+    discover_open_log_for_process_in_sessions_excluding(
+        root_pid,
+        cwd,
+        agent_backend,
+        sessions_dir,
+        &HashSet::new(),
+    )
+}
+
+pub(crate) fn discover_open_log_for_process_in_sessions_excluding(
+    root_pid: i64,
+    cwd: &str,
+    agent_backend: &str,
+    sessions_dir: &Path,
+    excluded_paths: &HashSet<PathBuf>,
+) -> Option<PathBuf> {
     if root_pid <= 0 {
         return None;
     }
@@ -6825,6 +6841,9 @@ pub(crate) fn discover_open_log_for_process_in_sessions(
         return None;
     }
     let mut candidates = proc_open_writable_rollout_logs(proc_root, root_pid, agent_backend, sessions_dir);
+    if !excluded_paths.is_empty() {
+        candidates.retain(|path| !path_in_set(path, excluded_paths));
+    }
     if candidates.is_empty() {
         return None;
     }
@@ -6854,6 +6873,14 @@ pub(crate) fn discover_open_log_for_process_in_sessions(
         return unique_open_main.into_iter().next();
     }
     None
+}
+
+fn path_in_set(path: &Path, paths: &HashSet<PathBuf>) -> bool {
+    if paths.contains(path) {
+        return true;
+    }
+    let resolved = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    paths.iter().any(|item| item == path || item == &resolved)
 }
 
 fn proc_open_writable_rollout_logs(
