@@ -1862,6 +1862,50 @@ mod tests {
     }
 
     #[test]
+    fn rust_broker_socket_send_and_keys_reach_live_cli_pty() {
+        let app_dir = temp_app_dir("broker-live-input");
+        let config = BrokerConfig {
+            cwd: app_dir.clone(),
+            agent_args: vec![
+                "-c".to_string(),
+                "printf READY; while IFS= read -r line; do printf 'LINE:%s\\n' \"$line\"; done"
+                    .to_string(),
+            ],
+            app_dir: app_dir.clone(),
+            agent_backend: "codex".to_string(),
+            agent_bin: "sh".to_string(),
+            agent_home: app_dir.join("codex-home"),
+            sessions_dir: app_dir.join("codex-home").join("sessions"),
+            owner: None,
+            mirror_output: false,
+            mirror_input: false,
+        };
+        let handle = thread::spawn(move || run_broker(config));
+        let sock_path = wait_for_sock(&app_dir);
+        let tail = wait_for_tail(&sock_path);
+        assert!(tail.contains("READY"));
+
+        let send = socket_request(
+            &sock_path,
+            json!({"cmd":"send","text":"browser-send","enter_seq":"\\n"}),
+        );
+        assert_eq!(send.get("queued").and_then(Value::as_bool), Some(false));
+        let send_tail = wait_for_tail_containing(&sock_path, "LINE:");
+        assert!(send_tail.contains("LINE:"));
+        assert!(send_tail.contains("browser-send"));
+
+        let keys = socket_request(&sock_path, json!({"cmd":"keys","seq":"raw-key\\n"}));
+        assert_eq!(keys.get("ok").and_then(Value::as_bool), Some(true));
+        let keys_tail = wait_for_tail_containing(&sock_path, "LINE:raw-key");
+        assert!(keys_tail.contains("LINE:raw-key"));
+
+        let shutdown = socket_request(&sock_path, json!({"cmd":"shutdown"}));
+        assert_eq!(shutdown.get("ok").and_then(Value::as_bool), Some(true));
+        let result = handle.join().unwrap();
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[test]
     fn rust_broker_serves_socket_for_pi_backend() {
         let app_dir = temp_app_dir("broker-pi-socket");
         let pi_home = app_dir.join("pi-home");
@@ -2022,6 +2066,23 @@ mod tests {
             thread::sleep(Duration::from_millis(25));
         }
         panic!("broker tail never contained READY");
+    }
+
+    fn wait_for_tail_containing(sock_path: &Path, needle: &str) -> String {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            let payload = socket_request(sock_path, json!({"cmd":"tail"}));
+            let tail = payload
+                .get("tail")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            if tail.contains(needle) {
+                return tail;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        panic!("broker tail never contained {needle}");
     }
 
     fn wait_for_meta_session_id(sock_path: &Path, expected: &str) -> Value {

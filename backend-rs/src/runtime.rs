@@ -6844,8 +6844,13 @@ fn python_bin(repo_root: &Path) -> PathBuf {
 fn rust_broker_enabled() -> bool {
     env::var("CODOXEAR_ENABLE_RUST_BROKER")
         .ok()
-        .map(|value| value.trim() == "1")
-        .unwrap_or(false)
+        .map(|value| {
+            !matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "no" | "off"
+            )
+        })
+        .unwrap_or(true)
 }
 
 fn rust_broker_bin(repo_root: &Path) -> PathBuf {
@@ -9256,12 +9261,18 @@ mod tests {
     }
 
     #[test]
-    fn rust_broker_launch_is_explicit_opt_in() {
+    fn rust_broker_launch_defaults_to_rust_with_explicit_legacy_disable() {
         let _guard = env_lock().lock().unwrap();
         env::remove_var("CODOXEAR_ENABLE_RUST_BROKER");
         env::remove_var("CODOXEAR_RUST_BROKER_BIN");
-        assert!(!rust_broker_enabled());
+        assert!(rust_broker_enabled());
         env::set_var("CODOXEAR_ENABLE_RUST_BROKER", "0");
+        assert!(!rust_broker_enabled());
+        env::set_var("CODOXEAR_ENABLE_RUST_BROKER", "false");
+        assert!(!rust_broker_enabled());
+        env::set_var("CODOXEAR_ENABLE_RUST_BROKER", "no");
+        assert!(!rust_broker_enabled());
+        env::set_var("CODOXEAR_ENABLE_RUST_BROKER", "off");
         assert!(!rust_broker_enabled());
         env::set_var("CODOXEAR_ENABLE_RUST_BROKER", "1");
         assert!(rust_broker_enabled());
@@ -10033,6 +10044,40 @@ name = "CRS"
         assert_eq!(live.events[1]["answer"], "Single");
         assert_eq!(live.meta_delta["tool"], 2);
         assert_eq!(live.diag["last_tool"], "pi_tool");
+    }
+
+    #[test]
+    fn message_live_treats_pi_stop_message_with_thinking_as_final_response() {
+        let app_dir = temp_app_dir("message-live-pi-final");
+        let log_path = app_dir.join("pi-final.jsonl");
+        fs::write(
+            &log_path,
+            [
+                r#"{"type":"message","message":{"role":"user","content":[{"type":"text","text":"test"}]},"timestamp":"2026-04-24T10:00:00Z"}"#,
+                r#"{"type":"message","message":{"role":"assistant","stopReason":"stop","content":[{"type":"thinking","thinking":""},{"type":"text","text":"done","textSignature":"{\"v\":1,\"phase\":\"final_answer\"}"}]},"timestamp":"2026-04-24T10:00:01Z"}"#,
+            ]
+            .join("\n")
+                + "\n",
+        )
+        .unwrap();
+        fs::write(app_dir.join("socks").join("sid-pi-final.sock"), "").unwrap();
+        fs::write(
+            app_dir.join("socks").join("sid-pi-final.json"),
+            format!(
+                r#"{{"session_id":"thread-pi-final","codex_pid":1,"broker_pid":2,"cwd":"/work","log_path":"{}","start_ts":1.0,"agent_backend":"pi"}}"#,
+                log_path.display()
+            ),
+        )
+        .unwrap();
+        let config = RuntimeConfig { app_dir };
+
+        let live = load_messages_live(&config, "sid-pi-final", "0").unwrap();
+        assert_eq!(live.events.len(), 2);
+        assert_eq!(live.events[1]["role"], "assistant");
+        assert_eq!(live.events[1]["text"], "done");
+        assert_eq!(live.events[1]["message_class"], "final_response");
+        assert_eq!(live.meta_delta["thinking"], 1);
+        assert_eq!(live.turn_end, true);
     }
 
     #[test]

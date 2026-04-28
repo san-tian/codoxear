@@ -2608,13 +2608,16 @@ mod tests {
         let repo_root = temp_dir("repo-root");
         let cwd = repo_root.join("workspace");
         let log_path = repo_root.join("spawn.log");
-        let python_path = repo_root.join("fake-python.sh");
+        let broker_path = repo_root.join("fake-broker.sh");
         write_executable(
-            &python_path,
+            &broker_path,
             "#!/usr/bin/env bash\nset -euo pipefail\n{\n  printf 'PWD=%s\\n' \"$PWD\"\n  printf 'ARGV=%s\\n' \"$*\"\n  printf 'OWNER=%s\\n' \"${CODEX_WEB_OWNER-}\"\n  printf 'BACKEND=%s\\n' \"${CODEX_WEB_AGENT_BACKEND-}\"\n  printf 'MODEL=%s\\n' \"${CODEX_WEB_MODEL-}\"\n  printf 'EFFORT=%s\\n' \"${CODEX_WEB_REASONING_EFFORT-}\"\n} >> \"${CODOXEAR_TEST_LOG}\"\nsleep 30\n",
         );
         let _repo_root = EnvGuard::set("CODOXEAR_REPO_ROOT", repo_root.display().to_string());
-        let _python = EnvGuard::set("CODOXEAR_PYTHON_BIN", python_path.display().to_string());
+        let _broker = EnvGuard::set(
+            "CODOXEAR_RUST_BROKER_BIN",
+            broker_path.display().to_string(),
+        );
         let _log = EnvGuard::set("CODOXEAR_TEST_LOG", log_path.display().to_string());
         let app = router(build_state_from_config(RuntimeConfig { app_dir }).unwrap());
 
@@ -2642,10 +2645,7 @@ mod tests {
         let log = fs::read_to_string(&log_path).unwrap();
         assert!(cwd.is_dir());
         assert!(log.contains(&format!("PWD={}", repo_root.display())));
-        assert!(log.contains(&format!(
-            "ARGV=-m codoxear.broker --cwd {} --",
-            cwd.display()
-        )));
+        assert!(log.contains(&format!("ARGV=--cwd {} --", cwd.display())));
         assert!(log.contains("OWNER=web"));
         assert!(log.contains("BACKEND=codex"));
         assert!(log.contains("MODEL=gpt-5.4"));
@@ -2694,13 +2694,16 @@ mod tests {
             .success());
 
         let log_path = repo_root.join("worktree.log");
-        let python_path = repo_root.join("fake-python.sh");
+        let broker_path = repo_root.join("fake-broker.sh");
         write_executable(
-            &python_path,
+            &broker_path,
             "#!/usr/bin/env bash\nset -euo pipefail\nprintf 'ARGV=%s\\n' \"$*\" >> \"${CODOXEAR_TEST_LOG}\"\nsleep 30\n",
         );
         let _repo_root = EnvGuard::set("CODOXEAR_REPO_ROOT", repo_root.display().to_string());
-        let _python = EnvGuard::set("CODOXEAR_PYTHON_BIN", python_path.display().to_string());
+        let _broker = EnvGuard::set(
+            "CODOXEAR_RUST_BROKER_BIN",
+            broker_path.display().to_string(),
+        );
         let _log = EnvGuard::set("CODOXEAR_TEST_LOG", log_path.display().to_string());
         let app = router(build_state_from_config(RuntimeConfig { app_dir }).unwrap());
 
@@ -2790,6 +2793,10 @@ mod tests {
         );
         let _app_dir = EnvGuard::set("CODOXEAR_APP_DIR", app_dir.display().to_string());
         let _repo_root = EnvGuard::set("CODOXEAR_REPO_ROOT", repo_root.display().to_string());
+        let _broker = EnvGuard::set(
+            "CODOXEAR_RUST_BROKER_BIN",
+            repo_root.join("fake-broker-rs").display().to_string(),
+        );
         let _tmux = EnvGuard::set("CODOXEAR_TMUX_BIN", tmux_path.display().to_string());
         let _tmux_log = EnvGuard::set("CODOXEAR_TEST_TMUX_LOG", tmux_log.display().to_string());
         let app = router(build_state_from_config(RuntimeConfig { app_dir }).unwrap());
@@ -2822,7 +2829,7 @@ mod tests {
         let log = fs::read_to_string(&tmux_log).unwrap();
         assert!(log.contains("CODEX_WEB_TRANSPORT=tmux"));
         assert!(log.contains("CODEX_WEB_TMUX_SESSION=codoxear"));
-        assert!(log.contains("codoxear.broker"));
+        assert!(log.contains("fake-broker-rs"));
     }
 
     #[tokio::test]
