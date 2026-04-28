@@ -1,4 +1,7 @@
-use crate::runtime::{compute_idle_from_log, default_app_dir, discover_open_log_for_process, token_update_from_obj};
+use crate::runtime::{
+    compute_idle_from_log, default_app_dir, discover_open_log_for_process_in_sessions,
+    token_update_from_obj,
+};
 use serde_json::{json, Value};
 use std::env;
 use std::fs::{self, File};
@@ -90,6 +93,7 @@ struct BrokerConfig {
 struct BrokerRuntime {
     state: Arc<Mutex<BrokerState>>,
     stop: Arc<AtomicBool>,
+    sessions_dir: PathBuf,
 }
 
 pub fn main_entry() -> Result<(), String> {
@@ -205,6 +209,7 @@ fn run_broker(mut config: BrokerConfig) -> Result<(), String> {
     let runtime = BrokerRuntime {
         state: Arc::new(Mutex::new(state)),
         stop: Arc::new(AtomicBool::new(false)),
+        sessions_dir: config.sessions_dir.clone(),
     };
     spawn_socket_thread(runtime.clone());
     spawn_pty_reader_thread(runtime.clone());
@@ -459,8 +464,10 @@ fn spawn_log_discovery_thread(runtime: BrokerRuntime) {
                 thread::sleep(Duration::from_millis(250));
                 continue;
             }
-            if let Some(path) = discover_open_log_for_process(pid, &cwd, &backend) {
-                if let Some(session_id) = session_id_from_rollout_path(&path) {
+            if let Some(path) =
+                discover_open_log_for_process_in_sessions(pid, &cwd, &backend, &runtime.sessions_dir)
+            {
+                if let Some(session_id) = session_id_from_log(&path, &backend) {
                     if let Ok(mut state) = runtime.state.lock() {
                         state.log_path = Some(path);
                         state.session_id = Some(session_id);
@@ -911,7 +918,7 @@ mod tests {
     use super::{
         ensure_pi_session_arg, is_uuid_like, resume_session_id_from_args, run_broker,
         scan_token_updates_from_log, seq_bytes, session_id_from_log, session_id_from_rollout_path,
-        session_log_path_from_args, trim_utf8_tail, BrokerConfig,
+        session_log_path_from_args, shell_quote, trim_utf8_tail, BrokerConfig,
     };
     use serde_json::{json, Value};
     use std::fs;
@@ -1099,6 +1106,49 @@ mod tests {
         assert!(result.is_ok(), "{result:?}");
     }
 
+    #[test]
+    fn rust_broker_discovers_pi_session_log_after_start() {
+        let app_dir = temp_app_dir("broker-pi-discovery");
+        let pi_home = app_dir.join("pi-home");
+        let sessions_dir = pi_home.join("agent").join("sessions");
+        let session_dir = sessions_dir.join("--tmp-pi-discovery--");
+        fs::create_dir_all(&session_dir).unwrap();
+        let log_path = session_dir.join("live.jsonl");
+        let mut header = json!({
+            "type": "session",
+            "id": "pi-live",
+            "cwd": app_dir.display().to_string(),
+        })
+        .to_string();
+        header.push('\n');
+        let script = format!(
+            "exec 3>{}; printf %s {} >&3; printf READY; while true; do sleep 1; done",
+            shell_quote(&log_path.display().to_string()),
+            shell_quote(&header),
+        );
+        let config = BrokerConfig {
+            cwd: app_dir.clone(),
+            agent_args: vec!["-c".to_string(), script],
+            app_dir: app_dir.clone(),
+            agent_backend: "pi".to_string(),
+            agent_bin: "sh".to_string(),
+            agent_home: pi_home.clone(),
+            sessions_dir,
+            owner: None,
+            mirror_output: false,
+        };
+        let handle = thread::spawn(move || run_broker(config));
+        let sock_path = wait_for_sock(&app_dir);
+        let meta = wait_for_meta_session_id(&sock_path, "pi-live");
+        let expected_log_path = log_path.display().to_string();
+        assert_eq!(meta["log_path"].as_str(), Some(expected_log_path.as_str()));
+
+        let shutdown = socket_request(&sock_path, json!({"cmd":"shutdown"}));
+        assert_eq!(shutdown.get("ok").and_then(Value::as_bool), Some(true));
+        let result = handle.join().unwrap();
+        assert!(result.is_ok(), "{result:?}");
+    }
+
     fn temp_app_dir(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
             "codoxear-rs-{name}-{}",
@@ -1139,6 +1189,22 @@ mod tests {
             thread::sleep(Duration::from_millis(25));
         }
         panic!("broker tail never contained READY");
+    }
+
+    fn wait_for_meta_session_id(sock_path: &Path, expected: &str) -> Value {
+        let meta_path = sock_path.with_extension("json");
+        let deadline = Instant::now() + Duration::from_secs(4);
+        while Instant::now() < deadline {
+            if let Ok(raw) = fs::read_to_string(&meta_path) {
+                if let Ok(meta) = serde_json::from_str::<Value>(&raw) {
+                    if meta.get("session_id").and_then(Value::as_str) == Some(expected) {
+                        return meta;
+                    }
+                }
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        panic!("broker metadata never reported session_id {expected}");
     }
 
     fn socket_request(sock_path: &Path, request: Value) -> Value {

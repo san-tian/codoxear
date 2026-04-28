@@ -6807,6 +6807,16 @@ pub fn delete_session(config: &RuntimeConfig, session_id: &str) -> Result<Value,
 }
 
 pub(crate) fn discover_open_log_for_process(root_pid: i64, cwd: &str, agent_backend: &str) -> Option<PathBuf> {
+    let sessions_dir = agent_sessions_dir(agent_backend);
+    discover_open_log_for_process_in_sessions(root_pid, cwd, agent_backend, &sessions_dir)
+}
+
+pub(crate) fn discover_open_log_for_process_in_sessions(
+    root_pid: i64,
+    cwd: &str,
+    agent_backend: &str,
+    sessions_dir: &Path,
+) -> Option<PathBuf> {
     if root_pid <= 0 {
         return None;
     }
@@ -6814,7 +6824,7 @@ pub(crate) fn discover_open_log_for_process(root_pid: i64, cwd: &str, agent_back
     if !proc_root.exists() {
         return None;
     }
-    let mut candidates = proc_open_writable_rollout_logs(proc_root, root_pid, agent_backend);
+    let mut candidates = proc_open_writable_rollout_logs(proc_root, root_pid, agent_backend, sessions_dir);
     if candidates.is_empty() {
         return None;
     }
@@ -6846,9 +6856,13 @@ pub(crate) fn discover_open_log_for_process(root_pid: i64, cwd: &str, agent_back
     None
 }
 
-fn proc_open_writable_rollout_logs(proc_root: &Path, root_pid: i64, agent_backend: &str) -> Vec<PathBuf> {
+fn proc_open_writable_rollout_logs(
+    proc_root: &Path,
+    root_pid: i64,
+    agent_backend: &str,
+    sessions_dir: &Path,
+) -> Vec<PathBuf> {
     let uid = fs::metadata(proc_root.join("self")).ok().map(|meta| meta.uid());
-    let sessions_dir = agent_sessions_dir(agent_backend);
     let mut out = HashSet::new();
     for pid in proc_descendants(proc_root, root_pid) {
         let pid_uid = proc_pid_uid(proc_root, pid);
@@ -6880,7 +6894,7 @@ fn proc_open_writable_rollout_logs(proc_root: &Path, root_pid: i64, agent_backen
             if !target.is_absolute() || target.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
                 continue;
             }
-            if is_rollout_log_path(&target, agent_backend, &sessions_dir) {
+            if is_rollout_log_path(&target, agent_backend, sessions_dir) {
                 out.insert(target);
             }
         }
