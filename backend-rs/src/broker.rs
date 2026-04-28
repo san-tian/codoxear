@@ -87,6 +87,7 @@ struct BrokerConfig {
     sessions_dir: PathBuf,
     owner: Option<String>,
     mirror_output: bool,
+    mirror_input: bool,
 }
 
 #[derive(Clone)]
@@ -148,6 +149,7 @@ fn parse_args(args: Vec<String>) -> Result<BrokerConfig, String> {
     if agent_backend == "pi" {
         agent_args = ensure_pi_session_arg(&agent_args, &cwd, &sessions_dir)?;
     }
+    let owner = clean_env("CODEX_WEB_OWNER");
     Ok(BrokerConfig {
         cwd,
         agent_args,
@@ -156,8 +158,9 @@ fn parse_args(args: Vec<String>) -> Result<BrokerConfig, String> {
         agent_bin,
         agent_home,
         sessions_dir,
-        owner: clean_env("CODEX_WEB_OWNER"),
+        owner,
         mirror_output: true,
+        mirror_input: should_mirror_stdin(),
     })
 }
 
@@ -211,8 +214,16 @@ fn run_broker(mut config: BrokerConfig) -> Result<(), String> {
         stop: Arc::new(AtomicBool::new(false)),
         sessions_dir: config.sessions_dir.clone(),
     };
+    let stdin_termios = if config.mirror_input {
+        enable_raw_stdin().ok()
+    } else {
+        None
+    };
     spawn_socket_thread(runtime.clone());
     spawn_pty_reader_thread(runtime.clone());
+    if config.mirror_input {
+        spawn_stdin_thread(runtime.clone());
+    }
     spawn_log_discovery_thread(runtime.clone());
     spawn_log_idle_thread(runtime.clone());
     let mut child = child;
@@ -228,12 +239,33 @@ fn run_broker(mut config: BrokerConfig) -> Result<(), String> {
         }
     }
     runtime.stop.store(true, Ordering::Relaxed);
+    if let Some(termios) = stdin_termios.as_ref() {
+        let _ = restore_stdin(termios);
+    }
     let _ = unsafe { libc::close(master_fd) };
     if let Ok(state) = runtime.state.lock() {
         let _ = fs::remove_file(&state.sock_path);
         let _ = fs::remove_file(state.sock_path.with_extension("json"));
     }
     Ok(())
+}
+
+fn spawn_stdin_thread(runtime: BrokerRuntime) {
+    thread::spawn(move || {
+        let fd = match runtime.state.lock() {
+            Ok(state) => state.pty_master_fd,
+            Err(_) => return,
+        };
+        let pty_fd = unsafe { libc::dup(fd) };
+        if pty_fd < 0 {
+            return;
+        }
+        let reached_eof = copy_fd_to_pty(libc::STDIN_FILENO, pty_fd, &runtime.stop).unwrap_or(true);
+        let _ = unsafe { libc::close(pty_fd) };
+        if reached_eof {
+            runtime.stop.store(true, Ordering::Relaxed);
+        }
+    });
 }
 
 fn spawn_agent(config: &BrokerConfig, slave_fd: RawFd, rows: u16, cols: u16) -> Result<std::process::Child, String> {
@@ -584,6 +616,56 @@ fn write_all_fd(fd: RawFd, mut data: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
+fn copy_fd_to_pty(input_fd: RawFd, pty_fd: RawFd, stop: &AtomicBool) -> Result<bool, String> {
+    let mut buf = [0u8; 4096];
+    while !stop.load(Ordering::Relaxed) {
+        let n = unsafe { libc::read(input_fd, buf.as_mut_ptr().cast(), buf.len()) };
+        if n < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(format!("read stdin: {err}"));
+        }
+        if n == 0 {
+            return Ok(true);
+        }
+        write_all_fd(pty_fd, &buf[..n as usize])?;
+    }
+    Ok(false)
+}
+
+fn should_mirror_stdin() -> bool {
+    if clean_env("CODEX_WEB_EMULATE_TERMINAL").as_deref() == Some("1") {
+        return false;
+    }
+    unsafe { libc::isatty(libc::STDIN_FILENO) == 1 }
+}
+
+fn enable_raw_stdin() -> Result<libc::termios, String> {
+    let fd = libc::STDIN_FILENO;
+    let mut original = unsafe { std::mem::zeroed::<libc::termios>() };
+    if unsafe { libc::tcgetattr(fd, &mut original) } != 0 {
+        return Err(format!("tcgetattr stdin: {}", std::io::Error::last_os_error()));
+    }
+    let mut raw = original;
+    unsafe {
+        libc::cfmakeraw(&mut raw);
+    }
+    if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw) } != 0 {
+        return Err(format!("tcsetattr stdin raw: {}", std::io::Error::last_os_error()));
+    }
+    Ok(original)
+}
+
+fn restore_stdin(original: &libc::termios) -> Result<(), String> {
+    let fd = libc::STDIN_FILENO;
+    if unsafe { libc::tcsetattr(fd, libc::TCSANOW, original) } != 0 {
+        return Err(format!("restore stdin: {}", std::io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
 fn send_json_line(stream: &mut UnixStream, value: &Value) -> Result<(), String> {
     let mut raw = serde_json::to_vec(value).map_err(|err| format!("serialize socket response: {err}"))?;
     raw.push(b'\n');
@@ -916,16 +998,20 @@ fn shell_join(items: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ensure_pi_session_arg, is_uuid_like, resume_session_id_from_args, run_broker,
-        scan_token_updates_from_log, seq_bytes, session_id_from_log, session_id_from_rollout_path,
-        session_log_path_from_args, shell_quote, trim_utf8_tail, BrokerConfig,
+        copy_fd_to_pty, ensure_pi_session_arg, is_uuid_like, resume_session_id_from_args,
+        run_broker, scan_token_updates_from_log, seq_bytes, session_id_from_log,
+        session_id_from_rollout_path, session_log_path_from_args, shell_quote, trim_utf8_tail,
+        write_all_fd, BrokerConfig,
     };
     use serde_json::{json, Value};
     use std::fs;
     use std::io::{BufRead, BufReader, Write};
+    use std::os::fd::RawFd;
     use std::os::unix::net::UnixStream;
     use std::path::Path;
     use std::path::PathBuf;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -1007,6 +1093,34 @@ mod tests {
     }
 
     #[test]
+    fn rust_broker_copies_terminal_input_to_pty() {
+        let mut input = [0; 2];
+        let mut output = [0; 2];
+        assert_eq!(unsafe { libc::pipe(input.as_mut_ptr()) }, 0);
+        assert_eq!(unsafe { libc::pipe(output.as_mut_ptr()) }, 0);
+        let input_read = input[0];
+        let input_write = input[1];
+        let output_read = output[0];
+        let output_write = output[1];
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_for_thread = stop.clone();
+        let handle = thread::spawn(move || {
+            let result = copy_fd_to_pty(input_read, output_write, &stop_for_thread);
+            let _ = unsafe { libc::close(input_read) };
+            let _ = unsafe { libc::close(output_write) };
+            result
+        });
+
+        write_all_fd(input_write, b"hello from terminal\n").unwrap();
+        let _ = unsafe { libc::close(input_write) };
+        let copied = read_fd_to_end(output_read);
+        let _ = unsafe { libc::close(output_read) };
+
+        assert_eq!(handle.join().unwrap().unwrap(), true);
+        assert_eq!(copied, b"hello from terminal\n");
+    }
+
+    #[test]
     fn rust_broker_injects_pi_session_path_for_new_sessions() {
         let app_dir = temp_app_dir("broker-pi-session");
         let sessions_dir = app_dir.join("pi-home").join("agent").join("sessions");
@@ -1054,6 +1168,7 @@ mod tests {
             sessions_dir: app_dir.join("codex-home").join("sessions"),
             owner: None,
             mirror_output: false,
+            mirror_input: false,
         };
         let handle = thread::spawn(move || run_broker(config));
         let sock_path = wait_for_sock(&app_dir);
@@ -1091,6 +1206,7 @@ mod tests {
             sessions_dir: pi_home.join("agent").join("sessions"),
             owner: None,
             mirror_output: false,
+            mirror_input: false,
         };
         let handle = thread::spawn(move || run_broker(config));
         let sock_path = wait_for_sock(&app_dir);
@@ -1136,6 +1252,7 @@ mod tests {
             sessions_dir,
             owner: None,
             mirror_output: false,
+            mirror_input: false,
         };
         let handle = thread::spawn(move || run_broker(config));
         let sock_path = wait_for_sock(&app_dir);
@@ -1216,5 +1333,18 @@ mod tests {
         let mut line = String::new();
         reader.read_line(&mut line).unwrap();
         serde_json::from_str(line.trim()).unwrap()
+    }
+
+    fn read_fd_to_end(fd: RawFd) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut buf = [0u8; 1024];
+        loop {
+            let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+            if n <= 0 {
+                break;
+            }
+            out.extend_from_slice(&buf[..n as usize]);
+        }
+        out
     }
 }
