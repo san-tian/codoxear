@@ -419,6 +419,18 @@ button:disabled {
   box-shadow: 0 10px 24px rgba(245, 158, 11, 0.08);
 }
 
+.workspace.is-shelved {
+  opacity: 0.58;
+  border-color: rgba(148, 163, 184, 0.18);
+  background: rgba(248, 250, 252, 0.58);
+  box-shadow: none;
+}
+
+.workspace.is-shelved.active {
+  opacity: 0.76;
+  background: rgba(219, 234, 254, 0.42);
+}
+
 .workspaceSelect {
   width: 100%;
   min-width: 0;
@@ -440,7 +452,7 @@ button:disabled {
   display: grid;
   gap: 4px;
   min-width: 0;
-  padding-right: 48px;
+  padding-right: 78px;
 }
 
 .workspaceTitleRow {
@@ -519,6 +531,12 @@ button:disabled {
   color: #b45309;
   border-color: transparent;
   background: transparent;
+}
+
+.workspaceMarkerBtn.shelveMarker.active {
+  color: #64748b;
+  border-color: transparent;
+  background: rgba(100, 116, 139, 0.12);
 }
 
 .status-dot {
