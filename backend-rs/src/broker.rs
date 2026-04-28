@@ -1512,6 +1512,7 @@ mod tests {
     #[test]
     fn broker_seq_bytes_decodes_python_style_escape_sequences() {
         assert_eq!(seq_bytes("\\x1b"), vec![0x1b]);
+        assert_eq!(seq_bytes("\\x03"), vec![0x03]);
         assert_eq!(seq_bytes("hi\\r"), b"hi\r".to_vec());
         assert_eq!(seq_bytes("\\n\\t\\\\"), b"\n\t\\".to_vec());
     }

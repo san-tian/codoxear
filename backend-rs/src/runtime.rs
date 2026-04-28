@@ -50,6 +50,7 @@ const GIT_DIFF_MAX_BYTES: usize = 800 * 1024;
 const GIT_DIFF_TIMEOUT_SECONDS: f64 = 4.0;
 const GIT_CHANGED_FILES_MAX: usize = 400;
 const LOCAL_SERVICE_RESTART_DELAY_SECONDS: f64 = 0.75;
+const TERMINAL_INTERRUPT_SEQ: &str = "\\x03";
 const DEFAULT_HARNESS_SWEEP_SECONDS: f64 = 2.5;
 const DEFAULT_QUEUE_SWEEP_SECONDS: f64 = 1.0;
 const DEFAULT_VOICE_SCAN_SECONDS: f64 = 1.0;
@@ -7287,7 +7288,7 @@ pub fn interrupt_session(config: &RuntimeConfig, session_id: &str) -> Result<Val
     let broker = broker_request_for_session(
         config,
         &session,
-        &json!({"cmd": "keys", "seq": "\\x1b"}),
+        &json!({"cmd": "keys", "seq": TERMINAL_INTERRUPT_SEQ}),
         Duration::from_secs_f64(2.0),
     )?;
     Ok(json!({"ok": true, "broker": broker}))

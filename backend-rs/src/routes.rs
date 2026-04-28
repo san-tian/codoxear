@@ -3351,7 +3351,7 @@ mod tests {
                             .unwrap();
                     }
                     "keys" => {
-                        assert_eq!(payload["seq"], "\\x1b");
+                        assert_eq!(payload["seq"], "\\x03");
                         stream.write_all(b"{\"accepted\":true}\n").unwrap();
                     }
                     other => panic!("unexpected broker command: {other}"),
