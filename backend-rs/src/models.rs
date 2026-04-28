@@ -301,7 +301,9 @@ pub struct SendMessagePayload {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum LiveEvent {
-    Connected { created_at: f64 },
+    Connected {
+        created_at: f64,
+    },
     MessageCreated {
         session_id: String,
         event: TranscriptEvent,

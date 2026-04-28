@@ -5,32 +5,29 @@ use crate::models::{
     SendMessagePayload, TranscriptEvent,
 };
 use crate::runtime::{
-    create_session, create_session_request_from_payload,
-    default_file_search_limit, load_changed_files_response, load_diagnostics_response,
-    load_audio_playlist_bytes, load_audio_segment_bytes, load_codex_config_response,
-    load_notification_feed_response, load_notification_message_response,
-    load_notification_subscriptions_response, load_cwd_suggestions_response,
-    load_file_blob, load_file_read_response, load_file_search_response, load_git_diff_response,
-    load_git_file_versions_response, load_harness_response, load_messages_history,
-    load_messages_live, load_messages_tail, load_queue_response,
-    load_legacy_static_file, load_nova_shell_file,
-    load_voice_settings_response,
-    load_resume_candidates_response, load_sessions_response, normalize_backend, resolve_dir_target,
+    create_session, create_session_request_from_payload, default_file_search_limit,
     delete_queue_item, delete_session, edit_session, enqueue_session_message,
-    inject_session_attachment, interrupt_session, move_queue_item, rename_session,
-    save_codex_config_response, save_file_write_response, save_voice_settings_response,
-    schedule_local_service_restart_response, set_harness_config,
-    send_session_message, update_queue_item,
-    update_audio_listener_heartbeat_response,
-    toggle_notification_subscription_response, upsert_notification_subscription_response,
-    FileWriteError,
+    inject_session_attachment, interrupt_session, load_audio_playlist_bytes,
+    load_audio_segment_bytes, load_changed_files_response, load_codex_config_response,
+    load_cwd_suggestions_response, load_diagnostics_response, load_file_blob,
+    load_file_read_response, load_file_search_response, load_git_diff_response,
+    load_git_file_versions_response, load_harness_response, load_legacy_static_file,
+    load_messages_history, load_messages_live, load_messages_tail, load_notification_feed_response,
+    load_notification_message_response, load_notification_subscriptions_response,
+    load_nova_shell_file, load_queue_response, load_resume_candidates_response,
+    load_sessions_response, load_voice_settings_response, move_queue_item, normalize_backend,
+    rename_session, resolve_dir_target, save_codex_config_response, save_file_write_response,
+    save_voice_settings_response, schedule_local_service_restart_response, send_session_message,
+    set_harness_config, toggle_notification_subscription_response,
+    update_audio_listener_heartbeat_response, update_queue_item,
+    upsert_notification_subscription_response, FileWriteError,
 };
-use axum::extract::{Path, Query, State};
 use axum::body::Body;
+use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, Request, StatusCode};
 use axum::middleware::{self, Next};
-use axum::response::{Redirect, Response};
 use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::response::{Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -67,11 +64,23 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/health", get(health))
         .route("/api/v1/bootstrap", get(bootstrap))
         .route("/api/v1/me", get(me))
-        .route("/api/v1/session_resume_candidates", get(session_resume_candidates))
+        .route(
+            "/api/v1/session_resume_candidates",
+            get(session_resume_candidates),
+        )
         .route("/api/v1/cwd_suggestions", get(cwd_suggestions))
-        .route("/api/v1/settings/codex_config", get(settings_codex_config).post(settings_codex_config_save))
-        .route("/api/v1/settings/restart_service", post(settings_restart_service))
-        .route("/api/v1/settings/voice", get(settings_voice).post(settings_voice_save))
+        .route(
+            "/api/v1/settings/codex_config",
+            get(settings_codex_config).post(settings_codex_config_save),
+        )
+        .route(
+            "/api/v1/settings/restart_service",
+            post(settings_restart_service),
+        )
+        .route(
+            "/api/v1/settings/voice",
+            get(settings_voice).post(settings_voice_save),
+        )
         .route(
             "/api/v1/notifications/subscription",
             get(notification_subscriptions).post(notification_subscriptions_upsert),
@@ -90,28 +99,64 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/logout", post(logout))
         .route("/api/v1/sessions/:session_id/diagnostics", get(diagnostics))
         .route("/api/v1/sessions/:session_id/queue", get(queue))
-        .route("/api/v1/sessions/:session_id/enqueue", post(session_enqueue))
-        .route("/api/v1/sessions/:session_id/queue/delete", post(queue_delete))
-        .route("/api/v1/sessions/:session_id/queue/update", post(queue_update))
+        .route(
+            "/api/v1/sessions/:session_id/enqueue",
+            post(session_enqueue),
+        )
+        .route(
+            "/api/v1/sessions/:session_id/queue/delete",
+            post(queue_delete),
+        )
+        .route(
+            "/api/v1/sessions/:session_id/queue/update",
+            post(queue_update),
+        )
         .route("/api/v1/sessions/:session_id/queue/move", post(queue_move))
         .route("/api/v1/sessions/:session_id/rename", post(session_rename))
         .route("/api/v1/sessions/:session_id/edit", post(session_edit))
         .route("/api/v1/sessions/:session_id/delete", post(session_delete))
-        .route("/api/v1/sessions/:session_id/inject_file", post(session_inject_attachment))
-        .route("/api/v1/sessions/:session_id/inject_image", post(session_inject_attachment))
-        .route("/api/v1/sessions/:session_id/harness", get(harness).post(session_harness))
-        .route("/api/v1/sessions/:session_id/git/changed_files", get(changed_files))
+        .route(
+            "/api/v1/sessions/:session_id/inject_file",
+            post(session_inject_attachment),
+        )
+        .route(
+            "/api/v1/sessions/:session_id/inject_image",
+            post(session_inject_attachment),
+        )
+        .route(
+            "/api/v1/sessions/:session_id/harness",
+            get(harness).post(session_harness),
+        )
+        .route(
+            "/api/v1/sessions/:session_id/git/changed_files",
+            get(changed_files),
+        )
         .route("/api/v1/sessions/:session_id/git/diff", get(git_diff))
-        .route("/api/v1/sessions/:session_id/git/file_versions", get(git_file_versions))
+        .route(
+            "/api/v1/sessions/:session_id/git/file_versions",
+            get(git_file_versions),
+        )
         .route("/api/v1/sessions/:session_id/file/read", get(file_read))
         .route("/api/v1/sessions/:session_id/file/write", post(file_write))
         .route("/api/v1/sessions/:session_id/file/search", get(file_search))
         .route("/api/v1/sessions/:session_id/file/blob", get(file_blob))
-        .route("/api/v1/sessions/:session_id/messages/tail", get(messages_tail))
-        .route("/api/v1/sessions/:session_id/messages/history", get(messages_history))
-        .route("/api/v1/sessions/:session_id/messages/live", get(messages_live))
+        .route(
+            "/api/v1/sessions/:session_id/messages/tail",
+            get(messages_tail),
+        )
+        .route(
+            "/api/v1/sessions/:session_id/messages/history",
+            get(messages_history),
+        )
+        .route(
+            "/api/v1/sessions/:session_id/messages/live",
+            get(messages_live),
+        )
         .route("/api/v1/sessions/:session_id/send", post(session_send))
-        .route("/api/v1/sessions/:session_id/interrupt", post(session_interrupt))
+        .route(
+            "/api/v1/sessions/:session_id/interrupt",
+            post(session_interrupt),
+        )
         .route("/api/v1/messages/send", post(send_message))
         .route("/api/v1/events/stream", get(events))
         .nest("/api", public_api_router(state.clone()))
@@ -135,9 +180,15 @@ fn public_api_router(state: AppState) -> Router<AppState> {
         .route("/me", get(me))
         .route("/session_resume_candidates", get(session_resume_candidates))
         .route("/cwd_suggestions", get(cwd_suggestions))
-        .route("/settings/codex_config", get(settings_codex_config).post(settings_codex_config_save))
+        .route(
+            "/settings/codex_config",
+            get(settings_codex_config).post(settings_codex_config_save),
+        )
         .route("/settings/restart_service", post(settings_restart_service))
-        .route("/settings/voice", get(settings_voice).post(settings_voice_save))
+        .route(
+            "/settings/voice",
+            get(settings_voice).post(settings_voice_save),
+        )
         .route(
             "/notifications/subscription",
             get(notification_subscriptions).post(notification_subscriptions_upsert),
@@ -161,18 +212,36 @@ fn public_api_router(state: AppState) -> Router<AppState> {
         .route("/sessions/:session_id/rename", post(session_rename))
         .route("/sessions/:session_id/edit", post(session_edit))
         .route("/sessions/:session_id/delete", post(session_delete))
-        .route("/sessions/:session_id/inject_file", post(session_inject_attachment))
-        .route("/sessions/:session_id/inject_image", post(session_inject_attachment))
-        .route("/sessions/:session_id/harness", get(harness).post(session_harness))
-        .route("/sessions/:session_id/git/changed_files", get(changed_files))
+        .route(
+            "/sessions/:session_id/inject_file",
+            post(session_inject_attachment),
+        )
+        .route(
+            "/sessions/:session_id/inject_image",
+            post(session_inject_attachment),
+        )
+        .route(
+            "/sessions/:session_id/harness",
+            get(harness).post(session_harness),
+        )
+        .route(
+            "/sessions/:session_id/git/changed_files",
+            get(changed_files),
+        )
         .route("/sessions/:session_id/git/diff", get(git_diff))
-        .route("/sessions/:session_id/git/file_versions", get(git_file_versions))
+        .route(
+            "/sessions/:session_id/git/file_versions",
+            get(git_file_versions),
+        )
         .route("/sessions/:session_id/file/read", get(file_read))
         .route("/sessions/:session_id/file/write", post(file_write))
         .route("/sessions/:session_id/file/search", get(file_search))
         .route("/sessions/:session_id/file/blob", get(file_blob))
         .route("/sessions/:session_id/messages/tail", get(messages_tail))
-        .route("/sessions/:session_id/messages/history", get(messages_history))
+        .route(
+            "/sessions/:session_id/messages/history",
+            get(messages_history),
+        )
         .route("/sessions/:session_id/messages/live", get(messages_live))
         .route("/sessions/:session_id/send", post(session_send))
         .route("/sessions/:session_id/interrupt", post(session_interrupt))
@@ -217,7 +286,10 @@ async fn nova_preview_asset(Path(path): Path<String>) -> Result<Response, (Statu
 async fn nova_preview_spa(Path(path): Path<String>) -> Result<Response, (StatusCode, String)> {
     let last = path.rsplit('/').next().unwrap_or_default();
     if last.contains('.') {
-        return Err((StatusCode::NOT_FOUND, format!("static file not found: {path}")));
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("static file not found: {path}"),
+        ));
     }
     static_file_response(load_nova_shell_file("index.html"), true)
 }
@@ -295,7 +367,9 @@ async fn me() -> Json<Value> {
     Json(json!({ "ok": true, "server_pid": i64::from(process::id()) }))
 }
 
-async fn sessions(State(state): State<AppState>) -> Result<Json<crate::models::ApiSessionsResponse>, (StatusCode, String)> {
+async fn sessions(
+    State(state): State<AppState>,
+) -> Result<Json<crate::models::ApiSessionsResponse>, (StatusCode, String)> {
     load_sessions_response(&state.config)
         .map(Json)
         .map_err(|message| (StatusCode::INTERNAL_SERVER_ERROR, message))
@@ -305,7 +379,8 @@ async fn session_create(
     State(state): State<AppState>,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    let request = create_session_request_from_payload(&payload).map_err(create_session_error_response)?;
+    let request =
+        create_session_request_from_payload(&payload).map_err(create_session_error_response)?;
     create_session(&state.config, request)
         .map(Json)
         .map_err(create_session_error_response)
@@ -344,7 +419,10 @@ async fn session_harness(
     Json(payload): Json<serde_json::Value>,
 ) -> Result<Json<ApiHarnessResponse>, (StatusCode, String)> {
     if !payload.is_object() {
-        return Err((StatusCode::BAD_REQUEST, "invalid json body (expected object)".to_string()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "invalid json body (expected object)".to_string(),
+        ));
     }
     set_harness_config(
         &state.config,
@@ -455,10 +533,13 @@ async fn cwd_suggestions(
     let raw_query = query.q.unwrap_or_default();
     let limit = match query.limit.as_deref() {
         None => 12,
-        Some(raw) => raw
-            .trim()
-            .parse::<usize>()
-            .map_err(|_| json_error(StatusCode::BAD_REQUEST, "limit must be an integer", Some("limit")))?,
+        Some(raw) => raw.trim().parse::<usize>().map_err(|_| {
+            json_error(
+                StatusCode::BAD_REQUEST,
+                "limit must be an integer",
+                Some("limit"),
+            )
+        })?,
     };
     load_cwd_suggestions_response(&state.config, &raw_query, limit)
         .map(Json)
@@ -475,7 +556,10 @@ async fn settings_codex_config_save(
     Json(payload): Json<Value>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     if !payload.is_object() {
-        return Err((StatusCode::BAD_REQUEST, "invalid json body (expected object)".to_string()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "invalid json body (expected object)".to_string(),
+        ));
     }
     let Some(text) = payload.get("text").and_then(Value::as_str) else {
         return Err((StatusCode::BAD_REQUEST, "text required".to_string()));
@@ -504,7 +588,10 @@ async fn settings_voice_save(
     Json(payload): Json<Value>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     if !payload.is_object() {
-        return Err((StatusCode::BAD_REQUEST, "invalid json body (expected object)".to_string()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "invalid json body (expected object)".to_string(),
+        ));
     }
     save_voice_settings_response(&state.config, &payload)
         .map(Json)
@@ -524,14 +611,26 @@ async fn notification_subscriptions_upsert(
     Json(payload): Json<Value>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     if !payload.is_object() {
-        return Err((StatusCode::BAD_REQUEST, "invalid json body (expected object)".to_string()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "invalid json body (expected object)".to_string(),
+        ));
     }
     upsert_notification_subscription_response(
         &state.config,
         payload.get("subscription").unwrap_or(&Value::Null),
-        payload.get("user_agent").and_then(Value::as_str).unwrap_or_default(),
-        payload.get("device_label").and_then(Value::as_str).unwrap_or_default(),
-        payload.get("device_class").and_then(Value::as_str).unwrap_or_default(),
+        payload
+            .get("user_agent")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+        payload
+            .get("device_label")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+        payload
+            .get("device_class")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
     )
     .map(Json)
     .map_err(notification_route_error)
@@ -542,13 +641,19 @@ async fn notification_subscriptions_toggle(
     Json(payload): Json<Value>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     if !payload.is_object() {
-        return Err((StatusCode::BAD_REQUEST, "invalid json body (expected object)".to_string()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "invalid json body (expected object)".to_string(),
+        ));
     }
     let Some(endpoint) = payload.get("endpoint").and_then(Value::as_str) else {
         return Err((StatusCode::BAD_REQUEST, "endpoint required".to_string()));
     };
     let Some(enabled) = payload.get("enabled").and_then(Value::as_bool) else {
-        return Err((StatusCode::BAD_REQUEST, "enabled must be a boolean".to_string()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "enabled must be a boolean".to_string(),
+        ));
     };
     toggle_notification_subscription_response(&state.config, endpoint, enabled)
         .map(Json)
@@ -584,9 +689,7 @@ async fn notification_feed(
         .map_err(notification_message_route_error)
 }
 
-async fn audio_playlist(
-    State(state): State<AppState>,
-) -> Result<Response, (StatusCode, String)> {
+async fn audio_playlist(State(state): State<AppState>) -> Result<Response, (StatusCode, String)> {
     audio_response(
         load_audio_playlist_bytes(&state.config).map_err(audio_route_error)?,
         "application/vnd.apple.mpegurl",
@@ -608,13 +711,19 @@ async fn audio_listener(
     Json(payload): Json<Value>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     if !payload.is_object() {
-        return Err((StatusCode::BAD_REQUEST, "invalid json body (expected object)".to_string()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "invalid json body (expected object)".to_string(),
+        ));
     }
     let Some(client_id) = payload.get("client_id").and_then(Value::as_str) else {
         return Err((StatusCode::BAD_REQUEST, "client_id required".to_string()));
     };
     let Some(enabled) = payload.get("enabled").and_then(Value::as_bool) else {
-        return Err((StatusCode::BAD_REQUEST, "enabled must be a boolean".to_string()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "enabled must be a boolean".to_string(),
+        ));
     };
     update_audio_listener_heartbeat_response(&state.config, client_id, enabled)
         .map(Json)
@@ -627,11 +736,14 @@ async fn login(
     Json(payload): Json<Value>,
 ) -> Result<Response, (StatusCode, Json<Value>)> {
     let password = payload.get("password").and_then(Value::as_str);
-    let same = is_same_password(password).map_err(|message| json_error(StatusCode::INTERNAL_SERVER_ERROR, &message, None))?;
+    let same = is_same_password(password)
+        .map_err(|message| json_error(StatusCode::INTERNAL_SERVER_ERROR, &message, None))?;
     if !same {
         return Err(json_error(StatusCode::FORBIDDEN, "bad password", None));
     }
-    let forwarded_proto = headers.get("X-Forwarded-Proto").and_then(|value| value.to_str().ok());
+    let forwarded_proto = headers
+        .get("X-Forwarded-Proto")
+        .and_then(|value| value.to_str().ok());
     let cookie = auth_cookie_header(&state.config.app_dir, forwarded_proto)
         .map_err(|message| json_error(StatusCode::INTERNAL_SERVER_ERROR, &message, None))?;
     json_response_with_cookie(json!({ "ok": true }), &cookie)
@@ -639,7 +751,8 @@ async fn login(
 }
 
 async fn logout() -> Result<Response, (StatusCode, Json<Value>)> {
-    let cookie = logout_cookie_header().map_err(|message| json_error(StatusCode::INTERNAL_SERVER_ERROR, &message, None))?;
+    let cookie = logout_cookie_header()
+        .map_err(|message| json_error(StatusCode::INTERNAL_SERVER_ERROR, &message, None))?;
     json_response_with_cookie(json!({ "ok": true }), &cookie)
         .map_err(|message| json_error(StatusCode::INTERNAL_SERVER_ERROR, &message, None))
 }
@@ -659,9 +772,14 @@ async fn messages_history(
     Path(session_id): Path<String>,
     Query(query): Query<HistoryQuery>,
 ) -> Result<Json<crate::models::ApiMessagesHistoryResponse>, (StatusCode, String)> {
-    load_messages_history(&state.config, &session_id, &query.cursor, query.limit.unwrap_or(60))
-        .map(Json)
-        .map_err(route_error)
+    load_messages_history(
+        &state.config,
+        &session_id,
+        &query.cursor,
+        query.limit.unwrap_or(60),
+    )
+    .map(Json)
+    .map_err(route_error)
 }
 
 async fn messages_live(
@@ -864,9 +982,12 @@ async fn file_search(
             let parsed = if trimmed.is_empty() {
                 default_limit as i64
             } else {
-                trimmed
-                    .parse::<i64>()
-                    .map_err(|_| (StatusCode::BAD_REQUEST, "limit must be an integer".to_string()))?
+                trimmed.parse::<i64>().map_err(|_| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        "limit must be an integer".to_string(),
+                    )
+                })?
             };
             if parsed < 1 {
                 return Err((StatusCode::BAD_REQUEST, "limit must be >= 1".to_string()));
@@ -884,17 +1005,20 @@ async fn file_blob(
     Path(session_id): Path<String>,
     Query(query): Query<FilePathQuery>,
 ) -> Result<Response, (StatusCode, String)> {
-    let (raw, content_type) = load_file_blob(&state.config, &session_id, &query.path).map_err(route_error)?;
+    let (raw, content_type) =
+        load_file_blob(&state.config, &session_id, &query.path).map_err(route_error)?;
     let mut response = Response::new(Body::from(raw.clone()));
     *response.status_mut() = StatusCode::OK;
     let headers = response.headers_mut();
     headers.insert(
         header::CONTENT_TYPE,
-        HeaderValue::from_str(&content_type).map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?,
+        HeaderValue::from_str(&content_type)
+            .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?,
     );
     headers.insert(
         header::CONTENT_LENGTH,
-        HeaderValue::from_str(&raw.len().to_string()).map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?,
+        HeaderValue::from_str(&raw.len().to_string())
+            .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?,
     );
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     headers.insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
@@ -981,12 +1105,17 @@ fn file_write_route_error(error: FileWriteError) -> (StatusCode, Json<Value>) {
         FileWriteError::NotFound(message) => json_error(StatusCode::NOT_FOUND, &message, None),
         FileWriteError::Forbidden(message) => json_error(StatusCode::FORBIDDEN, &message, None),
         FileWriteError::Conflict(payload) => (StatusCode::CONFLICT, Json(payload)),
-        FileWriteError::Internal(message) => json_error(StatusCode::INTERNAL_SERVER_ERROR, &message, None),
+        FileWriteError::Internal(message) => {
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, &message, None)
+        }
     }
 }
 
 fn settings_route_error(message: String) -> (StatusCode, String) {
-    if message == "text required" || message == "invalid json body (expected object)" || message.starts_with("invalid TOML:") {
+    if message == "text required"
+        || message == "invalid json body (expected object)"
+        || message.starts_with("invalid TOML:")
+    {
         return (StatusCode::BAD_REQUEST, message);
     }
     (StatusCode::INTERNAL_SERVER_ERROR, message)
@@ -1017,7 +1146,9 @@ fn notification_route_error(message: String) -> (StatusCode, String) {
 }
 
 fn voice_route_error(message: String) -> (StatusCode, String) {
-    if message == "invalid json body (expected object)" || message == "tts_base_url must start with http:// or https://" {
+    if message == "invalid json body (expected object)"
+        || message == "tts_base_url must start with http:// or https://"
+    {
         return (StatusCode::BAD_REQUEST, message);
     }
     (StatusCode::INTERNAL_SERVER_ERROR, message)
@@ -1067,7 +1198,9 @@ fn queue_action_error(message: String) -> (StatusCode, String) {
     (StatusCode::BAD_GATEWAY, message)
 }
 
-fn create_session_error_response(error: crate::runtime::CreateSessionError) -> (StatusCode, Json<serde_json::Value>) {
+fn create_session_error_response(
+    error: crate::runtime::CreateSessionError,
+) -> (StatusCode, Json<serde_json::Value>) {
     let status = if error.is_bad_request() {
         StatusCode::BAD_REQUEST
     } else {
@@ -1109,7 +1242,8 @@ fn json_response_with_cookie(payload: Value, set_cookie: &str) -> Result<Respons
 }
 
 fn json_response(status: StatusCode, payload: Value) -> Response {
-    let raw = serde_json::to_vec(&payload).unwrap_or_else(|_| b"{\"error\":\"internal server error\"}".to_vec());
+    let raw = serde_json::to_vec(&payload)
+        .unwrap_or_else(|_| b"{\"error\":\"internal server error\"}".to_vec());
     let mut response = Response::new(Body::from(raw.clone()));
     *response.status_mut() = status;
     let headers = response.headers_mut();
@@ -1123,7 +1257,10 @@ fn json_response(status: StatusCode, payload: Value) -> Response {
     response
 }
 
-fn audio_response(raw: Vec<u8>, content_type: &'static str) -> Result<Response, (StatusCode, String)> {
+fn audio_response(
+    raw: Vec<u8>,
+    content_type: &'static str,
+) -> Result<Response, (StatusCode, String)> {
     let mut response = Response::new(Body::from(raw.clone()));
     *response.status_mut() = StatusCode::OK;
     let headers = response.headers_mut();
@@ -1147,7 +1284,10 @@ async fn require_public_api_auth(
     match request_is_authenticated(request.headers(), &state.config.app_dir) {
         Ok(true) => next.run(request).await,
         Ok(false) => json_response(StatusCode::UNAUTHORIZED, json!({ "error": "unauthorized" })),
-        Err(message) => json_response(StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": message })),
+        Err(message) => json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!({ "error": message }),
+        ),
     }
 }
 
@@ -1165,8 +1305,14 @@ fn is_same_password(raw: Option<&str>) -> Result<bool, String> {
     Ok(password == expected)
 }
 
-fn request_is_authenticated(headers: &HeaderMap, app_dir: &std::path::Path) -> Result<bool, String> {
-    let Some(cookie_header) = headers.get(header::COOKIE).and_then(|value| value.to_str().ok()) else {
+fn request_is_authenticated(
+    headers: &HeaderMap,
+    app_dir: &std::path::Path,
+) -> Result<bool, String> {
+    let Some(cookie_header) = headers
+        .get(header::COOKIE)
+        .and_then(|value| value.to_str().ok())
+    else {
         return Ok(false);
     };
     let Some(token) = cookie_value(cookie_header, cookie_name()) else {
@@ -1212,7 +1358,10 @@ fn verify_auth_cookie(value: &str, app_dir: &std::path::Path) -> Result<bool, St
     Ok(exp > epoch_now() as i64)
 }
 
-fn auth_cookie_header(app_dir: &std::path::Path, forwarded_proto: Option<&str>) -> Result<String, String> {
+fn auth_cookie_header(
+    app_dir: &std::path::Path,
+    forwarded_proto: Option<&str>,
+) -> Result<String, String> {
     let exp = epoch_now() as i64 + cookie_ttl_seconds();
     let raw = serde_json::to_vec(&json!({ "exp": exp })).map_err(|err| err.to_string())?;
     let secret = load_or_create_hmac_secret(app_dir)?;
@@ -1220,7 +1369,12 @@ fn auth_cookie_header(app_dir: &std::path::Path, forwarded_proto: Option<&str>) 
     mac.update(&raw);
     let sig = mac.finalize().into_bytes();
     let mut attrs = vec![
-        format!("{}={}.{}", cookie_name(), URL_SAFE_NO_PAD.encode(raw), URL_SAFE_NO_PAD.encode(sig)),
+        format!(
+            "{}={}.{}",
+            cookie_name(),
+            URL_SAFE_NO_PAD.encode(raw),
+            URL_SAFE_NO_PAD.encode(sig)
+        ),
         format!("Path={}", cookie_path()?),
         "HttpOnly".to_string(),
         "SameSite=Strict".to_string(),
@@ -1247,7 +1401,10 @@ fn load_or_create_hmac_secret(app_dir: &std::path::Path) -> Result<Vec<u8>, Stri
     if path.exists() {
         let bytes = fs::read(&path).map_err(|err| format!("read {}: {err}", path.display()))?;
         if bytes.len() < 32 {
-            return Err(format!("invalid hmac secret (too short): {}", path.display()));
+            return Err(format!(
+                "invalid hmac secret (too short): {}",
+                path.display()
+            ));
         }
         return Ok(bytes.into_iter().take(64).collect());
     }
@@ -1263,7 +1420,8 @@ fn load_or_create_hmac_secret(app_dir: &std::path::Path) -> Result<Vec<u8>, Stri
             .map_err(|err| format!("stat {}: {err}", path.display()))?
             .permissions();
         permissions.set_mode(0o600);
-        fs::set_permissions(&path, permissions).map_err(|err| format!("chmod {}: {err}", path.display()))?;
+        fs::set_permissions(&path, permissions)
+            .map_err(|err| format!("chmod {}: {err}", path.display()))?;
     }
     Ok(secret)
 }
@@ -1381,10 +1539,15 @@ async fn send_message(
                 return;
             };
             detail.transcript.push(assistant_event.clone());
-            let Some(session) = store.sessions.iter_mut().find(|session| session.id == spawned_session_id) else {
+            let Some(session) = store
+                .sessions
+                .iter_mut()
+                .find(|session| session.id == spawned_session_id)
+            else {
                 return;
             };
-            session.last_line = "Synthetic assistant response emitted from Rust preview backend.".into();
+            session.last_line =
+                "Synthetic assistant response emitted from Rust preview backend.".into();
             session.status = "idle".into();
             session.updated_at = now;
             session.clone()
@@ -1410,11 +1573,11 @@ async fn events(
         };
         Ok(Event::default().data(serde_json::to_string(&event).unwrap()))
     });
-    let broadcast_stream = BroadcastStream::new(receiver).filter_map(|event| {
-        match event {
-            Ok(payload) => Some(Ok(Event::default().data(serde_json::to_string(&payload).unwrap()))),
-            Err(_) => None,
-        }
+    let broadcast_stream = BroadcastStream::new(receiver).filter_map(|event| match event {
+        Ok(payload) => Some(Ok(
+            Event::default().data(serde_json::to_string(&payload).unwrap())
+        )),
+        Err(_) => None,
     });
 
     Sse::new(connected.chain(broadcast_stream)).keep_alive(
@@ -1444,12 +1607,17 @@ mod tests {
 
     #[tokio::test]
     async fn health_route_responds() {
-      let app = router(build_state());
-      let response = app
-          .oneshot(Request::builder().uri("/api/v1/health").body(Body::empty()).unwrap())
-          .await
-          .unwrap();
-      assert_eq!(response.status(), StatusCode::OK);
+        let app = router(build_state());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -1463,7 +1631,12 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(response.status(), StatusCode::PERMANENT_REDIRECT);
-            let location = response.headers().get(header::LOCATION).unwrap().to_str().unwrap();
+            let location = response
+                .headers()
+                .get(header::LOCATION)
+                .unwrap()
+                .to_str()
+                .unwrap();
             assert!(location.starts_with("/nova-preview/"));
         }
     }
@@ -1473,12 +1646,23 @@ mod tests {
         let _guard = env_lock().lock().unwrap();
         let app = router(build_state());
         let response = app
-            .oneshot(Request::builder().uri("/nova-preview/").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/nova-preview/")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(response.headers().get(header::CONTENT_TYPE).unwrap(), "text/html; charset=utf-8");
-        assert_eq!(response.headers().get(header::CACHE_CONTROL).unwrap(), "no-store");
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/html; charset=utf-8"
+        );
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store"
+        );
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         assert!(std::str::from_utf8(&body).unwrap().contains("<html"));
     }
@@ -1489,11 +1673,18 @@ mod tests {
         let app = router(build_state());
         let index_response = app
             .clone()
-            .oneshot(Request::builder().uri("/nova-preview/").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/nova-preview/")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(index_response.status(), StatusCode::OK);
-        let index_body = to_bytes(index_response.into_body(), usize::MAX).await.unwrap();
+        let index_body = to_bytes(index_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let index_text = std::str::from_utf8(&index_body).unwrap();
         let script_marker = "<script type=\"module\" crossorigin src=\"";
         let script_path = index_text
@@ -1504,11 +1695,19 @@ mod tests {
         assert!(script_path.starts_with("/nova-preview/assets/"));
 
         let response = app
-            .oneshot(Request::builder().uri(script_path).body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri(script_path)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(response.headers().get(header::CONTENT_TYPE).unwrap(), "text/javascript; charset=utf-8");
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/javascript; charset=utf-8"
+        );
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let text = std::str::from_utf8(&body).unwrap();
         assert!(text.contains("function") || text.contains("=>") || text.contains("import"));
@@ -1519,12 +1718,23 @@ mod tests {
         let _guard = env_lock().lock().unwrap();
         let app = router(build_state());
         let response = app
-            .oneshot(Request::builder().uri("/service-worker.js").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/service-worker.js")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(response.headers().get(header::CONTENT_TYPE).unwrap(), "text/javascript; charset=utf-8");
-        assert_eq!(response.headers().get(header::CACHE_CONTROL).unwrap(), "no-store");
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/javascript; charset=utf-8"
+        );
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store"
+        );
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let text = std::str::from_utf8(&body).unwrap();
         assert!(text.contains("self.addEventListener") || text.contains("addEventListener("));
@@ -1532,12 +1742,19 @@ mod tests {
 
     #[tokio::test]
     async fn me_route_returns_server_pid() {
-        let app = router(build_state_from_config(RuntimeConfig {
-            app_dir: temp_app_dir("me"),
-        })
-        .unwrap());
+        let app = router(
+            build_state_from_config(RuntimeConfig {
+                app_dir: temp_app_dir("me"),
+            })
+            .unwrap(),
+        );
         let response = app
-            .oneshot(Request::builder().uri("/api/v1/me").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/me")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -1567,7 +1784,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(login.status(), StatusCode::OK);
-        let login_cookie = login.headers().get(header::SET_COOKIE).unwrap().to_str().unwrap().to_string();
+        let login_cookie = login
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
         assert!(login_cookie.starts_with("codoxear_auth="));
         assert!(login_cookie.contains("HttpOnly"));
         assert!(login_cookie.contains("SameSite=Strict"));
@@ -1586,7 +1809,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(logout.status(), StatusCode::OK);
-        let logout_cookie = logout.headers().get(header::SET_COOKIE).unwrap().to_str().unwrap();
+        let logout_cookie = logout
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap();
         assert!(logout_cookie.contains("codoxear_auth=deleted"));
         assert!(logout_cookie.contains("Max-Age=0"));
     }
@@ -1602,11 +1830,18 @@ mod tests {
 
         let unauthorized = app
             .clone()
-            .oneshot(Request::builder().uri("/api/me").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/me")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
-        let unauthorized_body = to_bytes(unauthorized.into_body(), usize::MAX).await.unwrap();
+        let unauthorized_body = to_bytes(unauthorized.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let unauthorized_payload: Value = serde_json::from_slice(&unauthorized_body).unwrap();
         assert_eq!(unauthorized_payload["error"], "unauthorized");
 
@@ -1746,8 +1981,16 @@ mod tests {
 "#,
         )
         .unwrap();
-        fs::write(app_dir.join("audio").join("live.m3u8"), b"#EXTM3U\n# rust playlist\n").unwrap();
-        fs::write(app_dir.join("audio").join("segments").join("clip-a.ts"), b"segment:clip-a").unwrap();
+        fs::write(
+            app_dir.join("audio").join("live.m3u8"),
+            b"#EXTM3U\n# rust playlist\n",
+        )
+        .unwrap();
+        fs::write(
+            app_dir.join("audio").join("segments").join("clip-a.ts"),
+            b"segment:clip-a",
+        )
+        .unwrap();
         let _password = EnvGuard::set("CODEX_WEB_PASSWORD", "topsecret");
         let app = router(build_state_from_config(RuntimeConfig { app_dir }).unwrap());
         let cookie = login_cookie(&app).await;
@@ -1841,11 +2084,13 @@ mod tests {
 
         let listeners_text = fs::read_to_string(&listeners_path).unwrap();
         let listeners_payload: Value = serde_json::from_str(&listeners_text).unwrap();
-        assert!(listeners_payload
-            .get("listener-a")
-            .and_then(Value::as_f64)
-            .unwrap()
-            > 0.0);
+        assert!(
+            listeners_payload
+                .get("listener-a")
+                .and_then(Value::as_f64)
+                .unwrap()
+                > 0.0
+        );
 
         let settings_after_listener = app
             .clone()
@@ -1859,9 +2104,16 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(settings_after_listener.status(), StatusCode::OK);
-        let settings_after_listener_body = to_bytes(settings_after_listener.into_body(), usize::MAX).await.unwrap();
-        let settings_after_listener_payload: Value = serde_json::from_slice(&settings_after_listener_body).unwrap();
-        assert_eq!(settings_after_listener_payload["audio"]["active_listener_count"], 1);
+        let settings_after_listener_body =
+            to_bytes(settings_after_listener.into_body(), usize::MAX)
+                .await
+                .unwrap();
+        let settings_after_listener_payload: Value =
+            serde_json::from_slice(&settings_after_listener_body).unwrap();
+        assert_eq!(
+            settings_after_listener_payload["audio"]["active_listener_count"],
+            1
+        );
 
         let playlist = app
             .clone()
@@ -1896,7 +2148,10 @@ mod tests {
             .unwrap();
         assert_eq!(segment.status(), StatusCode::OK);
         let segment_body = to_bytes(segment.into_body(), usize::MAX).await.unwrap();
-        assert_eq!(std::str::from_utf8(&segment_body).unwrap(), "segment:clip-a");
+        assert_eq!(
+            std::str::from_utf8(&segment_body).unwrap(),
+            "segment:clip-a"
+        );
     }
 
     #[tokio::test]
@@ -1909,7 +2164,12 @@ mod tests {
 
         let unauthorized = app
             .clone()
-            .oneshot(Request::builder().uri("/legacy").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/legacy")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
@@ -1944,7 +2204,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(app_js.status(), StatusCode::OK);
-        assert_eq!(app_js.headers().get(header::CONTENT_TYPE).unwrap(), "text/javascript; charset=utf-8");
+        assert_eq!(
+            app_js.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/javascript; charset=utf-8"
+        );
     }
 
     #[tokio::test]
@@ -1953,9 +2216,14 @@ mod tests {
         let app_dir = temp_app_dir("resume-candidates");
         let codex_home = temp_dir("resume-candidates-home");
         let workspace = temp_dir("resume-candidates-workspace");
-        let sessions_dir = codex_home.join("sessions").join("2026").join("04").join("26");
+        let sessions_dir = codex_home
+            .join("sessions")
+            .join("2026")
+            .join("04")
+            .join("26");
         fs::create_dir_all(&sessions_dir).unwrap();
-        let log_path = sessions_dir.join("rollout-2026-04-26T01-00-00-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa.jsonl");
+        let log_path = sessions_dir
+            .join("rollout-2026-04-26T01-00-00-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa.jsonl");
         fs::write(
             &log_path,
             format!(
@@ -1968,7 +2236,11 @@ mod tests {
             ),
         )
         .unwrap();
-        fs::write(app_dir.join("session_aliases.json"), r#"{"resume-a":"Alias A"}"#).unwrap();
+        fs::write(
+            app_dir.join("session_aliases.json"),
+            r#"{"resume-a":"Alias A"}"#,
+        )
+        .unwrap();
         let _codex_home = EnvGuard::set("CODEX_HOME", codex_home.display().to_string());
         let app = router(build_state_from_config(RuntimeConfig { app_dir }).unwrap());
 
@@ -1991,7 +2263,10 @@ mod tests {
         assert_eq!(payload["exists"], true);
         assert_eq!(payload["sessions"][0]["session_id"], "resume-a");
         assert_eq!(payload["sessions"][0]["alias"], "Alias A");
-        assert_eq!(payload["sessions"][0]["last_user_message"], "latest prompt from resume route");
+        assert_eq!(
+            payload["sessions"][0]["last_user_message"],
+            "latest prompt from resume route"
+        );
     }
 
     #[tokio::test]
@@ -2024,8 +2299,12 @@ mod tests {
             .iter()
             .filter_map(|entry| entry.get("value").and_then(Value::as_str))
             .collect::<Vec<_>>();
-        assert!(values.iter().any(|value| *value == alpha.display().to_string()));
-        assert!(values.iter().any(|value| *value == alpine.display().to_string()));
+        assert!(values
+            .iter()
+            .any(|value| *value == alpha.display().to_string()));
+        assert!(values
+            .iter()
+            .any(|value| *value == alpine.display().to_string()));
     }
 
     #[tokio::test]
@@ -2126,7 +2405,12 @@ mod tests {
     #[tokio::test]
     async fn notification_subscription_routes_manage_records() {
         let app_dir = temp_app_dir("notification-subscriptions");
-        let app = router(build_state_from_config(RuntimeConfig { app_dir: app_dir.clone() }).unwrap());
+        let app = router(
+            build_state_from_config(RuntimeConfig {
+                app_dir: app_dir.clone(),
+            })
+            .unwrap(),
+        );
 
         let initial = app
             .clone()
@@ -2143,7 +2427,10 @@ mod tests {
         let initial_payload: Value = serde_json::from_slice(&initial_body).unwrap();
         assert_eq!(initial_payload["ok"], true);
         assert!(initial_payload["vapid_public_key"].as_str().unwrap().len() > 10);
-        assert_eq!(initial_payload["subscriptions"].as_array().unwrap().len(), 0);
+        assert_eq!(
+            initial_payload["subscriptions"].as_array().unwrap().len(),
+            0
+        );
         assert!(app_dir.join("webpush_vapid_private.pem").exists());
 
         let endpoint = "https://push.example.test/sub/abc";
@@ -2187,7 +2474,10 @@ mod tests {
         assert_eq!(toggle.status(), StatusCode::OK);
         let toggle_body = to_bytes(toggle.into_body(), usize::MAX).await.unwrap();
         let toggle_payload: Value = serde_json::from_slice(&toggle_body).unwrap();
-        assert_eq!(toggle_payload["subscriptions"][0]["notifications_enabled"], false);
+        assert_eq!(
+            toggle_payload["subscriptions"][0]["notifications_enabled"],
+            false
+        );
         let saved = fs::read_to_string(app_dir.join("push_subscriptions.json")).unwrap();
         assert!(saved.contains(endpoint));
         assert!(saved.contains("\"notifications_enabled\": false"));
@@ -2352,7 +2642,10 @@ mod tests {
         let log = fs::read_to_string(&log_path).unwrap();
         assert!(cwd.is_dir());
         assert!(log.contains(&format!("PWD={}", repo_root.display())));
-        assert!(log.contains(&format!("ARGV=-m codoxear.broker --cwd {} --", cwd.display())));
+        assert!(log.contains(&format!(
+            "ARGV=-m codoxear.broker --cwd {} --",
+            cwd.display()
+        )));
         assert!(log.contains("OWNER=web"));
         assert!(log.contains("BACKEND=codex"));
         assert!(log.contains("MODEL=gpt-5.4"));
@@ -2412,7 +2705,10 @@ mod tests {
         let app = router(build_state_from_config(RuntimeConfig { app_dir }).unwrap());
 
         let branch = "feature/test-worktree";
-        let expected_worktree = workspace.parent().unwrap().join("repo-feature-test-worktree");
+        let expected_worktree = workspace
+            .parent()
+            .unwrap()
+            .join("repo-feature-test-worktree");
         let response = app
             .oneshot(
                 Request::builder()
@@ -2474,7 +2770,10 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let payload: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(payload["error"], "resume session not found for cwd: missing");
+        assert_eq!(
+            payload["error"],
+            "resume session not found for cwd: missing"
+        );
     }
 
     #[tokio::test]
@@ -2515,7 +2814,10 @@ mod tests {
         let payload: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(payload["broker_pid"], 7777);
         assert_eq!(payload["tmux_session"], "codoxear");
-        assert!(payload["tmux_window"].as_str().unwrap().starts_with("workspace-"));
+        assert!(payload["tmux_window"]
+            .as_str()
+            .unwrap()
+            .starts_with("workspace-"));
 
         let log = fs::read_to_string(&tmux_log).unwrap();
         assert!(log.contains("CODEX_WEB_TRANSPORT=tmux"));
@@ -2597,7 +2899,11 @@ mod tests {
             .status()
             .unwrap()
             .success());
-        fs::write(repo_dir.join("notes.txt"), "hello from rust\nwith unstaged line\n").unwrap();
+        fs::write(
+            repo_dir.join("notes.txt"),
+            "hello from rust\nwith unstaged line\n",
+        )
+        .unwrap();
         fs::write(repo_dir.join("staged.txt"), "staged only\n").unwrap();
         assert!(std::process::Command::new("git")
             .current_dir(&repo_dir)
@@ -2611,7 +2917,9 @@ mod tests {
             for _ in 0..10 {
                 let (mut stream, _) = listener.accept().unwrap();
                 let mut line = String::new();
-                BufReader::new(stream.try_clone().unwrap()).read_line(&mut line).unwrap();
+                BufReader::new(stream.try_clone().unwrap())
+                    .read_line(&mut line)
+                    .unwrap();
                 assert_eq!(line.trim(), "{\"cmd\":\"state\"}");
                 stream
                     .write_all(
@@ -2716,7 +3024,10 @@ mod tests {
         let file_body = to_bytes(file.into_body(), usize::MAX).await.unwrap();
         let file_payload: Value = serde_json::from_slice(&file_body).unwrap();
         assert_eq!(file_payload["kind"], "text");
-        assert_eq!(file_payload["text"], "hello from rust\nwith unstaged line\n");
+        assert_eq!(
+            file_payload["text"],
+            "hello from rust\nwith unstaged line\n"
+        );
 
         let search = app
             .clone()
@@ -2748,7 +3059,10 @@ mod tests {
         let changed_body = to_bytes(changed.into_body(), usize::MAX).await.unwrap();
         let changed_payload: Value = serde_json::from_slice(&changed_body).unwrap();
         let entries = changed_payload["entries"].as_array().unwrap();
-        let notes_entry = entries.iter().find(|entry| entry["path"] == "notes.txt").unwrap();
+        let notes_entry = entries
+            .iter()
+            .find(|entry| entry["path"] == "notes.txt")
+            .unwrap();
         assert_eq!(notes_entry["additions"], 1);
         let staged = changed_payload["staged"].as_array().unwrap();
         assert!(staged.iter().any(|entry| entry == "staged.txt"));
@@ -2768,7 +3082,10 @@ mod tests {
         let diff_payload: Value = serde_json::from_slice(&diff_body).unwrap();
         assert_eq!(diff_payload["path"], "notes.txt");
         assert_eq!(diff_payload["staged"], false);
-        assert!(diff_payload["diff"].as_str().unwrap().contains("+with unstaged line"));
+        assert!(diff_payload["diff"]
+            .as_str()
+            .unwrap()
+            .contains("+with unstaged line"));
 
         let versions = app
             .clone()
@@ -2786,7 +3103,10 @@ mod tests {
         assert_eq!(versions_payload["path"], "notes.txt");
         assert_eq!(versions_payload["current_exists"], true);
         assert_eq!(versions_payload["current_size"], 35);
-        assert_eq!(versions_payload["current_text"], "hello from rust\nwith unstaged line\n");
+        assert_eq!(
+            versions_payload["current_text"],
+            "hello from rust\nwith unstaged line\n"
+        );
         assert_eq!(versions_payload["base_exists"], true);
         assert_eq!(versions_payload["base_text"], "hello from rust\n");
 
@@ -2844,7 +3164,12 @@ mod tests {
         )
         .unwrap();
         let _password = EnvGuard::set("CODEX_WEB_PASSWORD", "topsecret");
-        let app = router(build_state_from_config(RuntimeConfig { app_dir: app_dir.clone() }).unwrap());
+        let app = router(
+            build_state_from_config(RuntimeConfig {
+                app_dir: app_dir.clone(),
+            })
+            .unwrap(),
+        );
 
         let unauthorized = app
             .clone()
@@ -2853,7 +3178,9 @@ mod tests {
                     .method("POST")
                     .uri("/api/sessions/sid-write/file/write")
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(r#"{"path":"notes.txt","text":"new\n","version":"stale"}"#))
+                    .body(Body::from(
+                        r#"{"path":"notes.txt","text":"new\n","version":"stale"}"#,
+                    ))
                     .unwrap(),
             )
             .await
@@ -2898,7 +3225,9 @@ mod tests {
         assert_eq!(save_payload["rel"], "notes.txt");
         assert_eq!(fs::read_to_string(&file_path).unwrap(), "new\n");
 
-        let files: Value = serde_json::from_str(&fs::read_to_string(app_dir.join("session_files.json")).unwrap()).unwrap();
+        let files: Value =
+            serde_json::from_str(&fs::read_to_string(app_dir.join("session_files.json")).unwrap())
+                .unwrap();
         assert_eq!(files["sid:sid-write"][0], file_path.display().to_string());
         assert!(files.get("sid-write").is_none());
         assert_eq!(files["other"][0], "keep.txt");
@@ -2929,7 +3258,9 @@ mod tests {
                     .method("POST")
                     .uri("/api/v1/sessions/sid-write/file/write")
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(r#"{"path":"nested/new.txt","text":"created\n","create":true}"#))
+                    .body(Body::from(
+                        r#"{"path":"nested/new.txt","text":"created\n","create":true}"#,
+                    ))
                     .unwrap(),
             )
             .await
@@ -2938,7 +3269,10 @@ mod tests {
         let create_body = to_bytes(create.into_body(), usize::MAX).await.unwrap();
         let create_payload: Value = serde_json::from_slice(&create_body).unwrap();
         assert_eq!(create_payload["rel"], "nested/new.txt");
-        assert_eq!(fs::read_to_string(repo_dir.join("nested").join("new.txt")).unwrap(), "created\n");
+        assert_eq!(
+            fs::read_to_string(repo_dir.join("nested").join("new.txt")).unwrap(),
+            "created\n"
+        );
 
         let create_conflict = app
             .clone()
@@ -2947,13 +3281,17 @@ mod tests {
                     .method("POST")
                     .uri("/api/v1/sessions/sid-write/file/write")
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(r#"{"path":"nested/new.txt","text":"again\n","create":true}"#))
+                    .body(Body::from(
+                        r#"{"path":"nested/new.txt","text":"again\n","create":true}"#,
+                    ))
                     .unwrap(),
             )
             .await
             .unwrap();
         assert_eq!(create_conflict.status(), StatusCode::CONFLICT);
-        let create_conflict_body = to_bytes(create_conflict.into_body(), usize::MAX).await.unwrap();
+        let create_conflict_body = to_bytes(create_conflict.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let create_conflict_payload: Value = serde_json::from_slice(&create_conflict_body).unwrap();
         assert_eq!(create_conflict_payload["error"], "file already exists");
         assert_eq!(create_conflict_payload["conflict"], true);
@@ -2965,7 +3303,9 @@ mod tests {
                     .method("POST")
                     .uri("/api/v1/sessions/sid-write/file/write")
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(r#"{"path":"nested/new.txt","text":"stale\n","version":"old-version"}"#))
+                    .body(Body::from(
+                        r#"{"path":"nested/new.txt","text":"stale\n","version":"old-version"}"#,
+                    ))
                     .unwrap(),
             )
             .await
@@ -2987,7 +3327,9 @@ mod tests {
             for _ in 0..5 {
                 let (mut stream, _) = listener.accept().unwrap();
                 let mut line = String::new();
-                BufReader::new(stream.try_clone().unwrap()).read_line(&mut line).unwrap();
+                BufReader::new(stream.try_clone().unwrap())
+                    .read_line(&mut line)
+                    .unwrap();
                 let payload: Value = serde_json::from_str(line.trim()).unwrap();
                 match payload["cmd"].as_str().unwrap() {
                     "state" => {
@@ -3074,7 +3416,12 @@ mod tests {
         )
         .unwrap();
         fs::write(app_dir.join("session_aliases.json"), r#"{"other":"keep"}"#).unwrap();
-        let app = router(build_state_from_config(RuntimeConfig { app_dir: app_dir.clone() }).unwrap());
+        let app = router(
+            build_state_from_config(RuntimeConfig {
+                app_dir: app_dir.clone(),
+            })
+            .unwrap(),
+        );
 
         let rename = app
             .clone()
@@ -3093,7 +3440,10 @@ mod tests {
         let rename_payload: Value = serde_json::from_slice(&rename_body).unwrap();
         assert_eq!(rename_payload["alias"], "hello rust world");
 
-        let aliases: Value = serde_json::from_str(&fs::read_to_string(app_dir.join("session_aliases.json")).unwrap()).unwrap();
+        let aliases: Value = serde_json::from_str(
+            &fs::read_to_string(app_dir.join("session_aliases.json")).unwrap(),
+        )
+        .unwrap();
         assert_eq!(aliases["sid-rename"], "hello rust world");
         assert_eq!(aliases["other"], "keep");
 
@@ -3113,7 +3463,10 @@ mod tests {
         let clear_payload: Value = serde_json::from_slice(&clear_body).unwrap();
         assert_eq!(clear_payload["alias"], "");
 
-        let cleared_aliases: Value = serde_json::from_str(&fs::read_to_string(app_dir.join("session_aliases.json")).unwrap()).unwrap();
+        let cleared_aliases: Value = serde_json::from_str(
+            &fs::read_to_string(app_dir.join("session_aliases.json")).unwrap(),
+        )
+        .unwrap();
         assert!(cleared_aliases.get("sid-rename").is_none());
         assert_eq!(cleared_aliases["other"], "keep");
     }
@@ -3148,9 +3501,18 @@ mod tests {
         )
         .unwrap();
         fs::write(app_dir.join("session_aliases.json"), r#"{"other":"keep"}"#).unwrap();
-        fs::write(app_dir.join("session_sidebar.json"), r#"{"other":{"priority_offset":0.25}}"#).unwrap();
+        fs::write(
+            app_dir.join("session_sidebar.json"),
+            r#"{"other":{"priority_offset":0.25}}"#,
+        )
+        .unwrap();
 
-        let app = router(build_state_from_config(RuntimeConfig { app_dir: app_dir.clone() }).unwrap());
+        let app = router(
+            build_state_from_config(RuntimeConfig {
+                app_dir: app_dir.clone(),
+            })
+            .unwrap(),
+        );
 
         let edit = app
             .oneshot(
@@ -3173,14 +3535,23 @@ mod tests {
         assert_eq!(edit_payload["snooze_until"], 1234.0);
         assert_eq!(edit_payload["dependency_session_id"], "sid-dependency");
 
-        let aliases: Value = serde_json::from_str(&fs::read_to_string(app_dir.join("session_aliases.json")).unwrap()).unwrap();
+        let aliases: Value = serde_json::from_str(
+            &fs::read_to_string(app_dir.join("session_aliases.json")).unwrap(),
+        )
+        .unwrap();
         assert_eq!(aliases["sid-edit"], "hello rust edit");
         assert_eq!(aliases["other"], "keep");
 
-        let sidebar: Value = serde_json::from_str(&fs::read_to_string(app_dir.join("session_sidebar.json")).unwrap()).unwrap();
+        let sidebar: Value = serde_json::from_str(
+            &fs::read_to_string(app_dir.join("session_sidebar.json")).unwrap(),
+        )
+        .unwrap();
         assert_eq!(sidebar["sid-edit"]["priority_offset"], 0.75);
         assert_eq!(sidebar["sid-edit"]["snooze_until"], 1234.0);
-        assert_eq!(sidebar["sid-edit"]["dependency_session_id"], "sid-dependency");
+        assert_eq!(
+            sidebar["sid-edit"]["dependency_session_id"],
+            "sid-dependency"
+        );
         assert_eq!(sidebar["other"]["priority_offset"], 0.25);
     }
 
@@ -3205,11 +3576,15 @@ mod tests {
                     Err(err) => panic!("accept failed: {err}"),
                 };
                 let mut line = String::new();
-                BufReader::new(stream.try_clone().unwrap()).read_line(&mut line).unwrap();
+                BufReader::new(stream.try_clone().unwrap())
+                    .read_line(&mut line)
+                    .unwrap();
                 let payload: Value = serde_json::from_str(line.trim()).unwrap();
                 match payload["cmd"].as_str().unwrap() {
                     "state" => {
-                        stream.write_all(b"{\"busy\":false,\"queue_len\":0}\n").unwrap();
+                        stream
+                            .write_all(b"{\"busy\":false,\"queue_len\":0}\n")
+                            .unwrap();
                     }
                     "keys" => {
                         let seq = payload["seq"].as_str().unwrap();
@@ -3233,7 +3608,12 @@ mod tests {
             ),
         )
         .unwrap();
-        let app = router(build_state_from_config(RuntimeConfig { app_dir: app_dir.clone() }).unwrap());
+        let app = router(
+            build_state_from_config(RuntimeConfig {
+                app_dir: app_dir.clone(),
+            })
+            .unwrap(),
+        );
 
         let response = app
             .oneshot(
@@ -3251,10 +3631,20 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
         let payload: Value = serde_json::from_slice(&body).unwrap();
         let staged_path = PathBuf::from(payload["path"].as_str().unwrap());
-        assert_eq!(staged_path.parent().unwrap(), app_dir.join("uploads").join("sid-attach"));
-        assert!(staged_path.file_name().unwrap().to_string_lossy().ends_with("payload.tar.gz"));
+        assert_eq!(
+            staged_path.parent().unwrap(),
+            app_dir.join("uploads").join("sid-attach")
+        );
+        assert!(staged_path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .ends_with("payload.tar.gz"));
         assert_eq!(fs::read(&staged_path).unwrap(), b"\x00\x01payload");
-        assert_eq!(payload["inject_text"], format!("Attachment 2: {}\n", staged_path.display()));
+        assert_eq!(
+            payload["inject_text"],
+            format!("Attachment 2: {}\n", staged_path.display())
+        );
         assert_eq!(payload["broker"]["accepted"], true);
 
         listener_thread.join().unwrap();
@@ -3270,10 +3660,14 @@ mod tests {
         let listener_thread = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let mut line = String::new();
-            BufReader::new(stream.try_clone().unwrap()).read_line(&mut line).unwrap();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut line)
+                .unwrap();
             let payload: Value = serde_json::from_str(line.trim()).unwrap();
             assert_eq!(payload["cmd"], "state");
-            stream.write_all(b"{\"busy\":false,\"queue_len\":0}\n").unwrap();
+            stream
+                .write_all(b"{\"busy\":false,\"queue_len\":0}\n")
+                .unwrap();
         });
         fs::write(
             app_dir.join("socks").join("sid-harness.json"),
@@ -3290,7 +3684,12 @@ mod tests {
             r#"{"sid-harness":{"enabled":false,"request":"old","cooldown_minutes":9,"remaining_injections":4}}"#,
         )
         .unwrap();
-        let app = router(build_state_from_config(RuntimeConfig { app_dir: app_dir.clone() }).unwrap());
+        let app = router(
+            build_state_from_config(RuntimeConfig {
+                app_dir: app_dir.clone(),
+            })
+            .unwrap(),
+        );
 
         let response = app
             .oneshot(
@@ -3314,7 +3713,9 @@ mod tests {
         assert_eq!(payload["cooldown_minutes"], 5.0);
         assert_eq!(payload["remaining_injections"], 2);
 
-        let harness: Value = serde_json::from_str(&fs::read_to_string(app_dir.join("harness.json")).unwrap()).unwrap();
+        let harness: Value =
+            serde_json::from_str(&fs::read_to_string(app_dir.join("harness.json")).unwrap())
+                .unwrap();
         assert_eq!(harness["sid-harness"]["enabled"], true);
         assert_eq!(harness["sid-harness"]["request"], "keep going");
         assert_eq!(harness["sid-harness"]["cooldown_minutes"], 5);
@@ -3334,11 +3735,15 @@ mod tests {
             for _ in 0..2 {
                 let (mut stream, _) = listener.accept().unwrap();
                 let mut line = String::new();
-                BufReader::new(stream.try_clone().unwrap()).read_line(&mut line).unwrap();
+                BufReader::new(stream.try_clone().unwrap())
+                    .read_line(&mut line)
+                    .unwrap();
                 let payload: Value = serde_json::from_str(line.trim()).unwrap();
                 match payload["cmd"].as_str().unwrap() {
                     "state" => {
-                        stream.write_all(b"{\"busy\":false,\"queue_len\":0}\n").unwrap();
+                        stream
+                            .write_all(b"{\"busy\":false,\"queue_len\":0}\n")
+                            .unwrap();
                     }
                     "shutdown" => {
                         stream.write_all(b"{\"ok\":true}\n").unwrap();
@@ -3387,7 +3792,12 @@ mod tests {
             r#"{"sid-delete":[{"id":"q1","text":"queued","created_ts":1.0}],"other":[{"id":"q2","text":"keep","created_ts":2.0}]}"#,
         )
         .unwrap();
-        let app = router(build_state_from_config(RuntimeConfig { app_dir: app_dir.clone() }).unwrap());
+        let app = router(
+            build_state_from_config(RuntimeConfig {
+                app_dir: app_dir.clone(),
+            })
+            .unwrap(),
+        );
 
         let delete = app
             .oneshot(
@@ -3407,26 +3817,38 @@ mod tests {
         assert!(!sock_path.exists());
         assert!(!app_dir.join("socks").join("sid-delete.json").exists());
 
-        let aliases: Value = serde_json::from_str(&fs::read_to_string(app_dir.join("session_aliases.json")).unwrap()).unwrap();
+        let aliases: Value = serde_json::from_str(
+            &fs::read_to_string(app_dir.join("session_aliases.json")).unwrap(),
+        )
+        .unwrap();
         assert!(aliases.get("sid-delete").is_none());
         assert_eq!(aliases["other"], "keep");
 
-        let sidebar: Value = serde_json::from_str(&fs::read_to_string(app_dir.join("session_sidebar.json")).unwrap()).unwrap();
+        let sidebar: Value = serde_json::from_str(
+            &fs::read_to_string(app_dir.join("session_sidebar.json")).unwrap(),
+        )
+        .unwrap();
         assert!(sidebar.get("sid-delete").is_none());
         assert!(sidebar["blocked"].get("dependency_session_id").is_none());
         assert_eq!(sidebar["other"]["priority_offset"], 0.1);
 
-        let harness: Value = serde_json::from_str(&fs::read_to_string(app_dir.join("harness.json")).unwrap()).unwrap();
+        let harness: Value =
+            serde_json::from_str(&fs::read_to_string(app_dir.join("harness.json")).unwrap())
+                .unwrap();
         assert!(harness.get("sid-delete").is_none());
         assert_eq!(harness["other"]["enabled"], false);
 
-        let files: Value = serde_json::from_str(&fs::read_to_string(app_dir.join("session_files.json")).unwrap()).unwrap();
+        let files: Value =
+            serde_json::from_str(&fs::read_to_string(app_dir.join("session_files.json")).unwrap())
+                .unwrap();
         assert!(files.get("sid-delete").is_none());
         assert!(files.get("sid:sid-delete").is_none());
         assert!(files.get(&format!("cwd:{}", repo_dir.display())).is_none());
         assert_eq!(files["other"][0], "keep.txt");
 
-        let queues: Value = serde_json::from_str(&fs::read_to_string(app_dir.join("session_queues.json")).unwrap()).unwrap();
+        let queues: Value =
+            serde_json::from_str(&fs::read_to_string(app_dir.join("session_queues.json")).unwrap())
+                .unwrap();
         assert!(queues.get("sid-delete").is_none());
         assert_eq!(queues["other"][0]["text"], "keep");
 
@@ -3443,7 +3865,9 @@ mod tests {
             for _ in 0..11 {
                 let (mut stream, _) = listener.accept().unwrap();
                 let mut line = String::new();
-                BufReader::new(stream.try_clone().unwrap()).read_line(&mut line).unwrap();
+                BufReader::new(stream.try_clone().unwrap())
+                    .read_line(&mut line)
+                    .unwrap();
                 let payload: Value = serde_json::from_str(line.trim()).unwrap();
                 match payload["cmd"].as_str().unwrap() {
                     "state" => {
@@ -3474,7 +3898,12 @@ mod tests {
             ),
         )
         .unwrap();
-        let app = router(build_state_from_config(RuntimeConfig { app_dir: app_dir.clone() }).unwrap());
+        let app = router(
+            build_state_from_config(RuntimeConfig {
+                app_dir: app_dir.clone(),
+            })
+            .unwrap(),
+        );
 
         let send_now = app
             .clone()
@@ -3504,9 +3933,15 @@ mod tests {
             )
             .await
             .unwrap();
-        let queue_after_send_body = to_bytes(queue_after_send.into_body(), usize::MAX).await.unwrap();
-        let queue_after_send_payload: Value = serde_json::from_slice(&queue_after_send_body).unwrap();
-        assert_eq!(queue_after_send_payload["items"].as_array().unwrap().len(), 0);
+        let queue_after_send_body = to_bytes(queue_after_send.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let queue_after_send_payload: Value =
+            serde_json::from_slice(&queue_after_send_body).unwrap();
+        assert_eq!(
+            queue_after_send_payload["items"].as_array().unwrap().len(),
+            0
+        );
 
         let first_queued = app
             .clone()
@@ -3521,9 +3956,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(first_queued.status(), StatusCode::OK);
-        let first_queued_body = to_bytes(first_queued.into_body(), usize::MAX).await.unwrap();
+        let first_queued_body = to_bytes(first_queued.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let first_queued_payload: Value = serde_json::from_slice(&first_queued_body).unwrap();
-        let first_id = first_queued_payload["item"]["id"].as_str().unwrap().to_string();
+        let first_id = first_queued_payload["item"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
         assert_eq!(first_queued_payload["queued"], true);
         assert_eq!(first_queued_payload["queue_len"], 1);
 
@@ -3540,9 +3980,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(second_queued.status(), StatusCode::OK);
-        let second_queued_body = to_bytes(second_queued.into_body(), usize::MAX).await.unwrap();
+        let second_queued_body = to_bytes(second_queued.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let second_queued_payload: Value = serde_json::from_slice(&second_queued_body).unwrap();
-        let second_id = second_queued_payload["item"]["id"].as_str().unwrap().to_string();
+        let second_id = second_queued_payload["item"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
         assert_eq!(second_queued_payload["queue_len"], 2);
 
         let update = app
@@ -3552,7 +3997,9 @@ mod tests {
                     .method("POST")
                     .uri("/api/v1/sessions/sid-queue/queue/update")
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(format!(r#"{{"id":"{first_id}","text":"queued one edited"}}"#)))
+                    .body(Body::from(format!(
+                        r#"{{"id":"{first_id}","text":"queued one edited"}}"#
+                    )))
                     .unwrap(),
             )
             .await
@@ -3569,7 +4016,9 @@ mod tests {
                     .method("POST")
                     .uri("/api/v1/sessions/sid-queue/queue/move")
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(format!(r#"{{"id":"{second_id}","to_index":0}}"#)))
+                    .body(Body::from(format!(
+                        r#"{{"id":"{second_id}","to_index":0}}"#
+                    )))
                     .unwrap(),
             )
             .await

@@ -82,7 +82,11 @@ impl BrokerState {
             output_tail: String::new(),
             token: None,
             resume_session_id: clean_env("CODEX_WEB_RESUME_SESSION_ID").or_else(|| {
-                resume_session_id_from_args(&config.agent_args, &config.agent_backend, &config.sessions_dir)
+                resume_session_id_from_args(
+                    &config.agent_args,
+                    &config.agent_backend,
+                    &config.sessions_dir,
+                )
             }),
             model_provider: clean_env("CODEX_WEB_MODEL_PROVIDER"),
             preferred_auth_method: clean_env("CODEX_WEB_PREFERRED_AUTH_METHOD"),
@@ -196,7 +200,10 @@ fn parse_args(args: Vec<String>) -> Result<BrokerConfig, String> {
         .unwrap_or_else(|| "codex".to_string());
     let (agent_bin, agent_home) = if agent_backend == "pi" {
         (
-            env::var("PI_BIN").ok().filter(|value| !value.trim().is_empty()).unwrap_or_else(|| "pi".to_string()),
+            env::var("PI_BIN")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| "pi".to_string()),
             env_path("PI_HOME").unwrap_or_else(|| home_dir().join(".pi")),
         )
     } else {
@@ -243,16 +250,26 @@ fn web_owned_codex_args(agent_backend: &str, owner: Option<&str>, args: &[String
 }
 
 fn initial_session_binding(config: &BrokerConfig) -> (Option<PathBuf>, Option<String>) {
-    session_log_path_from_args(&config.agent_args, &config.agent_backend, &config.sessions_dir)
-        .as_ref()
-        .filter(|path| path.exists())
-        .map(|path| (Some(path.clone()), session_id_from_log(path, &config.agent_backend)))
-        .unwrap_or((None, None))
+    session_log_path_from_args(
+        &config.agent_args,
+        &config.agent_backend,
+        &config.sessions_dir,
+    )
+    .as_ref()
+    .filter(|path| path.exists())
+    .map(|path| {
+        (
+            Some(path.clone()),
+            session_id_from_log(path, &config.agent_backend),
+        )
+    })
+    .unwrap_or((None, None))
 }
 
 fn run_broker(mut config: BrokerConfig) -> Result<i32, String> {
     if config.agent_backend == "pi" {
-        config.agent_args = ensure_pi_session_arg(&config.agent_args, &config.cwd, &config.sessions_dir)?;
+        config.agent_args =
+            ensure_pi_session_arg(&config.agent_args, &config.cwd, &config.sessions_dir)?;
     }
     let (rows, cols) = terminal_size();
     let (master_fd, slave_fd) = open_pty(rows, cols)?;
@@ -304,7 +321,11 @@ fn spawn_runtime_threads(runtime: &BrokerRuntime, mirror_input: bool) {
     spawn_busy_hint_idle_thread(BrokerRuntime::clone(runtime));
 }
 
-fn cleanup_runtime(runtime: &BrokerRuntime, master_fd: RawFd, stdin_termios: Option<&libc::termios>) {
+fn cleanup_runtime(
+    runtime: &BrokerRuntime,
+    master_fd: RawFd,
+    stdin_termios: Option<&libc::termios>,
+) {
     if let Some(termios) = stdin_termios {
         let _ = restore_stdin(termios);
     }
@@ -364,9 +385,17 @@ fn spawn_resize_thread(runtime: BrokerRuntime) {
     });
 }
 
-fn spawn_agent(config: &BrokerConfig, slave_fd: RawFd, rows: u16, cols: u16) -> Result<std::process::Child, String> {
+fn spawn_agent(
+    config: &BrokerConfig,
+    slave_fd: RawFd,
+    rows: u16,
+    cols: u16,
+) -> Result<std::process::Child, String> {
     let mut command = if config.owner.as_deref() == Some("web") {
-        let shell = env::var("SHELL").ok().filter(|value| !value.trim().is_empty()).unwrap_or_else(|| "/bin/bash".to_string());
+        let shell = env::var("SHELL")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "/bin/bash".to_string());
         let mut cmd = Command::new(shell);
         let inline = format!(
             "cd {} && exec {}",
@@ -393,16 +422,26 @@ fn spawn_agent(config: &BrokerConfig, slave_fd: RawFd, rows: u16, cols: u16) -> 
     }
     command
         .current_dir(&config.cwd)
-        .env("TERM", env::var("TERM").ok().filter(|value| !value.trim().is_empty()).unwrap_or_else(|| "xterm-256color".to_string()))
+        .env(
+            "TERM",
+            env::var("TERM")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| "xterm-256color".to_string()),
+        )
         .env("COLUMNS", cols.to_string())
         .env("LINES", rows.to_string())
         .stdin(unsafe { Stdio::from(File::from_raw_fd(stdin_fd)) })
         .stdout(unsafe { Stdio::from(File::from_raw_fd(stdout_fd)) })
         .stderr(unsafe { Stdio::from(File::from_raw_fd(stderr_fd)) });
     if config.agent_backend == "pi" {
-        command.env("PI_HOME", &config.agent_home).env_remove("CODEX_HOME");
+        command
+            .env("PI_HOME", &config.agent_home)
+            .env_remove("CODEX_HOME");
     } else {
-        command.env("CODEX_HOME", &config.agent_home).env_remove("PI_HOME");
+        command
+            .env("CODEX_HOME", &config.agent_home)
+            .env_remove("PI_HOME");
     }
     unsafe {
         command.pre_exec(move || {
@@ -411,7 +450,9 @@ fn spawn_agent(config: &BrokerConfig, slave_fd: RawFd, rows: u16, cols: u16) -> 
             Ok(())
         });
     }
-    let child = command.spawn().map_err(|err| format!("spawn {}: {err}", config.agent_bin))?;
+    let child = command
+        .spawn()
+        .map_err(|err| format!("spawn {}: {err}", config.agent_bin))?;
     let _ = unsafe { libc::close(slave_fd) };
     Ok(child)
 }
@@ -426,11 +467,17 @@ fn spawn_socket_thread(runtime: BrokerRuntime) {
 }
 
 fn socket_server(runtime: BrokerRuntime) -> Result<(), String> {
-    let sock_path = runtime.state.lock().map_err(|_| "broker state lock poisoned".to_string())?.sock_path.clone();
+    let sock_path = runtime
+        .state
+        .lock()
+        .map_err(|_| "broker state lock poisoned".to_string())?
+        .sock_path
+        .clone();
     if sock_path.exists() {
         let _ = fs::remove_file(&sock_path);
     }
-    let listener = UnixListener::bind(&sock_path).map_err(|err| format!("bind {}: {err}", sock_path.display()))?;
+    let listener = UnixListener::bind(&sock_path)
+        .map_err(|err| format!("bind {}: {err}", sock_path.display()))?;
     fs::set_permissions(&sock_path, fs::Permissions::from_mode(0o600))
         .map_err(|err| format!("chmod {}: {err}", sock_path.display()))?;
     listener
@@ -442,7 +489,9 @@ fn socket_server(runtime: BrokerRuntime) -> Result<(), String> {
                 let next = runtime.clone();
                 thread::spawn(move || handle_conn(next, stream));
             }
-            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => thread::sleep(Duration::from_millis(50)),
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(50))
+            }
             Err(err) => return Err(format!("accept {}: {err}", sock_path.display())),
         }
     }
@@ -453,23 +502,37 @@ fn handle_conn(runtime: BrokerRuntime, mut stream: UnixStream) {
     let cloned = match stream.try_clone() {
         Ok(value) => value,
         Err(err) => {
-            let _ = send_json_line(&mut stream, &json!({"error": format!("clone stream: {err}")}));
+            let _ = send_json_line(
+                &mut stream,
+                &json!({"error": format!("clone stream: {err}")}),
+            );
             return;
         }
     };
     let mut reader = BufReader::new(cloned);
     let mut line = String::new();
-    if reader.read_line(&mut line).ok().filter(|n| *n > 0).is_none() {
+    if reader
+        .read_line(&mut line)
+        .ok()
+        .filter(|n| *n > 0)
+        .is_none()
+    {
         return;
     }
     let request = match serde_json::from_str::<Value>(line.trim()) {
         Ok(value) => value,
         Err(err) => {
-            let _ = send_json_line(&mut stream, &json!({"error": format!("invalid json: {err}")}));
+            let _ = send_json_line(
+                &mut stream,
+                &json!({"error": format!("invalid json: {err}")}),
+            );
             return;
         }
     };
-    let cmd = request.get("cmd").and_then(Value::as_str).unwrap_or_default();
+    let cmd = request
+        .get("cmd")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     match cmd {
         "state" => {
             let response = runtime
@@ -488,7 +551,11 @@ fn handle_conn(runtime: BrokerRuntime, mut stream: UnixStream) {
             let _ = send_json_line(&mut stream, &response);
         }
         "send" => {
-            let Some(text) = request.get("text").and_then(Value::as_str).filter(|value| !value.trim().is_empty()) else {
+            let Some(text) = request
+                .get("text")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+            else {
                 let _ = send_json_line(&mut stream, &json!({"error": "text required"}));
                 return;
             };
@@ -511,7 +578,11 @@ fn handle_conn(runtime: BrokerRuntime, mut stream: UnixStream) {
             let _ = inject_text(fd, text, &enter);
         }
         "keys" => {
-            let Some(seq) = request.get("seq").and_then(Value::as_str).filter(|value| !value.is_empty()) else {
+            let Some(seq) = request
+                .get("seq")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+            else {
                 let _ = send_json_line(&mut stream, &json!({"error": "seq required"}));
                 return;
             };
@@ -523,7 +594,8 @@ fn handle_conn(runtime: BrokerRuntime, mut stream: UnixStream) {
                     return;
                 }
             };
-            let response = json!({"ok": true, "queued": false, "n": bytes.len(), "key_queue_len": 0});
+            let response =
+                json!({"ok": true, "queued": false, "n": bytes.len(), "key_queue_len": 0});
             let _ = send_json_line(&mut stream, &response);
             let _ = write_all_fd(fd, &bytes);
         }
@@ -640,16 +712,22 @@ fn update_detach_from_pty_text(state: &mut BrokerState, text: &str) -> bool {
 
 fn detach_current_session_binding(state: &mut BrokerState) {
     if let Some(path) = state.log_path.take() {
-        state.ignored_log_paths.insert(path.canonicalize().unwrap_or(path));
+        state
+            .ignored_log_paths
+            .insert(path.canonicalize().unwrap_or(path));
     }
     state.session_id = None;
     state.detach_trigger_tail.clear();
 }
 
 fn pty_busy_hint_seen(tail: &str, cleaned: &str) -> bool {
-    ["esc to interrupt", "compacting context", "compacting conversation"]
-        .iter()
-        .any(|phrase| hint_seen_in_new_text(tail, cleaned, phrase))
+    [
+        "esc to interrupt",
+        "compacting context",
+        "compacting conversation",
+    ]
+    .iter()
+    .any(|phrase| hint_seen_in_new_text(tail, cleaned, phrase))
 }
 
 fn hint_seen_in_new_text(tail: &str, cleaned: &str, phrase: &str) -> bool {
@@ -662,7 +740,11 @@ fn hint_seen_in_new_text(tail: &str, cleaned: &str, phrase: &str) -> bool {
     if overlap == 0 {
         return false;
     }
-    let stitched = format!("{}{}", utf8_suffix(tail, overlap).to_ascii_lowercase(), cleaned_lower);
+    let stitched = format!(
+        "{}{}",
+        utf8_suffix(tail, overlap).to_ascii_lowercase(),
+        cleaned_lower
+    );
     stitched
         .find(&phrase_lower)
         .map(|pos| pos + phrase_lower.len() > overlap)
@@ -754,8 +836,7 @@ fn spawn_log_discovery_thread(runtime: BrokerRuntime) {
                 &backend,
                 &runtime.sessions_dir,
                 &ignored,
-            )
-            {
+            ) {
                 if let Some(session_id) = session_id_from_log(&path, &backend) {
                     if let Ok(mut state) = runtime.state.lock() {
                         state.log_path = Some(path);
@@ -783,7 +864,9 @@ fn spawn_log_idle_thread(runtime: BrokerRuntime) {
                     token_scan_path = Some(path.clone());
                     token_scan_offset = 0;
                 }
-                if let Ok((next_offset, token_update)) = scan_token_updates_from_log(path, token_scan_offset) {
+                if let Ok((next_offset, token_update)) =
+                    scan_token_updates_from_log(path, token_scan_offset)
+                {
                     token_scan_offset = next_offset;
                     if let Some(token) = token_update {
                         if let Ok(mut state) = runtime.state.lock() {
@@ -829,8 +912,13 @@ fn busy_quiet_duration() -> Duration {
     Duration::from_secs_f64(seconds)
 }
 
-fn scan_token_updates_from_log(path: &Path, mut offset: u64) -> Result<(u64, Option<Value>), String> {
-    let len = fs::metadata(path).map_err(|err| format!("stat {}: {err}", path.display()))?.len();
+fn scan_token_updates_from_log(
+    path: &Path,
+    mut offset: u64,
+) -> Result<(u64, Option<Value>), String> {
+    let len = fs::metadata(path)
+        .map_err(|err| format!("stat {}: {err}", path.display()))?
+        .len();
     if offset > len {
         offset = 0;
     }
@@ -877,7 +965,12 @@ fn write_metadata(state: &BrokerState) -> Result<(), String> {
 }
 
 fn inject_text(fd: RawFd, text: &str, suffix: &[u8]) -> Result<(), String> {
-    inject_text_with_suffix_delay(fd, text, suffix, Duration::from_millis(PASTE_SUFFIX_DELAY_MILLIS))
+    inject_text_with_suffix_delay(
+        fd,
+        text,
+        suffix,
+        Duration::from_millis(PASTE_SUFFIX_DELAY_MILLIS),
+    )
 }
 
 fn inject_text_with_suffix_delay(
@@ -886,7 +979,8 @@ fn inject_text_with_suffix_delay(
     suffix: &[u8],
     delay: Duration,
 ) -> Result<(), String> {
-    let mut payload = Vec::with_capacity(BRACKETED_PASTE_START.len() + text.len() + BRACKETED_PASTE_END.len());
+    let mut payload =
+        Vec::with_capacity(BRACKETED_PASTE_START.len() + text.len() + BRACKETED_PASTE_END.len());
     payload.extend_from_slice(BRACKETED_PASTE_START);
     payload.extend_from_slice(text.as_bytes());
     payload.extend_from_slice(BRACKETED_PASTE_END);
@@ -941,14 +1035,20 @@ fn enable_raw_stdin() -> Result<libc::termios, String> {
     let fd = libc::STDIN_FILENO;
     let mut original = unsafe { std::mem::zeroed::<libc::termios>() };
     if unsafe { libc::tcgetattr(fd, &mut original) } != 0 {
-        return Err(format!("tcgetattr stdin: {}", std::io::Error::last_os_error()));
+        return Err(format!(
+            "tcgetattr stdin: {}",
+            std::io::Error::last_os_error()
+        ));
     }
     let mut raw = original;
     unsafe {
         libc::cfmakeraw(&mut raw);
     }
     if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw) } != 0 {
-        return Err(format!("tcsetattr stdin raw: {}", std::io::Error::last_os_error()));
+        return Err(format!(
+            "tcsetattr stdin raw: {}",
+            std::io::Error::last_os_error()
+        ));
     }
     Ok(original)
 }
@@ -956,15 +1056,21 @@ fn enable_raw_stdin() -> Result<libc::termios, String> {
 fn restore_stdin(original: &libc::termios) -> Result<(), String> {
     let fd = libc::STDIN_FILENO;
     if unsafe { libc::tcsetattr(fd, libc::TCSANOW, original) } != 0 {
-        return Err(format!("restore stdin: {}", std::io::Error::last_os_error()));
+        return Err(format!(
+            "restore stdin: {}",
+            std::io::Error::last_os_error()
+        ));
     }
     Ok(())
 }
 
 fn send_json_line(stream: &mut UnixStream, value: &Value) -> Result<(), String> {
-    let mut raw = serde_json::to_vec(value).map_err(|err| format!("serialize socket response: {err}"))?;
+    let mut raw =
+        serde_json::to_vec(value).map_err(|err| format!("serialize socket response: {err}"))?;
     raw.push(b'\n');
-    stream.write_all(&raw).map_err(|err| format!("write socket response: {err}"))
+    stream
+        .write_all(&raw)
+        .map_err(|err| format!("write socket response: {err}"))
 }
 
 fn seq_bytes(raw: &str) -> Vec<u8> {
@@ -997,7 +1103,11 @@ fn seq_bytes(raw: &str) -> Vec<u8> {
             None => out.push(b'\\'),
         }
     }
-    if out.is_empty() { vec![b'\r'] } else { out }
+    if out.is_empty() {
+        vec![b'\r']
+    } else {
+        out
+    }
 }
 
 fn default_enter_seq() -> Vec<u8> {
@@ -1020,8 +1130,14 @@ fn reply_to_terminal_queries(state: &mut BrokerState, bytes: &[u8]) {
         (b"\x1b[c".as_slice(), b"\x1b[?1;2c".as_slice()),
         (b"\x1b[>c".as_slice(), b"\x1b[>0;0;0c".as_slice()),
         (b"\x1b[?u".as_slice(), b"\x1b[?1u".as_slice()),
-        (b"\x1b]10;?\x1b\\".as_slice(), b"\x1b]10;rgb:c0c0/c0c0/c0c0\x1b\\".as_slice()),
-        (b"\x1b]11;?\x1b\\".as_slice(), b"\x1b]11;rgb:0000/0000/0000\x1b\\".as_slice()),
+        (
+            b"\x1b]10;?\x1b\\".as_slice(),
+            b"\x1b]10;rgb:c0c0/c0c0/c0c0\x1b\\".as_slice(),
+        ),
+        (
+            b"\x1b]11;?\x1b\\".as_slice(),
+            b"\x1b]11;rgb:0000/0000/0000\x1b\\".as_slice(),
+        ),
     ] {
         if contains_bytes(&state.term_query_buf, query) {
             let _ = write_all_fd(state.pty_master_fd, response);
@@ -1031,7 +1147,9 @@ fn reply_to_terminal_queries(state: &mut BrokerState, bytes: &[u8]) {
 }
 
 fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
-    haystack.windows(needle.len()).any(|window| window == needle)
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
 }
 
 fn session_id_from_rollout_path(path: &Path) -> Option<String> {
@@ -1120,7 +1238,10 @@ fn set_pty_winsize(fd: RawFd, rows: u16, cols: u16) -> Result<(), String> {
         ws_ypixel: 0,
     };
     if unsafe { libc::ioctl(fd, libc::TIOCSWINSZ, &mut winsize) } != 0 {
-        return Err(format!("set pty winsize: {}", std::io::Error::last_os_error()));
+        return Err(format!(
+            "set pty winsize: {}",
+            std::io::Error::last_os_error()
+        ));
     }
     Ok(())
 }
@@ -1141,8 +1262,16 @@ fn terminal_size_from_fd(fd: RawFd, fallback: (u16, u16)) -> Option<(u16, u16)> 
     if unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut winsize) } != 0 {
         return None;
     }
-    let rows = if winsize.ws_row > 0 { winsize.ws_row } else { fallback.0 };
-    let cols = if winsize.ws_col > 0 { winsize.ws_col } else { fallback.1 };
+    let rows = if winsize.ws_row > 0 {
+        winsize.ws_row
+    } else {
+        fallback.0
+    };
+    let cols = if winsize.ws_col > 0 {
+        winsize.ws_col
+    } else {
+        fallback.1
+    };
     Some((rows, cols))
 }
 
@@ -1169,7 +1298,11 @@ fn terminate_process_group(pid: i64) {
     }
 }
 
-fn resume_session_id_from_args(args: &[String], agent_backend: &str, sessions_dir: &Path) -> Option<String> {
+fn resume_session_id_from_args(
+    args: &[String],
+    agent_backend: &str,
+    sessions_dir: &Path,
+) -> Option<String> {
     if agent_backend == "pi" {
         for pair in args.windows(2) {
             if pair[0] != "--session" {
@@ -1194,7 +1327,11 @@ fn resume_session_id_from_args(args: &[String], agent_backend: &str, sessions_di
         .filter(|value| !value.is_empty())
 }
 
-fn session_log_path_from_args(args: &[String], agent_backend: &str, sessions_dir: &Path) -> Option<PathBuf> {
+fn session_log_path_from_args(
+    args: &[String],
+    agent_backend: &str,
+    sessions_dir: &Path,
+) -> Option<PathBuf> {
     if agent_backend != "pi" {
         return None;
     }
@@ -1215,7 +1352,11 @@ fn session_log_path_from_args(args: &[String], agent_backend: &str, sessions_dir
     None
 }
 
-fn ensure_pi_session_arg(args: &[String], cwd: &Path, sessions_dir: &Path) -> Result<Vec<String>, String> {
+fn ensure_pi_session_arg(
+    args: &[String],
+    cwd: &Path,
+    sessions_dir: &Path,
+) -> Result<Vec<String>, String> {
     let mut out = args.to_vec();
     if out.iter().any(|value| value == "--session") {
         return Ok(out);
@@ -1223,13 +1364,18 @@ fn ensure_pi_session_arg(args: &[String], cwd: &Path, sessions_dir: &Path) -> Re
     let Some(session_dir) = pi_session_dir_from_args(&out, cwd, sessions_dir)? else {
         return Ok(out);
     };
-    fs::create_dir_all(&session_dir).map_err(|err| format!("create {}: {err}", session_dir.display()))?;
+    fs::create_dir_all(&session_dir)
+        .map_err(|err| format!("create {}: {err}", session_dir.display()))?;
     out.push("--session".to_string());
     out.push(pi_new_session_log_path(&session_dir).display().to_string());
     Ok(out)
 }
 
-fn pi_session_dir_from_args(args: &[String], cwd: &Path, sessions_dir: &Path) -> Result<Option<PathBuf>, String> {
+fn pi_session_dir_from_args(
+    args: &[String],
+    cwd: &Path,
+    sessions_dir: &Path,
+) -> Result<Option<PathBuf>, String> {
     if args.iter().any(|value| value == "--no-session") {
         return Ok(None);
     }
@@ -1248,7 +1394,9 @@ fn pi_session_dir_from_args(args: &[String], cwd: &Path, sessions_dir: &Path) ->
             cwd.join(path)
         }));
     }
-    Ok(Some(sessions_dir.join(pi_session_dir_name(&cwd.display().to_string()))))
+    Ok(Some(
+        sessions_dir.join(pi_session_dir_name(&cwd.display().to_string())),
+    ))
 }
 
 fn pi_session_dir_name(cwd: &str) -> String {
@@ -1289,7 +1437,9 @@ fn expand_path(raw: &str) -> Result<PathBuf, String> {
     Ok(if path.is_absolute() {
         path
     } else {
-        env::current_dir().map_err(|err| format!("current dir: {err}"))?.join(path)
+        env::current_dir()
+            .map_err(|err| format!("current dir: {err}"))?
+            .join(path)
     })
 }
 
@@ -1309,7 +1459,9 @@ fn clean_env(key: &str) -> Option<String> {
 }
 
 fn home_dir() -> PathBuf {
-    env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("/"))
+    env::var("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/"))
 }
 
 fn epoch_now() -> f64 {
@@ -1327,18 +1479,22 @@ fn shell_quote(value: &str) -> String {
 }
 
 fn shell_join(items: &[String]) -> String {
-    items.iter().map(|item| shell_quote(item)).collect::<Vec<_>>().join(" ")
+    items
+        .iter()
+        .map(|item| shell_quote(item))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        copy_fd_to_pty, ensure_pi_session_arg, is_uuid_like, resume_session_id_from_args,
-        inject_text_with_suffix_delay, open_pty, run_broker, scan_token_updates_from_log,
-        seq_bytes, session_id_from_log, session_id_from_rollout_path, session_log_path_from_args,
-        set_pty_winsize, shell_quote, strip_ansi, terminal_size_from_fd, trim_utf8_tail,
-        update_busy_from_pty_text, clear_stale_pty_busy_hint, update_detach_from_pty_text,
-        web_owned_codex_args, write_all_fd, BrokerConfig, BrokerState,
+        clear_stale_pty_busy_hint, copy_fd_to_pty, ensure_pi_session_arg,
+        inject_text_with_suffix_delay, is_uuid_like, open_pty, resume_session_id_from_args,
+        run_broker, scan_token_updates_from_log, seq_bytes, session_id_from_log,
+        session_id_from_rollout_path, session_log_path_from_args, set_pty_winsize, shell_quote,
+        strip_ansi, terminal_size_from_fd, trim_utf8_tail, update_busy_from_pty_text,
+        update_detach_from_pty_text, web_owned_codex_args, write_all_fd, BrokerConfig, BrokerState,
     };
     use serde_json::{json, Value};
     use std::collections::HashSet;
@@ -1380,7 +1536,10 @@ mod tests {
         let mut byte = [0u8; 1];
         let n = unsafe { libc::read(read_fd, byte.as_mut_ptr().cast(), byte.len()) };
         assert_eq!(n, -1);
-        assert_eq!(std::io::Error::last_os_error().kind(), std::io::ErrorKind::WouldBlock);
+        assert_eq!(
+            std::io::Error::last_os_error().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
         set_nonblocking(read_fd, false);
 
         assert!(handle.join().unwrap().is_ok());
@@ -1409,7 +1568,9 @@ mod tests {
 
     #[test]
     fn broker_extracts_codex_session_id_from_rollout_filename() {
-        let path = Path::new("/tmp/rollout-2026-04-28T00-00-00-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee.jsonl");
+        let path = Path::new(
+            "/tmp/rollout-2026-04-28T00-00-00-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee.jsonl",
+        );
         assert_eq!(
             session_id_from_rollout_path(path).as_deref(),
             Some("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
@@ -1420,7 +1581,8 @@ mod tests {
     #[test]
     fn rust_broker_scans_codex_token_updates_incrementally() {
         let app_dir = temp_app_dir("broker-token");
-        let log_path = app_dir.join("rollout-2026-04-28T00-00-00-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee.jsonl");
+        let log_path =
+            app_dir.join("rollout-2026-04-28T00-00-00-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee.jsonl");
         let first = json!({
             "type": "event_msg",
             "timestamp": "2026-04-28T00:00:00Z",
@@ -1507,28 +1669,43 @@ mod tests {
         state.busy = true;
         state.busy_from_pty_hint = true;
         state.busy_hint_last_seen = Some(now - Duration::from_secs(4));
-        assert!(clear_stale_pty_busy_hint(&mut state, now, Duration::from_secs(3)));
+        assert!(clear_stale_pty_busy_hint(
+            &mut state,
+            now,
+            Duration::from_secs(3)
+        ));
         assert!(!state.busy);
         assert!(!state.busy_from_pty_hint);
 
         state.busy = true;
         state.busy_from_pty_hint = false;
         state.busy_hint_last_seen = Some(now - Duration::from_secs(4));
-        assert!(!clear_stale_pty_busy_hint(&mut state, now, Duration::from_secs(3)));
+        assert!(!clear_stale_pty_busy_hint(
+            &mut state,
+            now,
+            Duration::from_secs(3)
+        ));
         assert!(state.busy);
     }
 
     #[test]
     fn rust_broker_detaches_codex_log_binding_from_split_session_switch_hint() {
         let mut state = test_broker_state();
-        let log_path = temp_app_dir("broker-detach").join("rollout-2026-04-28T00-00-00-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee.jsonl");
+        let log_path = temp_app_dir("broker-detach")
+            .join("rollout-2026-04-28T00-00-00-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee.jsonl");
         fs::write(&log_path, "{}\n").unwrap();
         state.log_path = Some(log_path.clone());
         state.session_id = Some("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".to_string());
 
-        assert!(!update_detach_from_pty_text(&mut state, "To continue this "));
+        assert!(!update_detach_from_pty_text(
+            &mut state,
+            "To continue this "
+        ));
         assert!(state.log_path.is_some());
-        assert!(update_detach_from_pty_text(&mut state, "session, run codex resume ..."));
+        assert!(update_detach_from_pty_text(
+            &mut state,
+            "session, run codex resume ..."
+        ));
 
         assert!(state.log_path.is_none());
         assert!(state.session_id.is_none());
@@ -1608,14 +1785,24 @@ mod tests {
         let sessions_dir = app_dir.join("pi-home").join("agent").join("sessions");
         fs::create_dir_all(&sessions_dir).unwrap();
         let log_path = sessions_dir.join("resume.jsonl");
-        fs::write(&log_path, r#"{"type":"session","id":"resume-a","cwd":"/tmp"}"#).unwrap();
+        fs::write(
+            &log_path,
+            r#"{"type":"session","id":"resume-a","cwd":"/tmp"}"#,
+        )
+        .unwrap();
         let args = vec!["--session".to_string(), log_path.display().to_string()];
         assert_eq!(
             session_log_path_from_args(&args, "pi", &sessions_dir).as_deref(),
             Some(log_path.as_path())
         );
-        assert_eq!(session_id_from_log(&log_path, "pi").as_deref(), Some("resume-a"));
-        assert_eq!(resume_session_id_from_args(&args, "pi", &sessions_dir).as_deref(), Some("resume-a"));
+        assert_eq!(
+            session_id_from_log(&log_path, "pi").as_deref(),
+            Some("resume-a")
+        );
+        assert_eq!(
+            resume_session_id_from_args(&args, "pi", &sessions_dir).as_deref(),
+            Some("resume-a")
+        );
     }
 
     #[test]
@@ -1695,9 +1882,14 @@ mod tests {
         };
         let handle = thread::spawn(move || run_broker(config));
         let sock_path = wait_for_sock(&app_dir);
-        let meta: Value = serde_json::from_str(&fs::read_to_string(sock_path.with_extension("json")).unwrap()).unwrap();
+        let meta: Value =
+            serde_json::from_str(&fs::read_to_string(sock_path.with_extension("json")).unwrap())
+                .unwrap();
         assert_eq!(meta["agent_backend"], "pi");
-        assert!(meta["sock_path"].as_str().unwrap_or_default().ends_with(".sock"));
+        assert!(meta["sock_path"]
+            .as_str()
+            .unwrap_or_default()
+            .ends_with(".sock"));
 
         let tail = wait_for_tail(&sock_path);
         assert!(tail.contains("READY"));
@@ -1819,7 +2011,11 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(3);
         while Instant::now() < deadline {
             let payload = socket_request(sock_path, json!({"cmd":"tail"}));
-            let tail = payload.get("tail").and_then(Value::as_str).unwrap_or_default().to_string();
+            let tail = payload
+                .get("tail")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
             if tail.contains("READY") {
                 return tail;
             }

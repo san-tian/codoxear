@@ -1,34 +1,33 @@
 use crate::models::{
     ApiBackendDefaults, ApiChangedFileEntry, ApiChangedFilesResponse, ApiDiagnosticsResponse,
     ApiFileSearchMatch, ApiFileSearchResponse, ApiGitDiffResponse, ApiGitFileVersionsResponse,
-    ApiHarnessResponse,
-    ApiMessagesHistoryResponse, ApiMessagesLiveResponse, ApiMessagesTailResponse,
-    ApiNewSessionDefaults, ApiQueueItem, ApiQueueResponse, ApiSessionSummary,
-    ApiSessionsResponse, SessionDetail, SessionSummary,
+    ApiHarnessResponse, ApiMessagesHistoryResponse, ApiMessagesLiveResponse,
+    ApiMessagesTailResponse, ApiNewSessionDefaults, ApiQueueItem, ApiQueueResponse,
+    ApiSessionSummary, ApiSessionsResponse, SessionDetail, SessionSummary,
 };
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
 use std::cmp::Reverse;
 use std::collections::{hash_map::DefaultHasher, BinaryHeap, HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
-use std::path::Component;
-use std::os::unix::fs::PermissionsExt;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
+use std::path::Component;
 use std::path::{Path, PathBuf};
 use std::process::{self, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::task;
 use tokio::time::{self, MissedTickBehavior};
-use sha2::{Digest, Sha256};
 use toml::Value as TomlValue;
 
 const APP_VERSION: &str = "0.1.0";
@@ -59,8 +58,15 @@ const DEFAULT_HARNESS_MAX_SCAN_BYTES: usize = 8 * 1024 * 1024;
 const SIDEBAR_PRIORITY_HALF_LIFE_SECONDS: f64 = 8.0 * 3600.0;
 const SIDEBAR_PRIORITY_LAMBDA: f64 = std::f64::consts::LN_2 / SIDEBAR_PRIORITY_HALF_LIFE_SECONDS;
 const SUPPORTED_REASONING_EFFORTS: &[&str] = &["xhigh", "high", "medium", "low"];
-const SUPPORTED_PI_REASONING_EFFORTS: &[&str] = &["off", "minimal", "low", "medium", "high", "xhigh"];
-const BUILTIN_PI_PROVIDER_CHOICES: &[&str] = &["anthropic", "openai-codex", "github-copilot", "google-gemini-cli", "google-antigravity"];
+const SUPPORTED_PI_REASONING_EFFORTS: &[&str] =
+    &["off", "minimal", "low", "medium", "high", "xhigh"];
+const BUILTIN_PI_PROVIDER_CHOICES: &[&str] = &[
+    "anthropic",
+    "openai-codex",
+    "github-copilot",
+    "google-gemini-cli",
+    "google-antigravity",
+];
 const TMUX_META_WAIT_SECONDS: f64 = 10.0;
 const HARNESS_PROMPT_PREFIX: &str = r#"Unattended-mode instructions (optimize for 8+ hours, minimal turns, minimal repetition, maximal progress)
 
@@ -113,9 +119,9 @@ const FILE_LIST_IGNORED_DIRS: &[&str] = &[
     ".venv",
 ];
 const TEXTUAL_EXTENSIONS: &[&str] = &[
-    "bash", "c", "cc", "cfg", "conf", "cpp", "css", "csv", "diff", "go", "h", "hpp", "htm",
-    "html", "ini", "java", "js", "json", "jsonl", "log", "md", "markdown", "mdown", "mkd", "patch",
-    "py", "rs", "scss", "sh", "sql", "svg", "toml", "ts", "tsx", "txt", "xml", "yaml", "yml", "zsh",
+    "bash", "c", "cc", "cfg", "conf", "cpp", "css", "csv", "diff", "go", "h", "hpp", "htm", "html",
+    "ini", "java", "js", "json", "jsonl", "log", "md", "markdown", "mdown", "mkd", "patch", "py",
+    "rs", "scss", "sh", "sql", "svg", "toml", "ts", "tsx", "txt", "xml", "yaml", "yml", "zsh",
 ];
 const TEXTUAL_FILENAMES: &[&str] = &["dockerfile", "license", "makefile", "readme"];
 
@@ -205,7 +211,10 @@ pub struct CreateSessionRequest {
 
 #[derive(Debug, Clone)]
 pub enum CreateSessionError {
-    BadRequest { message: String, field: Option<String> },
+    BadRequest {
+        message: String,
+        field: Option<String>,
+    },
     Internal(String),
 }
 
@@ -254,8 +263,12 @@ pub fn default_app_dir() -> Result<PathBuf, String> {
             return Ok(PathBuf::from(trimmed));
         }
     }
-    let home = env::var("HOME").map_err(|_| "HOME is not set; cannot resolve Codoxear app dir".to_string())?;
-    Ok(PathBuf::from(home).join(".local").join("share").join("codoxear"))
+    let home = env::var("HOME")
+        .map_err(|_| "HOME is not set; cannot resolve Codoxear app dir".to_string())?;
+    Ok(PathBuf::from(home)
+        .join(".local")
+        .join("share")
+        .join("codoxear"))
 }
 
 pub fn load_sessions_response(config: &RuntimeConfig) -> Result<ApiSessionsResponse, String> {
@@ -350,7 +363,11 @@ pub fn load_resume_candidates_response(
     Ok(Value::Object(payload))
 }
 
-pub fn load_cwd_suggestions_response(config: &RuntimeConfig, raw: &str, limit: usize) -> Result<Value, String> {
+pub fn load_cwd_suggestions_response(
+    config: &RuntimeConfig,
+    raw: &str,
+    limit: usize,
+) -> Result<Value, String> {
     let recent_cwds = read_recent_cwds(&config.app_dir.join("recent_cwds.json"))?;
     list_directory_suggestions(raw, &recent_cwds, limit)
 }
@@ -382,7 +399,8 @@ fn read_legacy_static_bytes(static_dir: &Path, path: &Path) -> Result<Vec<u8>, S
     if path.extension().and_then(|ext| ext.to_str()) != Some("html") {
         return Ok(data);
     }
-    let mut text = String::from_utf8(data).map_err(|err| format!("decode {}: {err}", path.display()))?;
+    let mut text =
+        String::from_utf8(data).map_err(|err| format!("decode {}: {err}", path.display()))?;
     text = text.replace(
         STATIC_ASSET_VERSION_PLACEHOLDER,
         &legacy_static_asset_version(static_dir)?,
@@ -400,7 +418,10 @@ fn legacy_static_asset_version(static_dir: &Path) -> Result<String, String> {
     for rel in STATIC_ASSET_VERSION_FILES {
         let path = base.join(rel);
         if !path.starts_with(&base) {
-            return Err(format!("static asset escaped static dir: {}", path.display()));
+            return Err(format!(
+                "static asset escaped static dir: {}",
+                path.display()
+            ));
         }
         if !path.is_file() {
             continue;
@@ -444,7 +465,8 @@ pub fn schedule_local_service_restart_response() -> Result<Value, String> {
     if !script.exists() {
         return Err(format!("missing {}", script.display()));
     }
-    let metadata = fs::metadata(&script).map_err(|err| format!("stat {}: {err}", script.display()))?;
+    let metadata =
+        fs::metadata(&script).map_err(|err| format!("stat {}: {err}", script.display()))?;
     if metadata.permissions().mode() & 0o111 == 0 {
         return Err(format!("{} is not executable", script.display()));
     }
@@ -477,7 +499,10 @@ pub fn schedule_local_service_restart_response() -> Result<Value, String> {
 pub fn load_notification_subscriptions_response(config: &RuntimeConfig) -> Result<Value, String> {
     let records = read_notification_subscription_records(&push_subscriptions_path(config))?;
     let vapid_public_key = ensure_vapid_public_key(config)?;
-    Ok(notification_subscriptions_snapshot_value(&records, &vapid_public_key))
+    Ok(notification_subscriptions_snapshot_value(
+        &records,
+        &vapid_public_key,
+    ))
 }
 
 pub fn upsert_notification_subscription_response(
@@ -601,7 +626,10 @@ pub fn load_voice_settings_response(config: &RuntimeConfig) -> Result<Value, Str
     let vapid_public_key = ensure_vapid_public_key(config)?;
     let active_listener_count = current_voice_listener_count(
         config,
-        audio.get("active_listener_count").and_then(Value::as_i64).unwrap_or(0),
+        audio
+            .get("active_listener_count")
+            .and_then(Value::as_i64)
+            .unwrap_or(0),
     )?;
     let (enabled_devices, total_devices) = notification_mobile_device_counts(&records);
     Ok(json!({
@@ -628,7 +656,10 @@ pub fn load_voice_settings_response(config: &RuntimeConfig) -> Result<Value, Str
     }))
 }
 
-pub fn save_voice_settings_response(config: &RuntimeConfig, payload: &Value) -> Result<Value, String> {
+pub fn save_voice_settings_response(
+    config: &RuntimeConfig,
+    payload: &Value,
+) -> Result<Value, String> {
     let settings = clean_voice_settings_value(payload)?;
     let text = serde_json::to_string_pretty(&settings)
         .map_err(|err| format!("serialize {}: {err}", voice_settings_path(config).display()))?;
@@ -637,7 +668,10 @@ pub fn save_voice_settings_response(config: &RuntimeConfig, payload: &Value) -> 
     load_voice_settings_response(config)
 }
 
-pub fn load_notification_message_response(config: &RuntimeConfig, message_id: &str) -> Result<Value, String> {
+pub fn load_notification_message_response(
+    config: &RuntimeConfig,
+    message_id: &str,
+) -> Result<Value, String> {
     let message_id = message_id.trim();
     if message_id.is_empty() {
         return Err("message_id required".to_string());
@@ -656,7 +690,10 @@ pub fn load_notification_message_response(config: &RuntimeConfig, message_id: &s
     }))
 }
 
-pub fn load_notification_feed_response(config: &RuntimeConfig, since_ts: f64) -> Result<Value, String> {
+pub fn load_notification_feed_response(
+    config: &RuntimeConfig,
+    since_ts: f64,
+) -> Result<Value, String> {
     let ledger = read_voice_delivery_ledger(&voice_delivery_ledger_path(config))?;
     let mut items = ledger
         .iter()
@@ -695,7 +732,11 @@ pub fn load_notification_feed_response(config: &RuntimeConfig, since_ts: f64) ->
                 a.get("message_id")
                     .and_then(Value::as_str)
                     .unwrap_or_default()
-                    .cmp(b.get("message_id").and_then(Value::as_str).unwrap_or_default())
+                    .cmp(
+                        b.get("message_id")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default(),
+                    )
             })
     });
     Ok(json!({ "ok": true, "items": items }))
@@ -710,7 +751,10 @@ pub fn load_audio_playlist_bytes(config: &RuntimeConfig) -> Result<Vec<u8>, Stri
     }
 }
 
-pub fn load_audio_segment_bytes(config: &RuntimeConfig, segment_name: &str) -> Result<Vec<u8>, String> {
+pub fn load_audio_segment_bytes(
+    config: &RuntimeConfig,
+    segment_name: &str,
+) -> Result<Vec<u8>, String> {
     let name = Path::new(segment_name)
         .file_name()
         .and_then(|value| value.to_str())
@@ -755,7 +799,10 @@ fn normalize_nova_shell_path(path: &str) -> Result<String, String> {
     if trimmed.is_empty() {
         return Err("empty path".to_string());
     }
-    if trimmed.split('/').any(|segment| segment.is_empty() || segment == "." || segment == "..") {
+    if trimmed
+        .split('/')
+        .any(|segment| segment.is_empty() || segment == "." || segment == "..")
+    {
         return Err("invalid static path".to_string());
     }
     Ok(trimmed.to_string())
@@ -766,7 +813,11 @@ fn normalize_legacy_static_path(path: &str) -> Result<String, String> {
 }
 
 fn content_type_for_static_path(path: &str) -> &'static str {
-    match Path::new(path).extension().and_then(|ext| ext.to_str()).unwrap_or_default() {
+    match Path::new(path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or_default()
+    {
         "css" => "text/css; charset=utf-8",
         "html" => "text/html; charset=utf-8",
         "ico" => "image/x-icon",
@@ -796,7 +847,10 @@ fn list_resume_candidates_for_cwd(
         let Some(mut row) = resume_candidate_from_log(&log_path, agent_backend) else {
             continue;
         };
-        let session_id = row.get("session_id").and_then(Value::as_str).unwrap_or_default();
+        let session_id = row
+            .get("session_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         let row_cwd = row.get("cwd").and_then(Value::as_str).unwrap_or_default();
         if session_id.is_empty() || row_cwd != cwd_text || !seen.insert(session_id.to_string()) {
             continue;
@@ -823,7 +877,10 @@ fn resume_candidate_from_log(log_path: &Path, agent_backend: &str) -> Option<Val
     let session_id = payload.get("id").and_then(Value::as_str)?;
     let cwd = payload.get("cwd").and_then(Value::as_str)?;
     let mut out = serde_json::Map::new();
-    out.insert("session_id".to_string(), Value::String(session_id.to_string()));
+    out.insert(
+        "session_id".to_string(),
+        Value::String(session_id.to_string()),
+    );
     out.insert("cwd".to_string(), Value::String(cwd.to_string()));
     out.insert(
         "log_path".to_string(),
@@ -941,8 +998,14 @@ fn user_message_text(payload: &Map<String, Value>) -> String {
                 .iter()
                 .filter_map(|item| {
                     let kind = item.get("type").and_then(Value::as_str);
-                    if matches!(kind, Some("input_text") | Some("output_text") | Some("text")) {
-                        item.get("text").and_then(Value::as_str).map(str::trim).filter(|text| !text.is_empty())
+                    if matches!(
+                        kind,
+                        Some("input_text") | Some("output_text") | Some("text")
+                    ) {
+                        item.get("text")
+                            .and_then(Value::as_str)
+                            .map(str::trim)
+                            .filter(|text| !text.is_empty())
                     } else {
                         None
                     }
@@ -969,7 +1032,10 @@ fn resume_preview_from_text(text: &str, max_chars: usize) -> String {
     if compact.chars().count() <= max_chars {
         return compact;
     }
-    let mut head = compact.chars().take(max_chars.saturating_sub(1)).collect::<String>();
+    let mut head = compact
+        .chars()
+        .take(max_chars.saturating_sub(1))
+        .collect::<String>();
     if let Some(cut) = head.rfind(' ') {
         if cut >= max_chars.saturating_mul(3) / 5 {
             head.truncate(cut);
@@ -978,7 +1044,11 @@ fn resume_preview_from_text(text: &str, max_chars: usize) -> String {
     format!("{}...", head.trim_end())
 }
 
-fn list_directory_suggestions(raw: &str, recent_cwds: &[String], limit: usize) -> Result<Value, String> {
+fn list_directory_suggestions(
+    raw: &str,
+    recent_cwds: &[String],
+    limit: usize,
+) -> Result<Value, String> {
     let query = raw.trim().to_string();
     let cap = limit.clamp(1, 48);
     let mut suggestions = Vec::new();
@@ -987,11 +1057,19 @@ fn list_directory_suggestions(raw: &str, recent_cwds: &[String], limit: usize) -
     let mut resolved_query = String::new();
     if query.is_empty() {
         for recent in recent_cwds {
-            push_cwd_suggestion(&mut suggestions, &mut seen, cap, PathBuf::from(recent), "recent");
+            push_cwd_suggestion(
+                &mut suggestions,
+                &mut seen,
+                cap,
+                PathBuf::from(recent),
+                "recent",
+            );
         }
         if suggestions.len() < cap {
             if let Some(home) = home_dir().map(|path| fs::canonicalize(&path).unwrap_or(path)) {
-                for child in iter_matching_directories(&home, "", cap.saturating_sub(suggestions.len())) {
+                for child in
+                    iter_matching_directories(&home, "", cap.saturating_sub(suggestions.len()))
+                {
                     push_cwd_suggestion(&mut suggestions, &mut seen, cap, child, "directory");
                 }
             }
@@ -1008,7 +1086,12 @@ fn list_directory_suggestions(raw: &str, recent_cwds: &[String], limit: usize) -
         let mut search_root = if query.ends_with('/') || target.is_dir() {
             Some(target.clone())
         } else {
-            Some(target.parent().map(Path::to_path_buf).unwrap_or_else(|| target.clone()))
+            Some(
+                target
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| target.clone()),
+            )
         };
         let mut prefix = if query.ends_with('/') || target.is_dir() {
             String::new()
@@ -1085,7 +1168,11 @@ fn push_cwd_suggestion(
     let Some(row) = cwd_suggestion_entry(&path, kind) else {
         return;
     };
-    let value = row.get("value").and_then(Value::as_str).unwrap_or_default().to_string();
+    let value = row
+        .get("value")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
     if !seen.insert(value) {
         return;
     }
@@ -1171,7 +1258,10 @@ pub fn load_messages_tail(
     let take = limit.max(1).min(chat_records.len());
     let split = chat_records.len().saturating_sub(take);
     let selected = &chat_records[split..];
-    let events = selected.iter().map(|record| record.event.clone()).collect::<Vec<_>>();
+    let events = selected
+        .iter()
+        .map(|record| record.event.clone())
+        .collect::<Vec<_>>();
     let live_cursor = file_len(Path::new(log_path))?.to_string();
     let history_cursor = selected.first().map(|record| record.start.to_string());
     Ok(ApiMessagesTailResponse {
@@ -1273,7 +1363,9 @@ pub fn load_messages_live(
     })
 }
 
-pub fn load_preview_bootstrap(config: &RuntimeConfig) -> Result<(Vec<SessionSummary>, HashMap<String, SessionDetail>, String), String> {
+pub fn load_preview_bootstrap(
+    config: &RuntimeConfig,
+) -> Result<(Vec<SessionSummary>, HashMap<String, SessionDetail>, String), String> {
     let sessions_response = load_sessions_response(config)?;
     let selected = sessions_response
         .sessions
@@ -1291,7 +1383,11 @@ pub fn load_preview_bootstrap(config: &RuntimeConfig) -> Result<(Vec<SessionSumm
                 session.alias.clone()
             },
             backend: session.agent_backend,
-            status: if session.busy { "running".into() } else { "idle".into() },
+            status: if session.busy {
+                "running".into()
+            } else {
+                "idle".into()
+            },
             workspace: session.cwd,
             transport: session.transport,
             tmux_session: session.tmux_session,
@@ -1304,7 +1400,10 @@ pub fn load_preview_bootstrap(config: &RuntimeConfig) -> Result<(Vec<SessionSumm
     Ok((sessions, HashMap::new(), selected))
 }
 
-pub fn load_diagnostics_response(config: &RuntimeConfig, session_id: &str) -> Result<ApiDiagnosticsResponse, String> {
+pub fn load_diagnostics_response(
+    config: &RuntimeConfig,
+    session_id: &str,
+) -> Result<ApiDiagnosticsResponse, String> {
     let session = find_session(config, session_id)?;
     let broker_state = read_live_broker_state(config, &session)?;
     let broker_busy = broker_state.busy;
@@ -1319,8 +1418,15 @@ pub fn load_diagnostics_response(config: &RuntimeConfig, session_id: &str) -> Re
     let time_priority = priority_from_elapsed_seconds((now - session.updated_ts).max(0.0));
     let base_priority = clip01(time_priority + session.priority_offset);
     let blocked = session.dependency_session_id.is_some();
-    let snoozed = session.snooze_until.map(|value| value > now).unwrap_or(false);
-    let final_priority = if blocked || snoozed { 0.0 } else { base_priority };
+    let snoozed = session
+        .snooze_until
+        .map(|value| value > now)
+        .unwrap_or(false);
+    let final_priority = if blocked || snoozed {
+        0.0
+    } else {
+        base_priority
+    };
     Ok(ApiDiagnosticsResponse {
         session_id: session.session_id,
         thread_id: session.thread_id,
@@ -1358,14 +1464,20 @@ pub fn load_diagnostics_response(config: &RuntimeConfig, session_id: &str) -> Re
     })
 }
 
-pub fn load_queue_response(config: &RuntimeConfig, session_id: &str) -> Result<ApiQueueResponse, String> {
+pub fn load_queue_response(
+    config: &RuntimeConfig,
+    session_id: &str,
+) -> Result<ApiQueueResponse, String> {
     let _ = find_session(config, session_id)?;
     let queues = read_array_map(&config.app_dir.join("session_queues.json"))?;
     let items = normalized_queue_values(queues.get(session_id).map(Vec::as_slice).unwrap_or(&[]))
         .iter()
         .map(queue_item_from_value)
         .collect::<Vec<_>>();
-    let queue = items.iter().map(|item| item.text.clone()).collect::<Vec<_>>();
+    let queue = items
+        .iter()
+        .map(|item| item.text.clone())
+        .collect::<Vec<_>>();
     Ok(ApiQueueResponse {
         ok: true,
         items,
@@ -1373,14 +1485,19 @@ pub fn load_queue_response(config: &RuntimeConfig, session_id: &str) -> Result<A
     })
 }
 
-pub fn enqueue_session_message(config: &RuntimeConfig, session_id: &str, text: &str) -> Result<Value, String> {
+pub fn enqueue_session_message(
+    config: &RuntimeConfig,
+    session_id: &str,
+    text: &str,
+) -> Result<Value, String> {
     if text.trim().is_empty() {
         return Err("text required".to_string());
     }
     let session = find_session(config, session_id)?;
     let queue_path = config.app_dir.join("session_queues.json");
     let mut queues = read_array_map(&queue_path)?;
-    let mut items = normalized_queue_values(queues.get(session_id).map(Vec::as_slice).unwrap_or(&[]));
+    let mut items =
+        normalized_queue_values(queues.get(session_id).map(Vec::as_slice).unwrap_or(&[]));
     let item = new_queue_item_value(text, None);
     let item_id = item
         .get("id")
@@ -1422,8 +1539,12 @@ pub fn enqueue_session_message(config: &RuntimeConfig, session_id: &str, text: &
 
     match send_result {
         Ok(response) => {
-            let mut remaining = normalized_queue_values(queues.get(session_id).map(Vec::as_slice).unwrap_or(&[]));
-            if let Some(index) = remaining.iter().position(|entry| entry.get("id").and_then(Value::as_str) == Some(item_id.as_str())) {
+            let mut remaining =
+                normalized_queue_values(queues.get(session_id).map(Vec::as_slice).unwrap_or(&[]));
+            if let Some(index) = remaining
+                .iter()
+                .position(|entry| entry.get("id").and_then(Value::as_str) == Some(item_id.as_str()))
+            {
                 remaining.remove(index);
             }
             set_normalized_queue_values(&mut queues, session_id, remaining);
@@ -1431,8 +1552,12 @@ pub fn enqueue_session_message(config: &RuntimeConfig, session_id: &str, text: &
             Ok(response)
         }
         Err(_) => {
-            let mut reverted = normalized_queue_values(queues.get(session_id).map(Vec::as_slice).unwrap_or(&[]));
-            if let Some(entry) = reverted.iter_mut().find(|entry| entry.get("id").and_then(Value::as_str) == Some(item_id.as_str())) {
+            let mut reverted =
+                normalized_queue_values(queues.get(session_id).map(Vec::as_slice).unwrap_or(&[]));
+            if let Some(entry) = reverted
+                .iter_mut()
+                .find(|entry| entry.get("id").and_then(Value::as_str) == Some(item_id.as_str()))
+            {
                 entry.as_object_mut().map(|object| object.remove("sending"));
             }
             set_normalized_queue_values(&mut queues, session_id, reverted);
@@ -1442,7 +1567,11 @@ pub fn enqueue_session_message(config: &RuntimeConfig, session_id: &str, text: &
     }
 }
 
-pub fn delete_queue_item(config: &RuntimeConfig, session_id: &str, item_id: &str) -> Result<Value, String> {
+pub fn delete_queue_item(
+    config: &RuntimeConfig,
+    session_id: &str,
+    item_id: &str,
+) -> Result<Value, String> {
     let item_id = item_id.trim();
     if item_id.is_empty() {
         return Err("id required".to_string());
@@ -1450,8 +1579,12 @@ pub fn delete_queue_item(config: &RuntimeConfig, session_id: &str, item_id: &str
     let _ = find_session(config, session_id)?;
     let queue_path = config.app_dir.join("session_queues.json");
     let mut queues = read_array_map(&queue_path)?;
-    let mut items = normalized_queue_values(queues.get(session_id).map(Vec::as_slice).unwrap_or(&[]));
-    let Some(index) = items.iter().position(|entry| entry.get("id").and_then(Value::as_str) == Some(item_id)) else {
+    let mut items =
+        normalized_queue_values(queues.get(session_id).map(Vec::as_slice).unwrap_or(&[]));
+    let Some(index) = items
+        .iter()
+        .position(|entry| entry.get("id").and_then(Value::as_str) == Some(item_id))
+    else {
         return Err("item not found".to_string());
     };
     if items[index].get("sending").and_then(Value::as_bool) == Some(true) {
@@ -1464,7 +1597,12 @@ pub fn delete_queue_item(config: &RuntimeConfig, session_id: &str, item_id: &str
     Ok(json!({"ok": true, "queue_len": queue_len}))
 }
 
-pub fn update_queue_item(config: &RuntimeConfig, session_id: &str, item_id: &str, text: &str) -> Result<Value, String> {
+pub fn update_queue_item(
+    config: &RuntimeConfig,
+    session_id: &str,
+    item_id: &str,
+    text: &str,
+) -> Result<Value, String> {
     let item_id = item_id.trim();
     if item_id.is_empty() {
         return Err("id required".to_string());
@@ -1475,8 +1613,12 @@ pub fn update_queue_item(config: &RuntimeConfig, session_id: &str, item_id: &str
     let _ = find_session(config, session_id)?;
     let queue_path = config.app_dir.join("session_queues.json");
     let mut queues = read_array_map(&queue_path)?;
-    let mut items = normalized_queue_values(queues.get(session_id).map(Vec::as_slice).unwrap_or(&[]));
-    let Some(index) = items.iter().position(|entry| entry.get("id").and_then(Value::as_str) == Some(item_id)) else {
+    let mut items =
+        normalized_queue_values(queues.get(session_id).map(Vec::as_slice).unwrap_or(&[]));
+    let Some(index) = items
+        .iter()
+        .position(|entry| entry.get("id").and_then(Value::as_str) == Some(item_id))
+    else {
         return Err("item not found".to_string());
     };
     if items[index].get("sending").and_then(Value::as_bool) == Some(true) {
@@ -1490,7 +1632,12 @@ pub fn update_queue_item(config: &RuntimeConfig, session_id: &str, item_id: &str
     Ok(json!({"ok": true, "queue_len": queue_len, "item": item}))
 }
 
-pub fn move_queue_item(config: &RuntimeConfig, session_id: &str, item_id: &str, to_index: i64) -> Result<Value, String> {
+pub fn move_queue_item(
+    config: &RuntimeConfig,
+    session_id: &str,
+    item_id: &str,
+    to_index: i64,
+) -> Result<Value, String> {
     let item_id = item_id.trim();
     if item_id.is_empty() {
         return Err("id required".to_string());
@@ -1498,14 +1645,21 @@ pub fn move_queue_item(config: &RuntimeConfig, session_id: &str, item_id: &str, 
     let _ = find_session(config, session_id)?;
     let queue_path = config.app_dir.join("session_queues.json");
     let mut queues = read_array_map(&queue_path)?;
-    let mut items = normalized_queue_values(queues.get(session_id).map(Vec::as_slice).unwrap_or(&[]));
-    let Some(index) = items.iter().position(|entry| entry.get("id").and_then(Value::as_str) == Some(item_id)) else {
+    let mut items =
+        normalized_queue_values(queues.get(session_id).map(Vec::as_slice).unwrap_or(&[]));
+    let Some(index) = items
+        .iter()
+        .position(|entry| entry.get("id").and_then(Value::as_str) == Some(item_id))
+    else {
         return Err("item not found".to_string());
     };
     if items[index].get("sending").and_then(Value::as_bool) == Some(true) {
         return Err("item is already sending".to_string());
     }
-    let min_index = if items.iter().any(|entry| entry.get("sending").and_then(Value::as_bool) == Some(true)) {
+    let min_index = if items
+        .iter()
+        .any(|entry| entry.get("sending").and_then(Value::as_bool) == Some(true))
+    {
         1usize
     } else {
         0usize
@@ -1678,7 +1832,8 @@ fn run_queue_sweep_once(
         let Some(session) = session_by_id.get(&session_id) else {
             continue;
         };
-        let mut items = normalized_queue_values(queues.get(&session_id).map(Vec::as_slice).unwrap_or(&[]));
+        let mut items =
+            normalized_queue_values(queues.get(&session_id).map(Vec::as_slice).unwrap_or(&[]));
         if items.is_empty() {
             queues.remove(&session_id);
             idle_since.remove(&session_id);
@@ -1737,7 +1892,8 @@ fn run_queue_sweep_once(
             Duration::from_secs_f64(3.0),
         )
         .and_then(|response| {
-            if !response.is_object() || response.get("queue_len").and_then(Value::as_u64).is_none() {
+            if !response.is_object() || response.get("queue_len").and_then(Value::as_u64).is_none()
+            {
                 return Err("invalid broker send response".to_string());
             }
             Ok(response)
@@ -1745,11 +1901,12 @@ fn run_queue_sweep_once(
 
         match send_result {
             Ok(_) => {
-                let mut remaining = normalized_queue_values(queues.get(&session_id).map(Vec::as_slice).unwrap_or(&[]));
-                if let Some(index) = remaining
-                    .iter()
-                    .position(|entry| entry.get("id").and_then(Value::as_str) == Some(item_id.as_str()))
-                {
+                let mut remaining = normalized_queue_values(
+                    queues.get(&session_id).map(Vec::as_slice).unwrap_or(&[]),
+                );
+                if let Some(index) = remaining.iter().position(|entry| {
+                    entry.get("id").and_then(Value::as_str) == Some(item_id.as_str())
+                }) {
                     remaining.remove(index);
                 }
                 set_normalized_queue_values(&mut queues, &session_id, remaining);
@@ -1757,7 +1914,9 @@ fn run_queue_sweep_once(
                 return Ok(true);
             }
             Err(_) => {
-                let mut reverted = normalized_queue_values(queues.get(&session_id).map(Vec::as_slice).unwrap_or(&[]));
+                let mut reverted = normalized_queue_values(
+                    queues.get(&session_id).map(Vec::as_slice).unwrap_or(&[]),
+                );
                 if let Some(entry) = reverted
                     .iter_mut()
                     .find(|entry| entry.get("id").and_then(Value::as_str) == Some(item_id.as_str()))
@@ -1778,7 +1937,10 @@ fn run_queue_sweep_once(
     Ok(false)
 }
 
-fn run_voice_scan_once(config: &RuntimeConfig, offsets: &mut HashMap<String, u64>) -> Result<usize, String> {
+fn run_voice_scan_once(
+    config: &RuntimeConfig,
+    offsets: &mut HashMap<String, u64>,
+) -> Result<usize, String> {
     let sessions = load_sessions_response(config)?;
     let ledger = read_voice_delivery_ledger(&voice_delivery_ledger_path(config))?;
     let mut seen_keys = HashSet::new();
@@ -1864,11 +2026,12 @@ fn extract_voice_delivery_messages(objs: &[Value]) -> Vec<VoiceDeliveryMessage> 
                 if message.trim().is_empty() {
                     continue;
                 }
-                let message_class = if payload.get("phase").and_then(Value::as_str) == Some("final_answer") {
-                    "final_response"
-                } else {
-                    "narration"
-                };
+                let message_class =
+                    if payload.get("phase").and_then(Value::as_str) == Some("final_answer") {
+                        "final_response"
+                    } else {
+                        "narration"
+                    };
                 (message_class, message.to_string())
             }
             Some("response_item") => {
@@ -1886,7 +2049,8 @@ fn extract_voice_delivery_messages(objs: &[Value]) -> Vec<VoiceDeliveryMessage> 
                 if value.trim().is_empty() {
                     continue;
                 }
-                let message_class = if payload.get("phase").and_then(Value::as_str) == Some("final_answer")
+                let message_class = if payload.get("phase").and_then(Value::as_str)
+                    == Some("final_answer")
                     || payload.get("end_turn").and_then(Value::as_bool) == Some(true)
                 {
                     "final_response"
@@ -1922,7 +2086,11 @@ fn extract_voice_delivery_messages(objs: &[Value]) -> Vec<VoiceDeliveryMessage> 
     out
 }
 
-fn read_jsonl_values_from_offset(path: &Path, offset: u64, max_bytes: usize) -> Result<(Vec<Value>, u64), String> {
+fn read_jsonl_values_from_offset(
+    path: &Path,
+    offset: u64,
+    max_bytes: usize,
+) -> Result<(Vec<Value>, u64), String> {
     let file = fs::File::open(path).map_err(|err| format!("open {}: {err}", path.display()))?;
     let mut reader = BufReader::new(file);
     reader
@@ -1964,7 +2132,8 @@ fn voice_text_message_id(message_class: &str, text: &str, ts: Option<f64>) -> St
         .filter(|value| value.is_finite())
         .map(|value| python_round_to_i64(value * 1000.0).to_string())
         .unwrap_or_else(|| "null".to_string());
-    let payload = format!("{{\"class\": {class_json}, \"text\": {text_json}, \"ts_ms\": {ts_json}}}");
+    let payload =
+        format!("{{\"class\": {class_json}, \"text\": {text_json}, \"ts_ms\": {ts_json}}}");
     let digest = Sha256::digest(payload.as_bytes());
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
@@ -1978,7 +2147,11 @@ fn python_round_to_i64(value: f64) -> i64 {
         floor as i64 + 1
     } else {
         let base = floor as i64;
-        if base % 2 == 0 { base } else { base + 1 }
+        if base % 2 == 0 {
+            base
+        } else {
+            base + 1
+        }
     }
 }
 
@@ -1999,14 +2172,17 @@ fn strip_oai_mem_citation_tail(text: &str) -> String {
 }
 
 fn session_resume_id(config: &RuntimeConfig, session_id: &str) -> Result<Option<String>, String> {
-    let meta_path = config.app_dir.join("socks").join(format!("{session_id}.json"));
+    let meta_path = config
+        .app_dir
+        .join("socks")
+        .join(format!("{session_id}.json"));
     let raw = match fs::read_to_string(&meta_path) {
         Ok(raw) => raw,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(format!("read {}: {err}", meta_path.display())),
     };
-    let meta: SessionMeta =
-        serde_json::from_str(&raw).map_err(|err| format!("parse {}: {err}", meta_path.display()))?;
+    let meta: SessionMeta = serde_json::from_str(&raw)
+        .map_err(|err| format!("parse {}: {err}", meta_path.display()))?;
     Ok(clean_optional(meta.resume_session_id))
 }
 
@@ -2117,10 +2293,9 @@ fn run_harness_sweep_once(
                 continue;
             }
         };
-        let persisted_queue_len = normalized_queue_values(
-            queues.get(&session_id).map(Vec::as_slice).unwrap_or(&[]),
-        )
-        .len();
+        let persisted_queue_len =
+            normalized_queue_values(queues.get(&session_id).map(Vec::as_slice).unwrap_or(&[]))
+                .len();
         if broker_state.busy || broker_state._queue_len > 0 || persisted_queue_len > 0 {
             continue;
         }
@@ -2143,7 +2318,8 @@ fn run_harness_sweep_once(
             Duration::from_secs_f64(3.0),
         )
         .and_then(|response| {
-            if !response.is_object() || response.get("queue_len").and_then(Value::as_u64).is_none() {
+            if !response.is_object() || response.get("queue_len").and_then(Value::as_u64).is_none()
+            {
                 return Err("invalid broker send response".to_string());
             }
             Ok(response)
@@ -2171,7 +2347,10 @@ fn run_harness_sweep_once(
     Ok(did_send)
 }
 
-pub fn load_harness_response(config: &RuntimeConfig, session_id: &str) -> Result<ApiHarnessResponse, String> {
+pub fn load_harness_response(
+    config: &RuntimeConfig,
+    session_id: &str,
+) -> Result<ApiHarnessResponse, String> {
     let _ = find_session(config, session_id)?;
     let harness = read_object_map(&config.app_dir.join("harness.json"))?;
     let entry = harness.get(session_id);
@@ -2179,8 +2358,10 @@ pub fn load_harness_response(config: &RuntimeConfig, session_id: &str) -> Result
         ok: true,
         enabled: object_bool(entry, "enabled").unwrap_or(false),
         request: object_string(entry, "request").unwrap_or_default(),
-        cooldown_minutes: object_number(entry, "cooldown_minutes").unwrap_or(HARNESS_DEFAULT_IDLE_MINUTES),
-        remaining_injections: object_i64(entry, "remaining_injections").unwrap_or(HARNESS_DEFAULT_MAX_INJECTIONS),
+        cooldown_minutes: object_number(entry, "cooldown_minutes")
+            .unwrap_or(HARNESS_DEFAULT_IDLE_MINUTES),
+        remaining_injections: object_i64(entry, "remaining_injections")
+            .unwrap_or(HARNESS_DEFAULT_MAX_INJECTIONS),
     })
 }
 
@@ -2298,7 +2479,10 @@ pub fn load_file_search_response(
     })
 }
 
-pub fn load_changed_files_response(config: &RuntimeConfig, session_id: &str) -> Result<ApiChangedFilesResponse, String> {
+pub fn load_changed_files_response(
+    config: &RuntimeConfig,
+    session_id: &str,
+) -> Result<ApiChangedFilesResponse, String> {
     let session = find_session(config, session_id)?;
     let cwd = resolve_search_root(&session.cwd)?;
     ensure_git_repo(&cwd)?;
@@ -2398,7 +2582,12 @@ pub fn load_git_diff_response(
     }
     args.push("--");
     args.push(rel.as_str());
-    let diff = run_git_capture(&cwd, &args, default_git_diff_timeout(), default_git_diff_max_bytes())?;
+    let diff = run_git_capture(
+        &cwd,
+        &args,
+        default_git_diff_timeout(),
+        default_git_diff_max_bytes(),
+    )?;
 
     Ok(ApiGitDiffResponse {
         ok: true,
@@ -2453,7 +2642,11 @@ pub fn load_git_file_versions_response(
     })
 }
 
-pub fn load_file_read_response(config: &RuntimeConfig, session_id: &str, raw_path: &str) -> Result<Value, String> {
+pub fn load_file_read_response(
+    config: &RuntimeConfig,
+    session_id: &str,
+    raw_path: &str,
+) -> Result<Value, String> {
     let session = find_session(config, session_id)?;
     let resolved = resolve_session_path(&session.cwd, raw_path)?;
     let rel = raw_path.trim().to_string();
@@ -2526,9 +2719,9 @@ pub fn save_file_write_response(
     session_id: &str,
     payload: &Value,
 ) -> Result<Value, FileWriteError> {
-    let object = payload
-        .as_object()
-        .ok_or_else(|| FileWriteError::BadRequest("invalid json body (expected object)".to_string()))?;
+    let object = payload.as_object().ok_or_else(|| {
+        FileWriteError::BadRequest("invalid json body (expected object)".to_string())
+    })?;
     let path_raw = object
         .get("path")
         .and_then(Value::as_str)
@@ -2539,8 +2732,15 @@ pub fn save_file_write_response(
         .get("text")
         .and_then(Value::as_str)
         .ok_or_else(|| FileWriteError::BadRequest("text must be a string".to_string()))?;
-    let create = object.get("create").and_then(Value::as_bool).unwrap_or(false);
-    let version_raw = object.get("version").and_then(Value::as_str).map(str::trim).unwrap_or_default();
+    let create = object
+        .get("create")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let version_raw = object
+        .get("version")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default();
     if !create && version_raw.is_empty() {
         return Err(FileWriteError::BadRequest("version required".to_string()));
     }
@@ -2564,7 +2764,9 @@ pub fn save_file_write_response(
                     "path": target.display().to_string(),
                 });
                 if target.is_file() {
-                    if let Ok((_text, _size, current_version)) = read_text_file_for_write(&target, FILE_READ_MAX_BYTES) {
+                    if let Ok((_text, _size, current_version)) =
+                        read_text_file_for_write(&target, FILE_READ_MAX_BYTES)
+                    {
                         payload["version"] = Value::String(current_version);
                     }
                 }
@@ -2573,9 +2775,11 @@ pub fn save_file_write_response(
             Err(message) => return Err(map_file_write_message(message)),
         }
     } else {
-        let target = resolve_session_path(&session.cwd, path_raw).map_err(FileWriteError::BadRequest)?;
+        let target =
+            resolve_session_path(&session.cwd, path_raw).map_err(FileWriteError::BadRequest)?;
         let (_current_text, _current_size, current_version) =
-            read_text_file_for_write(&target, FILE_READ_MAX_BYTES).map_err(map_file_write_message)?;
+            read_text_file_for_write(&target, FILE_READ_MAX_BYTES)
+                .map_err(map_file_write_message)?;
         if current_version != version_raw {
             return Err(FileWriteError::Conflict(json!({
                 "error": "file changed on disk",
@@ -2584,7 +2788,8 @@ pub fn save_file_write_response(
                 "version": current_version,
             })));
         }
-        let (size, next_version) = write_editable_text_file_atomic(&target, text_raw).map_err(map_file_write_message)?;
+        let (size, next_version) =
+            write_editable_text_file_atomic(&target, text_raw).map_err(map_file_write_message)?;
         (target, size, next_version)
     };
 
@@ -2601,13 +2806,19 @@ pub fn save_file_write_response(
     }))
 }
 
-pub fn load_file_blob(config: &RuntimeConfig, session_id: &str, raw_path: &str) -> Result<(Vec<u8>, String), String> {
+pub fn load_file_blob(
+    config: &RuntimeConfig,
+    session_id: &str,
+    raw_path: &str,
+) -> Result<(Vec<u8>, String), String> {
     let session = find_session(config, session_id)?;
     let resolved = resolve_session_path(&session.cwd, raw_path)?;
     let raw = fs::read(&resolved).map_err(map_io_error)?;
     let (_kind, content_type) = detect_file_kind(&resolved, &raw);
     match content_type {
-        Some(value) if value.starts_with("image/") || value == "application/pdf" => Ok((raw, value.to_string())),
+        Some(value) if value.starts_with("image/") || value == "application/pdf" => {
+            Ok((raw, value.to_string()))
+        }
         _ => Err("file is not previewable inline".to_string()),
     }
 }
@@ -2643,10 +2854,14 @@ fn session_from_meta(
     });
     let harness_entry = harness.get(session_id);
     let sidebar_entry = sidebar.get(session_id);
-    let priority_offset = object_number(sidebar_entry, "priority_offset").unwrap_or(0.0).clamp(-1.0, 1.0);
+    let priority_offset = object_number(sidebar_entry, "priority_offset")
+        .unwrap_or(0.0)
+        .clamp(-1.0, 1.0);
     let blocked = object_string(sidebar_entry, "dependency_session_id").is_some();
     let snooze_until = object_number(sidebar_entry, "snooze_until");
-    let snoozed = snooze_until.map(|value| value > epoch_now()).unwrap_or(false);
+    let snoozed = snooze_until
+        .map(|value| value > epoch_now())
+        .unwrap_or(false);
     let queue_len = queues.get(session_id).map(|items| items.len()).unwrap_or(0);
     let thread_id = clean_optional(meta.session_id).unwrap_or_else(|| session_id.to_string());
     let mut model_provider = clean_optional(meta.model_provider);
@@ -2664,10 +2879,13 @@ fn session_from_meta(
         Err(_) if !pid_alive(pid) && !pid_alive(broker_pid) => return Ok(None),
         Err(_) => None,
     };
-    if (model_provider.is_none() || model.is_none() || reasoning_effort.is_none()) && log_path.as_deref().is_some() {
+    if (model_provider.is_none() || model.is_none() || reasoning_effort.is_none())
+        && log_path.as_deref().is_some()
+    {
         let log = Path::new(log_path.as_deref().unwrap_or_default());
         if log.exists() {
-            let (log_provider, log_model, log_effort) = read_run_settings_from_log(log, &agent_backend);
+            let (log_provider, log_model, log_effort) =
+                read_run_settings_from_log(log, &agent_backend);
             if model_provider.is_none() {
                 model_provider = log_provider;
             }
@@ -2687,7 +2905,11 @@ fn session_from_meta(
         .unwrap_or(meta_updated_ts);
     let time_priority = priority_from_elapsed_seconds((epoch_now() - updated_ts).max(0.0));
     let base_priority = clip01(time_priority + priority_offset);
-    let final_priority = if blocked || snoozed { 0.0 } else { base_priority };
+    let final_priority = if blocked || snoozed {
+        0.0
+    } else {
+        base_priority
+    };
     let busy = log_path
         .as_deref()
         .map(Path::new)
@@ -2698,7 +2920,13 @@ fn session_from_meta(
     let token = broker_state
         .as_ref()
         .and_then(|state| state.token.clone())
-        .or_else(|| log_path.as_deref().map(Path::new).filter(|path| path.exists()).and_then(latest_token_update_from_log));
+        .or_else(|| {
+            log_path
+                .as_deref()
+                .map(Path::new)
+                .filter(|path| path.exists())
+                .and_then(latest_token_update_from_log)
+        });
     let last_assistant_ts = log_path
         .as_deref()
         .map(Path::new)
@@ -2721,14 +2949,19 @@ fn session_from_meta(
         busy,
         token,
         harness_enabled: object_bool(harness_entry, "enabled").unwrap_or(false),
-        harness_cooldown_minutes: object_number(harness_entry, "cooldown_minutes").unwrap_or(HARNESS_DEFAULT_IDLE_MINUTES),
-        harness_remaining_injections: object_i64(harness_entry, "remaining_injections").unwrap_or(HARNESS_DEFAULT_MAX_INJECTIONS),
+        harness_cooldown_minutes: object_number(harness_entry, "cooldown_minutes")
+            .unwrap_or(HARNESS_DEFAULT_IDLE_MINUTES),
+        harness_remaining_injections: object_i64(harness_entry, "remaining_injections")
+            .unwrap_or(HARNESS_DEFAULT_MAX_INJECTIONS),
         alias: aliases.get(session_id).cloned().unwrap_or_default(),
         files: files.get(session_id).cloned().unwrap_or_default(),
         git_branch,
         model_provider: model_provider.clone(),
         preferred_auth_method: preferred_auth_method.clone(),
-        provider_choice: provider_choice_for_settings(model_provider.as_deref(), preferred_auth_method.as_deref()),
+        provider_choice: provider_choice_for_settings(
+            model_provider.as_deref(),
+            preferred_auth_method.as_deref(),
+        ),
         model,
         reasoning_effort,
         service_tier,
@@ -2761,10 +2994,21 @@ fn queue_item_from_value(value: &Value) -> ApiQueueItem {
         .filter(|ts| ts.is_finite() && *ts > 0.0)
         .unwrap_or_else(epoch_now);
     ApiQueueItem {
-        id: value.get("id").and_then(Value::as_str).unwrap_or_default().to_string(),
-        text: value.get("text").and_then(Value::as_str).unwrap_or_default().to_string(),
+        id: value
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        text: value
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
         created_ts,
-        sending: value.get("sending").and_then(Value::as_bool).unwrap_or(false),
+        sending: value
+            .get("sending")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
     }
 }
 
@@ -2775,13 +3019,24 @@ fn normalized_queue_values(values: &[Value]) -> Vec<Value> {
         let Some(item) = coerce_queue_item_value(value) else {
             continue;
         };
-        let item_id = item.get("id").and_then(Value::as_str).unwrap_or_default().to_string();
+        let item_id = item
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
         let unique_item = if seen.insert(item_id.clone()) {
             item
         } else {
-            let text = item.get("text").and_then(Value::as_str).unwrap_or_default().to_string();
+            let text = item
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
             let created_ts = item.get("created_ts").and_then(Value::as_f64);
-            let sending = item.get("sending").and_then(Value::as_bool).unwrap_or(false);
+            let sending = item
+                .get("sending")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             let mut regenerated = new_queue_item_value(&text, created_ts);
             if sending {
                 regenerated["sending"] = Value::Bool(true);
@@ -2825,7 +3080,10 @@ fn coerce_queue_item_value(value: &Value) -> Option<Value> {
                 .get("created_ts")
                 .and_then(Value::as_f64)
                 .filter(|ts| ts.is_finite() && *ts > 0.0);
-            let sending = object.get("sending").and_then(Value::as_bool).unwrap_or(false);
+            let sending = object
+                .get("sending")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             let mut item = new_queue_item_value(text, created_ts);
             item["id"] = Value::String(id);
             if sending {
@@ -2857,7 +3115,11 @@ fn new_queue_item_value(text: &str, created_ts: Option<f64>) -> Value {
     })
 }
 
-fn set_normalized_queue_values(queues: &mut HashMap<String, Vec<Value>>, session_id: &str, items: Vec<Value>) {
+fn set_normalized_queue_values(
+    queues: &mut HashMap<String, Vec<Value>>,
+    session_id: &str,
+    items: Vec<Value>,
+) {
     if items.is_empty() {
         queues.remove(session_id);
     } else {
@@ -2866,18 +3128,23 @@ fn set_normalized_queue_values(queues: &mut HashMap<String, Vec<Value>>, session
 }
 
 fn write_json_value(path: &Path, value: &Value) -> Result<(), String> {
-    let parent = path.parent().ok_or_else(|| format!("missing parent for {}", path.display()))?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("missing parent for {}", path.display()))?;
     fs::create_dir_all(parent).map_err(|err| format!("create {}: {err}", parent.display()))?;
     let tmp = path.with_extension("json.tmp");
     let raw = serde_json::to_string_pretty(value)
         .map(|body| body + "\n")
         .map_err(|err| format!("serialize {}: {err}", path.display()))?;
     fs::write(&tmp, raw).map_err(|err| format!("write {}: {err}", tmp.display()))?;
-    fs::rename(&tmp, path).map_err(|err| format!("rename {} -> {}: {err}", tmp.display(), path.display()))
+    fs::rename(&tmp, path)
+        .map_err(|err| format!("rename {} -> {}: {err}", tmp.display(), path.display()))
 }
 
 fn write_text_file_atomic(path: &Path, text: &str) -> Result<(), String> {
-    let parent = path.parent().ok_or_else(|| format!("missing parent for {}", path.display()))?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("missing parent for {}", path.display()))?;
     fs::create_dir_all(parent).map_err(|err| format!("create {}: {err}", parent.display()))?;
     let file_name = path
         .file_name()
@@ -2885,7 +3152,8 @@ fn write_text_file_atomic(path: &Path, text: &str) -> Result<(), String> {
         .ok_or_else(|| format!("invalid filename for {}", path.display()))?;
     let tmp = path.with_file_name(format!("{file_name}.tmp"));
     fs::write(&tmp, text).map_err(|err| format!("write {}: {err}", tmp.display()))?;
-    fs::rename(&tmp, path).map_err(|err| format!("rename {} -> {}: {err}", tmp.display(), path.display()))
+    fs::rename(&tmp, path)
+        .map_err(|err| format!("rename {} -> {}: {err}", tmp.display(), path.display()))
 }
 
 fn unique_temp_sibling_path(path: &Path) -> Result<PathBuf, String> {
@@ -2929,7 +3197,9 @@ fn write_editable_text_file_atomic(path: &Path, text: &str) -> Result<(u64, Stri
 }
 
 fn write_new_text_file_atomic(path: &Path, text: &str) -> Result<(u64, String), String> {
-    let parent = path.parent().ok_or_else(|| format!("missing parent for {}", path.display()))?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("missing parent for {}", path.display()))?;
     if !parent.exists() {
         return Err("parent directory not found".to_string());
     }
@@ -2985,7 +3255,10 @@ fn write_string_map(path: &Path, values: &HashMap<String, String>) -> Result<(),
     write_json_value(path, &Value::Object(object))
 }
 
-fn write_string_array_map(path: &Path, values: &HashMap<String, Vec<String>>) -> Result<(), String> {
+fn write_string_array_map(
+    path: &Path,
+    values: &HashMap<String, Vec<String>>,
+) -> Result<(), String> {
     let mut keys = values.keys().cloned().collect::<Vec<_>>();
     keys.sort();
     let mut object = serde_json::Map::new();
@@ -3039,7 +3312,12 @@ fn clean_alias(name: &str) -> String {
         return String::new();
     }
     if cleaned.chars().count() > 80 {
-        cleaned = cleaned.chars().take(80).collect::<String>().trim_end().to_string();
+        cleaned = cleaned
+            .chars()
+            .take(80)
+            .collect::<String>()
+            .trim_end()
+            .to_string();
     }
     cleaned
 }
@@ -3048,9 +3326,12 @@ fn json_truthy(value: &Value) -> bool {
     match value {
         Value::Null => false,
         Value::Bool(flag) => *flag,
-        Value::Number(number) => {
-            number.as_i64().map(|value| value != 0).or_else(|| number.as_u64().map(|value| value != 0)).or_else(|| number.as_f64().map(|value| value != 0.0)).unwrap_or(false)
-        }
+        Value::Number(number) => number
+            .as_i64()
+            .map(|value| value != 0)
+            .or_else(|| number.as_u64().map(|value| value != 0))
+            .or_else(|| number.as_f64().map(|value| value != 0.0))
+            .unwrap_or(false),
         Value::String(text) => !text.is_empty(),
         Value::Array(items) => !items.is_empty(),
         Value::Object(map) => !map.is_empty(),
@@ -3068,7 +3349,12 @@ fn notification_subscription_id(endpoint: &str) -> String {
 
 fn notification_device_class_from_user_agent(user_agent: &str) -> String {
     let ua = user_agent.trim().to_ascii_lowercase();
-    if ua.contains("mobile") || ua.contains("android") || ua.contains("iphone") || ua.contains("ipad") || ua.contains("ipod") {
+    if ua.contains("mobile")
+        || ua.contains("android")
+        || ua.contains("iphone")
+        || ua.contains("ipad")
+        || ua.contains("ipod")
+    {
         "mobile".to_string()
     } else {
         "desktop".to_string()
@@ -3139,7 +3425,10 @@ fn clean_notification_subscription_record(raw: &Value, now_ts: f64) -> Option<Va
         .trim()
         .to_string();
     let device_class = clean_notification_device_class(
-        object.get("device_class").and_then(Value::as_str).unwrap_or_default(),
+        object
+            .get("device_class")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
         &user_agent,
     );
     Some(json!({
@@ -3183,7 +3472,10 @@ fn read_notification_subscription_records(path: &Path) -> Result<HashMap<String,
     Ok(out)
 }
 
-fn write_notification_subscription_records(path: &Path, records: &HashMap<String, Value>) -> Result<(), String> {
+fn write_notification_subscription_records(
+    path: &Path,
+    records: &HashMap<String, Value>,
+) -> Result<(), String> {
     let mut ids = records.keys().cloned().collect::<Vec<_>>();
     ids.sort();
     let items = ids
@@ -3221,8 +3513,14 @@ fn notification_subscriptions_snapshot_value(
         })
         .collect::<Vec<_>>();
     items.sort_by(|left, right| {
-        let left_ts = left.get("updated_ts").and_then(Value::as_f64).unwrap_or(0.0);
-        let right_ts = right.get("updated_ts").and_then(Value::as_f64).unwrap_or(0.0);
+        let left_ts = left
+            .get("updated_ts")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
+        let right_ts = right
+            .get("updated_ts")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
         right_ts
             .partial_cmp(&left_ts)
             .unwrap_or(std::cmp::Ordering::Equal)
@@ -3243,7 +3541,10 @@ fn string_field(row: &serde_json::Map<String, Value>, field: &str) -> String {
 }
 
 fn compact_text(raw: impl AsRef<str>) -> String {
-    raw.as_ref().split_whitespace().collect::<Vec<_>>().join(" ")
+    raw.as_ref()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn default_session_display_name(raw: String) -> String {
@@ -3266,7 +3567,9 @@ fn normalize_voice_base_url(raw: Option<&str>) -> Result<String, String> {
     Ok(value.trim_end_matches('/').to_string())
 }
 
-fn clean_voice_settings_object(object: Option<&serde_json::Map<String, Value>>) -> Result<Value, String> {
+fn clean_voice_settings_object(
+    object: Option<&serde_json::Map<String, Value>>,
+) -> Result<Value, String> {
     let narration = object
         .and_then(|row| row.get("tts_enabled_for_narration"))
         .map(json_truthy)
@@ -3357,7 +3660,9 @@ fn read_voice_delivery_ledger(path: &Path) -> Result<HashMap<String, Value>, Str
         };
         let session_id = string_field(&row, "session_id");
         let message_class = string_field(&row, "message_class");
-        if session_id.is_empty() || (message_class != "narration" && message_class != "final_response") {
+        if session_id.is_empty()
+            || (message_class != "narration" && message_class != "final_response")
+        {
             continue;
         }
         row.insert("message_id".to_string(), Value::String(message_id.clone()));
@@ -3401,7 +3706,10 @@ fn clean_harness_cooldown_minutes_value(value: &Value) -> Result<i64, String> {
     Ok(raw)
 }
 
-fn clean_harness_remaining_injections_value(value: &Value, allow_zero: bool) -> Result<i64, String> {
+fn clean_harness_remaining_injections_value(
+    value: &Value,
+    allow_zero: bool,
+) -> Result<i64, String> {
     if value.is_boolean() {
         return Err("harness remaining_injections must be an integer".to_string());
     }
@@ -3436,7 +3744,12 @@ fn safe_filename(name: &str, default: &str) -> String {
     cleaned.chars().take(96).collect()
 }
 
-fn stage_uploaded_file(config: &RuntimeConfig, session_id: &str, filename: &str, raw: &[u8]) -> Result<PathBuf, String> {
+fn stage_uploaded_file(
+    config: &RuntimeConfig,
+    session_id: &str,
+    filename: &str,
+    raw: &[u8],
+) -> Result<PathBuf, String> {
     if session_id.trim().is_empty() {
         return Err("session_id required".to_string());
     }
@@ -3444,13 +3757,17 @@ fn stage_uploaded_file(config: &RuntimeConfig, session_id: &str, filename: &str,
         return Err("filename required".to_string());
     }
     if raw.len() > ATTACH_UPLOAD_MAX_BYTES {
-        return Err(format!("file too large (max {ATTACH_UPLOAD_MAX_BYTES} bytes)"));
+        return Err(format!(
+            "file too large (max {ATTACH_UPLOAD_MAX_BYTES} bytes)"
+        ));
     }
     let safe_name = safe_filename(filename, "file");
     let subdir = config.app_dir.join("uploads").join(session_id);
-    fs::create_dir_all(&subdir).map_err(|err| format!("create upload dir {}: {err}", subdir.display()))?;
+    fs::create_dir_all(&subdir)
+        .map_err(|err| format!("create upload dir {}: {err}", subdir.display()))?;
     let out_path = subdir.join(format!("{}_{}", (epoch_now() * 1000.0) as i64, safe_name));
-    fs::write(&out_path, raw).map_err(|err| format!("write upload {}: {err}", out_path.display()))?;
+    fs::write(&out_path, raw)
+        .map_err(|err| format!("write upload {}: {err}", out_path.display()))?;
     fs::set_permissions(&out_path, fs::Permissions::from_mode(0o600))
         .map_err(|err| format!("chmod upload {}: {err}", out_path.display()))?;
     Ok(out_path)
@@ -3460,7 +3777,10 @@ fn attachment_inject_text(attachment_index: i64, path: &Path) -> Result<String, 
     if attachment_index <= 0 {
         return Err("attachment_index must be >= 1".to_string());
     }
-    Ok(format!("Attachment {attachment_index}: {}\n", path.display()))
+    Ok(format!(
+        "Attachment {attachment_index}: {}\n",
+        path.display()
+    ))
 }
 
 fn clean_priority_offset_value(raw: Option<&Value>) -> Result<f64, String> {
@@ -3530,7 +3850,11 @@ fn clean_dependency_session_id_value(raw: Option<&Value>) -> Result<Option<Strin
     Ok(Some(trimmed.to_string()))
 }
 
-fn clear_deleted_session_state(config: &RuntimeConfig, session_id: &str, cwd: Option<&str>) -> Result<(), String> {
+fn clear_deleted_session_state(
+    config: &RuntimeConfig,
+    session_id: &str,
+    cwd: Option<&str>,
+) -> Result<(), String> {
     let alias_path = config.app_dir.join("session_aliases.json");
     let mut aliases = read_string_map(&alias_path)?;
     aliases.remove(session_id);
@@ -3685,7 +4009,9 @@ fn kill_session_via_pids(config: &RuntimeConfig, session: &ApiSessionSummary) ->
     if group_alive && !terminate_process_group(session.pid, Duration::from_secs_f64(1.0)) {
         return false;
     }
-    if pid_alive(session.broker_pid) && !terminate_process(session.broker_pid, Duration::from_secs_f64(1.0)) {
+    if pid_alive(session.broker_pid)
+        && !terminate_process(session.broker_pid, Duration::from_secs_f64(1.0))
+    {
         return false;
     }
     let group_dead = !process_group_alive(session.pid);
@@ -3799,10 +4125,21 @@ fn default_git_changed_files_max() -> usize {
 }
 
 fn ensure_git_repo(cwd: &Path) -> Result<(), String> {
-    run_git_capture(cwd, &["rev-parse", "--is-inside-work-tree"], default_git_diff_timeout(), 4096).map(|_| ())
+    run_git_capture(
+        cwd,
+        &["rev-parse", "--is-inside-work-tree"],
+        default_git_diff_timeout(),
+        4096,
+    )
+    .map(|_| ())
 }
 
-fn run_git_capture(cwd: &Path, args: &[&str], timeout: Duration, max_bytes: usize) -> Result<String, String> {
+fn run_git_capture(
+    cwd: &Path,
+    args: &[&str],
+    timeout: Duration,
+    max_bytes: usize,
+) -> Result<String, String> {
     let mut child = Command::new("git")
         .current_dir(cwd)
         .args(args)
@@ -3828,7 +4165,10 @@ fn run_git_capture(cwd: &Path, args: &[&str], timeout: Duration, max_bytes: usiz
     if !output.status.success() {
         let err = String::from_utf8_lossy(&output.stderr).trim().to_string();
         return Err(if err.is_empty() {
-            format!("git failed with code {}", output.status.code().unwrap_or_default())
+            format!(
+                "git failed with code {}",
+                output.status.code().unwrap_or_default()
+            )
         } else {
             err
         });
@@ -3971,7 +4311,11 @@ fn git_repo_root(cwd: &Path) -> Option<PathBuf> {
     Some(PathBuf::from(trimmed))
 }
 
-fn search_walk_relative_files(root: &Path, query: &str, limit: usize) -> Result<FileSearchResult, String> {
+fn search_walk_relative_files(
+    root: &Path,
+    query: &str,
+    limit: usize,
+) -> Result<FileSearchResult, String> {
     let mut state = FileSearchState {
         heap: BinaryHeap::new(),
         scanned: 0,
@@ -3984,7 +4328,12 @@ fn search_walk_relative_files(root: &Path, query: &str, limit: usize) -> Result<
     Ok(finish_file_search(state, "walk"))
 }
 
-fn walk_relative_files(root: &Path, current: &Path, query: &str, state: &mut FileSearchState) -> Result<(), String> {
+fn walk_relative_files(
+    root: &Path,
+    current: &Path,
+    query: &str,
+    state: &mut FileSearchState,
+) -> Result<(), String> {
     let mut entries = fs::read_dir(current)
         .map_err(map_io_error)?
         .collect::<Result<Vec<_>, _>>()
@@ -3998,7 +4347,10 @@ fn walk_relative_files(root: &Path, current: &Path, query: &str, state: &mut Fil
         let file_type = entry.file_type().map_err(map_io_error)?;
         let name = entry.file_name().to_string_lossy().into_owned();
         if file_type.is_dir() {
-            if FILE_LIST_IGNORED_DIRS.iter().any(|ignored| *ignored == name) {
+            if FILE_LIST_IGNORED_DIRS
+                .iter()
+                .any(|ignored| *ignored == name)
+            {
                 continue;
             }
             walk_relative_files(root, &path, query, state)?;
@@ -4023,7 +4375,11 @@ fn walk_relative_files(root: &Path, current: &Path, query: &str, state: &mut Fil
     Ok(())
 }
 
-fn search_git_relative_files(root: &Path, query: &str, limit: usize) -> Result<FileSearchResult, String> {
+fn search_git_relative_files(
+    root: &Path,
+    query: &str,
+    limit: usize,
+) -> Result<FileSearchResult, String> {
     let mut state = FileSearchState {
         heap: BinaryHeap::new(),
         scanned: 0,
@@ -4039,8 +4395,14 @@ fn search_git_relative_files(root: &Path, query: &str, limit: usize) -> Result<F
         .stderr(Stdio::piped())
         .spawn()
         .map_err(map_io_error)?;
-    let stdout = child.stdout.take().ok_or_else(|| "git ls-files missing stdout".to_string())?;
-    let stderr = child.stderr.take().ok_or_else(|| "git ls-files missing stderr".to_string())?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "git ls-files missing stdout".to_string())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "git ls-files missing stderr".to_string())?;
     let reader = BufReader::new(stdout);
     for line in reader.lines() {
         let path = line.map_err(map_io_error)?;
@@ -4070,7 +4432,10 @@ fn search_git_relative_files(root: &Path, query: &str, limit: usize) -> Result<F
     if !status.success() {
         let err = stderr_text.trim();
         return Err(if err.is_empty() {
-            format!("git ls-files failed with code {}", status.code().unwrap_or_default())
+            format!(
+                "git ls-files failed with code {}",
+                status.code().unwrap_or_default()
+            )
         } else {
             err.to_string()
         });
@@ -4078,7 +4443,12 @@ fn search_git_relative_files(root: &Path, query: &str, limit: usize) -> Result<F
     Ok(finish_file_search(state, "git"))
 }
 
-fn push_file_search_match(heap: &mut BinaryHeap<Reverse<(i64, String)>>, path: &str, score: i64, limit: usize) {
+fn push_file_search_match(
+    heap: &mut BinaryHeap<Reverse<(i64, String)>>,
+    path: &str,
+    score: i64,
+    limit: usize,
+) {
     let item = Reverse((score, path.to_string()));
     if heap.len() < limit {
         heap.push(item);
@@ -4134,9 +4504,15 @@ fn file_search_score(candidate: &str, query: &str) -> i64 {
             } else {
                 '\0'
             };
-            let boundary_bonus = if exact_idx == 0 || is_file_search_boundary(prev) { 24 } else { 0 };
+            let boundary_bonus = if exact_idx == 0 || is_file_search_boundary(prev) {
+                24
+            } else {
+                0
+            };
             let base_idx = base.find(token);
-            total += 240 - (exact_idx as i64) * 2 + boundary_bonus + base_idx.map(|idx| 44 - idx as i64).unwrap_or(0);
+            total += 240 - (exact_idx as i64) * 2
+                + boundary_bonus
+                + base_idx.map(|idx| 44 - idx as i64).unwrap_or(0);
             continue;
         }
         let mut search_start = 0_usize;
@@ -4166,7 +4542,9 @@ fn file_search_score(candidate: &str, query: &str) -> i64 {
         let first_idx = first.unwrap_or(0);
         let last_idx = last.unwrap_or(first_idx);
         let span = last_idx.saturating_sub(first_idx) + 1;
-        total += 120 - first_idx as i64 - ((span.saturating_sub(token.len())) as i64 * 4) + consecutive * 10 + boundaries * 8;
+        total += 120 - first_idx as i64 - ((span.saturating_sub(token.len())) as i64 * 4)
+            + consecutive * 10
+            + boundaries * 8;
     }
     total
 }
@@ -4230,7 +4608,12 @@ fn resolve_relative_under(base: &Path, raw_path: &str) -> Result<PathBuf, String
 }
 
 fn resolve_git_path(cwd: &Path, raw_path: &str) -> Result<(PathBuf, PathBuf, String), String> {
-    let repo_root_raw = run_git_capture(cwd, &["rev-parse", "--show-toplevel"], default_git_diff_timeout(), 64 * 1024)?;
+    let repo_root_raw = run_git_capture(
+        cwd,
+        &["rev-parse", "--show-toplevel"],
+        default_git_diff_timeout(),
+        64 * 1024,
+    )?;
     let repo_root_candidate = PathBuf::from(repo_root_raw.trim());
     let repo_root = fs::canonicalize(&repo_root_candidate).unwrap_or(repo_root_candidate);
     let target = resolve_session_path(&cwd.display().to_string(), raw_path)?;
@@ -4320,7 +4703,11 @@ fn map_file_write_message(message: String) -> FileWriteError {
     }
 }
 
-fn update_session_file_history(config: &RuntimeConfig, session_id: &str, path: &str) -> Result<(), String> {
+fn update_session_file_history(
+    config: &RuntimeConfig,
+    session_id: &str,
+    path: &str,
+) -> Result<(), String> {
     let trimmed = path.trim();
     if trimmed.is_empty() {
         return Ok(());
@@ -4340,7 +4727,12 @@ fn update_session_file_history(config: &RuntimeConfig, session_id: &str, path: &
 }
 
 fn detect_file_kind(path: &Path, raw: &[u8]) -> (&'static str, Option<&'static str>) {
-    if path.extension().and_then(|ext| ext.to_str()).map(|ext| ext.eq_ignore_ascii_case("svg")).unwrap_or(false) {
+    if path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.eq_ignore_ascii_case("svg"))
+        .unwrap_or(false)
+    {
         return ("image", Some("image/svg+xml; charset=utf-8"));
     }
     if raw.starts_with(b"\x89PNG\r\n\x1a\n") {
@@ -4352,7 +4744,11 @@ fn detect_file_kind(path: &Path, raw: &[u8]) -> (&'static str, Option<&'static s
     if raw.len() >= 12 && &raw[..4] == b"RIFF" && &raw[8..12] == b"WEBP" {
         return ("image", Some("image/webp"));
     }
-    if path.extension().and_then(|ext| ext.to_str()).map(|ext| ext.eq_ignore_ascii_case("pdf")).unwrap_or(false)
+    if path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.eq_ignore_ascii_case("pdf"))
+        .unwrap_or(false)
         || raw.starts_with(b"%PDF-")
     {
         return ("pdf", Some("application/pdf"));
@@ -4380,11 +4776,19 @@ fn content_version(raw: &[u8]) -> String {
 }
 
 fn path_looks_textual(path: &Path) -> bool {
-    let ext = path.extension().and_then(|ext| ext.to_str()).unwrap_or_default().to_ascii_lowercase();
+    let ext = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
     if TEXTUAL_EXTENSIONS.iter().any(|candidate| *candidate == ext) {
         return true;
     }
-    let name = path.file_name().and_then(|name| name.to_str()).unwrap_or_default().to_ascii_lowercase();
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
     TEXTUAL_FILENAMES.iter().any(|candidate| *candidate == name)
 }
 
@@ -4419,7 +4823,10 @@ fn current_git_branch(cwd: &Path) -> Option<String> {
         .filter(|text| !text.is_empty())
 }
 
-fn provider_choice_for_settings(model_provider: Option<&str>, preferred_auth_method: Option<&str>) -> Option<String> {
+fn provider_choice_for_settings(
+    model_provider: Option<&str>,
+    preferred_auth_method: Option<&str>,
+) -> Option<String> {
     let provider = model_provider.unwrap_or("openai");
     if provider == "openai" {
         Some(if preferred_auth_method == Some("chatgpt") {
@@ -4464,7 +4871,8 @@ fn read_positioned_records(path: &Path) -> Result<Vec<PositionedRecord>, String>
         if trimmed.is_empty() {
             continue;
         }
-        let obj = serde_json::from_str(trimmed).map_err(|err| format!("parse {} at byte {start}: {err}", path.display()))?;
+        let obj = serde_json::from_str(trimmed)
+            .map_err(|err| format!("parse {} at byte {start}: {err}", path.display()))?;
         records.push(PositionedRecord { start, obj });
     }
     Ok(records)
@@ -4548,7 +4956,8 @@ fn extract_chat_events(objs: &[Value]) -> ExtractedChatBatch {
                                 if item.get("type").and_then(Value::as_str) != Some("toolCall") {
                                     continue;
                                 }
-                                let name = non_empty_string(item.get("name")).unwrap_or_else(|| "tool".to_string());
+                                let name = non_empty_string(item.get("name"))
+                                    .unwrap_or_else(|| "tool".to_string());
                                 let call_id = non_empty_string(item.get("id"));
                                 let args = coerce_tool_arguments(item.get("arguments"));
                                 tool_names.insert("pi_tool".to_string());
@@ -4559,18 +4968,27 @@ fn extract_chat_events(objs: &[Value]) -> ExtractedChatBatch {
                                     continue;
                                 };
                                 if is_ask_user_tool(&name) {
-                                    let event = ask_user_event(&args, call_id.as_deref(), ts, false);
+                                    let event =
+                                        ask_user_event(&args, call_id.as_deref(), ts, false);
                                     if let Some(call_id) = call_id.as_ref() {
-                                        pending_ask_user_calls.insert(call_id.clone(), event.clone());
+                                        pending_ask_user_calls
+                                            .insert(call_id.clone(), event.clone());
                                     }
                                     events.push(event);
                                     continue;
                                 }
-                                if let Some(event) = extension_event_from_tool(&name, &args, call_id.as_deref(), ts) {
+                                if let Some(event) =
+                                    extension_event_from_tool(&name, &args, call_id.as_deref(), ts)
+                                {
                                     events.push(event);
                                     continue;
                                 }
-                                events.push(tool_event(&name, call_id.as_deref(), tool_call_summary(&name, &args), ts));
+                                events.push(tool_event(
+                                    &name,
+                                    call_id.as_deref(),
+                                    tool_call_summary(&name, &args),
+                                    ts,
+                                ));
                             }
                         }
                     }
@@ -4580,16 +4998,30 @@ fn extract_chat_events(objs: &[Value]) -> ExtractedChatBatch {
                         last_tool = Some("pi_tool".to_string());
                         let call_id = non_empty_string(payload.get("toolCallId"));
                         let name = non_empty_string(payload.get("toolName"))
-                            .or_else(|| call_id.as_ref().and_then(|id| known_tool_names.get(id).cloned()))
+                            .or_else(|| {
+                                call_id
+                                    .as_ref()
+                                    .and_then(|id| known_tool_names.get(id).cloned())
+                            })
                             .unwrap_or_else(|| "tool".to_string());
                         let details = payload.get("details").and_then(Value::as_object);
                         let text = tool_result_text(payload);
                         if let Some(ts) = ets {
-                            if let Some(event) = extension_event_from_tool_result(&name, payload, call_id.as_deref(), ts) {
+                            if let Some(event) = extension_event_from_tool_result(
+                                &name,
+                                payload,
+                                call_id.as_deref(),
+                                ts,
+                            ) {
                                 events.push(event);
                                 continue;
                             }
-                            if is_ask_user_tool(&name) || call_id.as_ref().map(|id| pending_ask_user_calls.contains_key(id)).unwrap_or(false) {
+                            if is_ask_user_tool(&name)
+                                || call_id
+                                    .as_ref()
+                                    .map(|id| pending_ask_user_calls.contains_key(id))
+                                    .unwrap_or(false)
+                            {
                                 let base = ask_user_base_event(
                                     call_id.as_deref(),
                                     ts,
@@ -4602,7 +5034,9 @@ fn extract_chat_events(objs: &[Value]) -> ExtractedChatBatch {
                                     details,
                                     text.as_deref(),
                                 ));
-                            } else if text.is_some() || payload.get("isError").and_then(Value::as_bool) == Some(true) {
+                            } else if text.is_some()
+                                || payload.get("isError").and_then(Value::as_bool) == Some(true)
+                            {
                                 events.push(tool_result_event(
                                     &name,
                                     call_id.as_deref(),
@@ -4659,14 +5093,20 @@ fn extract_chat_events(objs: &[Value]) -> ExtractedChatBatch {
                             let Some(text) = payload.get("content").and_then(output_text) else {
                                 continue;
                             };
-                            let message_class = if payload.get("phase").and_then(Value::as_str) == Some("final_answer")
+                            let message_class = if payload.get("phase").and_then(Value::as_str)
+                                == Some("final_answer")
                                 || payload.get("end_turn").and_then(Value::as_bool) == Some(true)
                             {
                                 Some("final_response")
                             } else {
                                 Some("narration")
                             };
-                            events.push(json_text_event("assistant", &text, event_ts(obj), message_class));
+                            events.push(json_text_event(
+                                "assistant",
+                                &text,
+                                event_ts(obj),
+                                message_class,
+                            ));
                             continue;
                         }
                         _ => {}
@@ -4676,7 +5116,8 @@ fn extract_chat_events(objs: &[Value]) -> ExtractedChatBatch {
                 match pt {
                     Some("reasoning") => total_thinking += 1,
                     Some("function_call") => {
-                        let name = non_empty_string(payload.get("name")).unwrap_or_else(|| "tool".to_string());
+                        let name = non_empty_string(payload.get("name"))
+                            .unwrap_or_else(|| "tool".to_string());
                         let call_id = non_empty_string(payload.get("call_id"));
                         let args = coerce_tool_arguments(payload.get("arguments"));
                         tool_names.insert(name.clone());
@@ -4692,19 +5133,29 @@ fn extract_chat_events(objs: &[Value]) -> ExtractedChatBatch {
                                     pending_ask_user_calls.insert(call_id.clone(), event.clone());
                                 }
                                 events.push(event);
-                            } else if let Some(event) = extension_event_from_tool(&name, &args, call_id.as_deref(), ts) {
+                            } else if let Some(event) =
+                                extension_event_from_tool(&name, &args, call_id.as_deref(), ts)
+                            {
                                 events.push(event);
                             } else {
-                                events.push(tool_event(&name, call_id.as_deref(), tool_call_summary(&name, &args), ts));
+                                events.push(tool_event(
+                                    &name,
+                                    call_id.as_deref(),
+                                    tool_call_summary(&name, &args),
+                                    ts,
+                                ));
                             }
                         }
                     }
-                    Some("custom_tool_call") | Some("web_search_call") | Some("local_shell_call") => {
+                    Some("custom_tool_call")
+                    | Some("web_search_call")
+                    | Some("local_shell_call") => {
                         total_tools += 1;
                         let name = match pt {
                             Some("web_search_call") => "web_search".to_string(),
                             Some("local_shell_call") => "local_shell".to_string(),
-                            _ => non_empty_string(payload.get("name")).unwrap_or_else(|| "tool".to_string()),
+                            _ => non_empty_string(payload.get("name"))
+                                .unwrap_or_else(|| "tool".to_string()),
                         };
                         let call_id = non_empty_string(payload.get("call_id"));
                         if let Some(call_id) = call_id.as_ref() {
@@ -4717,10 +5168,17 @@ fn extract_chat_events(objs: &[Value]) -> ExtractedChatBatch {
                             if args.is_empty() {
                                 args = payload.clone();
                             }
-                            if let Some(event) = extension_event_from_tool(&name, &args, call_id.as_deref(), ts) {
+                            if let Some(event) =
+                                extension_event_from_tool(&name, &args, call_id.as_deref(), ts)
+                            {
                                 events.push(event);
                             } else {
-                                events.push(tool_event(&name, call_id.as_deref(), tool_call_summary(&name, &args), ts));
+                                events.push(tool_event(
+                                    &name,
+                                    call_id.as_deref(),
+                                    tool_call_summary(&name, &args),
+                                    ts,
+                                ));
                             }
                         }
                     }
@@ -4728,17 +5186,29 @@ fn extract_chat_events(objs: &[Value]) -> ExtractedChatBatch {
                         total_tools += 1;
                         let call_id = non_empty_string(payload.get("call_id"));
                         let name = non_empty_string(payload.get("name"))
-                            .or_else(|| call_id.as_ref().and_then(|id| known_tool_names.get(id).cloned()))
+                            .or_else(|| {
+                                call_id
+                                    .as_ref()
+                                    .and_then(|id| known_tool_names.get(id).cloned())
+                            })
                             .unwrap_or_else(|| "tool".to_string());
                         tool_names.insert(name.clone());
                         last_tool = Some(name.clone());
                         let details = payload.get("details").and_then(Value::as_object);
                         let text = tool_result_text(payload);
                         if let Some(ts) = event_ts(obj) {
-                            if let Some(event) = extension_event_from_tool_result(&name, payload, call_id.as_deref(), ts) {
+                            if let Some(event) = extension_event_from_tool_result(
+                                &name,
+                                payload,
+                                call_id.as_deref(),
+                                ts,
+                            ) {
                                 events.push(event);
                             } else if is_ask_user_tool(&name)
-                                || call_id.as_ref().map(|id| pending_ask_user_calls.contains_key(id)).unwrap_or(false)
+                                || call_id
+                                    .as_ref()
+                                    .map(|id| pending_ask_user_calls.contains_key(id))
+                                    .unwrap_or(false)
                             {
                                 let base = ask_user_base_event(
                                     call_id.as_deref(),
@@ -4752,7 +5222,9 @@ fn extract_chat_events(objs: &[Value]) -> ExtractedChatBatch {
                                     details,
                                     text.as_deref(),
                                 ));
-                            } else if text.is_some() || payload.get("is_error").and_then(Value::as_bool) == Some(true) {
+                            } else if text.is_some()
+                                || payload.get("is_error").and_then(Value::as_bool) == Some(true)
+                            {
                                 events.push(tool_result_event(
                                     &name,
                                     call_id.as_deref(),
@@ -4808,7 +5280,12 @@ fn pi_single_chat_event(obj: &Value) -> Option<Value> {
         } else {
             Some("narration")
         };
-        return Some(json_text_event("assistant", &assistant_text, event_ts(obj), class));
+        return Some(json_text_event(
+            "assistant",
+            &assistant_text,
+            event_ts(obj),
+            class,
+        ));
     }
     let payload = obj.get("message")?.as_object()?;
     let role = payload.get("role")?.as_str()?;
@@ -4830,20 +5307,30 @@ fn pi_single_chat_event(obj: &Value) -> Option<Value> {
                     return ets.map(|ts| ask_user_event(&args, call_id.as_deref(), ts, false));
                 }
                 if let Some(ts) = ets {
-                    if let Some(event) = extension_event_from_tool(&name, &args, call_id.as_deref(), ts) {
+                    if let Some(event) =
+                        extension_event_from_tool(&name, &args, call_id.as_deref(), ts)
+                    {
                         return Some(event);
                     }
-                    return Some(tool_event(&name, call_id.as_deref(), tool_call_summary(&name, &args), ts));
+                    return Some(tool_event(
+                        &name,
+                        call_id.as_deref(),
+                        tool_call_summary(&name, &args),
+                        ts,
+                    ));
                 }
             }
             None
         }
         "toolResult" => {
             let call_id = non_empty_string(payload.get("toolCallId"));
-            let name = non_empty_string(payload.get("toolName")).unwrap_or_else(|| "tool".to_string());
+            let name =
+                non_empty_string(payload.get("toolName")).unwrap_or_else(|| "tool".to_string());
             let text = tool_result_text(payload);
             if let Some(ts) = ets {
-                if let Some(event) = extension_event_from_tool_result(&name, payload, call_id.as_deref(), ts) {
+                if let Some(event) =
+                    extension_event_from_tool_result(&name, payload, call_id.as_deref(), ts)
+                {
                     return Some(event);
                 }
                 if is_ask_user_tool(&name) {
@@ -4874,14 +5361,24 @@ fn pi_single_chat_event(obj: &Value) -> Option<Value> {
 fn event_msg_chat_event(obj: &Value) -> Option<Value> {
     let payload = obj.get("payload")?.as_object()?;
     match payload.get("type")?.as_str()? {
-        "user_message" => Some(json_text_event("user", payload.get("message")?.as_str()?, event_ts(obj), None)),
+        "user_message" => Some(json_text_event(
+            "user",
+            payload.get("message")?.as_str()?,
+            event_ts(obj),
+            None,
+        )),
         "agent_message" => {
             let class = if payload.get("phase").and_then(Value::as_str) == Some("final_answer") {
                 Some("final_response")
             } else {
                 Some("narration")
             };
-            Some(json_text_event("assistant", payload.get("message")?.as_str()?, event_ts(obj), class))
+            Some(json_text_event(
+                "assistant",
+                payload.get("message")?.as_str()?,
+                event_ts(obj),
+                class,
+            ))
         }
         _ => None,
     }
@@ -4899,10 +5396,16 @@ fn response_item_chat_event(obj: &Value) -> Option<Value> {
                 return ets.map(|ts| ask_user_event(&args, call_id.as_deref(), ts, false));
             }
             if let Some(ts) = ets {
-                if let Some(event) = extension_event_from_tool(&name, &args, call_id.as_deref(), ts) {
+                if let Some(event) = extension_event_from_tool(&name, &args, call_id.as_deref(), ts)
+                {
                     return Some(event);
                 }
-                return Some(tool_event(&name, call_id.as_deref(), tool_call_summary(&name, &args), ts));
+                return Some(tool_event(
+                    &name,
+                    call_id.as_deref(),
+                    tool_call_summary(&name, &args),
+                    ts,
+                ));
             }
             None
         }
@@ -4918,10 +5421,16 @@ fn response_item_chat_event(obj: &Value) -> Option<Value> {
                 args = payload.clone();
             }
             if let Some(ts) = ets {
-                if let Some(event) = extension_event_from_tool(&name, &args, call_id.as_deref(), ts) {
+                if let Some(event) = extension_event_from_tool(&name, &args, call_id.as_deref(), ts)
+                {
                     return Some(event);
                 }
-                return Some(tool_event(&name, call_id.as_deref(), tool_call_summary(&name, &args), ts));
+                return Some(tool_event(
+                    &name,
+                    call_id.as_deref(),
+                    tool_call_summary(&name, &args),
+                    ts,
+                ));
             }
             None
         }
@@ -4930,7 +5439,9 @@ fn response_item_chat_event(obj: &Value) -> Option<Value> {
             let name = non_empty_string(payload.get("name")).unwrap_or_else(|| "tool".to_string());
             let text = tool_result_text(payload);
             if let Some(ts) = ets {
-                if let Some(event) = extension_event_from_tool_result(&name, payload, call_id.as_deref(), ts) {
+                if let Some(event) =
+                    extension_event_from_tool_result(&name, payload, call_id.as_deref(), ts)
+                {
                     return Some(event);
                 }
                 if is_ask_user_tool(&name) {
@@ -4942,7 +5453,8 @@ fn response_item_chat_event(obj: &Value) -> Option<Value> {
                         text.as_deref(),
                     ));
                 }
-                if text.is_some() || payload.get("is_error").and_then(Value::as_bool) == Some(true) {
+                if text.is_some() || payload.get("is_error").and_then(Value::as_bool) == Some(true)
+                {
                     return Some(tool_result_event(
                         &name,
                         call_id.as_deref(),
@@ -4994,7 +5506,13 @@ fn tool_event(name: &str, call_id: Option<&str>, text: Option<String>, ts: f64) 
     event
 }
 
-fn tool_result_event(name: &str, call_id: Option<&str>, text: Option<String>, is_error: bool, ts: f64) -> Value {
+fn tool_result_event(
+    name: &str,
+    call_id: Option<&str>,
+    text: Option<String>,
+    is_error: bool,
+    ts: f64,
+) -> Value {
     let mut event = json!({"type": "tool_result", "name": name, "ts": ts});
     if let Some(call_id) = call_id {
         event["tool_call_id"] = json!(call_id);
@@ -5045,14 +5563,21 @@ fn tool_text_from_content(value: &Value) -> Option<String> {
         .filter_map(|item| {
             let item = item.as_object()?;
             let kind = item.get("type").and_then(Value::as_str);
-            if matches!(kind, Some("text") | Some("output_text") | Some("input_text")) {
+            if matches!(
+                kind,
+                Some("text") | Some("output_text") | Some("input_text")
+            ) {
                 item.get("text").and_then(Value::as_str)
             } else {
                 None
             }
         })
         .collect::<String>();
-    if text.is_empty() { None } else { Some(text) }
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
 }
 
 fn tool_result_text(payload: &Map<String, Value>) -> Option<String> {
@@ -5063,7 +5588,9 @@ fn tool_result_text(payload: &Map<String, Value>) -> Option<String> {
         if let Some(text) = tool_text_from_content(value) {
             return Some(text);
         }
-        if matches!(value, Value::Object(map) if !map.is_empty()) || matches!(value, Value::Array(items) if !items.is_empty()) {
+        if matches!(value, Value::Object(map) if !map.is_empty())
+            || matches!(value, Value::Array(items) if !items.is_empty())
+        {
             return serde_json::to_string(value).ok();
         }
     }
@@ -5087,7 +5614,16 @@ fn tool_call_summary(name: &str, args: &Map<String, Value>) -> Option<String> {
         }
         return None;
     }
-    for key in ["cmd", "command", "query", "prompt", "path", "file_path", "url", "subject"] {
+    for key in [
+        "cmd",
+        "command",
+        "query",
+        "prompt",
+        "path",
+        "file_path",
+        "url",
+        "subject",
+    ] {
         if let Some(value) = non_empty_string(args.get(key)) {
             return Some(value);
         }
@@ -5129,13 +5665,31 @@ fn normalize_ask_user_questions(value: Option<&Value>) -> Vec<Value> {
         .collect()
 }
 
-fn ask_user_event(args: &Map<String, Value>, call_id: Option<&str>, ts: f64, resolved: bool) -> Value {
-    let mut question = args.get("question").and_then(Value::as_str).unwrap_or("").to_string();
-    let mut context = args.get("context").and_then(Value::as_str).unwrap_or("").to_string();
+fn ask_user_event(
+    args: &Map<String, Value>,
+    call_id: Option<&str>,
+    ts: f64,
+    resolved: bool,
+) -> Value {
+    let mut question = args
+        .get("question")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let mut context = args
+        .get("context")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
     let mut options = args
         .get("options")
         .and_then(Value::as_array)
-        .map(|options| options.iter().filter_map(|option| option.as_str().map(|s| s.to_string())).collect::<Vec<_>>())
+        .map(|options| {
+            options
+                .iter()
+                .filter_map(|option| option.as_str().map(|s| s.to_string()))
+                .collect::<Vec<_>>()
+        })
         .unwrap_or_default();
     let mut allow_freeform = normalize_bool_arg(args, &["allow_freeform", "allowFreeform"], true);
     let mut allow_multiple = normalize_bool_arg(args, &["allow_multiple", "allowMultiple"], false);
@@ -5157,10 +5711,19 @@ fn ask_user_event(args: &Map<String, Value>, call_id: Option<&str>, ts: f64, res
             }
         }
         if let Some(values) = first.get("options").and_then(Value::as_array) {
-            options = values.iter().filter_map(|option| option.as_str().map(|s| s.to_string())).collect();
+            options = values
+                .iter()
+                .filter_map(|option| option.as_str().map(|s| s.to_string()))
+                .collect();
         }
-        allow_freeform = first.get("allowFreeform").and_then(Value::as_bool).unwrap_or(allow_freeform);
-        allow_multiple = first.get("multiSelect").and_then(Value::as_bool).unwrap_or(allow_multiple);
+        allow_freeform = first
+            .get("allowFreeform")
+            .and_then(Value::as_bool)
+            .unwrap_or(allow_freeform);
+        allow_multiple = first
+            .get("multiSelect")
+            .and_then(Value::as_bool)
+            .unwrap_or(allow_multiple);
     }
     let mut event = json!({
         "type": "ask_user",
@@ -5197,7 +5760,10 @@ fn normalize_ask_user_answer(value: Option<&Value>, allow_multiple: bool) -> Opt
     }
     if allow_multiple {
         if let Some(values) = value.and_then(Value::as_array) {
-            let items = values.iter().filter_map(|item| item.as_str().map(|s| s.to_string())).collect::<Vec<_>>();
+            let items = values
+                .iter()
+                .filter_map(|item| item.as_str().map(|s| s.to_string()))
+                .collect::<Vec<_>>();
             if !items.is_empty() {
                 return Some(json!(items));
             }
@@ -5221,14 +5787,20 @@ fn normalize_ask_user_result(
             }
         }
     }
-    let was_custom = details.get("wasCustom").and_then(Value::as_bool).unwrap_or(false);
+    let was_custom = details
+        .get("wasCustom")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     if let Some(answer) = normalize_ask_user_answer(details.get("answer"), allow_multiple) {
         return (Some(answer), was_custom);
     }
     if let Some(response) = details.get("response").and_then(Value::as_object) {
         let kind = response.get("kind").and_then(Value::as_str).unwrap_or("");
         if let Some(selections) = response.get("selections").and_then(Value::as_array) {
-            let normalized = selections.iter().filter_map(|item| item.as_str().map(|s| s.to_string())).collect::<Vec<_>>();
+            let normalized = selections
+                .iter()
+                .filter_map(|item| item.as_str().map(|s| s.to_string()))
+                .collect::<Vec<_>>();
             if !normalized.is_empty() {
                 if allow_multiple || normalized.len() > 1 {
                     return (Some(json!(normalized)), was_custom || kind == "custom");
@@ -5262,13 +5834,19 @@ fn resolve_ask_user_event(
     if let Some(call_id) = call_id {
         event["tool_call_id"] = json!(call_id);
     }
-    let allow_multiple = event.get("allow_multiple").and_then(Value::as_bool).unwrap_or(false);
+    let allow_multiple = event
+        .get("allow_multiple")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let question = event.get("question").and_then(Value::as_str).unwrap_or("");
     let (answer, was_custom) = normalize_ask_user_result(details, allow_multiple, question);
     if let Some(answer) = answer {
         event["answer"] = answer;
     }
-    if let Some(cancelled) = details.and_then(|details| details.get("cancelled")).and_then(Value::as_bool) {
+    if let Some(cancelled) = details
+        .and_then(|details| details.get("cancelled"))
+        .and_then(Value::as_bool)
+    {
         event["cancelled"] = json!(cancelled);
     }
     event["was_custom"] = json!(was_custom);
@@ -5276,7 +5854,11 @@ fn resolve_ask_user_event(
 }
 
 fn extension_item(value: &Value) -> Option<Value> {
-    if let Some(label) = value.as_str().map(str::trim).filter(|label| !label.is_empty()) {
+    if let Some(label) = value
+        .as_str()
+        .map(str::trim)
+        .filter(|label| !label.is_empty())
+    {
         return Some(json!({ "label": label }));
     }
     let object = value.as_object()?;
@@ -5287,7 +5869,9 @@ fn extension_item(value: &Value) -> Option<Value> {
     if let Some(status) = non_empty_string(object.get("status")) {
         item["status"] = json!(status);
     }
-    if let Some(detail) = non_empty_string(object.get("detail")).or_else(|| non_empty_string(object.get("summary"))) {
+    if let Some(detail) =
+        non_empty_string(object.get("detail")).or_else(|| non_empty_string(object.get("summary")))
+    {
         item["detail"] = json!(detail);
     }
     Some(item)
@@ -5318,15 +5902,27 @@ fn extension_display_event(
     if let Some(call_id) = call_id {
         event["tool_call_id"] = json!(call_id);
     }
-    for (source_key, event_key) in [("status", "status"), ("summary", "summary"), ("text", "text")] {
+    for (source_key, event_key) in [
+        ("status", "status"),
+        ("summary", "summary"),
+        ("text", "text"),
+    ] {
         if let Some(value) = non_empty_string(payload.get(source_key)) {
             event[event_key] = json!(value);
         }
     }
-    if let Some(current) = progress.and_then(|progress| progress.get("current")).or_else(|| payload.get("progress_current")).and_then(number_json) {
+    if let Some(current) = progress
+        .and_then(|progress| progress.get("current"))
+        .or_else(|| payload.get("progress_current"))
+        .and_then(number_json)
+    {
         event["progress_current"] = current;
     }
-    if let Some(total) = progress.and_then(|progress| progress.get("total")).or_else(|| payload.get("progress_total")).and_then(number_json) {
+    if let Some(total) = progress
+        .and_then(|progress| progress.get("total"))
+        .or_else(|| payload.get("progress_total"))
+        .and_then(number_json)
+    {
         event["progress_total"] = total;
     }
     if let Some(label) = progress
@@ -5350,7 +5946,10 @@ fn number_json(value: &Value) -> Option<Value> {
 }
 
 fn plan_status(items: &[Value]) -> &'static str {
-    let statuses = items.iter().filter_map(|item| item.get("status").and_then(Value::as_str)).collect::<Vec<_>>();
+    let statuses = items
+        .iter()
+        .filter_map(|item| item.get("status").and_then(Value::as_str))
+        .collect::<Vec<_>>();
     if statuses.iter().any(|status| *status == "in_progress") {
         "running"
     } else if !statuses.is_empty() && statuses.iter().all(|status| *status == "completed") {
@@ -5389,7 +5988,12 @@ fn update_plan_event(args: &Map<String, Value>, call_id: Option<&str>, ts: f64) 
     ))
 }
 
-fn extension_event_from_tool(name: &str, args: &Map<String, Value>, call_id: Option<&str>, ts: f64) -> Option<Value> {
+fn extension_event_from_tool(
+    name: &str,
+    args: &Map<String, Value>,
+    call_id: Option<&str>,
+    ts: f64,
+) -> Option<Value> {
     if name == "update_plan" {
         return update_plan_event(args, call_id, ts);
     }
@@ -5401,7 +6005,10 @@ fn extension_event_from_tool(name: &str, args: &Map<String, Value>, call_id: Opt
     Some(extension_display_event(payload, call_id, ts, name, name))
 }
 
-fn extension_payload_from_result<'a>(name: &str, payload: &'a Map<String, Value>) -> Option<&'a Map<String, Value>> {
+fn extension_payload_from_result<'a>(
+    name: &str,
+    payload: &'a Map<String, Value>,
+) -> Option<&'a Map<String, Value>> {
     for key in [
         EXTENSION_DISPLAY_KEY,
         "structuredContent",
@@ -5413,7 +6020,10 @@ fn extension_payload_from_result<'a>(name: &str, payload: &'a Map<String, Value>
         let Some(candidate) = payload.get(key).and_then(Value::as_object) else {
             continue;
         };
-        if let Some(nested) = candidate.get(EXTENSION_DISPLAY_KEY).and_then(Value::as_object) {
+        if let Some(nested) = candidate
+            .get(EXTENSION_DISPLAY_KEY)
+            .and_then(Value::as_object)
+        {
             return Some(nested);
         }
         if EXTENSION_DISPLAY_TOOL_NAMES.contains(&name) {
@@ -5423,9 +6033,20 @@ fn extension_payload_from_result<'a>(name: &str, payload: &'a Map<String, Value>
     None
 }
 
-fn extension_event_from_tool_result(name: &str, payload: &Map<String, Value>, call_id: Option<&str>, ts: f64) -> Option<Value> {
+fn extension_event_from_tool_result(
+    name: &str,
+    payload: &Map<String, Value>,
+    call_id: Option<&str>,
+    ts: f64,
+) -> Option<Value> {
     let extension_payload = extension_payload_from_result(name, payload)?;
-    Some(extension_display_event(extension_payload, call_id, ts, name, name))
+    Some(extension_display_event(
+        extension_payload,
+        call_id,
+        ts,
+        name,
+        name,
+    ))
 }
 
 fn output_text(value: &Value) -> Option<String> {
@@ -5440,7 +6061,11 @@ fn output_text(value: &Value) -> Option<String> {
             }
         })
         .collect::<String>();
-    if text.is_empty() { None } else { Some(text) }
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
 }
 
 fn content_text(value: &Value) -> Option<String> {
@@ -5459,7 +6084,11 @@ fn content_text(value: &Value) -> Option<String> {
             }
         })
         .collect::<String>();
-    if text.is_empty() { None } else { Some(text) }
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
 }
 
 fn parse_iso8601_to_epoch(ts: &str) -> Option<f64> {
@@ -5476,7 +6105,11 @@ fn parse_iso8601_to_epoch(ts: &str) -> Option<f64> {
     let (time_part, offset_seconds) = if let Some(time_part) = time_and_zone.strip_suffix('Z') {
         (time_part, 0_i32)
     } else if let Some((time_part, offset_part)) = time_and_zone.rsplit_once(['+', '-']) {
-        let sign = if time_and_zone.as_bytes().get(time_part.len()) == Some(&b'+') { 1_i32 } else { -1_i32 };
+        let sign = if time_and_zone.as_bytes().get(time_part.len()) == Some(&b'+') {
+            1_i32
+        } else {
+            -1_i32
+        };
         let (offset_hour, offset_minute) = offset_part.split_once(':')?;
         let hours = offset_hour.parse::<i32>().ok()?;
         let minutes = offset_minute.parse::<i32>().ok()?;
@@ -5516,7 +6149,11 @@ fn days_from_civil(year: i32, month: u32, day: u32) -> Option<i64> {
         return None;
     }
     let adjusted_year = year - i32::from(month <= 2);
-    let era = if adjusted_year >= 0 { adjusted_year } else { adjusted_year - 399 } / 400;
+    let era = if adjusted_year >= 0 {
+        adjusted_year
+    } else {
+        adjusted_year - 399
+    } / 400;
     let yoe = adjusted_year - era * 400;
     let month_prime = month as i32 + if month > 2 { -3 } else { 9 };
     let doy = (153 * month_prime + 2) / 5 + day as i32 - 1;
@@ -5528,7 +6165,11 @@ fn event_ts(obj: &Value) -> Option<f64> {
     obj.get("ts")
         .and_then(Value::as_f64)
         .or_else(|| obj.get("timestamp").and_then(Value::as_f64))
-        .or_else(|| obj.get("timestamp").and_then(Value::as_str).and_then(parse_iso8601_to_epoch))
+        .or_else(|| {
+            obj.get("timestamp")
+                .and_then(Value::as_str)
+                .and_then(parse_iso8601_to_epoch)
+        })
 }
 
 fn parse_cursor(raw: &str) -> Result<u64, String> {
@@ -5573,7 +6214,10 @@ fn read_voice_listener_records(path: &Path, now_ts: f64) -> Result<HashMap<Strin
     Ok(listeners)
 }
 
-fn write_voice_listener_records(path: &Path, listeners: &HashMap<String, f64>) -> Result<(), String> {
+fn write_voice_listener_records(
+    path: &Path,
+    listeners: &HashMap<String, f64>,
+) -> Result<(), String> {
     let mut keys = listeners.keys().cloned().collect::<Vec<_>>();
     keys.sort();
     let mut object = serde_json::Map::new();
@@ -5586,7 +6230,10 @@ fn write_voice_listener_records(path: &Path, listeners: &HashMap<String, f64>) -
     write_json_value(path, &Value::Object(object))
 }
 
-fn current_voice_listener_count(config: &RuntimeConfig, fallback_count: i64) -> Result<i64, String> {
+fn current_voice_listener_count(
+    config: &RuntimeConfig,
+    fallback_count: i64,
+) -> Result<i64, String> {
     let path = voice_listeners_path(config);
     if !path.exists() {
         return Ok(fallback_count.max(0));
@@ -5685,13 +6332,16 @@ pub(crate) fn normalize_backend(value: Option<&str>) -> Result<String, String> {
     }
 }
 
-pub fn create_session_request_from_payload(payload: &Value) -> Result<CreateSessionRequest, CreateSessionError> {
+pub fn create_session_request_from_payload(
+    payload: &Value,
+) -> Result<CreateSessionRequest, CreateSessionError> {
     let obj = payload
         .as_object()
         .ok_or_else(|| CreateSessionError::bad_request("invalid json body (expected object)"))?;
 
     let agent_backend_raw = obj.get("agent_backend").map(value_to_pythonish_text);
-    let agent_backend = normalize_backend(agent_backend_raw.as_deref()).map_err(CreateSessionError::bad_request)?;
+    let agent_backend =
+        normalize_backend(agent_backend_raw.as_deref()).map_err(CreateSessionError::bad_request)?;
 
     let cwd = obj
         .get("cwd")
@@ -5700,45 +6350,75 @@ pub fn create_session_request_from_payload(payload: &Value) -> Result<CreateSess
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| CreateSessionError::bad_request_with_field("cwd required", "cwd"))?;
 
-    let (model_provider, preferred_auth_method, model, reasoning_effort, service_tier) = if agent_backend == "codex" {
-        let defaults = read_codex_launch_defaults().map_err(CreateSessionError::bad_request)?;
-        let allowed = allowed_model_providers(&defaults.provider_choices);
-        let model_provider = normalize_requested_model_provider(obj.get("model_provider").and_then(Value::as_str), Some(&allowed))
+    let (model_provider, preferred_auth_method, model, reasoning_effort, service_tier) =
+        if agent_backend == "codex" {
+            let defaults = read_codex_launch_defaults().map_err(CreateSessionError::bad_request)?;
+            let allowed = allowed_model_providers(&defaults.provider_choices);
+            let model_provider = normalize_requested_model_provider(
+                obj.get("model_provider").and_then(Value::as_str),
+                Some(&allowed),
+            )
             .map_err(CreateSessionError::bad_request)?;
-        let preferred_auth_method = normalize_requested_preferred_auth_method(
-            obj.get("preferred_auth_method").and_then(Value::as_str),
-        )
-        .map_err(CreateSessionError::bad_request)?;
-        let model = normalize_requested_model(obj.get("model")).map_err(CreateSessionError::bad_request)?;
-        let reasoning_effort = normalize_requested_reasoning_effort(obj.get("reasoning_effort").and_then(Value::as_str))
+            let preferred_auth_method = normalize_requested_preferred_auth_method(
+                obj.get("preferred_auth_method").and_then(Value::as_str),
+            )
             .map_err(CreateSessionError::bad_request)?;
-        let service_tier = normalize_requested_service_tier(obj.get("service_tier").and_then(Value::as_str))
+            let model = normalize_requested_model(obj.get("model"))
+                .map_err(CreateSessionError::bad_request)?;
+            let reasoning_effort = normalize_requested_reasoning_effort(
+                obj.get("reasoning_effort").and_then(Value::as_str),
+            )
             .map_err(CreateSessionError::bad_request)?;
-        (model_provider, preferred_auth_method, model, reasoning_effort, service_tier)
-    } else {
-        let defaults = read_pi_launch_defaults().map_err(CreateSessionError::bad_request)?;
-        let allowed = (!defaults.provider_choices.is_empty()).then_some(defaults.provider_choices.iter().cloned().collect::<HashSet<_>>());
-        let model_provider = normalize_requested_model_provider(
-            obj.get("model_provider").and_then(Value::as_str),
-            allowed.as_ref(),
-        )
-        .map_err(CreateSessionError::bad_request)?;
-        if !value_is_missing_or_empty_string(obj.get("preferred_auth_method")) {
-            return Err(CreateSessionError::bad_request("preferred_auth_method is not supported for pi"));
-        }
-        let model = normalize_requested_model(obj.get("model")).map_err(CreateSessionError::bad_request)?;
-        let reasoning_effort = normalize_requested_pi_reasoning_effort(obj.get("reasoning_effort"))
+            let service_tier =
+                normalize_requested_service_tier(obj.get("service_tier").and_then(Value::as_str))
+                    .map_err(CreateSessionError::bad_request)?;
+            (
+                model_provider,
+                preferred_auth_method,
+                model,
+                reasoning_effort,
+                service_tier,
+            )
+        } else {
+            let defaults = read_pi_launch_defaults().map_err(CreateSessionError::bad_request)?;
+            let allowed = (!defaults.provider_choices.is_empty()).then_some(
+                defaults
+                    .provider_choices
+                    .iter()
+                    .cloned()
+                    .collect::<HashSet<_>>(),
+            );
+            let model_provider = normalize_requested_model_provider(
+                obj.get("model_provider").and_then(Value::as_str),
+                allowed.as_ref(),
+            )
             .map_err(CreateSessionError::bad_request)?;
-        if !value_is_missing_or_empty_string(obj.get("service_tier")) {
-            return Err(CreateSessionError::bad_request("service_tier is not supported for pi"));
-        }
-        (model_provider, None, model, reasoning_effort, None)
-    };
+            if !value_is_missing_or_empty_string(obj.get("preferred_auth_method")) {
+                return Err(CreateSessionError::bad_request(
+                    "preferred_auth_method is not supported for pi",
+                ));
+            }
+            let model = normalize_requested_model(obj.get("model"))
+                .map_err(CreateSessionError::bad_request)?;
+            let reasoning_effort =
+                normalize_requested_pi_reasoning_effort(obj.get("reasoning_effort"))
+                    .map_err(CreateSessionError::bad_request)?;
+            if !value_is_missing_or_empty_string(obj.get("service_tier")) {
+                return Err(CreateSessionError::bad_request(
+                    "service_tier is not supported for pi",
+                ));
+            }
+            (model_provider, None, model, reasoning_effort, None)
+        };
 
     let create_in_tmux = match obj.get("create_in_tmux") {
         None | Some(Value::Null) => false,
         Some(Value::Bool(value)) => *value,
-        _ => return Err(CreateSessionError::bad_request("create_in_tmux must be a boolean")),
+        _ => {
+            return Err(CreateSessionError::bad_request(
+                "create_in_tmux must be a boolean",
+            ))
+        }
     };
 
     let resume_session_id = match obj.get("resume_session_id") {
@@ -5747,7 +6427,11 @@ pub fn create_session_request_from_payload(payload: &Value) -> Result<CreateSess
             let trimmed = value.trim();
             (!trimmed.is_empty()).then(|| trimmed.to_string())
         }
-        _ => return Err(CreateSessionError::bad_request("resume_session_id must be a string")),
+        _ => {
+            return Err(CreateSessionError::bad_request(
+                "resume_session_id must be a string",
+            ))
+        }
     };
 
     let worktree_branch = match obj.get("worktree_branch") {
@@ -5756,7 +6440,11 @@ pub fn create_session_request_from_payload(payload: &Value) -> Result<CreateSess
             let trimmed = value.trim();
             (!trimmed.is_empty()).then(|| trimmed.to_string())
         }
-        _ => return Err(CreateSessionError::bad_request("worktree_branch must be a string")),
+        _ => {
+            return Err(CreateSessionError::bad_request(
+                "worktree_branch must be a string",
+            ))
+        }
     };
 
     let args = match obj.get("args") {
@@ -5765,7 +6453,9 @@ pub fn create_session_request_from_payload(payload: &Value) -> Result<CreateSess
             let mut out = Vec::new();
             for value in values {
                 let Some(text) = value.as_str() else {
-                    return Err(CreateSessionError::bad_request("args must be a list of strings"));
+                    return Err(CreateSessionError::bad_request(
+                        "args must be a list of strings",
+                    ));
                 };
                 if !text.is_empty() {
                     out.push(text.to_string());
@@ -5773,7 +6463,11 @@ pub fn create_session_request_from_payload(payload: &Value) -> Result<CreateSess
             }
             out
         }
-        _ => return Err(CreateSessionError::bad_request("args must be a list of strings")),
+        _ => {
+            return Err(CreateSessionError::bad_request(
+                "args must be a list of strings",
+            ))
+        }
     };
 
     Ok(CreateSessionRequest {
@@ -5825,7 +6519,9 @@ fn normalize_requested_model(value: Option<&Value>) -> Result<Option<String>, St
     Ok(Some(trimmed.to_string()))
 }
 
-fn normalize_requested_pi_reasoning_effort(value: Option<&Value>) -> Result<Option<String>, String> {
+fn normalize_requested_pi_reasoning_effort(
+    value: Option<&Value>,
+) -> Result<Option<String>, String> {
     let Some(value) = value else {
         return Ok(None);
     };
@@ -5864,13 +6560,23 @@ fn tmux_session_name() -> String {
 }
 
 fn next_spawn_nonce() -> String {
-    format!("{:08x}{:08x}", std::process::id(), QUEUE_ITEM_COUNTER.fetch_add(1, Ordering::Relaxed))
+    format!(
+        "{:08x}{:08x}",
+        std::process::id(),
+        QUEUE_ITEM_COUNTER.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
-fn base_spawn_env_overrides(backend_name: &str, resume_session_id: Option<&str>) -> HashMap<String, String> {
+fn base_spawn_env_overrides(
+    backend_name: &str,
+    resume_session_id: Option<&str>,
+) -> HashMap<String, String> {
     let mut out = HashMap::new();
     out.insert("CODEX_WEB_OWNER".to_string(), "web".to_string());
-    out.insert("CODEX_WEB_AGENT_BACKEND".to_string(), backend_name.to_string());
+    out.insert(
+        "CODEX_WEB_AGENT_BACKEND".to_string(),
+        backend_name.to_string(),
+    );
     if backend_name == "codex" {
         out.insert("CODEX_HOME".to_string(), codex_home().display().to_string());
     } else {
@@ -5926,14 +6632,22 @@ fn spawn_command(program: &str) -> Command {
         _ => None,
     };
     if let Some(env_key) = env_key {
-        if let Some(path) = env::var(env_key).ok().map(|value| value.trim().to_string()).filter(|value| !value.is_empty()) {
+        if let Some(path) = env::var(env_key)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+        {
             return Command::new(path);
         }
     }
     Command::new(program)
 }
 
-fn wait_or_raise(child: &mut std::process::Child, label: &str, timeout: Duration) -> Result<(), String> {
+fn wait_or_raise(
+    child: &mut std::process::Child,
+    label: &str,
+    timeout: Duration,
+) -> Result<(), String> {
     let deadline = Instant::now() + timeout;
     loop {
         match child.try_wait().map_err(map_io_error)? {
@@ -5946,7 +6660,18 @@ fn wait_or_raise(child: &mut std::process::Child, label: &str, timeout: Duration
                 return Err(format!(
                     "{label} exited early (rc={}): {}",
                     status.code().unwrap_or_default(),
-                    if trimmed.is_empty() { String::new() } else { trimmed.chars().rev().take(4000).collect::<String>().chars().rev().collect() }
+                    if trimmed.is_empty() {
+                        String::new()
+                    } else {
+                        trimmed
+                            .chars()
+                            .rev()
+                            .take(4000)
+                            .collect::<String>()
+                            .chars()
+                            .rev()
+                            .collect()
+                    }
                 ));
             }
             None if Instant::now() >= deadline => return Ok(()),
@@ -5955,7 +6680,11 @@ fn wait_or_raise(child: &mut std::process::Child, label: &str, timeout: Duration
     }
 }
 
-fn wait_for_spawned_broker_meta(config: &RuntimeConfig, spawn_nonce: &str, timeout: Duration) -> Result<Value, String> {
+fn wait_for_spawned_broker_meta(
+    config: &RuntimeConfig,
+    spawn_nonce: &str,
+    timeout: Duration,
+) -> Result<Value, String> {
     let deadline = Instant::now() + timeout;
     let socks_dir = config.app_dir.join("socks");
     while Instant::now() <= deadline {
@@ -5997,7 +6726,14 @@ fn tmux_capture_pane_tail(pane_id: &str, lines: i64) -> String {
         return String::new();
     }
     let output = match spawn_command("tmux")
-        .args(["capture-pane", "-p", "-t", pane, "-S", &format!("-{}", lines.max(1))])
+        .args([
+            "capture-pane",
+            "-p",
+            "-t",
+            pane,
+            "-S",
+            &format!("-{}", lines.max(1)),
+        ])
         .output()
     {
         Ok(output) => output,
@@ -6043,11 +6779,18 @@ fn shell_quote(raw: &str) -> String {
 }
 
 fn shell_join(argv: &[String]) -> String {
-    argv.iter().map(|value| shell_quote(value)).collect::<Vec<_>>().join(" ")
+    argv.iter()
+        .map(|value| shell_quote(value))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn repo_root() -> Result<PathBuf, String> {
-    if let Some(path) = env::var("CODOXEAR_REPO_ROOT").ok().map(|value| value.trim().to_string()).filter(|value| !value.is_empty()) {
+    if let Some(path) = env::var("CODOXEAR_REPO_ROOT")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
         return Ok(PathBuf::from(path));
     }
     let mut candidates = Vec::new();
@@ -6074,14 +6817,22 @@ fn looks_like_repo_root(path: &Path) -> bool {
 }
 
 fn python_bin(repo_root: &Path) -> PathBuf {
-    if let Some(path) = env::var("CODOXEAR_PYTHON_BIN").ok().map(|value| value.trim().to_string()).filter(|value| !value.is_empty()) {
+    if let Some(path) = env::var("CODOXEAR_PYTHON_BIN")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
         return PathBuf::from(path);
     }
     let venv_python = repo_root.join(".venv").join("bin").join("python");
     if venv_python.exists() {
         return venv_python;
     }
-    if let Some(path) = env::var("VIRTUAL_ENV").ok().map(|value| value.trim().to_string()).filter(|value| !value.is_empty()) {
+    if let Some(path) = env::var("VIRTUAL_ENV")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
         let candidate = PathBuf::from(path).join("bin").join("python");
         if candidate.exists() {
             return candidate;
@@ -6098,7 +6849,11 @@ fn rust_broker_enabled() -> bool {
 }
 
 fn rust_broker_bin(repo_root: &Path) -> PathBuf {
-    if let Some(path) = env::var("CODOXEAR_RUST_BROKER_BIN").ok().map(|value| value.trim().to_string()).filter(|value| !value.is_empty()) {
+    if let Some(path) = env::var("CODOXEAR_RUST_BROKER_BIN")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
         return PathBuf::from(path);
     }
     if let Ok(exe) = env::current_exe() {
@@ -6174,10 +6929,13 @@ fn worktree_path_slug(branch: &str) -> String {
 
 fn default_worktree_path(source_cwd: &Path, branch: &str) -> PathBuf {
     let slug = worktree_path_slug(branch);
-    source_cwd
-        .parent()
-        .unwrap_or(source_cwd)
-        .join(format!("{}-{slug}", source_cwd.file_name().and_then(|name| name.to_str()).unwrap_or("worktree")))
+    source_cwd.parent().unwrap_or(source_cwd).join(format!(
+        "{}-{slug}",
+        source_cwd
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("worktree")
+    ))
 }
 
 fn create_git_worktree(source_cwd: &Path, worktree_branch: &str) -> Result<PathBuf, String> {
@@ -6190,14 +6948,23 @@ fn create_git_worktree(source_cwd: &Path, worktree_branch: &str) -> Result<PathB
     }
     let target = default_worktree_path(source_cwd, branch);
     if target.exists() {
-        return Err(format!("derived worktree path already exists: {}", target.display()));
+        return Err(format!(
+            "derived worktree path already exists: {}",
+            target.display()
+        ));
     }
     if let Some(parent) = target.parent() {
         fs::create_dir_all(parent).map_err(map_io_error)?;
     }
     let output = Command::new("git")
         .current_dir(&repo_root)
-        .args(["worktree", "add", "-b", branch, &target.display().to_string()])
+        .args([
+            "worktree",
+            "add",
+            "-b",
+            branch,
+            &target.display().to_string(),
+        ])
         .output()
         .map_err(map_io_error)?;
     if !output.status.success() {
@@ -6208,13 +6975,20 @@ fn create_git_worktree(source_cwd: &Path, worktree_branch: &str) -> Result<PathB
         } else if !fallback.is_empty() {
             fallback
         } else {
-            format!("git worktree add failed with code {}", output.status.code().unwrap_or_default())
+            format!(
+                "git worktree add failed with code {}",
+                output.status.code().unwrap_or_default()
+            )
         });
     }
     Ok(fs::canonicalize(&target).unwrap_or(target))
 }
 
-fn find_resume_candidate_for_cwd(cwd: &str, agent_backend: &str, target_session_id: &str) -> Option<(String, Option<PathBuf>)> {
+fn find_resume_candidate_for_cwd(
+    cwd: &str,
+    agent_backend: &str,
+    target_session_id: &str,
+) -> Option<(String, Option<PathBuf>)> {
     let cwd_text = fs::canonicalize(expand_user_and_vars(cwd))
         .unwrap_or_else(|_| expand_user_and_vars(cwd))
         .display()
@@ -6269,7 +7043,8 @@ fn iter_session_logs_for_backend(agent_backend: &str) -> Vec<PathBuf> {
 
 fn session_log_matches_backend(path: &Path, agent_backend: &str, sessions_dir: &Path) -> bool {
     if agent_backend == "pi" {
-        return path.extension().and_then(|ext| ext.to_str()) == Some("jsonl") && path.starts_with(sessions_dir);
+        return path.extension().and_then(|ext| ext.to_str()) == Some("jsonl")
+            && path.starts_with(sessions_dir);
     }
     path.file_name()
         .and_then(|name| name.to_str())
@@ -6290,7 +7065,11 @@ fn object_i64(value: Option<&Value>, key: &str) -> Option<i64> {
 }
 
 fn object_string(value: Option<&Value>, key: &str) -> Option<String> {
-    value?.as_object()?.get(key)?.as_str().map(|text| text.to_string())
+    value?
+        .as_object()?
+        .get(key)?
+        .as_str()
+        .map(|text| text.to_string())
 }
 
 fn epoch_now() -> f64 {
@@ -6301,10 +7080,12 @@ fn epoch_now() -> f64 {
 }
 
 fn broker_request(sock_path: &Path, request: &Value, timeout: Duration) -> Result<Value, String> {
-    let mut stream = UnixStream::connect(sock_path).map_err(|err| format!("connect {}: {err}", sock_path.display()))?;
+    let mut stream = UnixStream::connect(sock_path)
+        .map_err(|err| format!("connect {}: {err}", sock_path.display()))?;
     let _ = stream.set_read_timeout(Some(timeout));
     let _ = stream.set_write_timeout(Some(timeout));
-    let mut line = serde_json::to_string(request).map_err(|err| format!("serialize broker request {}: {err}", sock_path.display()))?;
+    let mut line = serde_json::to_string(request)
+        .map_err(|err| format!("serialize broker request {}: {err}", sock_path.display()))?;
     line.push('\n');
     stream
         .write_all(line.as_bytes())
@@ -6316,20 +7097,31 @@ fn broker_request(sock_path: &Path, request: &Value, timeout: Duration) -> Resul
         .map_err(|err| format!("read {}: {err}", sock_path.display()))?;
     let trimmed = response_line.trim();
     if trimmed.is_empty() {
-        return Err(format!("empty broker response from {}", sock_path.display()));
+        return Err(format!(
+            "empty broker response from {}",
+            sock_path.display()
+        ));
     }
-    serde_json::from_str(trimmed).map_err(|err| format!("parse broker response {}: {err}", sock_path.display()))
+    serde_json::from_str(trimmed)
+        .map_err(|err| format!("parse broker response {}: {err}", sock_path.display()))
 }
 
 fn session_sock_path(config: &RuntimeConfig, session_id: &str) -> PathBuf {
-    config.app_dir.join("socks").join(format!("{}.sock", session_id))
+    config
+        .app_dir
+        .join("socks")
+        .join(format!("{}.sock", session_id))
 }
 
 fn read_broker_state(sock_path: &Path) -> Result<Option<BrokerState>, String> {
     if !sock_path.exists() {
         return Ok(None);
     }
-    let value = broker_request(sock_path, &json!({"cmd": "state"}), Duration::from_millis(500))?;
+    let value = broker_request(
+        sock_path,
+        &json!({"cmd": "state"}),
+        Duration::from_millis(500),
+    )?;
     if !value.is_object() {
         return Ok(None);
     }
@@ -6341,7 +7133,12 @@ fn read_broker_state(sock_path: &Path) -> Result<Option<BrokerState>, String> {
         .get("queue_len")
         .and_then(Value::as_u64)
         .map(|value| value as usize)
-        .ok_or_else(|| format!("missing queue_len in broker state for {}", sock_path.display()))?;
+        .ok_or_else(|| {
+            format!(
+                "missing queue_len in broker state for {}",
+                sock_path.display()
+            )
+        })?;
     let token = match value.get("token") {
         Some(Value::Object(_)) => value.get("token").cloned(),
         _ => None,
@@ -6353,7 +7150,10 @@ fn read_broker_state(sock_path: &Path) -> Result<Option<BrokerState>, String> {
     }))
 }
 
-fn read_live_broker_state(config: &RuntimeConfig, session: &ApiSessionSummary) -> Result<BrokerState, String> {
+fn read_live_broker_state(
+    config: &RuntimeConfig,
+    session: &ApiSessionSummary,
+) -> Result<BrokerState, String> {
     let sock_path = session_sock_path(config, &session.session_id);
     match read_broker_state(&sock_path) {
         Ok(Some(state)) => Ok(state),
@@ -6381,7 +7181,11 @@ fn broker_request_for_session(
     }
 }
 
-pub fn send_session_message(config: &RuntimeConfig, session_id: &str, text: &str) -> Result<Value, String> {
+pub fn send_session_message(
+    config: &RuntimeConfig,
+    session_id: &str,
+    text: &str,
+) -> Result<Value, String> {
     if text.trim().is_empty() {
         return Err("text required".to_string());
     }
@@ -6409,7 +7213,11 @@ pub fn interrupt_session(config: &RuntimeConfig, session_id: &str) -> Result<Val
     Ok(json!({"ok": true, "broker": broker}))
 }
 
-pub fn rename_session(config: &RuntimeConfig, session_id: &str, name: &str) -> Result<Value, String> {
+pub fn rename_session(
+    config: &RuntimeConfig,
+    session_id: &str,
+    name: &str,
+) -> Result<Value, String> {
     let _ = find_session(config, session_id)?;
     let alias_path = config.app_dir.join("session_aliases.json");
     let mut aliases = read_string_map(&alias_path)?;
@@ -6440,7 +7248,8 @@ pub fn edit_session(
         return Err("session cannot depend on itself".to_string());
     }
     if let Some(dependency_id) = dependency_clean.as_deref() {
-        find_session(config, dependency_id).map_err(|_| "dependency session not found".to_string())?;
+        find_session(config, dependency_id)
+            .map_err(|_| "dependency session not found".to_string())?;
     }
 
     let alias_path = config.app_dir.join("session_aliases.json");
@@ -6508,9 +7317,14 @@ pub fn inject_session_attachment(
     }))
 }
 
-pub fn create_session(config: &RuntimeConfig, request: CreateSessionRequest) -> Result<Value, CreateSessionError> {
-    let backend_name = normalize_backend(Some(request.agent_backend.as_str())).map_err(CreateSessionError::bad_request)?;
-    let cwd_path = resolve_dir_target(&request.cwd).map_err(|message| create_session_cwd_error(&message))?;
+pub fn create_session(
+    config: &RuntimeConfig,
+    request: CreateSessionRequest,
+) -> Result<Value, CreateSessionError> {
+    let backend_name = normalize_backend(Some(request.agent_backend.as_str()))
+        .map_err(CreateSessionError::bad_request)?;
+    let cwd_path =
+        resolve_dir_target(&request.cwd).map_err(|message| create_session_cwd_error(&message))?;
     if !cwd_path.exists() {
         fs::create_dir_all(&cwd_path).map_err(|err| {
             CreateSessionError::bad_request_with_field(
@@ -6526,15 +7340,26 @@ pub fn create_session(config: &RuntimeConfig, request: CreateSessionRequest) -> 
         ));
     }
     if request.resume_session_id.is_some() && request.worktree_branch.is_some() {
-        return Err(CreateSessionError::bad_request("worktree_branch cannot be used when resuming a session"));
+        return Err(CreateSessionError::bad_request(
+            "worktree_branch cannot be used when resuming a session",
+        ));
     }
 
     let cwd_display = cwd_path.display().to_string();
-    let resume_id = request.resume_session_id.as_deref().map(str::trim).filter(|value| !value.is_empty());
+    let resume_id = request
+        .resume_session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
     let resume_target = if let Some(resume_id) = resume_id {
         Some(
-            find_resume_candidate_for_cwd(&cwd_display, &backend_name, resume_id)
-                .ok_or_else(|| CreateSessionError::bad_request(format!("resume session not found for cwd: {resume_id}")))?,
+            find_resume_candidate_for_cwd(&cwd_display, &backend_name, resume_id).ok_or_else(
+                || {
+                    CreateSessionError::bad_request(format!(
+                        "resume session not found for cwd: {resume_id}"
+                    ))
+                },
+            )?,
         )
     } else {
         None
@@ -6565,7 +7390,10 @@ pub fn create_session(config: &RuntimeConfig, request: CreateSessionRequest) -> 
         }
         if let Some(preferred_auth_method) = request.preferred_auth_method.as_deref() {
             agent_args.push("-c".to_string());
-            agent_args.push(format!("preferred_auth_method=\"{}\"", preferred_auth_method));
+            agent_args.push(format!(
+                "preferred_auth_method=\"{}\"",
+                preferred_auth_method
+            ));
         }
         if let Some(service_tier) = request.service_tier.as_deref() {
             agent_args.push("-c".to_string());
@@ -6577,10 +7405,14 @@ pub fn create_session(config: &RuntimeConfig, request: CreateSessionRequest) -> 
         }
     } else {
         if request.preferred_auth_method.is_some() {
-            return Err(CreateSessionError::bad_request("preferred_auth_method is not supported for pi"));
+            return Err(CreateSessionError::bad_request(
+                "preferred_auth_method is not supported for pi",
+            ));
         }
         if request.service_tier.is_some() {
-            return Err(CreateSessionError::bad_request("service_tier is not supported for pi"));
+            return Err(CreateSessionError::bad_request(
+                "service_tier is not supported for pi",
+            ));
         }
         if let Some(model_provider) = request.model_provider.as_deref() {
             agent_args.push("--provider".to_string());
@@ -6604,13 +7436,23 @@ pub fn create_session(config: &RuntimeConfig, request: CreateSessionRequest) -> 
             );
         }
     }
-    agent_args.extend(request.args.iter().filter(|value| !value.is_empty()).cloned());
+    agent_args.extend(
+        request
+            .args
+            .iter()
+            .filter(|value| !value.is_empty())
+            .cloned(),
+    );
 
     let repo_root = repo_root().map_err(CreateSessionError::internal)?;
     let python_bin = python_bin(&repo_root);
     let use_rust_broker = rust_broker_enabled();
     let (broker_program, broker_args) = if use_rust_broker {
-        let mut args = vec!["--cwd".to_string(), spawn_cwd.display().to_string(), "--".to_string()];
+        let mut args = vec![
+            "--cwd".to_string(),
+            spawn_cwd.display().to_string(),
+            "--".to_string(),
+        ];
         args.extend(agent_args.iter().cloned());
         (rust_broker_bin(&repo_root), args)
     } else {
@@ -6627,7 +7469,10 @@ pub fn create_session(config: &RuntimeConfig, request: CreateSessionRequest) -> 
     let tmux_session = tmux_session_name();
     let mut env_overrides = base_spawn_env_overrides(&backend_name, resume_id);
     if let Some(model_provider) = request.model_provider.as_deref() {
-        env_overrides.insert("CODEX_WEB_MODEL_PROVIDER".to_string(), model_provider.to_string());
+        env_overrides.insert(
+            "CODEX_WEB_MODEL_PROVIDER".to_string(),
+            model_provider.to_string(),
+        );
     }
     if let Some(preferred_auth_method) = request.preferred_auth_method.as_deref() {
         env_overrides.insert(
@@ -6645,18 +7490,26 @@ pub fn create_session(config: &RuntimeConfig, request: CreateSessionRequest) -> 
         );
     }
     if let Some(service_tier) = request.service_tier.as_deref() {
-        env_overrides.insert("CODEX_WEB_SERVICE_TIER".to_string(), service_tier.to_string());
+        env_overrides.insert(
+            "CODEX_WEB_SERVICE_TIER".to_string(),
+            service_tier.to_string(),
+        );
     }
 
     if request.create_in_tmux {
         if !tmux_available() {
-            return Err(CreateSessionError::bad_request("tmux is unavailable on this host"));
+            return Err(CreateSessionError::bad_request(
+                "tmux is unavailable on this host",
+            ));
         }
         let spawn_nonce = next_spawn_nonce();
         let tmux_window = safe_filename(
             &format!(
                 "{}-{}",
-                spawn_cwd.file_name().and_then(|name| name.to_str()).unwrap_or("session"),
+                spawn_cwd
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("session"),
                 &spawn_nonce[..6],
             ),
             "session",
@@ -6670,10 +7523,18 @@ pub fn create_session(config: &RuntimeConfig, request: CreateSessionRequest) -> 
         for (key, value) in sorted_env_items(&env_overrides) {
             inline_argv.push(format!("{key}={value}"));
         }
-        if let Some(codex_bin) = env::var("CODEX_BIN").ok().map(|value| value.trim().to_string()).filter(|value| !value.is_empty()) {
+        if let Some(codex_bin) = env::var("CODEX_BIN")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+        {
             inline_argv.push(format!("CODEX_BIN={codex_bin}"));
         }
-        if let Some(pi_bin) = env::var("PI_BIN").ok().map(|value| value.trim().to_string()).filter(|value| !value.is_empty()) {
+        if let Some(pi_bin) = env::var("PI_BIN")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+        {
             inline_argv.push(format!("PI_BIN={pi_bin}"));
         }
         inline_argv.push(broker_program.display().to_string());
@@ -6725,32 +7586,50 @@ pub fn create_session(config: &RuntimeConfig, request: CreateSessionRequest) -> 
             .output()
             .map_err(|err| CreateSessionError::internal(format!("tmux launch failed: {err}")))?;
         if !tmux_output.status.success() {
-            let detail = String::from_utf8_lossy(&tmux_output.stderr).trim().to_string();
-            let fallback = String::from_utf8_lossy(&tmux_output.stdout).trim().to_string();
+            let detail = String::from_utf8_lossy(&tmux_output.stderr)
+                .trim()
+                .to_string();
+            let fallback = String::from_utf8_lossy(&tmux_output.stdout)
+                .trim()
+                .to_string();
             let message = if !detail.is_empty() {
                 detail
             } else if !fallback.is_empty() {
                 fallback
             } else {
-                format!("exit status {}", tmux_output.status.code().unwrap_or_default())
+                format!(
+                    "exit status {}",
+                    tmux_output.status.code().unwrap_or_default()
+                )
             };
-            return Err(CreateSessionError::internal(format!("tmux launch failed: {message}")));
+            return Err(CreateSessionError::internal(format!(
+                "tmux launch failed: {message}"
+            )));
         }
-        let pane_id = String::from_utf8_lossy(&tmux_output.stdout).trim().to_string();
-        let meta = wait_for_spawned_broker_meta(config, &spawn_nonce, Duration::from_secs_f64(TMUX_META_WAIT_SECONDS)).map_err(
-            |message| {
-                let pane_tail = tmux_capture_pane_tail(&pane_id, 80);
-                if pane_tail.is_empty() {
-                    CreateSessionError::internal(message)
-                } else {
-                    CreateSessionError::internal(format!("{message}\nLast tmux pane output:\n{pane_tail}"))
-                }
-            },
-        )?;
+        let pane_id = String::from_utf8_lossy(&tmux_output.stdout)
+            .trim()
+            .to_string();
+        let meta = wait_for_spawned_broker_meta(
+            config,
+            &spawn_nonce,
+            Duration::from_secs_f64(TMUX_META_WAIT_SECONDS),
+        )
+        .map_err(|message| {
+            let pane_tail = tmux_capture_pane_tail(&pane_id, 80);
+            if pane_tail.is_empty() {
+                CreateSessionError::internal(message)
+            } else {
+                CreateSessionError::internal(format!(
+                    "{message}\nLast tmux pane output:\n{pane_tail}"
+                ))
+            }
+        })?;
         let broker_pid = meta
             .get("broker_pid")
             .and_then(Value::as_i64)
-            .ok_or_else(|| CreateSessionError::internal("tmux launch metadata is missing broker_pid"))?;
+            .ok_or_else(|| {
+                CreateSessionError::internal("tmux launch metadata is missing broker_pid")
+            })?;
         return Ok(json!({
             "ok": true,
             "broker_pid": broker_pid,
@@ -6771,7 +7650,8 @@ pub fn create_session(config: &RuntimeConfig, request: CreateSessionRequest) -> 
     let mut child = child
         .spawn()
         .map_err(|err| CreateSessionError::internal(format!("spawn failed: {err}")))?;
-    wait_or_raise(&mut child, "broker", Duration::from_secs_f64(1.5)).map_err(CreateSessionError::internal)?;
+    wait_or_raise(&mut child, "broker", Duration::from_secs_f64(1.5))
+        .map_err(CreateSessionError::internal)?;
     let broker_pid = i64::from(child.id());
     let stderr = child.stderr.take();
     std::thread::spawn(move || {
@@ -6806,7 +7686,11 @@ pub fn delete_session(config: &RuntimeConfig, session_id: &str) -> Result<Value,
     Ok(json!({"ok": true}))
 }
 
-pub(crate) fn discover_open_log_for_process(root_pid: i64, cwd: &str, agent_backend: &str) -> Option<PathBuf> {
+pub(crate) fn discover_open_log_for_process(
+    root_pid: i64,
+    cwd: &str,
+    agent_backend: &str,
+) -> Option<PathBuf> {
     let sessions_dir = agent_sessions_dir(agent_backend);
     discover_open_log_for_process_in_sessions(root_pid, cwd, agent_backend, &sessions_dir)
 }
@@ -6840,7 +7724,8 @@ pub(crate) fn discover_open_log_for_process_in_sessions_excluding(
     if !proc_root.exists() {
         return None;
     }
-    let mut candidates = proc_open_writable_rollout_logs(proc_root, root_pid, agent_backend, sessions_dir);
+    let mut candidates =
+        proc_open_writable_rollout_logs(proc_root, root_pid, agent_backend, sessions_dir);
     if !excluded_paths.is_empty() {
         candidates.retain(|path| !path_in_set(path, excluded_paths));
     }
@@ -6889,7 +7774,9 @@ fn proc_open_writable_rollout_logs(
     agent_backend: &str,
     sessions_dir: &Path,
 ) -> Vec<PathBuf> {
-    let uid = fs::metadata(proc_root.join("self")).ok().map(|meta| meta.uid());
+    let uid = fs::metadata(proc_root.join("self"))
+        .ok()
+        .map(|meta| meta.uid());
     let mut out = HashSet::new();
     for pid in proc_descendants(proc_root, root_pid) {
         let pid_uid = proc_pid_uid(proc_root, pid);
@@ -6918,7 +7805,9 @@ fn proc_open_writable_rollout_logs(
             if path_text.ends_with(" (deleted)") {
                 continue;
             }
-            if !target.is_absolute() || target.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+            if !target.is_absolute()
+                || target.extension().and_then(|ext| ext.to_str()) != Some("jsonl")
+            {
                 continue;
             }
             if is_rollout_log_path(&target, agent_backend, sessions_dir) {
@@ -6949,7 +7838,9 @@ fn is_rollout_log_path(path: &Path, agent_backend: &str, sessions_dir: &Path) ->
 }
 
 fn proc_pid_uid(proc_root: &Path, pid: i64) -> Option<u32> {
-    fs::metadata(proc_root.join(pid.to_string())).ok().map(|meta| meta.uid())
+    fs::metadata(proc_root.join(pid.to_string()))
+        .ok()
+        .map(|meta| meta.uid())
 }
 
 fn proc_children(proc_root: &Path, pid: i64) -> Vec<i64> {
@@ -7087,11 +7978,19 @@ pub(crate) fn compute_idle_from_log(path: &Path) -> Option<bool> {
                     continue;
                 };
                 match payload.get("type").and_then(Value::as_str) {
-                    Some("user_message") if payload.get("message" ).and_then(Value::as_str).is_some() => {
+                    Some("user_message")
+                        if payload.get("message").and_then(Value::as_str).is_some() =>
+                    {
                         saw_terminal_signal = true;
                         idle = false;
                     }
-                    Some("agent_message") if payload.get("message").and_then(Value::as_str).map(|text| !text.trim().is_empty()).unwrap_or(false) => {
+                    Some("agent_message")
+                        if payload
+                            .get("message")
+                            .and_then(Value::as_str)
+                            .map(|text| !text.trim().is_empty())
+                            .unwrap_or(false) =>
+                    {
                         saw_terminal_signal = true;
                         idle = false;
                     }
@@ -7099,7 +7998,10 @@ pub(crate) fn compute_idle_from_log(path: &Path) -> Option<bool> {
                         saw_terminal_signal = true;
                         idle = false;
                     }
-                    Some("turn_aborted") | Some("thread_rolled_back") | Some("task_complete") | Some("turn_complete") => {
+                    Some("turn_aborted")
+                    | Some("thread_rolled_back")
+                    | Some("task_complete")
+                    | Some("turn_complete") => {
                         saw_terminal_signal = true;
                         idle = true;
                     }
@@ -7116,7 +8018,16 @@ pub(crate) fn compute_idle_from_log(path: &Path) -> Option<bool> {
                     idle = payload.get("end_turn").and_then(Value::as_bool) == Some(true);
                     continue;
                 }
-                if matches!(payload_type, Some("reasoning") | Some("function_call") | Some("function_call_output") | Some("custom_tool_call") | Some("custom_tool_call_output") | Some("web_search_call") | Some("local_shell_call")) {
+                if matches!(
+                    payload_type,
+                    Some("reasoning")
+                        | Some("function_call")
+                        | Some("function_call_output")
+                        | Some("custom_tool_call")
+                        | Some("custom_tool_call_output")
+                        | Some("web_search_call")
+                        | Some("local_shell_call")
+                ) {
                     saw_terminal_signal = true;
                     idle = false;
                 }
@@ -7166,7 +8077,9 @@ fn last_chat_role_ts_from_log(path: &Path) -> Option<(&'static str, f64)> {
                     continue;
                 };
                 match payload.get("type").and_then(Value::as_str) {
-                    Some("user_message") if payload.get("message").and_then(Value::as_str).is_some() => {
+                    Some("user_message")
+                        if payload.get("message").and_then(Value::as_str).is_some() =>
+                    {
                         if let Some(ts) = event_ts(obj) {
                             last_user = Some((record.start, ts));
                         }
@@ -7213,7 +8126,11 @@ fn sidebar_conversation_ts(obj: &Value) -> Option<f64> {
         Some("event_msg") => {
             let payload = obj.get("payload").and_then(Value::as_object)?;
             match payload.get("type").and_then(Value::as_str) {
-                Some("user_message") if payload.get("message").and_then(Value::as_str).is_some() => event_ts(obj),
+                Some("user_message")
+                    if payload.get("message").and_then(Value::as_str).is_some() =>
+                {
+                    event_ts(obj)
+                }
                 Some("task_complete") | Some("turn_complete")
                     if payload
                         .get("last_agent_message")
@@ -7261,8 +8178,12 @@ fn sidebar_conversation_ts(obj: &Value) -> Option<f64> {
 }
 
 fn has_assistant_output(obj: &Value) -> bool {
-    matches!(obj.get("type").and_then(Value::as_str), Some("message") | Some("response_item") | Some("event_msg"))
-        && (pi_assistant_text_value(obj).is_some() || response_item_has_assistant_output(obj) || event_msg_has_assistant_output(obj))
+    matches!(
+        obj.get("type").and_then(Value::as_str),
+        Some("message") | Some("response_item") | Some("event_msg")
+    ) && (pi_assistant_text_value(obj).is_some()
+        || response_item_has_assistant_output(obj)
+        || event_msg_has_assistant_output(obj))
 }
 
 fn event_msg_has_assistant_output(obj: &Value) -> bool {
@@ -7304,14 +8225,18 @@ fn pi_message_content_parts(obj: &Value) -> Vec<&serde_json::Map<String, Value>>
 }
 
 fn pi_user_text_value(obj: &Value) -> Option<String> {
-    if obj.get("type").and_then(Value::as_str) != Some("message") || pi_message_role_value(obj) != Some("user") {
+    if obj.get("type").and_then(Value::as_str) != Some("message")
+        || pi_message_role_value(obj) != Some("user")
+    {
         return None;
     }
     content_text(obj.get("message")?.get("content")?)
 }
 
 fn pi_assistant_text_value(obj: &Value) -> Option<String> {
-    if obj.get("type").and_then(Value::as_str) != Some("message") || pi_message_role_value(obj) != Some("assistant") {
+    if obj.get("type").and_then(Value::as_str) != Some("message")
+        || pi_message_role_value(obj) != Some("assistant")
+    {
         return None;
     }
     let text = pi_message_content_parts(obj)
@@ -7324,7 +8249,11 @@ fn pi_assistant_text_value(obj: &Value) -> Option<String> {
             }
         })
         .collect::<String>();
-    if text.is_empty() { None } else { Some(text) }
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
 }
 
 fn pi_assistant_tool_use_count(obj: &Value) -> usize {
@@ -7356,14 +8285,19 @@ fn pi_assistant_is_final_turn_end(obj: &Value) -> bool {
         .and_then(Value::as_object)
         .and_then(|message| message.get("stopReason"))
         .and_then(Value::as_str);
-    if pi_assistant_tool_use_count(obj) == 0 && pi_assistant_thinking_count(obj) == 0 && stop_reason != Some("toolUse") {
+    if pi_assistant_tool_use_count(obj) == 0
+        && pi_assistant_thinking_count(obj) == 0
+        && stop_reason != Some("toolUse")
+    {
         return true;
     }
     matches!(stop_reason, Some(reason) if reason != "toolUse")
 }
 
 fn pi_message_keeps_turn_busy(obj: &Value) -> bool {
-    pi_message_role_value(obj) == Some("toolResult") || pi_assistant_tool_use_count(obj) > 0 || pi_assistant_thinking_count(obj) > 0
+    pi_message_role_value(obj) == Some("toolResult")
+        || pi_assistant_tool_use_count(obj) > 0
+        || pi_assistant_thinking_count(obj) > 0
 }
 
 pub(crate) fn token_update_from_obj(obj: &Value) -> Option<Value> {
@@ -7382,7 +8316,10 @@ fn codex_token_update_from_obj(obj: &Value) -> Option<Value> {
     let total_usage = info.get("total_token_usage")?.as_object()?;
     let _ = total_usage;
     let context_window = info.get("model_context_window")?.as_i64()?;
-    let total_tokens = info.get("last_token_usage")?.get("total_tokens")?.as_i64()?;
+    let total_tokens = info
+        .get("last_token_usage")?
+        .get("total_tokens")?
+        .as_i64()?;
     Some(json!({
         "context_window": context_window,
         "tokens_in_context": total_tokens,
@@ -7394,7 +8331,9 @@ fn codex_token_update_from_obj(obj: &Value) -> Option<Value> {
 }
 
 fn pi_token_update_from_obj(obj: &Value) -> Option<Value> {
-    if obj.get("type").and_then(Value::as_str) != Some("message") || pi_message_role_value(obj) != Some("assistant") {
+    if obj.get("type").and_then(Value::as_str) != Some("message")
+        || pi_message_role_value(obj) != Some("assistant")
+    {
         return None;
     }
     let message = obj.get("message")?.as_object()?;
@@ -7434,13 +8373,22 @@ fn pi_model_context_window(provider: &str, model: &str) -> Option<i64> {
         .as_i64()
 }
 
-fn read_run_settings_from_log(path: &Path, agent_backend: &str) -> (Option<String>, Option<String>, Option<String>) {
+fn read_run_settings_from_log(
+    path: &Path,
+    agent_backend: &str,
+) -> (Option<String>, Option<String>, Option<String>) {
     if agent_backend == "pi" {
         let Some(obj) = read_first_json_object(path) else {
             return (None, None, None);
         };
-        let provider = obj.get("provider").and_then(Value::as_str).map(ToString::to_string);
-        let model = obj.get("model").and_then(Value::as_str).map(ToString::to_string);
+        let provider = obj
+            .get("provider")
+            .and_then(Value::as_str)
+            .map(ToString::to_string);
+        let model = obj
+            .get("model")
+            .and_then(Value::as_str)
+            .map(ToString::to_string);
         let reasoning = obj
             .get("thinking_level")
             .and_then(Value::as_str)
@@ -7452,8 +8400,14 @@ fn read_run_settings_from_log(path: &Path, agent_backend: &str) -> (Option<Strin
         return (None, None, None);
     };
     (
-        payload.get("model_provider").and_then(Value::as_str).map(ToString::to_string),
-        payload.get("model").and_then(Value::as_str).map(ToString::to_string),
+        payload
+            .get("model_provider")
+            .and_then(Value::as_str)
+            .map(ToString::to_string),
+        payload
+            .get("model")
+            .and_then(Value::as_str)
+            .map(ToString::to_string),
         payload
             .get("reasoning_effort")
             .and_then(Value::as_str)
@@ -7498,7 +8452,8 @@ fn new_session_defaults() -> Result<ApiNewSessionDefaults, String> {
     let mut backends = HashMap::new();
     backends.insert("codex".to_string(), read_codex_launch_defaults()?);
     backends.insert("pi".to_string(), read_pi_launch_defaults()?);
-    let default_backend_raw = env::var("CODEX_WEB_DEFAULT_AGENT_BACKEND").unwrap_or_else(|_| "codex".to_string());
+    let default_backend_raw =
+        env::var("CODEX_WEB_DEFAULT_AGENT_BACKEND").unwrap_or_else(|_| "codex".to_string());
     Ok(ApiNewSessionDefaults {
         default_backend: normalize_backend(Some(default_backend_raw.as_str()))?,
         backends,
@@ -7514,8 +8469,10 @@ fn read_codex_launch_defaults() -> Result<ApiBackendDefaults, String> {
     let mut configured_providers = vec!["chatgpt".to_string(), "openai-api".to_string()];
     let config_path = codex_config_path();
     if config_path.exists() {
-        let data = fs::read_to_string(&config_path).map_err(|err| format!("read {}: {err}", config_path.display()))?;
-        let parsed: TomlValue = toml::from_str(&data).map_err(|err| format!("parse {}: {err}", config_path.display()))?;
+        let data = fs::read_to_string(&config_path)
+            .map_err(|err| format!("read {}: {err}", config_path.display()))?;
+        let parsed: TomlValue = toml::from_str(&data)
+            .map_err(|err| format!("parse {}: {err}", config_path.display()))?;
         let table = parsed
             .as_table()
             .ok_or_else(|| format!("invalid Codex config in {}", config_path.display()))?;
@@ -7530,14 +8487,20 @@ fn read_codex_launch_defaults() -> Result<ApiBackendDefaults, String> {
             }
         }
         configured_providers = vec!["chatgpt".to_string(), "openai-api".to_string()];
-        configured_providers.extend(configured_model_providers(table).into_iter().filter(|provider| provider != "openai"));
+        configured_providers.extend(
+            configured_model_providers(table)
+                .into_iter()
+                .filter(|provider| provider != "openai"),
+        );
         let allowed = allowed_model_providers(&configured_providers);
         if let Some(value) = table
             .get("model_provider")
             .or_else(|| table.get("model_provider_id"))
             .and_then(toml_string)
         {
-            if let Some(provider) = normalize_requested_model_provider(Some(&value), Some(&allowed))? {
+            if let Some(provider) =
+                normalize_requested_model_provider(Some(&value), Some(&allowed))?
+            {
                 configured_provider = Some(provider);
             }
         }
@@ -7561,10 +8524,13 @@ fn read_codex_launch_defaults() -> Result<ApiBackendDefaults, String> {
                 configured_effort = rows
                     .iter()
                     .find(|row| {
-                        [row.get("slug").and_then(Value::as_str), row.get("display_name").and_then(Value::as_str)]
-                            .into_iter()
-                            .flatten()
-                            .any(|candidate| candidate == model)
+                        [
+                            row.get("slug").and_then(Value::as_str),
+                            row.get("display_name").and_then(Value::as_str),
+                        ]
+                        .into_iter()
+                        .flatten()
+                        .any(|candidate| candidate == model)
                     })
                     .and_then(|row| row.get("default_reasoning_level").and_then(Value::as_str))
                     .and_then(display_reasoning_effort);
@@ -7576,12 +8542,22 @@ fn read_codex_launch_defaults() -> Result<ApiBackendDefaults, String> {
                         left.get("priority")
                             .and_then(Value::as_i64)
                             .unwrap_or(999_999)
-                            .cmp(&right.get("priority").and_then(Value::as_i64).unwrap_or(999_999))
+                            .cmp(
+                                &right
+                                    .get("priority")
+                                    .and_then(Value::as_i64)
+                                    .unwrap_or(999_999),
+                            )
                             .then_with(|| {
                                 left.get("slug")
                                     .and_then(Value::as_str)
                                     .unwrap_or_default()
-                                    .cmp(right.get("slug").and_then(Value::as_str).unwrap_or_default())
+                                    .cmp(
+                                        right
+                                            .get("slug")
+                                            .and_then(Value::as_str)
+                                            .unwrap_or_default(),
+                                    )
                             })
                     })
                     .and_then(|row| row.get("default_reasoning_level").and_then(Value::as_str))
@@ -7599,12 +8575,18 @@ fn read_codex_launch_defaults() -> Result<ApiBackendDefaults, String> {
         model: configured_model,
         models: vec![],
         reasoning_effort: configured_effort.unwrap_or_default(),
-        reasoning_efforts: SUPPORTED_REASONING_EFFORTS.iter().map(|value| (*value).to_string()).collect(),
+        reasoning_efforts: SUPPORTED_REASONING_EFFORTS
+            .iter()
+            .map(|value| (*value).to_string())
+            .collect(),
         service_tier: configured_service_tier,
         supports_fast: true,
     };
     apply_codex_launch_default_env_overrides(&mut defaults)?;
-    defaults.provider_choice = provider_choice_for_settings(defaults.model_provider.as_deref(), defaults.preferred_auth_method.as_deref());
+    defaults.provider_choice = provider_choice_for_settings(
+        defaults.model_provider.as_deref(),
+        defaults.preferred_auth_method.as_deref(),
+    );
     Ok(defaults)
 }
 
@@ -7618,8 +8600,14 @@ fn read_pi_launch_defaults() -> Result<ApiBackendDefaults, String> {
     let settings_path = pi_settings_path();
     if settings_path.exists() {
         let settings: Value = read_json_file(&settings_path)?;
-        configured_provider = settings.get("defaultProvider").and_then(Value::as_str).map(ToString::to_string);
-        configured_model = settings.get("defaultModel").and_then(Value::as_str).map(ToString::to_string);
+        configured_provider = settings
+            .get("defaultProvider")
+            .and_then(Value::as_str)
+            .map(ToString::to_string);
+        configured_model = settings
+            .get("defaultModel")
+            .and_then(Value::as_str)
+            .map(ToString::to_string);
     }
 
     let models_path = pi_models_path();
@@ -7632,7 +8620,9 @@ fn read_pi_launch_defaults() -> Result<ApiBackendDefaults, String> {
                     continue;
                 }
                 provider_choices.push(name.to_string());
-                if configured_provider.as_deref().is_some() && configured_provider.as_deref() != Some(name) {
+                if configured_provider.as_deref().is_some()
+                    && configured_provider.as_deref() != Some(name)
+                {
                     continue;
                 }
                 for row in value
@@ -7665,7 +8655,10 @@ fn read_pi_launch_defaults() -> Result<ApiBackendDefaults, String> {
                 let auth_type = value.get("type").and_then(Value::as_str);
                 let access = value.get("access").and_then(Value::as_str);
                 let refresh = value.get("refresh").and_then(Value::as_str);
-                if auth_type == Some("oauth") && (access.is_some() || refresh.is_some()) && !provider_choices.iter().any(|item| item == key) {
+                if auth_type == Some("oauth")
+                    && (access.is_some() || refresh.is_some())
+                    && !provider_choices.iter().any(|item| item == key)
+                {
                     provider_choices.push(key.to_string());
                 }
             }
@@ -7692,7 +8685,10 @@ fn read_pi_launch_defaults() -> Result<ApiBackendDefaults, String> {
         model: configured_model,
         models: model_choices,
         reasoning_effort: configured_effort,
-        reasoning_efforts: SUPPORTED_PI_REASONING_EFFORTS.iter().map(|value| (*value).to_string()).collect(),
+        reasoning_efforts: SUPPORTED_PI_REASONING_EFFORTS
+            .iter()
+            .map(|value| (*value).to_string())
+            .collect(),
         service_tier: None,
         supports_fast: false,
     })
@@ -7703,7 +8699,11 @@ fn codex_home() -> PathBuf {
         .ok()
         .filter(|value| !value.trim().is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(|| home_dir().unwrap_or_else(|| PathBuf::from(".")).join(".codex"))
+        .unwrap_or_else(|| {
+            home_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(".codex")
+        })
 }
 
 fn pi_home() -> PathBuf {
@@ -7773,7 +8773,9 @@ fn pi_auth_path() -> PathBuf {
 fn ensure_vapid_public_key(config: &RuntimeConfig) -> Result<String, String> {
     let path = vapid_private_key_path(config);
     if !path.exists() {
-        let parent = path.parent().ok_or_else(|| format!("missing parent for {}", path.display()))?;
+        let parent = path
+            .parent()
+            .ok_or_else(|| format!("missing parent for {}", path.display()))?;
         fs::create_dir_all(parent).map_err(|err| format!("create {}: {err}", parent.display()))?;
         let output = Command::new("openssl")
             .arg("genpkey")
@@ -7798,7 +8800,8 @@ fn ensure_vapid_public_key(config: &RuntimeConfig) -> Result<String, String> {
                 .map_err(|err| format!("stat {}: {err}", path.display()))?
                 .permissions();
             permissions.set_mode(0o600);
-            fs::set_permissions(&path, permissions).map_err(|err| format!("chmod {}: {err}", path.display()))?;
+            fs::set_permissions(&path, permissions)
+                .map_err(|err| format!("chmod {}: {err}", path.display()))?;
         }
     }
     let output = Command::new("openssl")
@@ -7890,7 +8893,10 @@ fn der_read_length(raw: &[u8], idx: &mut usize) -> Result<usize, String> {
 }
 
 fn toml_string(value: &TomlValue) -> Option<String> {
-    value.as_str().map(|text| text.trim().to_string()).filter(|text| !text.is_empty())
+    value
+        .as_str()
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())
 }
 
 fn display_reasoning_effort(value: &str) -> Option<String> {
@@ -7933,8 +8939,14 @@ fn allowed_model_providers(provider_choices: &[String]) -> HashSet<String> {
     out
 }
 
-fn normalize_requested_model_provider(value: Option<&str>, allowed: Option<&HashSet<String>>) -> Result<Option<String>, String> {
-    let provider = value.map(str::trim).filter(|value| !value.is_empty()).map(ToString::to_string);
+fn normalize_requested_model_provider(
+    value: Option<&str>,
+    allowed: Option<&HashSet<String>>,
+) -> Result<Option<String>, String> {
+    let provider = value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
     let Some(provider) = provider else {
         return Ok(None);
     };
@@ -7942,14 +8954,22 @@ fn normalize_requested_model_provider(value: Option<&str>, allowed: Option<&Hash
         if !allowed_set.contains(&provider) {
             let mut allowed_values = allowed_set.iter().cloned().collect::<Vec<_>>();
             allowed_values.sort();
-            return Err(format!("model_provider must be one of {}", allowed_values.join(", ")));
+            return Err(format!(
+                "model_provider must be one of {}",
+                allowed_values.join(", ")
+            ));
         }
     }
     Ok(Some(provider))
 }
 
-fn normalize_requested_preferred_auth_method(value: Option<&str>) -> Result<Option<String>, String> {
-    let method = value.map(str::trim).filter(|value| !value.is_empty()).map(ToString::to_string);
+fn normalize_requested_preferred_auth_method(
+    value: Option<&str>,
+) -> Result<Option<String>, String> {
+    let method = value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
     let Some(method) = method else {
         return Ok(None);
     };
@@ -7960,7 +8980,10 @@ fn normalize_requested_preferred_auth_method(value: Option<&str>) -> Result<Opti
 }
 
 fn normalize_requested_service_tier(value: Option<&str>) -> Result<Option<String>, String> {
-    let tier = value.map(str::trim).filter(|value| !value.is_empty()).map(ToString::to_string);
+    let tier = value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
     let Some(tier) = tier else {
         return Ok(None);
     };
@@ -7971,31 +8994,56 @@ fn normalize_requested_service_tier(value: Option<&str>) -> Result<Option<String
 }
 
 fn normalize_requested_reasoning_effort(value: Option<&str>) -> Result<Option<String>, String> {
-    let effort = value.map(str::trim).filter(|value| !value.is_empty()).map(ToString::to_string);
+    let effort = value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
     let Some(effort) = effort else {
         return Ok(None);
     };
     if display_reasoning_effort(&effort).is_none() {
-        return Err(format!("reasoning_effort must be one of {}", SUPPORTED_REASONING_EFFORTS.join(", ")));
+        return Err(format!(
+            "reasoning_effort must be one of {}",
+            SUPPORTED_REASONING_EFFORTS.join(", ")
+        ));
     }
     Ok(Some(effort))
 }
 
-fn apply_codex_launch_default_env_overrides(defaults: &mut ApiBackendDefaults) -> Result<(), String> {
+fn apply_codex_launch_default_env_overrides(
+    defaults: &mut ApiBackendDefaults,
+) -> Result<(), String> {
     let allowed = allowed_model_providers(&defaults.provider_choices);
-    if let Some(model_provider) = normalize_requested_model_provider(env::var("CODEX_WEB_DEFAULT_MODEL_PROVIDER").ok().as_deref(), Some(&allowed))? {
+    if let Some(model_provider) = normalize_requested_model_provider(
+        env::var("CODEX_WEB_DEFAULT_MODEL_PROVIDER").ok().as_deref(),
+        Some(&allowed),
+    )? {
         defaults.model_provider = Some(model_provider);
     }
-    if let Some(method) = normalize_requested_preferred_auth_method(env::var("CODEX_WEB_DEFAULT_PREFERRED_AUTH_METHOD").ok().as_deref())? {
+    if let Some(method) = normalize_requested_preferred_auth_method(
+        env::var("CODEX_WEB_DEFAULT_PREFERRED_AUTH_METHOD")
+            .ok()
+            .as_deref(),
+    )? {
         defaults.preferred_auth_method = Some(method);
     }
-    if let Some(model) = env::var("CODEX_WEB_DEFAULT_MODEL").ok().map(|value| value.trim().to_string()).filter(|value| !value.is_empty()) {
+    if let Some(model) = env::var("CODEX_WEB_DEFAULT_MODEL")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
         defaults.model = Some(model);
     }
-    if let Some(effort) = normalize_requested_reasoning_effort(env::var("CODEX_WEB_DEFAULT_REASONING_EFFORT").ok().as_deref())? {
+    if let Some(effort) = normalize_requested_reasoning_effort(
+        env::var("CODEX_WEB_DEFAULT_REASONING_EFFORT")
+            .ok()
+            .as_deref(),
+    )? {
         defaults.reasoning_effort = effort;
     }
-    if let Some(tier) = normalize_requested_service_tier(env::var("CODEX_WEB_DEFAULT_SERVICE_TIER").ok().as_deref())? {
+    if let Some(tier) = normalize_requested_service_tier(
+        env::var("CODEX_WEB_DEFAULT_SERVICE_TIER").ok().as_deref(),
+    )? {
         defaults.service_tier = Some(tier);
     }
     Ok(())
@@ -8014,9 +9062,9 @@ mod tests {
     use super::{
         load_changed_files_response, load_file_search_response, load_git_diff_response,
         load_git_file_versions_response, load_harness_response, load_messages_history,
-        load_messages_live, load_messages_tail, load_sessions_response,
-        run_harness_sweep_once, run_queue_sweep_once, run_voice_scan_once, rust_broker_bin,
-        rust_broker_enabled, voice_text_message_id, RuntimeConfig,
+        load_messages_live, load_messages_tail, load_sessions_response, run_harness_sweep_once,
+        run_queue_sweep_once, run_voice_scan_once, rust_broker_bin, rust_broker_enabled,
+        voice_text_message_id, RuntimeConfig,
     };
     use serde_json::Value;
     use std::collections::HashMap;
@@ -8072,14 +9120,26 @@ mod tests {
             }"#,
         )
         .unwrap();
-        fs::write(app_dir.join("session_aliases.json"), r#"{"sid-a":"Alias A"}"#).unwrap();
-        fs::write(app_dir.join("session_queues.json"), r#"{"sid-a":[{"id":"q1","text":"next"}]}"#).unwrap();
+        fs::write(
+            app_dir.join("session_aliases.json"),
+            r#"{"sid-a":"Alias A"}"#,
+        )
+        .unwrap();
+        fs::write(
+            app_dir.join("session_queues.json"),
+            r#"{"sid-a":[{"id":"q1","text":"next"}]}"#,
+        )
+        .unwrap();
         fs::write(
             app_dir.join("harness.json"),
             r#"{"sid-a":{"enabled":true,"cooldown_minutes":3.5,"remaining_injections":2}}"#,
         )
         .unwrap();
-        fs::write(app_dir.join("session_files.json"), r#"{"sid-a":["README.md"]}"#).unwrap();
+        fs::write(
+            app_dir.join("session_files.json"),
+            r#"{"sid-a":["README.md"]}"#,
+        )
+        .unwrap();
 
         let response = load_sessions_response(&RuntimeConfig { app_dir }).unwrap();
         assert_eq!(response.sessions.len(), 1);
@@ -8146,7 +9206,9 @@ mod tests {
         )
         .unwrap();
 
-        let config = RuntimeConfig { app_dir: app_dir.clone() };
+        let config = RuntimeConfig {
+            app_dir: app_dir.clone(),
+        };
         let mut offsets = HashMap::new();
         assert_eq!(run_voice_scan_once(&config, &mut offsets).unwrap(), 0);
         {
@@ -8164,11 +9226,24 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         assert_eq!(entries.len(), 1);
-        let payload: Value = serde_json::from_str(&fs::read_to_string(entries[0].path()).unwrap()).unwrap();
-        assert_eq!(payload.get("session_id").and_then(Value::as_str), Some("sid-voice"));
-        assert_eq!(payload.get("session_display_name").and_then(Value::as_str), Some("Session"));
-        assert_eq!(payload.get("message_class").and_then(Value::as_str), Some("final_response"));
-        assert_eq!(payload.get("text").and_then(Value::as_str), Some("new final"));
+        let payload: Value =
+            serde_json::from_str(&fs::read_to_string(entries[0].path()).unwrap()).unwrap();
+        assert_eq!(
+            payload.get("session_id").and_then(Value::as_str),
+            Some("sid-voice")
+        );
+        assert_eq!(
+            payload.get("session_display_name").and_then(Value::as_str),
+            Some("Session")
+        );
+        assert_eq!(
+            payload.get("message_class").and_then(Value::as_str),
+            Some("final_response")
+        );
+        assert_eq!(
+            payload.get("text").and_then(Value::as_str),
+            Some("new final")
+        );
     }
 
     #[test]
@@ -8191,7 +9266,10 @@ mod tests {
         env::set_var("CODOXEAR_ENABLE_RUST_BROKER", "1");
         assert!(rust_broker_enabled());
         env::set_var("CODOXEAR_RUST_BROKER_BIN", "/tmp/custom-codoxear-broker-rs");
-        assert_eq!(rust_broker_bin(Path::new("/repo")), PathBuf::from("/tmp/custom-codoxear-broker-rs"));
+        assert_eq!(
+            rust_broker_bin(Path::new("/repo")),
+            PathBuf::from("/tmp/custom-codoxear-broker-rs")
+        );
         env::remove_var("CODOXEAR_ENABLE_RUST_BROKER");
         env::remove_var("CODOXEAR_RUST_BROKER_BIN");
     }
@@ -8250,7 +9328,9 @@ name = "CRS"
         let thread = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let mut line = String::new();
-            BufReader::new(stream.try_clone().unwrap()).read_line(&mut line).unwrap();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut line)
+                .unwrap();
             assert_eq!(line.trim(), "{\"cmd\":\"state\"}");
             stream
                 .write_all(b"{\"busy\":true,\"queue_len\":0,\"token\":{\"context_window\":128000,\"tokens_in_context\":64000,\"percent_remaining\":50}}\n")
@@ -8280,7 +9360,11 @@ name = "CRS"
             ),
         )
         .unwrap();
-        fs::write(app_dir.join("session_queues.json"), r#"{"sid-live":[{"id":"q1","text":"queued"}],"sid-dead":[{"id":"q2","text":"dead"}]}"#).unwrap();
+        fs::write(
+            app_dir.join("session_queues.json"),
+            r#"{"sid-live":[{"id":"q1","text":"queued"}],"sid-dead":[{"id":"q2","text":"dead"}]}"#,
+        )
+        .unwrap();
 
         fs::write(app_dir.join("socks").join("sid-dead.sock"), "").unwrap();
         fs::write(
@@ -8289,7 +9373,10 @@ name = "CRS"
         )
         .unwrap();
 
-        let response = load_sessions_response(&RuntimeConfig { app_dir: app_dir.clone() }).unwrap();
+        let response = load_sessions_response(&RuntimeConfig {
+            app_dir: app_dir.clone(),
+        })
+        .unwrap();
         thread.join().unwrap();
 
         match prev_codex_home {
@@ -8312,9 +9399,22 @@ name = "CRS"
         assert!(!session.busy);
         assert_eq!(session.token.as_ref().unwrap()["context_window"], 128000);
         assert_eq!(response.new_session_defaults.default_backend, "pi");
-        assert_eq!(response.new_session_defaults.backends["codex"].provider_choice.as_deref(), Some("crs"));
-        assert_eq!(response.new_session_defaults.backends["codex"].reasoning_effort, "medium");
-        assert_eq!(response.new_session_defaults.backends["pi"].provider_choice.as_deref(), Some("macaron"));
+        assert_eq!(
+            response.new_session_defaults.backends["codex"]
+                .provider_choice
+                .as_deref(),
+            Some("crs")
+        );
+        assert_eq!(
+            response.new_session_defaults.backends["codex"].reasoning_effort,
+            "medium"
+        );
+        assert_eq!(
+            response.new_session_defaults.backends["pi"]
+                .provider_choice
+                .as_deref(),
+            Some("macaron")
+        );
         assert_eq!(
             response.new_session_defaults.backends["pi"].provider_choices,
             vec![
@@ -8346,7 +9446,11 @@ name = "CRS"
 "#,
         )
         .unwrap();
-        fs::write(pi_home.join("agent").join("settings.json"), r#"{"defaultProvider":"macaron"}"#).unwrap();
+        fs::write(
+            pi_home.join("agent").join("settings.json"),
+            r#"{"defaultProvider":"macaron"}"#,
+        )
+        .unwrap();
         fs::write(
             pi_home.join("agent").join("models.json"),
             r#"{"providers":{"macaron":{"models":[{"id":"gpt-5.4","contextWindow":200000}]}}}"#,
@@ -8397,7 +9501,10 @@ name = "CRS"
         )
         .unwrap();
 
-        let response = load_sessions_response(&RuntimeConfig { app_dir: app_dir.clone() }).unwrap();
+        let response = load_sessions_response(&RuntimeConfig {
+            app_dir: app_dir.clone(),
+        })
+        .unwrap();
 
         let _ = child.kill();
         let _ = child.wait();
@@ -8414,7 +9521,10 @@ name = "CRS"
         assert_eq!(response.sessions.len(), 1);
         let session = &response.sessions[0];
         assert_eq!(session.session_id, "sid-open");
-        assert_eq!(session.log_path.as_deref(), Some(log_path.to_string_lossy().as_ref()));
+        assert_eq!(
+            session.log_path.as_deref(),
+            Some(log_path.to_string_lossy().as_ref())
+        );
         assert_eq!(session.updated_ts, 3.0);
         assert!(!session.busy);
         assert_eq!(session.model_provider.as_deref(), Some("crs"));
@@ -8431,7 +9541,12 @@ name = "CRS"
         fs::write(repo_dir.join("notes-draft.md"), "draft note\n").unwrap();
         fs::write(repo_dir.join(".gitignore"), "ignored.log\n").unwrap();
         fs::write(repo_dir.join("ignored.log"), "ignore me\n").unwrap();
-        assert!(Command::new("git").current_dir(&repo_dir).args(["init", "-q"]).status().unwrap().success());
+        assert!(Command::new("git")
+            .current_dir(&repo_dir)
+            .args(["init", "-q"])
+            .status()
+            .unwrap()
+            .success());
         assert!(Command::new("git")
             .current_dir(&repo_dir)
             .args(["add", ".gitignore", "src/notes.txt"])
@@ -8450,13 +9565,24 @@ name = "CRS"
         )
         .unwrap();
 
-        let response = load_file_search_response(&RuntimeConfig { app_dir }, "sid-search", "notes", 10).unwrap();
+        let response =
+            load_file_search_response(&RuntimeConfig { app_dir }, "sid-search", "notes", 10)
+                .unwrap();
 
         assert_eq!(response.mode, "git");
         assert!(!response.truncated);
-        assert!(response.matches.iter().any(|entry| entry.path == "src/notes.txt"));
-        assert!(response.matches.iter().any(|entry| entry.path == "notes-draft.md"));
-        assert!(!response.matches.iter().any(|entry| entry.path == "ignored.log"));
+        assert!(response
+            .matches
+            .iter()
+            .any(|entry| entry.path == "src/notes.txt"));
+        assert!(response
+            .matches
+            .iter()
+            .any(|entry| entry.path == "notes-draft.md"));
+        assert!(!response
+            .matches
+            .iter()
+            .any(|entry| entry.path == "ignored.log"));
     }
 
     #[test]
@@ -8465,7 +9591,11 @@ name = "CRS"
         let repo_dir = app_dir.join("workspace");
         fs::create_dir_all(repo_dir.join("node_modules")).unwrap();
         fs::write(repo_dir.join("notes.txt"), "visible\n").unwrap();
-        fs::write(repo_dir.join("node_modules").join("notes-hidden.txt"), "hidden\n").unwrap();
+        fs::write(
+            repo_dir.join("node_modules").join("notes-hidden.txt"),
+            "hidden\n",
+        )
+        .unwrap();
         fs::write(app_dir.join("socks").join("sid-walk.sock"), "").unwrap();
         fs::write(
             app_dir.join("socks").join("sid-walk.json"),
@@ -8478,7 +9608,8 @@ name = "CRS"
         )
         .unwrap();
 
-        let response = load_file_search_response(&RuntimeConfig { app_dir }, "sid-walk", "notes", 10).unwrap();
+        let response =
+            load_file_search_response(&RuntimeConfig { app_dir }, "sid-walk", "notes", 10).unwrap();
 
         assert_eq!(response.mode, "walk");
         assert_eq!(response.matches.len(), 1);
@@ -8490,7 +9621,12 @@ name = "CRS"
         let app_dir = temp_app_dir("changed-files");
         let repo_dir = app_dir.join("repo");
         fs::create_dir_all(&repo_dir).unwrap();
-        assert!(Command::new("git").current_dir(&repo_dir).args(["init", "-q"]).status().unwrap().success());
+        assert!(Command::new("git")
+            .current_dir(&repo_dir)
+            .args(["init", "-q"])
+            .status()
+            .unwrap()
+            .success());
         assert!(Command::new("git")
             .current_dir(&repo_dir)
             .args(["config", "user.email", "test@example.com"])
@@ -8558,10 +9694,18 @@ name = "CRS"
         assert!(response.files.iter().any(|path| path == "mod.txt"));
         assert!(response.files.iter().any(|path| path == "staged.txt"));
 
-        let notes = response.entries.iter().find(|entry| entry.path == "notes.txt").unwrap();
+        let notes = response
+            .entries
+            .iter()
+            .find(|entry| entry.path == "notes.txt")
+            .unwrap();
         assert_eq!(notes.additions, Some(2));
         assert_eq!(notes.deletions, Some(0));
-        let staged = response.entries.iter().find(|entry| entry.path == "staged.txt").unwrap();
+        let staged = response
+            .entries
+            .iter()
+            .find(|entry| entry.path == "staged.txt")
+            .unwrap();
         assert_eq!(staged.additions, Some(1));
         assert_eq!(staged.deletions, Some(0));
     }
@@ -8571,7 +9715,12 @@ name = "CRS"
         let app_dir = temp_app_dir("git-diff");
         let repo_dir = app_dir.join("repo");
         fs::create_dir_all(&repo_dir).unwrap();
-        assert!(Command::new("git").current_dir(&repo_dir).args(["init", "-q"]).status().unwrap().success());
+        assert!(Command::new("git")
+            .current_dir(&repo_dir)
+            .args(["init", "-q"])
+            .status()
+            .unwrap()
+            .success());
         assert!(Command::new("git")
             .current_dir(&repo_dir)
             .args(["config", "user.email", "test@example.com"])
@@ -8620,13 +9769,23 @@ name = "CRS"
         )
         .unwrap();
 
-        let unstaged = load_git_diff_response(&RuntimeConfig { app_dir: app_dir.clone() }, "sid-diff", "notes.txt", false).unwrap();
+        let unstaged = load_git_diff_response(
+            &RuntimeConfig {
+                app_dir: app_dir.clone(),
+            },
+            "sid-diff",
+            "notes.txt",
+            false,
+        )
+        .unwrap();
         assert_eq!(unstaged.path, "notes.txt");
         assert!(!unstaged.staged);
         assert!(unstaged.diff.contains("+unstaged"));
         assert!(!unstaged.diff.contains("path is outside git repo"));
 
-        let staged = load_git_diff_response(&RuntimeConfig { app_dir }, "sid-diff", "notes.txt", true).unwrap();
+        let staged =
+            load_git_diff_response(&RuntimeConfig { app_dir }, "sid-diff", "notes.txt", true)
+                .unwrap();
         assert!(staged.staged);
         assert!(staged.diff.contains("+staged"));
         assert!(!staged.diff.contains("+unstaged"));
@@ -8637,7 +9796,12 @@ name = "CRS"
         let app_dir = temp_app_dir("git-file-versions");
         let repo_dir = app_dir.join("repo");
         fs::create_dir_all(&repo_dir).unwrap();
-        assert!(Command::new("git").current_dir(&repo_dir).args(["init", "-q"]).status().unwrap().success());
+        assert!(Command::new("git")
+            .current_dir(&repo_dir)
+            .args(["init", "-q"])
+            .status()
+            .unwrap()
+            .success());
         assert!(Command::new("git")
             .current_dir(&repo_dir)
             .args(["config", "user.email", "test@example.com"])
@@ -8679,8 +9843,12 @@ name = "CRS"
         )
         .unwrap();
 
-        let response =
-            load_git_file_versions_response(&RuntimeConfig { app_dir }, "sid-versions", "notes.txt").unwrap();
+        let response = load_git_file_versions_response(
+            &RuntimeConfig { app_dir },
+            "sid-versions",
+            "notes.txt",
+        )
+        .unwrap();
 
         assert_eq!(response.path, "notes.txt");
         assert!(response.current_exists);
@@ -8722,7 +9890,13 @@ name = "CRS"
         assert_eq!(tail.events[1]["message_class"], "final_response");
         assert!(tail.has_older);
 
-        let history = load_messages_history(&config, "sid-msg", tail.history_cursor.as_deref().unwrap(), 10).unwrap();
+        let history = load_messages_history(
+            &config,
+            "sid-msg",
+            tail.history_cursor.as_deref().unwrap(),
+            10,
+        )
+        .unwrap();
         assert_eq!(history.events.len(), 1);
         assert_eq!(history.events[0]["role"], "user");
 
@@ -8812,7 +9986,13 @@ name = "CRS"
         assert_eq!(tail.events[2]["type"], "ask_user");
         assert!(tail.has_older);
 
-        let history = load_messages_history(&config, "sid-tail", tail.history_cursor.as_deref().unwrap(), 10).unwrap();
+        let history = load_messages_history(
+            &config,
+            "sid-tail",
+            tail.history_cursor.as_deref().unwrap(),
+            10,
+        )
+        .unwrap();
         assert_eq!(history.events.len(), 2);
         assert_eq!(history.events[0]["type"], "tool");
         assert_eq!(history.events[1]["type"], "tool_result");
@@ -8868,13 +10048,19 @@ name = "CRS"
             for _ in 0..5 {
                 let (mut stream, _) = listener.accept().unwrap();
                 let mut line = String::new();
-                BufReader::new(stream.try_clone().unwrap()).read_line(&mut line).unwrap();
+                BufReader::new(stream.try_clone().unwrap())
+                    .read_line(&mut line)
+                    .unwrap();
                 if line.contains("\"cmd\":\"send\"") {
                     assert!(line.contains("queued from rust"));
-                    stream.write_all(b"{\"queued\":false,\"queue_len\":0}\n").unwrap();
+                    stream
+                        .write_all(b"{\"queued\":false,\"queue_len\":0}\n")
+                        .unwrap();
                     return;
                 }
-                stream.write_all(b"{\"busy\":false,\"queue_len\":0}\n").unwrap();
+                stream
+                    .write_all(b"{\"busy\":false,\"queue_len\":0}\n")
+                    .unwrap();
             }
             panic!("queue worker never sent queued head");
         });
@@ -8895,18 +10081,24 @@ name = "CRS"
         )
         .unwrap();
 
-        let config = RuntimeConfig { app_dir: app_dir.clone() };
+        let config = RuntimeConfig {
+            app_dir: app_dir.clone(),
+        };
         let mut idle_since = std::collections::HashMap::new();
         assert!(!run_queue_sweep_once(&config, &mut idle_since, 10.0).unwrap());
         assert_eq!(idle_since.get("sid-queue").copied(), Some(10.0));
 
-        let queued: Value = serde_json::from_str(&fs::read_to_string(app_dir.join("session_queues.json")).unwrap()).unwrap();
+        let queued: Value =
+            serde_json::from_str(&fs::read_to_string(app_dir.join("session_queues.json")).unwrap())
+                .unwrap();
         assert_eq!(queued["sid-queue"][0]["text"], "queued from rust");
         assert!(queued["sid-queue"][0].get("sending").is_none());
 
         assert!(run_queue_sweep_once(&config, &mut idle_since, 15.1).unwrap());
         assert!(idle_since.get("sid-queue").is_none());
-        let queues_after_send: Value = serde_json::from_str(&fs::read_to_string(app_dir.join("session_queues.json")).unwrap()).unwrap();
+        let queues_after_send: Value =
+            serde_json::from_str(&fs::read_to_string(app_dir.join("session_queues.json")).unwrap())
+                .unwrap();
         assert!(queues_after_send.get("sid-queue").is_none());
 
         listener_thread.join().unwrap();
@@ -8930,7 +10122,11 @@ name = "CRS"
             ),
         )
         .unwrap();
-        fs::write(app_dir.join("harness.json"), r#"{"sid-harness":{"enabled":true,"request":"keep going"}}"#).unwrap();
+        fs::write(
+            app_dir.join("harness.json"),
+            r#"{"sid-harness":{"enabled":true,"request":"keep going"}}"#,
+        )
+        .unwrap();
 
         let response = load_harness_response(&RuntimeConfig { app_dir }, "sid-harness").unwrap();
         assert!(response.enabled);
@@ -8948,13 +10144,19 @@ name = "CRS"
             for _ in 0..4 {
                 let (mut stream, _) = listener.accept().unwrap();
                 let mut line = String::new();
-                BufReader::new(stream.try_clone().unwrap()).read_line(&mut line).unwrap();
+                BufReader::new(stream.try_clone().unwrap())
+                    .read_line(&mut line)
+                    .unwrap();
                 if line.contains("\"cmd\":\"send\"") {
                     assert!(line.contains("Additional request from user: Keep going"));
-                    stream.write_all(b"{\"queued\":false,\"queue_len\":0}\n").unwrap();
+                    stream
+                        .write_all(b"{\"queued\":false,\"queue_len\":0}\n")
+                        .unwrap();
                     return;
                 }
-                stream.write_all(b"{\"busy\":false,\"queue_len\":0}\n").unwrap();
+                stream
+                    .write_all(b"{\"busy\":false,\"queue_len\":0}\n")
+                    .unwrap();
             }
             panic!("harness worker never injected prompt");
         });
@@ -8983,14 +10185,27 @@ name = "CRS"
         )
         .unwrap();
 
-        let config = RuntimeConfig { app_dir: app_dir.clone() };
+        let config = RuntimeConfig {
+            app_dir: app_dir.clone(),
+        };
         let mut last_injected = std::collections::HashMap::new();
         let mut last_injected_scope = std::collections::HashMap::new();
-        assert!(run_harness_sweep_once(&config, &mut last_injected, &mut last_injected_scope, 500.0).unwrap());
+        assert!(run_harness_sweep_once(
+            &config,
+            &mut last_injected,
+            &mut last_injected_scope,
+            500.0
+        )
+        .unwrap());
         assert_eq!(last_injected.get("sid-harness").copied(), Some(500.0));
-        assert_eq!(last_injected_scope.get("thread:thread-harness").copied(), Some(500.0));
+        assert_eq!(
+            last_injected_scope.get("thread:thread-harness").copied(),
+            Some(500.0)
+        );
 
-        let harness_after: Value = serde_json::from_str(&fs::read_to_string(app_dir.join("harness.json")).unwrap()).unwrap();
+        let harness_after: Value =
+            serde_json::from_str(&fs::read_to_string(app_dir.join("harness.json")).unwrap())
+                .unwrap();
         assert_eq!(harness_after["sid-harness"]["remaining_injections"], 1);
         assert_eq!(harness_after["sid-harness"]["enabled"], true);
 
@@ -9006,13 +10221,19 @@ name = "CRS"
             for _ in 0..4 {
                 let (mut stream, _) = listener.accept().unwrap();
                 let mut line = String::new();
-                BufReader::new(stream.try_clone().unwrap()).read_line(&mut line).unwrap();
+                BufReader::new(stream.try_clone().unwrap())
+                    .read_line(&mut line)
+                    .unwrap();
                 if line.contains("\"cmd\":\"send\"") {
                     assert!(line.contains("Additional request from user: A"));
-                    stream.write_all(b"{\"queued\":false,\"queue_len\":0}\n").unwrap();
+                    stream
+                        .write_all(b"{\"queued\":false,\"queue_len\":0}\n")
+                        .unwrap();
                     return;
                 }
-                stream.write_all(b"{\"busy\":false,\"queue_len\":0}\n").unwrap();
+                stream
+                    .write_all(b"{\"busy\":false,\"queue_len\":0}\n")
+                    .unwrap();
             }
             panic!("harness worker never injected first same-thread prompt");
         });
@@ -9060,15 +10281,28 @@ name = "CRS"
         )
         .unwrap();
 
-        let config = RuntimeConfig { app_dir: app_dir.clone() };
+        let config = RuntimeConfig {
+            app_dir: app_dir.clone(),
+        };
         let mut last_injected = std::collections::HashMap::new();
         let mut last_injected_scope = std::collections::HashMap::new();
-        assert!(run_harness_sweep_once(&config, &mut last_injected, &mut last_injected_scope, 500.0).unwrap());
+        assert!(run_harness_sweep_once(
+            &config,
+            &mut last_injected,
+            &mut last_injected_scope,
+            500.0
+        )
+        .unwrap());
 
-        let harness_after: Value = serde_json::from_str(&fs::read_to_string(app_dir.join("harness.json")).unwrap()).unwrap();
+        let harness_after: Value =
+            serde_json::from_str(&fs::read_to_string(app_dir.join("harness.json")).unwrap())
+                .unwrap();
         assert_eq!(harness_after["sid-a"]["remaining_injections"], 1);
         assert_eq!(harness_after["sid-b"]["remaining_injections"], 2);
-        assert_eq!(last_injected_scope.get("thread:thread-shared").copied(), Some(500.0));
+        assert_eq!(
+            last_injected_scope.get("thread:thread-shared").copied(),
+            Some(500.0)
+        );
 
         listener_thread.join().unwrap();
     }

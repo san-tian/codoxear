@@ -26,9 +26,12 @@ async fn main() {
     if rust_voice_scan_enabled() {
         spawn_voice_scan_worker(state.config.clone());
     }
-    let app = router(state)
-        .layer(TraceLayer::new_for_http())
-        .layer(CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any));
+    let app = router(state).layer(TraceLayer::new_for_http()).layer(
+        CorsLayer::new()
+            .allow_origin(Any)
+            .allow_methods(Any)
+            .allow_headers(Any),
+    );
 
     let host = env::var("CODOXEAR_BIND_HOST")
         .ok()
