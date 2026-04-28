@@ -3404,6 +3404,8 @@ mod tests {
         let delete_body = to_bytes(delete.into_body(), usize::MAX).await.unwrap();
         let delete_payload: Value = serde_json::from_slice(&delete_body).unwrap();
         assert_eq!(delete_payload["ok"], true);
+        assert!(!sock_path.exists());
+        assert!(!app_dir.join("socks").join("sid-delete.json").exists());
 
         let aliases: Value = serde_json::from_str(&fs::read_to_string(app_dir.join("session_aliases.json")).unwrap()).unwrap();
         assert!(aliases.get("sid-delete").is_none());

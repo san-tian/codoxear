@@ -6783,6 +6783,8 @@ pub fn create_session(config: &RuntimeConfig, request: CreateSessionRequest) -> 
 
 pub fn delete_session(config: &RuntimeConfig, session_id: &str) -> Result<Value, String> {
     let session = find_session(config, session_id)?;
+    let sock_path = session_sock_path(config, &session.session_id);
+    let meta_path = sock_path.with_extension("json");
     let deleted = match broker_request_for_session(
         config,
         &session,
@@ -6795,6 +6797,8 @@ pub fn delete_session(config: &RuntimeConfig, session_id: &str) -> Result<Value,
     if !deleted {
         return Err(format!("unknown session: {session_id}"));
     }
+    unlink_quiet(&sock_path);
+    unlink_quiet(&meta_path);
     clear_deleted_session_state(config, session_id, Some(session.cwd.as_str()))?;
     Ok(json!({"ok": true}))
 }
