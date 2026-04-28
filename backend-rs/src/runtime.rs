@@ -1942,9 +1942,13 @@ fn run_voice_scan_once(
     offsets: &mut HashMap<String, u64>,
 ) -> Result<usize, String> {
     let sessions = load_sessions_response(config)?;
-    let ledger = read_voice_delivery_ledger(&voice_delivery_ledger_path(config))?;
+    let ledger_path = voice_delivery_ledger_path(config);
+    let mut ledger = read_voice_delivery_ledger(&ledger_path)?;
+    let voice_settings = read_clean_voice_settings(&voice_settings_path(config))?;
+    let subscriptions = read_notification_subscription_records(&push_subscriptions_path(config))?;
     let mut seen_keys = HashSet::new();
     let mut delivered = 0usize;
+    let mut ledger_dirty = false;
 
     for session in sessions.sessions {
         let Some(log_path_raw) = session.log_path.as_deref() else {
@@ -1973,7 +1977,16 @@ fn run_voice_scan_once(
                     if ledger.contains_key(&message.message_id) {
                         continue;
                     }
-                    if write_voice_inbox_message(config, &session, &message)? {
+                    if maybe_record_voice_delivery_locally(
+                        &mut ledger,
+                        &session,
+                        &message,
+                        &voice_settings,
+                        &subscriptions,
+                    ) {
+                        ledger_dirty = true;
+                        delivered += 1;
+                    } else if write_voice_inbox_message(config, &session, &message)? {
                         delivered += 1;
                     }
                 }
@@ -1984,6 +1997,9 @@ fn run_voice_scan_once(
     }
 
     offsets.retain(|key, _| seen_keys.contains(key));
+    if ledger_dirty {
+        write_voice_delivery_ledger(&ledger_path, &ledger)?;
+    }
     Ok(delivered)
 }
 
@@ -2210,6 +2226,89 @@ fn write_voice_inbox_message(
     });
     write_json_value(&path, &payload)?;
     Ok(true)
+}
+
+fn maybe_record_voice_delivery_locally(
+    ledger: &mut HashMap<String, Value>,
+    session: &ApiSessionSummary,
+    message: &VoiceDeliveryMessage,
+    settings: &Value,
+    subscriptions: &HashMap<String, Value>,
+) -> bool {
+    let session_display_name = default_session_display_name(session.alias.clone());
+    let source_text = compact_text(&message.text);
+    if source_text.is_empty() {
+        return false;
+    }
+    let now_ts = epoch_now();
+    let narration_enabled = settings
+        .get("tts_enabled_for_narration")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let final_tts_enabled = settings
+        .get("tts_enabled_for_final_response")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let api_key_present = settings
+        .get("tts_api_key")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_some();
+    let mobile_push_enabled = subscriptions.values().any(|record| {
+        record
+            .get("notifications_enabled")
+            .map(json_truthy)
+            .unwrap_or(false)
+            && record.get("device_class").and_then(Value::as_str) == Some("mobile")
+    });
+
+    let mut row = json!({
+        "message_id": message.message_id,
+        "session_id": session.session_id,
+        "session_display_name": session_display_name,
+        "message_class": message.message_class,
+        "preview_text": clip_text(&message.text, 160),
+        "notification_text": "",
+        "summary_text": "",
+        "summary_status": "skipped",
+        "narrated_status": "skipped",
+        "push_status": "skipped",
+        "voice": "",
+        "created_ts": now_ts,
+        "updated_ts": now_ts,
+        "last_error": "",
+    });
+
+    match message.message_class.as_str() {
+        "narration" if !narration_enabled => {
+            ledger.insert(message.message_id.clone(), row);
+            true
+        }
+        "final_response" if !api_key_present && !mobile_push_enabled => {
+            row["notification_text"] = json!(clip_text(&source_text, 120));
+            if final_tts_enabled {
+                row["narrated_status"] = json!("error");
+                row["last_error"] = json!("tts_api_key is required");
+            }
+            ledger.insert(message.message_id.clone(), row);
+            true
+        }
+        _ => false,
+    }
+}
+
+fn write_voice_delivery_ledger(path: &Path, ledger: &HashMap<String, Value>) -> Result<(), String> {
+    let mut ids = ledger.keys().cloned().collect::<Vec<_>>();
+    ids.sort();
+    let mut object = serde_json::Map::new();
+    for id in ids {
+        let Some(value) = ledger.get(&id) else {
+            continue;
+        };
+        object.insert(id, value.clone());
+    }
+    write_json_value(path, &Value::Object(object))
 }
 
 fn run_harness_sweep_once(
@@ -3545,6 +3644,19 @@ fn compact_text(raw: impl AsRef<str>) -> String {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn clip_text(raw: &str, limit: usize) -> String {
+    let text = compact_text(raw);
+    if text.chars().count() <= limit {
+        return text;
+    }
+    text.chars()
+        .take(limit.saturating_sub(1))
+        .collect::<String>()
+        .trim_end()
+        .to_string()
+        + "..."
 }
 
 fn default_session_display_name(raw: String) -> String {
@@ -9100,6 +9212,37 @@ mod tests {
         ENV_LOCK.get_or_init(|| Mutex::new(()))
     }
 
+    fn write_voice_scan_session(app_dir: &Path, session_id: &str, log_path: &Path) {
+        fs::write(app_dir.join("socks").join(format!("{session_id}.sock")), "").unwrap();
+        fs::write(
+            app_dir.join("socks").join(format!("{session_id}.json")),
+            format!(
+                r#"{{
+                  "session_id": "thread-{session_id}",
+                  "codex_pid": {},
+                  "broker_pid": {},
+                  "agent_backend": "codex",
+                  "owner": "web",
+                  "cwd": "/work/project",
+                  "log_path": {},
+                  "start_ts": 10.0,
+                  "updated_ts": 15.0
+                }}"#,
+                std::process::id(),
+                std::process::id(),
+                serde_json::to_string(log_path.to_str().unwrap()).unwrap()
+            ),
+        )
+        .unwrap();
+    }
+
+    fn read_voice_delivery_ledger_for_test(app_dir: &Path) -> Value {
+        serde_json::from_str(
+            &fs::read_to_string(app_dir.join("voice_delivery_ledger.json")).unwrap(),
+        )
+        .unwrap()
+    }
+
     #[test]
     fn load_sessions_reads_socket_sidecar_metadata() {
         let app_dir = temp_app_dir("sessions");
@@ -9184,32 +9327,17 @@ mod tests {
         let app_dir = temp_app_dir("voice-scan");
         let log_path = app_dir.join("rollout-voice.jsonl");
         fs::write(
+            app_dir.join("voice_settings.json"),
+            r#"{"tts_api_key":"token"}"#,
+        )
+        .unwrap();
+        fs::write(
             &log_path,
             r#"{"type":"event_msg","timestamp":"2026-04-28T00:00:00Z","payload":{"type":"agent_message","message":"old final","phase":"final_answer"}}
 "#,
         )
         .unwrap();
-        fs::write(app_dir.join("socks").join("sid-voice.sock"), "").unwrap();
-        fs::write(
-            app_dir.join("socks").join("sid-voice.json"),
-            format!(
-                r#"{{
-                  "session_id": "thread-voice",
-                  "codex_pid": {},
-                  "broker_pid": {},
-                  "agent_backend": "codex",
-                  "owner": "web",
-                  "cwd": "/work/project",
-                  "log_path": {},
-                  "start_ts": 10.0,
-                  "updated_ts": 15.0
-                }}"#,
-                std::process::id(),
-                std::process::id(),
-                serde_json::to_string(log_path.to_str().unwrap()).unwrap()
-            ),
-        )
-        .unwrap();
+        write_voice_scan_session(&app_dir, "sid-voice", &log_path);
 
         let config = RuntimeConfig {
             app_dir: app_dir.clone(),
@@ -9248,6 +9376,164 @@ mod tests {
         assert_eq!(
             payload.get("text").and_then(Value::as_str),
             Some("new final")
+        );
+    }
+
+    #[test]
+    fn voice_scan_records_raw_final_response_locally_without_tts_or_push() {
+        let app_dir = temp_app_dir("voice-scan-local-final");
+        let log_path = app_dir.join("rollout-voice.jsonl");
+        fs::write(
+            app_dir.join("voice_settings.json"),
+            r#"{"tts_enabled_for_narration":false,"tts_enabled_for_final_response":false,"tts_api_key":""}"#,
+        )
+        .unwrap();
+        fs::write(
+            &log_path,
+            r#"{"type":"event_msg","timestamp":"2026-04-28T00:00:00Z","payload":{"type":"agent_message","message":"old final","phase":"final_answer"}}
+"#,
+        )
+        .unwrap();
+        write_voice_scan_session(&app_dir, "sid-voice", &log_path);
+
+        let config = RuntimeConfig {
+            app_dir: app_dir.clone(),
+        };
+        let mut offsets = HashMap::new();
+        assert_eq!(run_voice_scan_once(&config, &mut offsets).unwrap(), 0);
+        {
+            let mut handle = fs::OpenOptions::new().append(true).open(&log_path).unwrap();
+            writeln!(
+                handle,
+                r#"{{"type":"event_msg","timestamp":"2026-04-28T00:00:01Z","payload":{{"type":"agent_message","message":"Line one.\n\nLine two.","phase":"final_answer"}}}}"#
+            )
+            .unwrap();
+        }
+
+        assert_eq!(run_voice_scan_once(&config, &mut offsets).unwrap(), 1);
+        assert!(!app_dir.join("voice_inbox").exists());
+        let ledger = read_voice_delivery_ledger_for_test(&app_dir);
+        let rows = ledger.as_object().unwrap();
+        assert_eq!(rows.len(), 1);
+        let row = rows.values().next().unwrap();
+        assert_eq!(
+            row.get("message_class").and_then(Value::as_str),
+            Some("final_response")
+        );
+        assert_eq!(
+            row.get("notification_text").and_then(Value::as_str),
+            Some("Line one. Line two.")
+        );
+        assert_eq!(
+            row.get("summary_status").and_then(Value::as_str),
+            Some("skipped")
+        );
+        assert_eq!(
+            row.get("push_status").and_then(Value::as_str),
+            Some("skipped")
+        );
+        assert_eq!(
+            row.get("narrated_status").and_then(Value::as_str),
+            Some("skipped")
+        );
+        assert_eq!(
+            row.get("session_display_name").and_then(Value::as_str),
+            Some("Session")
+        );
+    }
+
+    #[test]
+    fn voice_scan_keeps_python_inbox_when_mobile_push_requires_worker() {
+        let app_dir = temp_app_dir("voice-scan-mobile-push");
+        let log_path = app_dir.join("rollout-voice.jsonl");
+        fs::write(
+            app_dir.join("push_subscriptions.json"),
+            r#"[{"subscription":{"endpoint":"https://push.example/a","keys":{"p256dh":"p","auth":"a"}},"notifications_enabled":true,"device_class":"mobile"}]"#,
+        )
+        .unwrap();
+        fs::write(
+            &log_path,
+            r#"{"type":"event_msg","timestamp":"2026-04-28T00:00:00Z","payload":{"type":"agent_message","message":"old final","phase":"final_answer"}}
+"#,
+        )
+        .unwrap();
+        write_voice_scan_session(&app_dir, "sid-voice", &log_path);
+
+        let config = RuntimeConfig {
+            app_dir: app_dir.clone(),
+        };
+        let mut offsets = HashMap::new();
+        assert_eq!(run_voice_scan_once(&config, &mut offsets).unwrap(), 0);
+        {
+            let mut handle = fs::OpenOptions::new().append(true).open(&log_path).unwrap();
+            writeln!(
+                handle,
+                r#"{{"type":"event_msg","timestamp":"2026-04-28T00:00:01Z","payload":{{"type":"agent_message","message":"push final","phase":"final_answer"}}}}"#
+            )
+            .unwrap();
+        }
+
+        assert_eq!(run_voice_scan_once(&config, &mut offsets).unwrap(), 1);
+        let entries = fs::read_dir(app_dir.join("voice_inbox"))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(!app_dir.join("voice_delivery_ledger.json").exists());
+    }
+
+    #[test]
+    fn voice_scan_records_disabled_narration_as_skipped_without_inbox() {
+        let app_dir = temp_app_dir("voice-scan-local-narration");
+        let log_path = app_dir.join("rollout-voice.jsonl");
+        fs::write(
+            app_dir.join("voice_settings.json"),
+            r#"{"tts_enabled_for_narration":false,"tts_enabled_for_final_response":false,"tts_api_key":""}"#,
+        )
+        .unwrap();
+        fs::write(
+            &log_path,
+            r#"{"type":"event_msg","timestamp":"2026-04-28T00:00:00Z","payload":{"type":"agent_message","message":"old narration"}}
+"#,
+        )
+        .unwrap();
+        write_voice_scan_session(&app_dir, "sid-voice", &log_path);
+
+        let config = RuntimeConfig {
+            app_dir: app_dir.clone(),
+        };
+        let mut offsets = HashMap::new();
+        assert_eq!(run_voice_scan_once(&config, &mut offsets).unwrap(), 0);
+        {
+            let mut handle = fs::OpenOptions::new().append(true).open(&log_path).unwrap();
+            writeln!(
+                handle,
+                r#"{{"type":"event_msg","timestamp":"2026-04-28T00:00:01Z","payload":{{"type":"agent_message","message":"working update"}}}}"#
+            )
+            .unwrap();
+        }
+
+        assert_eq!(run_voice_scan_once(&config, &mut offsets).unwrap(), 1);
+        assert!(!app_dir.join("voice_inbox").exists());
+        let ledger = read_voice_delivery_ledger_for_test(&app_dir);
+        let rows = ledger.as_object().unwrap();
+        assert_eq!(rows.len(), 1);
+        let row = rows.values().next().unwrap();
+        assert_eq!(
+            row.get("message_class").and_then(Value::as_str),
+            Some("narration")
+        );
+        assert_eq!(
+            row.get("summary_status").and_then(Value::as_str),
+            Some("skipped")
+        );
+        assert_eq!(
+            row.get("narrated_status").and_then(Value::as_str),
+            Some("skipped")
+        );
+        assert_eq!(
+            row.get("push_status").and_then(Value::as_str),
+            Some("skipped")
         );
     }
 
