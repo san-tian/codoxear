@@ -1,6 +1,9 @@
 fn main() {
-    if let Err(err) = codoxear_backend_rs::broker::main_entry() {
-        eprintln!("error: {err}");
-        std::process::exit(2);
+    match codoxear_backend_rs::broker::main_entry() {
+        Ok(code) => std::process::exit(code),
+        Err(err) => {
+            eprintln!("error: {err}");
+            std::process::exit(2);
+        }
     }
 }

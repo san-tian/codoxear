@@ -10,7 +10,7 @@ use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 use std::os::fd::{FromRawFd, RawFd};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::os::unix::process::CommandExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -107,7 +107,7 @@ struct BrokerRuntime {
     sessions_dir: PathBuf,
 }
 
-pub fn main_entry() -> Result<(), String> {
+pub fn main_entry() -> Result<i32, String> {
     let config = parse_args(env::args().skip(1).collect())?;
     run_broker(config)
 }
@@ -189,7 +189,7 @@ fn web_owned_codex_args(agent_backend: &str, owner: Option<&str>, args: &[String
     out
 }
 
-fn run_broker(mut config: BrokerConfig) -> Result<(), String> {
+fn run_broker(mut config: BrokerConfig) -> Result<i32, String> {
     if config.agent_backend == "pi" {
         config.agent_args = ensure_pi_session_arg(&config.agent_args, &config.cwd, &config.sessions_dir)?;
     }
@@ -260,16 +260,21 @@ fn run_broker(mut config: BrokerConfig) -> Result<(), String> {
     spawn_log_idle_thread(runtime.clone());
     spawn_busy_hint_idle_thread(runtime.clone());
     let mut child = child;
+    let mut exit_code = 0;
     loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                exit_code = exit_status_code(status);
+                break;
+            }
+            Ok(None) => {}
+            Err(_err) => break,
+        }
         if runtime.stop.load(Ordering::Relaxed) {
             terminate_process_group(i64::from(child.id()));
             break;
         }
-        match child.try_wait() {
-            Ok(Some(_status)) => break,
-            Ok(None) => thread::sleep(Duration::from_millis(100)),
-            Err(_err) => break,
-        }
+        thread::sleep(Duration::from_millis(100));
     }
     runtime.stop.store(true, Ordering::Relaxed);
     if let Some(termios) = stdin_termios.as_ref() {
@@ -280,7 +285,14 @@ fn run_broker(mut config: BrokerConfig) -> Result<(), String> {
         let _ = fs::remove_file(&state.sock_path);
         let _ = fs::remove_file(state.sock_path.with_extension("json"));
     }
-    Ok(())
+    Ok(exit_code)
+}
+
+fn exit_status_code(status: std::process::ExitStatus) -> i32 {
+    if let Some(code) = status.code() {
+        return code;
+    }
+    status.signal().map(|signal| 128 + signal).unwrap_or(1)
 }
 
 fn spawn_stdin_thread(runtime: BrokerRuntime) {
@@ -1534,6 +1546,25 @@ mod tests {
         );
         assert_eq!(session_id_from_log(&log_path, "pi").as_deref(), Some("resume-a"));
         assert_eq!(resume_session_id_from_args(&args, "pi", &sessions_dir).as_deref(), Some("resume-a"));
+    }
+
+    #[test]
+    fn rust_broker_returns_agent_exit_code() {
+        let app_dir = temp_app_dir("broker-exit-code");
+        let config = BrokerConfig {
+            cwd: app_dir.clone(),
+            agent_args: vec!["-c".to_string(), "exit 7".to_string()],
+            app_dir: app_dir.clone(),
+            agent_backend: "codex".to_string(),
+            agent_bin: "sh".to_string(),
+            agent_home: app_dir.join("codex-home"),
+            sessions_dir: app_dir.join("codex-home").join("sessions"),
+            owner: None,
+            mirror_output: false,
+            mirror_input: false,
+        };
+
+        assert_eq!(run_broker(config).unwrap(), 7);
     }
 
     #[test]
