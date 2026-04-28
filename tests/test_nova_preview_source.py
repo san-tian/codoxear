@@ -47,10 +47,20 @@ class NovaPreviewSourceTest(unittest.TestCase):
         self.assertIn("candidate.alias || candidate.last_user_message || candidate.session_id", app_source)
         self.assertNotIn("candidate.alias || candidate.first_user_message || candidate.session_id", app_source)
 
-    def test_new_session_defaults_to_tmux_when_available(self) -> None:
+    def test_new_session_reuses_last_created_options(self) -> None:
         source = APP_TSX.read_text(encoding="utf-8")
-        self.assertIn("setNewSessionTmux(tmuxAvailable);", source)
-        self.assertIn("create_in_tmux: tmuxAvailable && newSessionTmux", source)
+        self.assertIn('const NEW_SESSION_PREFERENCES_KEY = "codoxear.nova.newSessionPreferences";', source)
+        self.assertIn("function readStoredNewSessionPreferences(): NewSessionPreferences", source)
+        self.assertIn("function newSessionValuesForBackend(", source)
+        self.assertIn("const [newSessionPreferences, setNewSessionPreferences] = useState<NewSessionPreferences>(() => readStoredNewSessionPreferences());", source)
+        self.assertIn("const values = newSessionValuesForBackend(payload.new_session_defaults, backend, newSessionPreferences, Boolean(payload.tmux_available));", source)
+        self.assertIn("const preferences = readStoredNewSessionPreferences();", source)
+        self.assertIn("const values = newSessionValuesForBackend(newSessionDefaults, backend, preferences, tmuxAvailable);", source)
+        self.assertIn("const values = newSessionValuesForBackend(newSessionDefaults, backend, newSessionPreferences, tmuxAvailable);", source)
+        self.assertIn("const createInTmux = tmuxAvailable && newSessionTmux;", source)
+        self.assertIn("create_in_tmux: createInTmux", source)
+        self.assertIn("setNewSessionPreferences((current) => ({", source)
+        self.assertIn("writeLocalStorage(NEW_SESSION_PREFERENCES_KEY, JSON.stringify(newSessionPreferences));", source)
 
     def test_new_session_selection_updates_ref_before_send(self) -> None:
         source = APP_TSX.read_text(encoding="utf-8")

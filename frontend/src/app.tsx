@@ -41,6 +41,7 @@ const DESKTOP_NOTIFICATIONS_KEY = "codoxear.desktopNotificationsEnabled";
 const BUSY_SUBMIT_MODE_KEY = "codoxear.nova.busySubmitMode";
 const THEME_MODE_KEY = "codoxear.nova.theme";
 const SESSION_DRAFTS_KEY = "codoxear.nova.sessionDrafts";
+const NEW_SESSION_PREFERENCES_KEY = "codoxear.nova.newSessionPreferences";
 const SIDEBAR_WORKSPACE_ORDER_KEY = "codoxear.nova.sidebar.workspaceOrder";
 const SIDEBAR_SESSION_ORDER_KEY = "codoxear.nova.sidebar.sessionOrder";
 const SIDEBAR_WIDTH_KEY = "codoxear.nova.sidebar.width";
@@ -58,6 +59,18 @@ const IMPORTANT_PRIORITY_OFFSET = 0.85;
 
 type BusySubmitMode = "queue" | "interrupt";
 type ThemeMode = "dark" | "light";
+type AgentBackend = "codex" | "pi";
+type NewSessionBackendPreferences = {
+  provider?: string;
+  model?: string;
+  reasoning?: string;
+  fast?: boolean;
+};
+type NewSessionPreferences = {
+  backend?: AgentBackend;
+  tmux?: boolean;
+  backends?: Partial<Record<AgentBackend, NewSessionBackendPreferences>>;
+};
 type SessionMarkerState = "default" | "important";
 type SidebarSessionOrder = Record<string, string[]>;
 type SidebarDragEvent = JSX.TargetedDragEvent<HTMLElement>;
@@ -166,6 +179,39 @@ function readStoredSessionDrafts() {
     return out;
   } catch {
     return {} as Record<string, string>;
+  }
+}
+
+function isAgentBackend(value: unknown): value is AgentBackend {
+  return value === "codex" || value === "pi";
+}
+
+function readStoredNewSessionPreferences(): NewSessionPreferences {
+  try {
+    const parsed = JSON.parse(readLocalStorage(NEW_SESSION_PREFERENCES_KEY) || "{}");
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+    const raw = parsed as Record<string, unknown>;
+    const out: NewSessionPreferences = {};
+    if (isAgentBackend(raw.backend)) out.backend = raw.backend;
+    if (typeof raw.tmux === "boolean") out.tmux = raw.tmux;
+    if (raw.backends && typeof raw.backends === "object" && !Array.isArray(raw.backends)) {
+      const backends: Partial<Record<AgentBackend, NewSessionBackendPreferences>> = {};
+      (["codex", "pi"] as const).forEach((backend) => {
+        const value = (raw.backends as Record<string, unknown>)[backend];
+        if (!value || typeof value !== "object" || Array.isArray(value)) return;
+        const entry = value as Record<string, unknown>;
+        const clean: NewSessionBackendPreferences = {};
+        if (typeof entry.provider === "string") clean.provider = entry.provider;
+        if (typeof entry.model === "string") clean.model = entry.model;
+        if (typeof entry.reasoning === "string") clean.reasoning = entry.reasoning;
+        if (typeof entry.fast === "boolean") clean.fast = entry.fast;
+        backends[backend] = clean;
+      });
+      out.backends = backends;
+    }
+    return out;
+  } catch {
+    return {};
   }
 }
 
@@ -396,6 +442,33 @@ function workspaceTitle(cwd: string) {
 function defaultsForBackend(defaults: NewSessionDefaults | null, backend: "codex" | "pi") {
   if (!defaults) return null;
   return defaults.backends[backend];
+}
+
+function preferredNewSessionBackend(defaults: NewSessionDefaults | null, preferences: NewSessionPreferences): AgentBackend {
+  if (preferences.backend) return preferences.backend;
+  return defaults?.default_backend === "pi" ? "pi" : "codex";
+}
+
+function newSessionValuesForBackend(
+  defaults: NewSessionDefaults | null,
+  backend: AgentBackend,
+  preferences: NewSessionPreferences,
+  tmuxAvailable: boolean,
+) {
+  const backendDefaults = defaultsForBackend(defaults, backend);
+  const stored = preferences.backends?.[backend] || {};
+  const providerChoices = backendDefaults?.provider_choices || [];
+  const reasoningChoices = backendDefaults?.reasoning_efforts || [];
+  const storedProvider = typeof stored.provider === "string" ? stored.provider : "";
+  const storedReasoning = typeof stored.reasoning === "string" ? stored.reasoning : "";
+  const defaultFast = String(backendDefaults?.service_tier || "").toLowerCase() === "fast";
+  return {
+    provider: providerChoices.includes(storedProvider) ? storedProvider : String(backendDefaults?.provider_choice || ""),
+    model: typeof stored.model === "string" ? stored.model : String(backendDefaults?.model || ""),
+    reasoning: reasoningChoices.includes(storedReasoning) ? storedReasoning : String(backendDefaults?.reasoning_effort || "high"),
+    fast: Boolean(backendDefaults?.supports_fast && (typeof stored.fast === "boolean" ? stored.fast : defaultFast)),
+    tmux: tmuxAvailable ? (typeof preferences.tmux === "boolean" ? preferences.tmux : tmuxAvailable) : false,
+  };
 }
 
 function providerChoiceToSettings(choice: string, backend: "codex" | "pi") {
@@ -884,9 +957,10 @@ export function App() {
   const [newSessionOpen, setNewSessionOpen] = useState(false);
   const [newSessionBusy, setNewSessionBusy] = useState(false);
   const [newSessionDefaults, setNewSessionDefaults] = useState<NewSessionDefaults | null>(null);
+  const [newSessionPreferences, setNewSessionPreferences] = useState<NewSessionPreferences>(() => readStoredNewSessionPreferences());
   const [recentCwds, setRecentCwds] = useState<string[]>([]);
   const [tmuxAvailable, setTmuxAvailable] = useState(false);
-  const [newSessionBackend, setNewSessionBackend] = useState<"codex" | "pi">("codex");
+  const [newSessionBackend, setNewSessionBackend] = useState<AgentBackend>("codex");
   const [newSessionCwd, setNewSessionCwd] = useState("");
   const [newSessionCwdSuggestions, setNewSessionCwdSuggestions] = useState<CwdSuggestion[]>([]);
   const [newSessionCwdSuggestionsOpen, setNewSessionCwdSuggestionsOpen] = useState(false);
@@ -1354,15 +1428,15 @@ export function App() {
     setTmuxAvailable(Boolean(payload.tmux_available));
     setErrorText("");
     if (payload.new_session_defaults) {
-      const defaultBackend = payload.new_session_defaults.default_backend || "codex";
       if (!newSessionDefaults) {
-        const backend = defaultBackend === "pi" ? "pi" : "codex";
-        const backendDefaults = defaultsForBackend(payload.new_session_defaults, backend);
+        const backend = preferredNewSessionBackend(payload.new_session_defaults, newSessionPreferences);
+        const values = newSessionValuesForBackend(payload.new_session_defaults, backend, newSessionPreferences, Boolean(payload.tmux_available));
         setNewSessionBackend(backend);
-        setNewSessionProvider(String(backendDefaults?.provider_choice || ""));
-        setNewSessionModel(String(backendDefaults?.model || ""));
-        setNewSessionReasoning(String(backendDefaults?.reasoning_effort || "high"));
-        setNewSessionFast(String(backendDefaults?.service_tier || "").toLowerCase() === "fast");
+        setNewSessionProvider(values.provider);
+        setNewSessionModel(values.model);
+        setNewSessionReasoning(values.reasoning);
+        setNewSessionFast(values.fast);
+        setNewSessionTmux(values.tmux);
       }
     }
     if (!ordered.length) {
@@ -2012,17 +2086,21 @@ export function App() {
   }
 
   function openNewSessionDialog() {
-    const defaults = defaultsForBackend(newSessionDefaults, newSessionBackend) || defaultsForBackend(newSessionDefaults, "codex");
+    const preferences = readStoredNewSessionPreferences();
+    const backend = preferences.backend || newSessionBackend;
+    const values = newSessionValuesForBackend(newSessionDefaults, backend, preferences, tmuxAvailable);
+    setNewSessionPreferences(preferences);
+    setNewSessionBackend(backend);
     setNewSessionCwd(selectedSession?.cwd || recentCwds[0] || "");
     setNewSessionCwdSuggestions([]);
     setNewSessionCwdSuggestionsOpen(false);
     setNewSessionCwdSuggestionIndex(-1);
     setNewSessionCwdSuggestionError("");
-    setNewSessionProvider(String(defaults?.provider_choice || ""));
-    setNewSessionModel(String(defaults?.model || ""));
-    setNewSessionReasoning(String(defaults?.reasoning_effort || "high"));
-    setNewSessionFast(String(defaults?.service_tier || "").toLowerCase() === "fast");
-    setNewSessionTmux(tmuxAvailable);
+    setNewSessionProvider(values.provider);
+    setNewSessionModel(values.model);
+    setNewSessionReasoning(values.reasoning);
+    setNewSessionFast(values.fast);
+    setNewSessionTmux(values.tmux);
     setNewSessionResumeSelection(null);
     setNewSessionResumeCandidates([]);
     setNewSessionWorktree(false);
@@ -2064,6 +2142,7 @@ export function App() {
     const providerSettings = providerChoiceToSettings(providerChoice, backend);
     const model = String(newSessionModel || "").trim() || null;
     const reasoningEffort = String(newSessionReasoning || defaults?.reasoning_effort || "high").trim().toLowerCase();
+    const createInTmux = tmuxAvailable && newSessionTmux;
     const worktreeBranch =
       newSessionWorktree && !newSessionResumeSelection
         ? (String(newSessionWorktreeBranch || "").trim() || makeWorktreeSlug(baseName(cwd)))
@@ -2078,10 +2157,24 @@ export function App() {
         model,
         reasoning_effort: reasoningEffort,
         service_tier: backend === "codex" && newSessionFast ? "fast" : null,
-        create_in_tmux: tmuxAvailable && newSessionTmux,
+        create_in_tmux: createInTmux,
         resume_session_id: newSessionResumeSelection?.session_id || null,
         worktree_branch: worktreeBranch,
       });
+      setNewSessionPreferences((current) => ({
+        ...current,
+        backend,
+        tmux: tmuxAvailable ? createInTmux : current.tmux,
+        backends: {
+          ...(current.backends || {}),
+          [backend]: {
+            provider: providerChoice,
+            model: String(newSessionModel || "").trim(),
+            reasoning: reasoningEffort,
+            fast: Boolean(newSessionFast),
+          },
+        },
+      }));
       pushToast("Session starting…");
       setNewSessionOpen(false);
       void followCreatedSession(result.broker_pid).catch((error) => {
@@ -2379,6 +2472,10 @@ export function App() {
   useEffect(() => {
     writeLocalStorage(SESSION_DRAFTS_KEY, Object.keys(sessionDrafts).length ? JSON.stringify(sessionDrafts) : null);
   }, [sessionDrafts]);
+
+  useEffect(() => {
+    writeLocalStorage(NEW_SESSION_PREFERENCES_KEY, JSON.stringify(newSessionPreferences));
+  }, [newSessionPreferences]);
 
   useEffect(() => {
     writeLocalStorage(SIDEBAR_WIDTH_KEY, sidebarWidth == null ? null : String(Math.round(sidebarWidth)));
@@ -3159,12 +3256,13 @@ export function App() {
                     className={`backendTab${newSessionBackend === backend ? " active" : ""}`}
                     type="button"
                     onClick={() => {
-                      const nextDefaults = defaultsForBackend(newSessionDefaults, backend);
+                      const values = newSessionValuesForBackend(newSessionDefaults, backend, newSessionPreferences, tmuxAvailable);
                       setNewSessionBackend(backend);
-                      setNewSessionProvider(String(nextDefaults?.provider_choice || ""));
-                      setNewSessionModel(String(nextDefaults?.model || ""));
-                      setNewSessionReasoning(String(nextDefaults?.reasoning_effort || "high"));
-                      setNewSessionFast(String(nextDefaults?.service_tier || "").toLowerCase() === "fast");
+                      setNewSessionProvider(values.provider);
+                      setNewSessionModel(values.model);
+                      setNewSessionReasoning(values.reasoning);
+                      setNewSessionFast(values.fast);
+                      setNewSessionTmux(values.tmux);
                     }}
                   >
                     {backend.toUpperCase()}
