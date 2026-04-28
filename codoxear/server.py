@@ -458,6 +458,20 @@ def _tmux_available() -> bool:
     return shutil.which("tmux") is not None
 
 
+def _env_flag_enabled(name: str) -> bool:
+    return str(os.environ.get(name) or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _broker_launch_argv(cwd: Path) -> list[str]:
+    if not _env_flag_enabled("CODOXEAR_ENABLE_RUST_BROKER"):
+        return [sys.executable, "-m", "codoxear.broker", "--cwd", str(cwd), "--"]
+    raw_bin = _clean_optional_text(os.environ.get("CODOXEAR_RUST_BROKER_BIN"))
+    broker_bin = Path(raw_bin).expanduser() if raw_bin else REPO_ROOT / "backend-rs" / "target" / "release" / "codoxear-broker-rs"
+    if not broker_bin.exists():
+        raise RuntimeError(f"Rust broker binary not found: {broker_bin}")
+    return [str(broker_bin), "--cwd", str(cwd), "--"]
+
+
 def _wait_for_spawned_broker_meta(spawn_nonce: str, *, timeout_s: float = TMUX_META_WAIT_SECONDS) -> dict[str, Any]:
     deadline = time.monotonic() + max(timeout_s, 0.0)
     while time.monotonic() <= deadline:
@@ -4435,7 +4449,7 @@ class SessionManager:
         if worktree_branch is not None:
             spawn_cwd = _create_git_worktree(cwd_path, worktree_branch)
 
-        argv = [sys.executable, "-m", "codoxear.broker", "--cwd", str(spawn_cwd), "--"]
+        argv = _broker_launch_argv(spawn_cwd)
         codex_args: list[str] = []
         resume_row: dict[str, Any] | None = None
         if backend_name == "codex":
@@ -4558,6 +4572,9 @@ class SessionManager:
             codex_bin = _clean_optional_text(os.environ.get("CODEX_BIN"))
             if codex_bin is not None:
                 inline_env["CODEX_BIN"] = codex_bin
+            pi_bin = _clean_optional_text(os.environ.get("PI_BIN"))
+            if pi_bin is not None:
+                inline_env["PI_BIN"] = pi_bin
             repo_root = Path(__file__).resolve().parent.parent
             inline_argv = ["env", *[f"{key}={value}" for key, value in inline_env.items()], *argv]
             shell_cmd = f"cd {shlex.quote(str(repo_root))} && exec {shlex.join(inline_argv)}"

@@ -1,4 +1,5 @@
 import json
+import os
 import subprocess
 import threading
 import unittest
@@ -253,6 +254,51 @@ class TestSpawnWebSessionResume(unittest.TestCase):
         )
         self.assertEqual(result, {"broker_pid": 3210})
         self.assertEqual(thread_calls, ["start"])
+
+    def test_spawn_web_session_can_use_rust_broker_when_enabled(self) -> None:
+        manager = SessionManager.__new__(SessionManager)
+        thread_calls: list[str] = []
+
+        class _Proc:
+            pid = 3211
+            stderr = None
+
+            def wait(self) -> int:
+                return 0
+
+        with TemporaryDirectory() as td:
+            broker_bin = Path(td) / "codoxear-broker-rs"
+            broker_bin.write_text("#!/bin/sh\n", encoding="utf-8")
+            with patch.dict(
+                os.environ,
+                {
+                    "CODOXEAR_ENABLE_RUST_BROKER": "1",
+                    "CODOXEAR_RUST_BROKER_BIN": str(broker_bin),
+                },
+            ), patch("codoxear.server._wait_or_raise", return_value=None), patch(
+                "codoxear.server.subprocess.Popen", return_value=_Proc()
+            ) as popen_mock, patch.object(threading.Thread, "start", lambda self: thread_calls.append("start")):
+                result = SessionManager.spawn_web_session(manager, cwd=td, args=["--search"])
+
+        argv = popen_mock.call_args.args[0]
+        env = popen_mock.call_args.kwargs["env"]
+        self.assertEqual(argv[:4], [str(broker_bin), "--cwd", td, "--"])
+        self.assertIn("--search", argv)
+        self.assertEqual(env["CODEX_WEB_AGENT_BACKEND"], "codex")
+        self.assertEqual(result, {"broker_pid": 3211})
+        self.assertEqual(thread_calls, ["start"])
+
+    def test_spawn_web_session_requires_rust_broker_binary_when_enabled(self) -> None:
+        manager = SessionManager.__new__(SessionManager)
+        with TemporaryDirectory() as td, patch.dict(
+            os.environ,
+            {
+                "CODOXEAR_ENABLE_RUST_BROKER": "1",
+                "CODOXEAR_RUST_BROKER_BIN": str(Path(td) / "missing-broker"),
+            },
+        ):
+            with self.assertRaisesRegex(RuntimeError, "Rust broker binary not found"):
+                SessionManager.spawn_web_session(manager, cwd=td)
 
     def test_spawn_web_session_passes_resume_id_to_broker(self) -> None:
         manager = SessionManager.__new__(SessionManager)
