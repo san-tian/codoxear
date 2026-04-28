@@ -231,9 +231,12 @@ class NovaPreviewSourceTest(unittest.TestCase):
     def test_topbar_tool_toggle_uses_wrench_icon(self) -> None:
         source = APP_TSX.read_text(encoding="utf-8")
         self.assertIn('case "wrench":', source)
-        self.assertIn('title={showTools ? "Hide tool calls" : "Show tool calls"}', source)
+        self.assertIn('title={showTools ? "Hide tools and narration" : "Show tools and narration"}', source)
         self.assertIn('{icon("wrench")}', source)
         self.assertIn("setShowTools((current) => !current)", source)
+        self.assertIn("function transcriptEventVisibleWithToolsHidden(event: UiTranscriptEvent)", source)
+        self.assertIn('return event.meta.trim() !== "narration";', source)
+        self.assertIn("transcript.filter(transcriptEventVisibleWithToolsHidden)", source)
 
     def test_topbar_uses_stable_session_status_not_polling_label(self) -> None:
         source = APP_TSX.read_text(encoding="utf-8")
@@ -789,7 +792,8 @@ class NovaPreviewSourceTest(unittest.TestCase):
         self.assertIn('<div className="extension-progress"', transcript_source)
         self.assertIn('<ol className="extension-items">', transcript_source)
         self.assertIn('case "extension":\n      return "event-extension";', transcript_source)
-        self.assertIn('event.kind === "user" || event.kind === "assistant" || event.kind === "extension"', app_source)
+        self.assertIn("function transcriptEventVisibleWithToolsHidden(event: UiTranscriptEvent)", app_source)
+        self.assertIn("transcript.filter(transcriptEventVisibleWithToolsHidden)", app_source)
         self.assertIn("function isFloatingProgressEvent(event: UiTranscriptEvent)", app_source)
         self.assertIn('if (event.extensionKind !== "progress") return false;', app_source)
         self.assertNotIn('if (event.kind !== "extension") return false;', app_source)
@@ -873,7 +877,8 @@ class NovaPreviewSourceTest(unittest.TestCase):
         self.assertIn("const merged = mergeToolPair(next[existingIndex], event);", transcript_source)
         self.assertIn("next[existingIndex] = merged || event;", transcript_source)
         self.assertIn("() =>\n      coalesceAdjacentAssistantEvents(", app_source)
-        self.assertIn('event.kind === "user" || event.kind === "assistant" || event.kind === "extension"', app_source)
+        self.assertIn("function transcriptEventVisibleWithToolsHidden(event: UiTranscriptEvent)", app_source)
+        self.assertIn('return event.meta.trim() !== "narration";', app_source)
         self.assertIn("const showMessageSide = shouldShowMessageSide(events, index);", transcript_source)
         self.assertIn("const showMessageFooter = shouldShowMessageFooter(events, index, collapsible);", transcript_source)
         self.assertIn('className={`message-side${showMessageSide && !collapsible ? "" : " is-hidden"}`}', transcript_source)

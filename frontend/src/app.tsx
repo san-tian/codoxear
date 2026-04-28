@@ -386,6 +386,12 @@ function sessionIsShelved(session: SessionSummary | null) {
   return Number.isFinite(snoozeUntil) && snoozeUntil > Date.now() / 1000;
 }
 
+function transcriptEventVisibleWithToolsHidden(event: UiTranscriptEvent) {
+  if (event.kind === "user" || event.kind === "extension") return true;
+  if (event.kind !== "assistant") return false;
+  return event.meta.trim() !== "narration";
+}
+
 function partitionImportantFirst<T>(items: T[], isImportant: (item: T) => boolean) {
   const important: T[] = [];
   const regular: T[] = [];
@@ -1151,7 +1157,7 @@ export function App() {
       coalesceAdjacentAssistantEvents(
         showTools
           ? transcript
-          : transcript.filter((event) => event.kind === "user" || event.kind === "assistant" || event.kind === "extension"),
+          : transcript.filter(transcriptEventVisibleWithToolsHidden),
       ),
     [showTools, transcript],
   );
@@ -3148,7 +3154,7 @@ export function App() {
               <button
                 className={mobileViewport ? `actionBtn mobileActionBtn${showTools ? " active" : ""}` : `icon-btn${showTools ? " active" : ""}`}
                 type="button"
-                title={showTools ? "Hide tool calls" : "Show tool calls"}
+                title={showTools ? "Hide tools and narration" : "Show tools and narration"}
                 onClick={() => setShowTools((current) => !current)}
               >
                 {icon("wrench")}
