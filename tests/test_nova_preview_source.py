@@ -68,6 +68,22 @@ class NovaPreviewSourceTest(unittest.TestCase):
         self.assertIn("selectedSessionRef.current = sessionId;", source)
         self.assertIn("selectSession(found.session_id);", source)
 
+    def test_session_switch_restores_cached_view_before_tail_refresh(self) -> None:
+        source = APP_TSX.read_text(encoding="utf-8")
+        self.assertIn("type SessionViewSnapshot = {", source)
+        self.assertIn("const sessionViewCacheRef = useRef<Record<string, SessionViewSnapshot>>({});", source)
+        self.assertIn("function cacheSessionSnapshot(sessionId: string, patch: Partial<SessionViewSnapshot>)", source)
+        self.assertIn("function rememberActiveSessionSnapshot(sessionId = selectedSessionRef.current)", source)
+        self.assertIn("const previousSessionId = selectedSessionRef.current;", source)
+        self.assertIn("if (changed) rememberActiveSessionSnapshot(previousSessionId);", source)
+        self.assertIn("const cached = sessionViewCacheRef.current[sessionId];", source)
+        self.assertIn("setTranscript(cached.transcript);", source)
+        self.assertIn("if (!sessionViewCacheRef.current[sessionId]) setLoadingText(\"Loading session…\");", source)
+        self.assertIn("applyRuntime(data, sessionId, nextEvents);", source)
+        self.assertIn("cacheSessionSnapshot(sessionId, { transcript: merged });", source)
+        self.assertIn("delete sessionViewCacheRef.current[sessionId];", source)
+        self.assertIn("sessionViewCacheRef.current = {};", source)
+
     def test_new_session_dialog_closes_before_background_follow(self) -> None:
         source = APP_TSX.read_text(encoding="utf-8")
         self.assertIn("const composerInputRef = useRef<HTMLTextAreaElement | null>(null);", source)
@@ -673,7 +689,7 @@ class NovaPreviewSourceTest(unittest.TestCase):
         self.assertIn("setCollapsedEvents((current) => ({ ...current, [event.id]: !transcriptEventCollapsed(event, current) }));", app_source)
         self.assertIn("setCollapsedEvents({});", app_source)
         self.assertIn("const collapsed = transcriptEventCollapsed(event);", app_source)
-        self.assertIn("setTranscript((current) => mergeTranscriptEvents(older, current));", app_source)
+        self.assertIn("const merged = mergeTranscriptEvents(older, current);", app_source)
         self.assertIn('className={`message-side${showMessageSide && !collapsible ? "" : " is-hidden"}`}', transcript_source)
         self.assertIn("showMessageSide && !collapsible ? ", transcript_source)
         self.assertIn('<div className="message-inline">', transcript_source)

@@ -61,6 +61,7 @@ const IMPORTANT_PRIORITY_OFFSET = 0.85;
 type BusySubmitMode = "queue" | "interrupt";
 type ThemeMode = "dark" | "light";
 type AgentBackend = "codex" | "pi";
+type TokenSummary = { label: string; title: string };
 type NewSessionBackendPreferences = {
   provider?: string;
   model?: string;
@@ -81,6 +82,15 @@ type SidebarDropPosition = "before" | "after";
 type SidebarDropIndicator =
   | { kind: "workspace"; key: string; position: SidebarDropPosition }
   | { kind: "session"; key: string; position: SidebarDropPosition };
+type SessionViewSnapshot = {
+  transcript: UiTranscriptEvent[];
+  liveCursor: string | null;
+  historyCursor: string | null;
+  hasOlder: boolean;
+  busy: boolean;
+  queueLen: number;
+  tokenSummary: TokenSummary | null;
+};
 
 const EMPTY_VOICE_SETTINGS: VoiceSettingsResponse = {
   ok: true,
@@ -853,7 +863,7 @@ function formatTokenCount(value: number) {
   return Math.round(value).toLocaleString();
 }
 
-function renderTokenSummary(token: Record<string, unknown> | null | undefined): { label: string; title: string } | null {
+function renderTokenSummary(token: Record<string, unknown> | null | undefined): TokenSummary | null {
   if (!token || typeof token !== "object") return null;
   const contextWindow = Number(token.context_window);
   const tokensInContext = Number(token.tokens_in_context);
@@ -933,7 +943,7 @@ export function App() {
   const [interruptingFeedbackUntil, setInterruptingFeedbackUntil] = useState(0);
   const [sessionMarkerBusyId, setSessionMarkerBusyId] = useState("");
   const [queueLen, setQueueLen] = useState(0);
-  const [tokenSummary, setTokenSummary] = useState<{ label: string; title: string } | null>(null);
+  const [tokenSummary, setTokenSummary] = useState<TokenSummary | null>(null);
   const [liveCursor, setLiveCursor] = useState<string | null>(null);
   const [historyCursor, setHistoryCursor] = useState<string | null>(null);
   const [hasOlder, setHasOlder] = useState(false);
@@ -1030,6 +1040,7 @@ export function App() {
   const liveCursorRef = useRef<string | null>(null);
   const historyCursorRef = useRef<string | null>(null);
   const selectedSessionRef = useRef("");
+  const sessionViewCacheRef = useRef<Record<string, SessionViewSnapshot>>({});
   const fastPollUntilRef = useRef(0);
   const openRequestRef = useRef(0);
   const notificationFeedSinceRef = useRef(0);
@@ -1259,6 +1270,33 @@ export function App() {
     setMobileSidebarOpen(false);
   }
 
+  function cacheSessionSnapshot(sessionId: string, patch: Partial<SessionViewSnapshot>) {
+    if (!sessionId) return;
+    const current = sessionViewCacheRef.current[sessionId] || {
+      transcript: [],
+      liveCursor: null,
+      historyCursor: null,
+      hasOlder: false,
+      busy: false,
+      queueLen: 0,
+      tokenSummary: null,
+    };
+    sessionViewCacheRef.current[sessionId] = { ...current, ...patch };
+  }
+
+  function rememberActiveSessionSnapshot(sessionId = selectedSessionRef.current) {
+    if (!sessionId) return;
+    cacheSessionSnapshot(sessionId, {
+      transcript,
+      liveCursor: liveCursorRef.current,
+      historyCursor: historyCursorRef.current,
+      hasOlder,
+      busy,
+      queueLen,
+      tokenSummary,
+    });
+  }
+
   function toggleSidebarVisibility() {
     if (mobileViewport) {
       setMobileSidebarOpen((current) => !current);
@@ -1363,20 +1401,35 @@ export function App() {
 
   function selectSession(sessionId: string) {
     const changed = selectedSessionRef.current !== sessionId;
+    const previousSessionId = selectedSessionRef.current;
+    if (changed) rememberActiveSessionSnapshot(previousSessionId);
     selectedSessionRef.current = sessionId;
     if (changed) {
+      const cached = sessionViewCacheRef.current[sessionId];
       stickToBottomRef.current = true;
       lastAutoScrollKeyRef.current = "";
-      liveCursorRef.current = null;
-      historyCursorRef.current = null;
-      setLiveCursor(null);
-      setHistoryCursor(null);
-      setHasOlder(false);
       setHistoryTopBoundaryReached(true);
-      setTranscript([]);
-      setBusy(false);
-      setQueueLen(Number(sessions.find((session) => session.session_id === sessionId)?.queue_len || 0));
-      setTokenSummary(null);
+      if (cached) {
+        liveCursorRef.current = cached.liveCursor;
+        historyCursorRef.current = cached.historyCursor;
+        setLiveCursor(cached.liveCursor);
+        setHistoryCursor(cached.historyCursor);
+        setHasOlder(cached.hasOlder);
+        setTranscript(cached.transcript);
+        setBusy(cached.busy);
+        setQueueLen(cached.queueLen);
+        setTokenSummary(cached.tokenSummary);
+      } else {
+        liveCursorRef.current = null;
+        historyCursorRef.current = null;
+        setLiveCursor(null);
+        setHistoryCursor(null);
+        setHasOlder(false);
+        setTranscript([]);
+        setBusy(false);
+        setQueueLen(Number(sessions.find((session) => session.session_id === sessionId)?.queue_len || 0));
+        setTokenSummary(null);
+      }
     }
     if (mobileViewport) closeMobileSidebar();
     setSelectedSessionId(sessionId);
@@ -1445,19 +1498,37 @@ export function App() {
     queue_len: number;
     turn_aborted?: boolean;
     token?: Record<string, unknown> | null;
-  }, sessionId = selectedSessionRef.current) {
+  }, sessionId = selectedSessionRef.current, transcriptEvents?: UiTranscriptEvent[]) {
     liveCursorRef.current = data.live_cursor ?? null;
     setLiveCursor(liveCursorRef.current);
+    let nextHistoryCursor = historyCursorRef.current;
+    let nextHasOlder = sessionViewCacheRef.current[sessionId]?.hasOlder ?? hasOlder;
     if (Object.prototype.hasOwnProperty.call(data, "history_cursor")) {
       historyCursorRef.current = data.history_cursor ?? null;
+      nextHistoryCursor = historyCursorRef.current;
       setHistoryCursor(historyCursorRef.current);
     }
     if (Object.prototype.hasOwnProperty.call(data, "has_older")) {
-      setHasOlder(Boolean(data.has_older));
+      nextHasOlder = Boolean(data.has_older);
+      setHasOlder(nextHasOlder);
     }
-    setBusy(Boolean(data.busy));
-    setQueueLen(Number.isFinite(Number(data.queue_len)) ? Number(data.queue_len) : 0);
-    setTokenSummary(renderTokenSummary(data.token));
+    const nextBusy = Boolean(data.busy);
+    const nextQueueLen = Number.isFinite(Number(data.queue_len)) ? Number(data.queue_len) : 0;
+    const nextTokenSummary = renderTokenSummary(data.token);
+    setBusy(nextBusy);
+    setQueueLen(nextQueueLen);
+    setTokenSummary(nextTokenSummary);
+    if (sessionId) {
+      cacheSessionSnapshot(sessionId, {
+        ...(transcriptEvents ? { transcript: transcriptEvents } : {}),
+        liveCursor: liveCursorRef.current,
+        historyCursor: nextHistoryCursor,
+        hasOlder: nextHasOlder,
+        busy: nextBusy,
+        queueLen: nextQueueLen,
+        tokenSummary: nextTokenSummary,
+      });
+    }
     if (sessionId && (!data.busy || data.turn_aborted)) {
       setInterruptingSessionId((current) => (current === sessionId ? "" : current));
       setInterruptingFeedbackUntil(0);
@@ -1467,6 +1538,10 @@ export function App() {
   async function refreshSessions({ preserveSelection = true }: { preserveSelection?: boolean } = {}) {
     const payload = await api.fetchSessions();
     const ordered = sortSessions(payload.sessions || []);
+    const orderedSessionIds = new Set(ordered.map((session) => session.session_id));
+    Object.keys(sessionViewCacheRef.current).forEach((sessionId) => {
+      if (!orderedSessionIds.has(sessionId)) delete sessionViewCacheRef.current[sessionId];
+    });
     setSessions(ordered);
     setRecentCwds(Array.isArray(payload.recent_cwds) ? payload.recent_cwds : []);
     setNewSessionDefaults(payload.new_session_defaults || null);
@@ -1486,6 +1561,7 @@ export function App() {
     }
     if (!ordered.length) {
       selectSession("");
+      sessionViewCacheRef.current = {};
       setTranscript([]);
       return;
     }
@@ -1506,14 +1582,14 @@ export function App() {
     if (!sessionId) return;
     const requestId = openRequestRef.current + 1;
     openRequestRef.current = requestId;
-    setLoadingText("Loading session…");
+    if (!sessionViewCacheRef.current[sessionId]) setLoadingText("Loading session…");
     try {
       const data = await api.fetchTail(sessionId, INIT_PAGE_LIMIT);
       if (requestId !== openRequestRef.current || selectedSessionRef.current !== sessionId) return;
       const nextEvents = normalizeEvents(data.events || []);
       setTranscript(nextEvents);
       setSessionLastLines((current) => ({ ...current, [sessionId]: previewFromEvents(nextEvents) || current[sessionId] || "" }));
-      applyRuntime(data, sessionId);
+      applyRuntime(data, sessionId, nextEvents);
       if (showDetailsPanel) void loadDiagnostics(sessionId);
       if (showFilesPanel) void loadFiles(sessionId);
       schedulePoll(0);
@@ -1543,6 +1619,7 @@ export function App() {
         setTranscript((current) => {
           const merged = mergeTranscriptEvents(current, nextEvents);
           setSessionLastLines((prev) => ({ ...prev, [sessionId]: previewFromEvents(merged) || prev[sessionId] || "" }));
+          cacheSessionSnapshot(sessionId, { transcript: merged });
           return merged;
         });
       }
@@ -1568,18 +1645,33 @@ export function App() {
 
   async function loadOlder() {
     if (!selectedSessionId || !historyCursorRef.current || loadingOlder) return;
+    const sessionId = selectedSessionId;
     setLoadingOlder(true);
     try {
-      const data = await api.fetchHistory(selectedSessionId, historyCursorRef.current, OLDER_PAGE_LIMIT);
-      if (selectedSessionRef.current !== selectedSessionId) return;
+      const data = await api.fetchHistory(sessionId, historyCursorRef.current, OLDER_PAGE_LIMIT);
+      if (selectedSessionRef.current !== sessionId) return;
       const older = normalizeEvents(data.events || []);
       const jumpTargetId = olderHistoryJumpTarget(older);
-      setTranscript((current) => mergeTranscriptEvents(older, current));
+      setTranscript((current) => {
+        const merged = mergeTranscriptEvents(older, current);
+        cacheSessionSnapshot(sessionId, { transcript: merged });
+        return merged;
+      });
       historyCursorRef.current = data.history_cursor ?? null;
       setHistoryCursor(historyCursorRef.current);
       setHasOlder(Boolean(data.has_older));
       setBusy(Boolean(data.busy));
-      setQueueLen(Number.isFinite(Number(data.queue_len)) ? Number(data.queue_len) : 0);
+      const nextQueueLen = Number.isFinite(Number(data.queue_len)) ? Number(data.queue_len) : 0;
+      setQueueLen(nextQueueLen);
+      const nextTokenSummary = renderTokenSummary(data.token);
+      setTokenSummary(nextTokenSummary);
+      cacheSessionSnapshot(sessionId, {
+        historyCursor: historyCursorRef.current,
+        hasOlder: Boolean(data.has_older),
+        busy: Boolean(data.busy),
+        queueLen: nextQueueLen,
+        tokenSummary: nextTokenSummary,
+      });
       if (jumpTargetId) {
         window.requestAnimationFrame(() => {
           scrollChatEventIntoView(jumpTargetId);
@@ -1588,7 +1680,7 @@ export function App() {
     } catch (error) {
       const status = error && typeof error === "object" && "status" in error ? Number((error as { status?: number }).status) : 0;
       if (status === 409) {
-        await openSession(selectedSessionId);
+        await openSession(sessionId);
       } else {
         setErrorText(error instanceof Error ? error.message : "Unable to load older messages");
       }
@@ -1819,7 +1911,11 @@ export function App() {
         body: text,
         meta: "sending",
       };
-      setTranscript((current) => current.concat(localEvent as UiTranscriptEvent));
+      setTranscript((current) => {
+        const nextTranscript = current.concat(localEvent as UiTranscriptEvent);
+        cacheSessionSnapshot(sessionId, { transcript: nextTranscript });
+        return nextTranscript;
+      });
       setSessionLastLines((current) => ({ ...current, [sessionId]: eventTextPreview(localEvent as UiTranscriptEvent) }));
     }
     try {
@@ -1833,7 +1929,11 @@ export function App() {
         if (shouldInterrupt) await api.interrupt(sessionId);
         await api.sendMessage(sessionId, text);
         if (localEvent) {
-          setTranscript((current) => current.map((event) => (event.id === localEvent.id ? { ...event, meta: "sent" } : event)));
+          setTranscript((current) => {
+            const nextTranscript = current.map((event) => (event.id === localEvent.id ? { ...event, meta: "sent" } : event));
+            cacheSessionSnapshot(sessionId, { transcript: nextTranscript });
+            return nextTranscript;
+          });
         }
         pushToast(shouldInterrupt ? "Interrupted and sent" : "Sent");
       }
@@ -1842,7 +1942,11 @@ export function App() {
     } catch (error) {
       setSessionDraft(sessionId, text);
       if (localEvent) {
-        setTranscript((current) => current.map((event) => (event.id === localEvent.id ? { ...event, meta: "send failed" } : event)));
+        setTranscript((current) => {
+          const nextTranscript = current.map((event) => (event.id === localEvent.id ? { ...event, meta: "send failed" } : event));
+          cacheSessionSnapshot(sessionId, { transcript: nextTranscript });
+          return nextTranscript;
+        });
       }
       setErrorText(error instanceof Error ? error.message : "Unable to send message");
     } finally {
@@ -1874,6 +1978,7 @@ export function App() {
     setClosingSession(true);
     try {
       await api.deleteSession(sessionId);
+      delete sessionViewCacheRef.current[sessionId];
       setSessionDraft(sessionId, "");
       pushToast("Session closed");
       if (selectedSessionRef.current === sessionId) {
@@ -1955,6 +2060,7 @@ export function App() {
     await api.logout();
     setAuthState("login");
     setSessions([]);
+    sessionViewCacheRef.current = {};
     selectSession("");
     setTranscript([]);
   }
