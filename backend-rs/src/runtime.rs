@@ -53,6 +53,7 @@ const GIT_CHANGED_FILES_MAX: usize = 400;
 const LOCAL_SERVICE_RESTART_DELAY_SECONDS: f64 = 0.75;
 const DEFAULT_HARNESS_SWEEP_SECONDS: f64 = 2.5;
 const DEFAULT_QUEUE_SWEEP_SECONDS: f64 = 1.0;
+const DEFAULT_VOICE_SCAN_SECONDS: f64 = 1.0;
 const DEFAULT_QUEUE_IDLE_GRACE_SECONDS: f64 = 10.0;
 const DEFAULT_HARNESS_MAX_SCAN_BYTES: usize = 8 * 1024 * 1024;
 const SIDEBAR_PRIORITY_HALF_LIFE_SECONDS: f64 = 8.0 * 3600.0;
@@ -176,6 +177,8 @@ struct SessionMeta {
     tmux_session: Option<String>,
     #[serde(default)]
     tmux_window: Option<String>,
+    #[serde(default)]
+    resume_session_id: Option<String>,
 }
 
 #[derive(Debug)]
@@ -1532,6 +1535,13 @@ pub fn rust_harness_sweep_enabled() -> bool {
         .unwrap_or(false)
 }
 
+pub fn rust_voice_scan_enabled() -> bool {
+    env::var("CODOXEAR_ENABLE_VOICE_SCAN")
+        .ok()
+        .map(|value| value.trim() == "1")
+        .unwrap_or(false)
+}
+
 pub fn spawn_harness_sweep_worker(config: RuntimeConfig) {
     tokio::spawn(async move {
         let mut last_injected: HashMap<String, f64> = HashMap::new();
@@ -1598,6 +1608,37 @@ pub fn spawn_queue_sweep_worker(config: RuntimeConfig) {
                 }
                 Err(err) => {
                     tracing::warn!("rust queue sweep task join failed: {err}");
+                }
+            }
+        }
+    });
+}
+
+pub fn spawn_voice_scan_worker(config: RuntimeConfig) {
+    tokio::spawn(async move {
+        let mut offsets: HashMap<String, u64> = HashMap::new();
+        let mut interval = time::interval(voice_scan_interval());
+        interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            let scan_config = config.clone();
+            let prior_offsets = std::mem::take(&mut offsets);
+            match task::spawn_blocking(move || {
+                let mut next_offsets = prior_offsets;
+                let result = run_voice_scan_once(&scan_config, &mut next_offsets);
+                (next_offsets, result)
+            })
+            .await
+            {
+                Ok((next_offsets, Ok(_delivered))) => {
+                    offsets = next_offsets;
+                }
+                Ok((next_offsets, Err(err))) => {
+                    offsets = next_offsets;
+                    tracing::warn!("rust voice scan failed: {err}");
+                }
+                Err(err) => {
+                    tracing::warn!("rust voice scan task join failed: {err}");
                 }
             }
         }
@@ -1735,6 +1776,264 @@ fn run_queue_sweep_once(
         write_queue_map(&queue_path, &queues)?;
     }
     Ok(false)
+}
+
+fn run_voice_scan_once(config: &RuntimeConfig, offsets: &mut HashMap<String, u64>) -> Result<usize, String> {
+    let sessions = load_sessions_response(config)?;
+    let ledger = read_voice_delivery_ledger(&voice_delivery_ledger_path(config))?;
+    let mut seen_keys = HashSet::new();
+    let mut delivered = 0usize;
+
+    for session in sessions.sessions {
+        let Some(log_path_raw) = session.log_path.as_deref() else {
+            continue;
+        };
+        let log_path = Path::new(log_path_raw);
+        if !log_path.exists() {
+            continue;
+        }
+        let key = format!("{}|{}", session.session_id, log_path.display());
+        seen_keys.insert(key.clone());
+        let size = file_len(log_path).unwrap_or(0);
+        let offset = offsets.entry(key.clone()).or_insert(size);
+        if size < *offset {
+            *offset = 0;
+        }
+        let mut loops = 0usize;
+        while *offset < size && loops < 16 {
+            let (objs, new_offset) = read_jsonl_values_from_offset(log_path, *offset, 256 * 1024)?;
+            if new_offset <= *offset {
+                break;
+            }
+            if session_resume_id(config, &session.session_id)?.is_none() {
+                let messages = extract_voice_delivery_messages(&objs);
+                for message in messages {
+                    if ledger.contains_key(&message.message_id) {
+                        continue;
+                    }
+                    if write_voice_inbox_message(config, &session, &message)? {
+                        delivered += 1;
+                    }
+                }
+            }
+            *offset = new_offset;
+            loops += 1;
+        }
+    }
+
+    offsets.retain(|key, _| seen_keys.contains(key));
+    Ok(delivered)
+}
+
+#[derive(Clone, Debug)]
+struct VoiceDeliveryMessage {
+    message_id: String,
+    message_class: String,
+    text: String,
+    ts: Option<f64>,
+}
+
+fn extract_voice_delivery_messages(objs: &[Value]) -> Vec<VoiceDeliveryMessage> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    let mut last_text_key: Option<(String, String)> = None;
+
+    for obj in objs {
+        let (message_class, text) = match obj.get("type").and_then(Value::as_str) {
+            Some("message") => {
+                let Some(value) = pi_assistant_text_value(obj) else {
+                    continue;
+                };
+                let message_class = if pi_assistant_is_final_turn_end(obj) {
+                    "final_response"
+                } else {
+                    "narration"
+                };
+                (message_class, value)
+            }
+            Some("event_msg") => {
+                let Some(payload) = obj.get("payload").and_then(Value::as_object) else {
+                    continue;
+                };
+                if payload.get("type").and_then(Value::as_str) != Some("agent_message") {
+                    continue;
+                }
+                let Some(message) = payload.get("message").and_then(Value::as_str) else {
+                    continue;
+                };
+                if message.trim().is_empty() {
+                    continue;
+                }
+                let message_class = if payload.get("phase").and_then(Value::as_str) == Some("final_answer") {
+                    "final_response"
+                } else {
+                    "narration"
+                };
+                (message_class, message.to_string())
+            }
+            Some("response_item") => {
+                let Some(payload) = obj.get("payload").and_then(Value::as_object) else {
+                    continue;
+                };
+                if payload.get("type").and_then(Value::as_str) != Some("message")
+                    || payload.get("role").and_then(Value::as_str) != Some("assistant")
+                {
+                    continue;
+                }
+                let Some(value) = payload.get("content").and_then(output_text) else {
+                    continue;
+                };
+                if value.trim().is_empty() {
+                    continue;
+                }
+                let message_class = if payload.get("phase").and_then(Value::as_str) == Some("final_answer")
+                    || payload.get("end_turn").and_then(Value::as_bool) == Some(true)
+                {
+                    "final_response"
+                } else {
+                    "narration"
+                };
+                (message_class, value)
+            }
+            _ => continue,
+        };
+        let text = strip_oai_mem_citation_tail(&text);
+        if text.trim().is_empty() {
+            continue;
+        }
+        let normalized_text = compact_text(&text);
+        let text_key = (message_class.to_string(), normalized_text);
+        if last_text_key.as_ref() == Some(&text_key) {
+            continue;
+        }
+        let ts = event_ts(obj);
+        let message_id = voice_text_message_id(message_class, &text, ts);
+        if !seen.insert(message_id.clone()) {
+            continue;
+        }
+        last_text_key = Some(text_key);
+        out.push(VoiceDeliveryMessage {
+            message_id,
+            message_class: message_class.to_string(),
+            text,
+            ts,
+        });
+    }
+    out
+}
+
+fn read_jsonl_values_from_offset(path: &Path, offset: u64, max_bytes: usize) -> Result<(Vec<Value>, u64), String> {
+    let file = fs::File::open(path).map_err(|err| format!("open {}: {err}", path.display()))?;
+    let mut reader = BufReader::new(file);
+    reader
+        .seek(SeekFrom::Start(offset))
+        .map_err(|err| format!("seek {}: {err}", path.display()))?;
+    let mut values = Vec::new();
+    let mut cursor = offset;
+    let mut consumed = 0usize;
+    loop {
+        if consumed >= max_bytes {
+            break;
+        }
+        let mut line = String::new();
+        let n = reader
+            .read_line(&mut line)
+            .map_err(|err| format!("read {}: {err}", path.display()))?;
+        if n == 0 {
+            break;
+        }
+        consumed += n;
+        let start = cursor;
+        cursor += n as u64;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let value = serde_json::from_str(trimmed)
+            .map_err(|err| format!("parse {} at byte {start}: {err}", path.display()))?;
+        values.push(value);
+    }
+    Ok((values, cursor))
+}
+
+fn voice_text_message_id(message_class: &str, text: &str, ts: Option<f64>) -> String {
+    let normalized_text = compact_text(text);
+    let class_json = serde_json::to_string(message_class).unwrap_or_else(|_| "\"\"".to_string());
+    let text_json = serde_json::to_string(&normalized_text).unwrap_or_else(|_| "\"\"".to_string());
+    let ts_json = ts
+        .filter(|value| value.is_finite())
+        .map(|value| python_round_to_i64(value * 1000.0).to_string())
+        .unwrap_or_else(|| "null".to_string());
+    let payload = format!("{{\"class\": {class_json}, \"text\": {text_json}, \"ts_ms\": {ts_json}}}");
+    let digest = Sha256::digest(payload.as_bytes());
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn python_round_to_i64(value: f64) -> i64 {
+    let floor = value.floor();
+    let frac = value - floor;
+    if frac < 0.5 {
+        floor as i64
+    } else if frac > 0.5 {
+        floor as i64 + 1
+    } else {
+        let base = floor as i64;
+        if base % 2 == 0 { base } else { base + 1 }
+    }
+}
+
+fn strip_oai_mem_citation_tail(text: &str) -> String {
+    let Some(start) = text.rfind("<oai-mem-citation>") else {
+        return text.to_string();
+    };
+    let tail = &text[start..];
+    let Some(end_rel) = tail.rfind("</oai-mem-citation>") else {
+        return text.to_string();
+    };
+    let after = &tail[end_rel + "</oai-mem-citation>".len()..];
+    if after.trim().is_empty() {
+        text[..start].to_string()
+    } else {
+        text.to_string()
+    }
+}
+
+fn session_resume_id(config: &RuntimeConfig, session_id: &str) -> Result<Option<String>, String> {
+    let meta_path = config.app_dir.join("socks").join(format!("{session_id}.json"));
+    let raw = match fs::read_to_string(&meta_path) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(format!("read {}: {err}", meta_path.display())),
+    };
+    let meta: SessionMeta =
+        serde_json::from_str(&raw).map_err(|err| format!("parse {}: {err}", meta_path.display()))?;
+    Ok(clean_optional(meta.resume_session_id))
+}
+
+fn write_voice_inbox_message(
+    config: &RuntimeConfig,
+    session: &ApiSessionSummary,
+    message: &VoiceDeliveryMessage,
+) -> Result<bool, String> {
+    let session_slug = safe_filename(&session.session_id, "session");
+    let short_id = message.message_id.chars().take(16).collect::<String>();
+    let path = config
+        .app_dir
+        .join("voice_inbox")
+        .join(format!("{session_slug}-{short_id}.json"));
+    if path.exists() {
+        return Ok(false);
+    }
+    let payload = json!({
+        "message_id": message.message_id,
+        "session_id": session.session_id,
+        "session_display_name": default_session_display_name(session.alias.clone()),
+        "message_class": message.message_class,
+        "text": message.text,
+        "ts": message.ts,
+    });
+    write_json_value(&path, &payload)?;
+    Ok(true)
 }
 
 fn run_harness_sweep_once(
@@ -3428,6 +3727,15 @@ fn harness_sweep_interval() -> Duration {
         .and_then(|value| value.trim().parse::<f64>().ok())
         .filter(|value| value.is_finite() && *value > 0.0)
         .unwrap_or(DEFAULT_HARNESS_SWEEP_SECONDS);
+    Duration::from_secs_f64(seconds)
+}
+
+fn voice_scan_interval() -> Duration {
+    let seconds = env::var("CODEX_WEB_VOICE_PUSH_SWEEP_SECONDS")
+        .ok()
+        .and_then(|value| value.trim().parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .unwrap_or(DEFAULT_VOICE_SCAN_SECONDS);
     Duration::from_secs_f64(seconds)
 }
 
@@ -7615,9 +7923,11 @@ mod tests {
         load_changed_files_response, load_file_search_response, load_git_diff_response,
         load_git_file_versions_response, load_harness_response, load_messages_history,
         load_messages_live, load_messages_tail, load_sessions_response,
-        run_harness_sweep_once, run_queue_sweep_once, RuntimeConfig,
+        run_harness_sweep_once, run_queue_sweep_once, run_voice_scan_once,
+        voice_text_message_id, RuntimeConfig,
     };
     use serde_json::Value;
+    use std::collections::HashMap;
     use std::env;
     use std::fs;
     use std::io::{BufRead, BufReader, Write};
@@ -7710,6 +8020,72 @@ mod tests {
 
         let response = load_sessions_response(&RuntimeConfig { app_dir }).unwrap();
         assert!(response.sessions.is_empty());
+    }
+
+    #[test]
+    fn voice_scan_writes_new_delivery_messages_to_inbox() {
+        let app_dir = temp_app_dir("voice-scan");
+        let log_path = app_dir.join("rollout-voice.jsonl");
+        fs::write(
+            &log_path,
+            r#"{"type":"event_msg","timestamp":"2026-04-28T00:00:00Z","payload":{"type":"agent_message","message":"old final","phase":"final_answer"}}
+"#,
+        )
+        .unwrap();
+        fs::write(app_dir.join("socks").join("sid-voice.sock"), "").unwrap();
+        fs::write(
+            app_dir.join("socks").join("sid-voice.json"),
+            format!(
+                r#"{{
+                  "session_id": "thread-voice",
+                  "codex_pid": {},
+                  "broker_pid": {},
+                  "agent_backend": "codex",
+                  "owner": "web",
+                  "cwd": "/work/project",
+                  "log_path": {},
+                  "start_ts": 10.0,
+                  "updated_ts": 15.0
+                }}"#,
+                std::process::id(),
+                std::process::id(),
+                serde_json::to_string(log_path.to_str().unwrap()).unwrap()
+            ),
+        )
+        .unwrap();
+
+        let config = RuntimeConfig { app_dir: app_dir.clone() };
+        let mut offsets = HashMap::new();
+        assert_eq!(run_voice_scan_once(&config, &mut offsets).unwrap(), 0);
+        {
+            let mut handle = fs::OpenOptions::new().append(true).open(&log_path).unwrap();
+            writeln!(
+                handle,
+                r#"{{"type":"event_msg","timestamp":"2026-04-28T00:00:01Z","payload":{{"type":"agent_message","message":"new final","phase":"final_answer"}}}}"#
+            )
+            .unwrap();
+        }
+
+        assert_eq!(run_voice_scan_once(&config, &mut offsets).unwrap(), 1);
+        let entries = fs::read_dir(app_dir.join("voice_inbox"))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        let payload: Value = serde_json::from_str(&fs::read_to_string(entries[0].path()).unwrap()).unwrap();
+        assert_eq!(payload.get("session_id").and_then(Value::as_str), Some("sid-voice"));
+        assert_eq!(payload.get("session_display_name").and_then(Value::as_str), Some("Session"));
+        assert_eq!(payload.get("message_class").and_then(Value::as_str), Some("final_response"));
+        assert_eq!(payload.get("text").and_then(Value::as_str), Some("new final"));
+    }
+
+    #[test]
+    fn voice_delivery_message_id_matches_python_payload_shape() {
+        let id = voice_text_message_id("final_response", "hello   world", Some(1770000000.25));
+        assert_eq!(
+            id,
+            "6dfdb63d008010af119b758cf1c864942eedcbf4f33db478a27859ca557112f7"
+        );
     }
 
     #[test]

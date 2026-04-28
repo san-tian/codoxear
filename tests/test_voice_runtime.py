@@ -3,6 +3,7 @@ import os
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from codoxear.voice_runtime import VoiceRuntime
 
@@ -21,6 +22,36 @@ def _append_jsonl(path: Path, obj: dict) -> None:
 
 
 class TestVoiceRuntime(unittest.TestCase):
+    def test_consumes_rust_voice_inbox_without_log_scan(self) -> None:
+        with TemporaryDirectory() as td:
+            app_dir = Path(td) / "app"
+            inbox_dir = app_dir / "voice_inbox"
+            inbox_dir.mkdir(parents=True)
+            (inbox_dir / "session-a-msg.json").write_text(
+                json.dumps(
+                    {
+                        "message_id": "msg-1",
+                        "session_id": "session-a",
+                        "session_display_name": "Inbox Alias",
+                        "message_class": "final_response",
+                        "text": "final from rust",
+                        "ts": 1770000000.25,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            fake = _FakeCoordinator()
+            with patch.dict(os.environ, {"CODEX_WEB_DISABLE_VOICE_SCAN": "1"}):
+                runtime = VoiceRuntime(app_dir=app_dir, coordinator=fake)
+                runtime.scan_once()
+
+        self.assertEqual(len(fake.observed), 1)
+        self.assertEqual(fake.observed[0]["session_id"], "session-a")
+        self.assertEqual(fake.observed[0]["session_display_name"], "Inbox Alias")
+        self.assertEqual(fake.observed[0]["messages"][0].message_id, "msg-1")
+        self.assertEqual(fake.observed[0]["messages"][0].text, "final from rust")
+        self.assertFalse((inbox_dir / "session-a-msg.json").exists())
+
     def test_scans_new_log_delta_without_full_session_manager(self) -> None:
         with TemporaryDirectory() as td:
             app_dir = Path(td) / "app"

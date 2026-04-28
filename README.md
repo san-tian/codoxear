@@ -180,6 +180,7 @@ Set these in `.env` (or in the process environment):
 - `CODEX_WEB_COOKIE_TTL_SECONDS` (default `2592000`, 30 days)
 - `CODEX_WEB_COOKIE_SECURE` (default `0`; set to `1` behind HTTPS)
 - `CODEX_WEB_HARNESS_SWEEP_SECONDS` (default `2.5`)
+- `CODEX_WEB_VOICE_PUSH_SWEEP_SECONDS` (default `1.0`)
 
 ## Replatforming preview
 
@@ -215,10 +216,11 @@ The Nova preview frontend uses same-origin `/api` by default in production. For 
 
 The local deploy helper `./scripts/codoxear-local` now runs two processes:
 - public Rust web entry on `:8743` redirecting `/` and `/nova/` to `/nova-preview/`, serving the Nova preview shell, the legacy shell at `/legacy/*`, and the migrated public `/api/*` routes
-- voice-runtime Python companion process (no HTTP listen socket) for the remaining live voice/push worker; delayed queue draining and harness sweep both now run in Rust daemon workers, and broker/session discovery for public APIs is Rust-owned
+- voice-runtime Python companion process (no HTTP listen socket) for the remaining live push/TTS/audio worker; delayed queue draining, harness sweep, and live assistant-message voice scanning now run in Rust daemon workers, with voice delivery handed to Python through `APP_DIR/voice_inbox/*.json`
 - `CODEX_WEB_HARNESS_SWEEP_SECONDS` (default `2.5`)
 - `CODEX_WEB_QUEUE_SWEEP_SECONDS` (default `1.0`)
 - `CODEX_WEB_QUEUE_IDLE_GRACE_SECONDS` (default `10.0`)
+- `CODEX_WEB_VOICE_PUSH_SWEEP_SECONDS` (default `1.0`)
 - `CODEX_WEB_DISCOVER_MIN_INTERVAL_SECONDS` (default `1.0`)
 - `CODEX_WEB_METRICS_WINDOW` (default `256`)
 - `CODEX_WEB_FILE_READ_MAX_BYTES` (default `2097152`)

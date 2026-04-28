@@ -69,6 +69,7 @@ start_server() {
   set +a
 
   setsid env \
+    CODEX_WEB_DISABLE_VOICE_SCAN=1 \
     "$PYTHON_BIN" -m codoxear.voice_runtime >>"$WEB_LOG_FILE" 2>&1 < /dev/null &
   web_pid=$!
   echo "$web_pid" > "$WEB_PID_FILE"
@@ -78,6 +79,7 @@ start_server() {
     CODOXEAR_BIND_PORT=8743 \
     CODOXEAR_ENABLE_HARNESS_SWEEP=1 \
     CODOXEAR_ENABLE_QUEUE_SWEEP=1 \
+    CODOXEAR_ENABLE_VOICE_SCAN=1 \
     "$NOVA_BIN" >>"$RUST_LOG_FILE" 2>&1 < /dev/null &
   rust_pid=$!
   echo "$rust_pid" > "$RUST_PID_FILE"

@@ -16,6 +16,7 @@ from . import rollout_log
 from .util import default_app_dir
 from .util import proc_find_open_rollout_log
 from .util import read_jsonl_from_offset
+from .voice_push import ClassifiedAssistantMessage
 from .voice_push import VoicePushCoordinator
 
 
@@ -100,7 +101,9 @@ class VoiceRuntime:
         self.app_dir = Path(app_dir) if app_dir is not None else _app_dir_from_env()
         self.stop_event = stop_event if stop_event is not None else threading.Event()
         self.sock_dir = self.app_dir / "socks"
+        self.inbox_dir = self.app_dir / "voice_inbox"
         self.aliases_path = self.app_dir / "session_aliases.json"
+        self.disable_log_scan = os.environ.get("CODEX_WEB_DISABLE_VOICE_SCAN", "").strip() == "1"
         self.sessions: dict[str, VoiceSession] = {}
         self.coordinator = coordinator
         if self.coordinator is None:
@@ -127,6 +130,9 @@ class VoiceRuntime:
             self.stop_event.wait(VOICE_PUSH_SWEEP_SECONDS)
 
     def scan_once(self) -> None:
+        self.consume_inbox()
+        if self.disable_log_scan:
+            return
         self.discover_sessions()
         aliases = _read_aliases(self.aliases_path)
         for session_id in list(self.sessions.keys()):
@@ -179,6 +185,46 @@ class VoiceRuntime:
             previous.resume_session_id = resume_session_id
         for stale_id in [session_id for session_id in self.sessions.keys() if session_id not in seen]:
             self.sessions.pop(stale_id, None)
+
+    def consume_inbox(self) -> None:
+        if not self.inbox_dir.exists():
+            return
+        grouped: dict[tuple[str, str], list[tuple[Path, ClassifiedAssistantMessage]]] = {}
+        for path in sorted(self.inbox_dir.glob("*.json")):
+            payload = _read_json_object(path)
+            if payload is None:
+                raise ValueError(f"invalid voice inbox payload: {path}")
+            session_id = _clean_optional_text(payload.get("session_id"))
+            display_name = _clean_optional_text(payload.get("session_display_name")) or "Session"
+            message_id = _clean_optional_text(payload.get("message_id"))
+            message_class = _clean_optional_text(payload.get("message_class"))
+            text = payload.get("text")
+            raw_ts = payload.get("ts")
+            if not session_id or not message_id or message_class not in ("narration", "final_response"):
+                raise ValueError(f"invalid voice inbox payload: {path}")
+            if not isinstance(text, str) or not text.strip():
+                raise ValueError(f"invalid voice inbox text: {path}")
+            if raw_ts is None:
+                ts = None
+            elif isinstance(raw_ts, (int, float)):
+                ts = float(raw_ts)
+            else:
+                raise ValueError(f"invalid voice inbox timestamp: {path}")
+            message = ClassifiedAssistantMessage(
+                message_id=message_id,
+                message_class=message_class,
+                text=text,
+                ts=ts,
+            )
+            grouped.setdefault((session_id, display_name), []).append((path, message))
+        for (session_id, display_name), rows in grouped.items():
+            self.coordinator.observe_messages(
+                session_id=session_id,
+                session_display_name=display_name,
+                messages=[message for _path, message in rows],
+            )
+            for path, _message in rows:
+                path.unlink(missing_ok=True)
 
     def _log_path_from_meta(
         self,
