@@ -15,12 +15,13 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const BRACKETED_PASTE_START: &[u8] = b"\x1b[200~";
 const BRACKETED_PASTE_END: &[u8] = b"\x1b[201~";
 const OUTPUT_TAIL_MAX: usize = 256 * 1024;
 const BUSY_HINT_TAIL_MAX: usize = 4096;
+const BUSY_QUIET_SECONDS_DEFAULT: f64 = 3.0;
 static SIGWINCH_PENDING: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug)]
@@ -50,6 +51,8 @@ pub struct BrokerState {
     mirror_output: bool,
     term_query_buf: Vec<u8>,
     busy_hint_tail: String,
+    busy_hint_last_seen: Option<Instant>,
+    busy_from_pty_hint: bool,
 }
 
 impl BrokerState {
@@ -226,6 +229,8 @@ fn run_broker(mut config: BrokerConfig) -> Result<(), String> {
         mirror_output: config.mirror_output,
         term_query_buf: Vec::new(),
         busy_hint_tail: String::new(),
+        busy_hint_last_seen: None,
+        busy_from_pty_hint: false,
     };
     write_metadata(&state)?;
     let runtime = BrokerRuntime {
@@ -247,6 +252,7 @@ fn run_broker(mut config: BrokerConfig) -> Result<(), String> {
     spawn_resize_thread(runtime.clone());
     spawn_log_discovery_thread(runtime.clone());
     spawn_log_idle_thread(runtime.clone());
+    spawn_busy_hint_idle_thread(runtime.clone());
     let mut child = child;
     loop {
         if runtime.stop.load(Ordering::Relaxed) {
@@ -452,6 +458,8 @@ fn handle_conn(runtime: BrokerRuntime, mut stream: UnixStream) {
                     return;
                 };
                 state.busy = true;
+                state.busy_from_pty_hint = false;
+                state.busy_hint_last_seen = None;
                 state.pty_master_fd
             };
             let _ = send_json_line(&mut stream, &json!({"queued": false, "queue_len": 0}));
@@ -535,8 +543,33 @@ fn update_busy_from_pty_text(state: &mut BrokerState, text: &str) {
     state.busy_hint_tail.push_str(&cleaned);
     trim_utf8_tail(&mut state.busy_hint_tail, BUSY_HINT_TAIL_MAX);
     if pty_busy_hint_seen(&previous_tail, &cleaned) {
+        if !state.busy || state.busy_from_pty_hint {
+            state.busy_from_pty_hint = true;
+            state.busy_hint_last_seen = Some(Instant::now());
+        }
         state.busy = true;
     }
+}
+
+fn clear_stale_pty_busy_hint(state: &mut BrokerState, now: Instant, quiet: Duration) -> bool {
+    if !state.busy {
+        state.busy_from_pty_hint = false;
+        state.busy_hint_last_seen = None;
+        return false;
+    }
+    if !state.busy_from_pty_hint {
+        return false;
+    }
+    let Some(last_seen) = state.busy_hint_last_seen else {
+        return false;
+    };
+    if now.saturating_duration_since(last_seen) < quiet {
+        return false;
+    }
+    state.busy = false;
+    state.busy_from_pty_hint = false;
+    state.busy_hint_last_seen = None;
+    true
 }
 
 fn pty_busy_hint_seen(tail: &str, cleaned: &str) -> bool {
@@ -681,6 +714,8 @@ fn spawn_log_idle_thread(runtime: BrokerRuntime) {
                 if let Some(idle) = compute_idle_from_log(path) {
                     if let Ok(mut state) = runtime.state.lock() {
                         state.busy = !idle;
+                        state.busy_from_pty_hint = false;
+                        state.busy_hint_last_seen = None;
                         if idle && state.resume_session_id.is_some() {
                             state.resume_session_id = None;
                             let _ = write_metadata(&state);
@@ -691,6 +726,27 @@ fn spawn_log_idle_thread(runtime: BrokerRuntime) {
             thread::sleep(Duration::from_millis(250));
         }
     });
+}
+
+fn spawn_busy_hint_idle_thread(runtime: BrokerRuntime) {
+    thread::spawn(move || {
+        let quiet = busy_quiet_duration();
+        while !runtime.stop.load(Ordering::Relaxed) {
+            if let Ok(mut state) = runtime.state.lock() {
+                clear_stale_pty_busy_hint(&mut state, Instant::now(), quiet);
+            }
+            thread::sleep(Duration::from_millis(250));
+        }
+    });
+}
+
+fn busy_quiet_duration() -> Duration {
+    let seconds = env::var("CODEX_WEB_BUSY_QUIET_SECONDS")
+        .ok()
+        .and_then(|value| value.trim().parse::<f64>().ok())
+        .unwrap_or(BUSY_QUIET_SECONDS_DEFAULT)
+        .max(0.0);
+    Duration::from_secs_f64(seconds)
 }
 
 fn scan_token_updates_from_log(path: &Path, mut offset: u64) -> Result<(u64, Option<Value>), String> {
@@ -1186,7 +1242,7 @@ mod tests {
         open_pty, run_broker, scan_token_updates_from_log, seq_bytes, session_id_from_log,
         session_id_from_rollout_path, session_log_path_from_args, set_pty_winsize, shell_quote,
         strip_ansi, terminal_size_from_fd, trim_utf8_tail, update_busy_from_pty_text,
-        web_owned_codex_args, write_all_fd, BrokerConfig, BrokerState,
+        clear_stale_pty_busy_hint, web_owned_codex_args, write_all_fd, BrokerConfig, BrokerState,
     };
     use serde_json::{json, Value};
     use std::fs;
@@ -1311,9 +1367,29 @@ mod tests {
         assert!(!state.busy);
         update_busy_from_pty_text(&mut state, "interrupt");
         assert!(state.busy);
+        assert!(state.busy_from_pty_hint);
 
         state.busy = false;
         update_busy_from_pty_text(&mut state, "\x1b[2KCompacting conversation");
+        assert!(state.busy);
+        assert!(state.busy_from_pty_hint);
+    }
+
+    #[test]
+    fn rust_broker_clears_only_stale_pty_hint_busy_state() {
+        let mut state = test_broker_state();
+        let now = Instant::now();
+        state.busy = true;
+        state.busy_from_pty_hint = true;
+        state.busy_hint_last_seen = Some(now - Duration::from_secs(4));
+        assert!(clear_stale_pty_busy_hint(&mut state, now, Duration::from_secs(3)));
+        assert!(!state.busy);
+        assert!(!state.busy_from_pty_hint);
+
+        state.busy = true;
+        state.busy_from_pty_hint = false;
+        state.busy_hint_last_seen = Some(now - Duration::from_secs(4));
+        assert!(!clear_stale_pty_busy_hint(&mut state, now, Duration::from_secs(3)));
         assert!(state.busy);
     }
 
@@ -1551,6 +1627,8 @@ mod tests {
             mirror_output: false,
             term_query_buf: Vec::new(),
             busy_hint_tail: String::new(),
+            busy_hint_last_seen: None,
+            busy_from_pty_hint: false,
         }
     }
 
