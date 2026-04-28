@@ -1,8 +1,8 @@
-use crate::runtime::{compute_idle_from_log, default_app_dir, discover_open_log_for_process};
+use crate::runtime::{compute_idle_from_log, default_app_dir, discover_open_log_for_process, token_update_from_obj};
 use serde_json::{json, Value};
 use std::env;
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 use std::os::fd::{FromRawFd, RawFd};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -450,12 +450,26 @@ fn spawn_log_discovery_thread(runtime: BrokerRuntime) {
 
 fn spawn_log_idle_thread(runtime: BrokerRuntime) {
     thread::spawn(move || {
+        let mut token_scan_path: Option<PathBuf> = None;
+        let mut token_scan_offset = 0u64;
         while !runtime.stop.load(Ordering::Relaxed) {
             let log_path = match runtime.state.lock() {
                 Ok(state) => state.log_path.clone(),
                 Err(_) => return,
             };
             if let Some(path) = log_path.as_ref() {
+                if token_scan_path.as_ref() != Some(path) {
+                    token_scan_path = Some(path.clone());
+                    token_scan_offset = 0;
+                }
+                if let Ok((next_offset, token_update)) = scan_token_updates_from_log(path, token_scan_offset) {
+                    token_scan_offset = next_offset;
+                    if let Some(token) = token_update {
+                        if let Ok(mut state) = runtime.state.lock() {
+                            state.token = Some(token);
+                        }
+                    }
+                }
                 if let Some(idle) = compute_idle_from_log(path) {
                     if let Ok(mut state) = runtime.state.lock() {
                         state.busy = !idle;
@@ -469,6 +483,41 @@ fn spawn_log_idle_thread(runtime: BrokerRuntime) {
             thread::sleep(Duration::from_millis(250));
         }
     });
+}
+
+fn scan_token_updates_from_log(path: &Path, mut offset: u64) -> Result<(u64, Option<Value>), String> {
+    let len = fs::metadata(path).map_err(|err| format!("stat {}: {err}", path.display()))?.len();
+    if offset > len {
+        offset = 0;
+    }
+    let mut file = File::open(path).map_err(|err| format!("open {}: {err}", path.display()))?;
+    file.seek(SeekFrom::Start(offset))
+        .map_err(|err| format!("seek {}: {err}", path.display()))?;
+    let mut reader = BufReader::new(file);
+    let mut next_offset = offset;
+    let mut line = String::new();
+    let mut latest = None;
+    loop {
+        line.clear();
+        let bytes = reader
+            .read_line(&mut line)
+            .map_err(|err| format!("read {}: {err}", path.display()))?;
+        if bytes == 0 {
+            break;
+        }
+        let complete_line = line.ends_with('\n');
+        let parsed = serde_json::from_str::<Value>(line.trim());
+        if !complete_line && parsed.is_err() {
+            break;
+        }
+        next_offset += bytes as u64;
+        if let Ok(obj) = parsed {
+            if let Some(token) = token_update_from_obj(&obj) {
+                latest = Some(token);
+            }
+        }
+    }
+    Ok((next_offset, latest))
 }
 
 fn write_metadata(state: &BrokerState) -> Result<(), String> {
@@ -716,7 +765,7 @@ fn shell_join(items: &[String]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_uuid_like, run_broker, seq_bytes, session_id_from_rollout_path, BrokerConfig};
+    use super::{is_uuid_like, run_broker, scan_token_updates_from_log, seq_bytes, session_id_from_rollout_path, BrokerConfig};
     use serde_json::{json, Value};
     use std::fs;
     use std::io::{BufRead, BufReader, Write};
@@ -741,6 +790,57 @@ mod tests {
             Some("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
         );
         assert!(is_uuid_like("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"));
+    }
+
+    #[test]
+    fn rust_broker_scans_codex_token_updates_incrementally() {
+        let app_dir = temp_app_dir("broker-token");
+        let log_path = app_dir.join("rollout-2026-04-28T00-00-00-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee.jsonl");
+        let first = json!({
+            "type": "event_msg",
+            "timestamp": "2026-04-28T00:00:00Z",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "total_token_usage": {},
+                    "model_context_window": 128000,
+                    "last_token_usage": {"total_tokens": 64000}
+                }
+            }
+        });
+        fs::write(&log_path, format!("{first}\n")).unwrap();
+
+        let (offset, token) = scan_token_updates_from_log(&log_path, 0).unwrap();
+        let token = token.unwrap();
+        assert_eq!(token["context_window"], 128000);
+        assert_eq!(token["tokens_in_context"], 64000);
+        assert_eq!(token["tokens_remaining"], 64000);
+        assert_eq!(token["percent_remaining"], 55);
+        assert_eq!(token["baseline_tokens"], 12000);
+        assert_eq!(token["as_of"], "2026-04-28T00:00:00Z");
+
+        let second = json!({
+            "type": "event_msg",
+            "timestamp": "2026-04-28T00:00:01Z",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "total_token_usage": {},
+                    "model_context_window": 128000,
+                    "last_token_usage": {"total_tokens": 118000}
+                }
+            }
+        });
+        let mut file = fs::OpenOptions::new().append(true).open(&log_path).unwrap();
+        writeln!(file, "{{not-json").unwrap();
+        writeln!(file, "{second}").unwrap();
+
+        let (_next_offset, token) = scan_token_updates_from_log(&log_path, offset).unwrap();
+        let token = token.unwrap();
+        assert_eq!(token["tokens_in_context"], 118000);
+        assert_eq!(token["tokens_remaining"], 10000);
+        assert_eq!(token["percent_remaining"], 9);
+        assert_eq!(token["as_of"], "2026-04-28T00:00:01Z");
     }
 
     #[test]

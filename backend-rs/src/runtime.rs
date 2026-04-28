@@ -7318,7 +7318,7 @@ fn pi_message_keeps_turn_busy(obj: &Value) -> bool {
     pi_message_role_value(obj) == Some("toolResult") || pi_assistant_tool_use_count(obj) > 0 || pi_assistant_thinking_count(obj) > 0
 }
 
-fn token_update_from_obj(obj: &Value) -> Option<Value> {
+pub(crate) fn token_update_from_obj(obj: &Value) -> Option<Value> {
     pi_token_update_from_obj(obj).or_else(|| codex_token_update_from_obj(obj))
 }
 
