@@ -1,0 +1,833 @@
+use crate::runtime::{compute_idle_from_log, default_app_dir, discover_open_log_for_process};
+use serde_json::{json, Value};
+use std::env;
+use std::fs::{self, File};
+use std::io::{BufRead, BufReader, Write};
+use std::os::fd::{FromRawFd, RawFd};
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::process::CommandExt;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+const BRACKETED_PASTE_START: &[u8] = b"\x1b[200~";
+const BRACKETED_PASTE_END: &[u8] = b"\x1b[201~";
+const OUTPUT_TAIL_MAX: usize = 256 * 1024;
+
+#[derive(Debug)]
+pub struct BrokerState {
+    pub agent_pid: i64,
+    pub pty_master_fd: RawFd,
+    pub cwd: String,
+    pub start_ts: f64,
+    pub sock_path: PathBuf,
+    pub agent_backend: String,
+    pub owner: Option<String>,
+    pub log_path: Option<PathBuf>,
+    pub session_id: Option<String>,
+    pub busy: bool,
+    pub output_tail: String,
+    pub token: Option<Value>,
+    pub resume_session_id: Option<String>,
+    pub model_provider: Option<String>,
+    pub preferred_auth_method: Option<String>,
+    pub model: Option<String>,
+    pub reasoning_effort: Option<String>,
+    pub service_tier: Option<String>,
+    pub transport: Option<String>,
+    pub tmux_session: Option<String>,
+    pub tmux_window: Option<String>,
+    pub spawn_nonce: Option<String>,
+    mirror_output: bool,
+    term_query_buf: Vec<u8>,
+}
+
+impl BrokerState {
+    fn metadata_value(&self) -> Value {
+        json!({
+            "session_id": self.session_id,
+            "owner": self.owner,
+            "broker_pid": std::process::id(),
+            "sessiond_pid": std::process::id(),
+            "codex_pid": self.agent_pid,
+            "cwd": self.cwd,
+            "start_ts": self.start_ts,
+            "log_path": self.log_path.as_ref().map(|path| path.display().to_string()),
+            "sock_path": self.sock_path.display().to_string(),
+            "agent_backend": self.agent_backend,
+            "resume_session_id": self.resume_session_id,
+            "model_provider": self.model_provider,
+            "preferred_auth_method": self.preferred_auth_method,
+            "model": self.model,
+            "reasoning_effort": self.reasoning_effort,
+            "service_tier": self.service_tier,
+            "transport": self.transport,
+            "tmux_session": self.tmux_session,
+            "tmux_window": self.tmux_window,
+            "spawn_nonce": self.spawn_nonce,
+        })
+    }
+}
+
+#[derive(Debug)]
+struct BrokerConfig {
+    cwd: PathBuf,
+    agent_args: Vec<String>,
+    app_dir: PathBuf,
+    agent_backend: String,
+    agent_bin: String,
+    agent_home: PathBuf,
+    owner: Option<String>,
+    mirror_output: bool,
+}
+
+#[derive(Clone)]
+struct BrokerRuntime {
+    state: Arc<Mutex<BrokerState>>,
+    stop: Arc<AtomicBool>,
+}
+
+pub fn main_entry() -> Result<(), String> {
+    let config = parse_args(env::args().skip(1).collect())?;
+    run_broker(config)
+}
+
+fn parse_args(args: Vec<String>) -> Result<BrokerConfig, String> {
+    let mut cwd = env::current_dir().map_err(|err| format!("current dir: {err}"))?;
+    let mut index = 0usize;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--cwd" => {
+                index += 1;
+                let Some(raw) = args.get(index) else {
+                    return Err("--cwd requires a value".to_string());
+                };
+                cwd = expand_path(raw)?;
+                index += 1;
+            }
+            "--" => {
+                index += 1;
+                break;
+            }
+            value => {
+                return Err(format!("unknown broker argument: {value}"));
+            }
+        }
+    }
+    let agent_args = args[index..].to_vec();
+    let app_dir = default_app_dir()?;
+    let agent_backend = env::var("CODEX_WEB_AGENT_BACKEND")
+        .ok()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "codex".to_string());
+    let (agent_bin, agent_home) = if agent_backend == "pi" {
+        (
+            env::var("PI_BIN").ok().filter(|value| !value.trim().is_empty()).unwrap_or_else(|| "pi".to_string()),
+            env_path("PI_HOME").unwrap_or_else(|| home_dir().join(".pi")),
+        )
+    } else {
+        (
+            env::var("CODEX_BIN")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| "codex".to_string()),
+            env_path("CODEX_HOME").unwrap_or_else(|| home_dir().join(".codex")),
+        )
+    };
+    Ok(BrokerConfig {
+        cwd,
+        agent_args,
+        app_dir,
+        agent_backend,
+        agent_bin,
+        agent_home,
+        owner: clean_env("CODEX_WEB_OWNER"),
+        mirror_output: true,
+    })
+}
+
+fn run_broker(config: BrokerConfig) -> Result<(), String> {
+    if config.agent_backend != "codex" {
+        return Err("codoxear-broker-rs currently supports Codex sessions only".to_string());
+    }
+    let (rows, cols) = terminal_size();
+    let (master_fd, slave_fd) = open_pty(rows, cols)?;
+    let child = spawn_agent(&config, slave_fd, rows, cols)?;
+    let sock_dir = config.app_dir.join("socks");
+    fs::create_dir_all(&sock_dir).map_err(|err| format!("create {}: {err}", sock_dir.display()))?;
+    let sock_path = sock_dir.join(format!("broker-{}.sock", std::process::id()));
+    let start_ts = epoch_now();
+    let state = BrokerState {
+        agent_pid: i64::from(child.id()),
+        pty_master_fd: master_fd,
+        cwd: config.cwd.display().to_string(),
+        start_ts,
+        sock_path,
+        agent_backend: config.agent_backend.clone(),
+        owner: config.owner.clone(),
+        log_path: None,
+        session_id: None,
+        busy: false,
+        output_tail: String::new(),
+        token: None,
+        resume_session_id: clean_env("CODEX_WEB_RESUME_SESSION_ID").or_else(|| resume_session_id_from_args(&config.agent_args)),
+        model_provider: clean_env("CODEX_WEB_MODEL_PROVIDER"),
+        preferred_auth_method: clean_env("CODEX_WEB_PREFERRED_AUTH_METHOD"),
+        model: clean_env("CODEX_WEB_MODEL"),
+        reasoning_effort: clean_env("CODEX_WEB_REASONING_EFFORT"),
+        service_tier: clean_env("CODEX_WEB_SERVICE_TIER"),
+        transport: clean_env("CODEX_WEB_TRANSPORT"),
+        tmux_session: clean_env("CODEX_WEB_TMUX_SESSION"),
+        tmux_window: clean_env("CODEX_WEB_TMUX_WINDOW"),
+        spawn_nonce: clean_env("CODEX_WEB_SPAWN_NONCE"),
+        mirror_output: config.mirror_output,
+        term_query_buf: Vec::new(),
+    };
+    write_metadata(&state)?;
+    let runtime = BrokerRuntime {
+        state: Arc::new(Mutex::new(state)),
+        stop: Arc::new(AtomicBool::new(false)),
+    };
+    spawn_socket_thread(runtime.clone());
+    spawn_pty_reader_thread(runtime.clone());
+    spawn_log_discovery_thread(runtime.clone());
+    spawn_log_idle_thread(runtime.clone());
+    let mut child = child;
+    loop {
+        if runtime.stop.load(Ordering::Relaxed) {
+            terminate_process_group(i64::from(child.id()));
+            break;
+        }
+        match child.try_wait() {
+            Ok(Some(_status)) => break,
+            Ok(None) => thread::sleep(Duration::from_millis(100)),
+            Err(_err) => break,
+        }
+    }
+    runtime.stop.store(true, Ordering::Relaxed);
+    let _ = unsafe { libc::close(master_fd) };
+    if let Ok(state) = runtime.state.lock() {
+        let _ = fs::remove_file(&state.sock_path);
+        let _ = fs::remove_file(state.sock_path.with_extension("json"));
+    }
+    Ok(())
+}
+
+fn spawn_agent(config: &BrokerConfig, slave_fd: RawFd, rows: u16, cols: u16) -> Result<std::process::Child, String> {
+    let mut command = if config.owner.as_deref() == Some("web") {
+        let shell = env::var("SHELL").ok().filter(|value| !value.trim().is_empty()).unwrap_or_else(|| "/bin/bash".to_string());
+        let mut cmd = Command::new(shell);
+        let inline = format!(
+            "cd {} && exec {}",
+            shell_quote(&config.cwd.display().to_string()),
+            shell_join(
+                std::iter::once(config.agent_bin.clone())
+                    .chain(config.agent_args.iter().cloned())
+                    .collect::<Vec<_>>()
+                    .as_slice(),
+            ),
+        );
+        cmd.args(["-l", "-i", "-c", &inline]);
+        cmd
+    } else {
+        let mut cmd = Command::new(&config.agent_bin);
+        cmd.args(config.agent_args.iter().map(String::as_str));
+        cmd
+    };
+    let stdin_fd = unsafe { libc::dup(slave_fd) };
+    let stdout_fd = unsafe { libc::dup(slave_fd) };
+    let stderr_fd = unsafe { libc::dup(slave_fd) };
+    if stdin_fd < 0 || stdout_fd < 0 || stderr_fd < 0 {
+        return Err("dup pty slave failed".to_string());
+    }
+    command
+        .current_dir(&config.cwd)
+        .env("TERM", env::var("TERM").ok().filter(|value| !value.trim().is_empty()).unwrap_or_else(|| "xterm-256color".to_string()))
+        .env("COLUMNS", cols.to_string())
+        .env("LINES", rows.to_string())
+        .env("CODEX_HOME", &config.agent_home)
+        .stdin(unsafe { Stdio::from(File::from_raw_fd(stdin_fd)) })
+        .stdout(unsafe { Stdio::from(File::from_raw_fd(stdout_fd)) })
+        .stderr(unsafe { Stdio::from(File::from_raw_fd(stderr_fd)) });
+    unsafe {
+        command.pre_exec(move || {
+            libc::setsid();
+            libc::ioctl(slave_fd, libc::TIOCSCTTY, 0);
+            Ok(())
+        });
+    }
+    let child = command.spawn().map_err(|err| format!("spawn {}: {err}", config.agent_bin))?;
+    let _ = unsafe { libc::close(slave_fd) };
+    Ok(child)
+}
+
+fn spawn_socket_thread(runtime: BrokerRuntime) {
+    thread::spawn(move || {
+        if let Err(err) = socket_server(runtime.clone()) {
+            eprintln!("error: rust broker socket server crashed: {err}");
+            runtime.stop.store(true, Ordering::Relaxed);
+        }
+    });
+}
+
+fn socket_server(runtime: BrokerRuntime) -> Result<(), String> {
+    let sock_path = runtime.state.lock().map_err(|_| "broker state lock poisoned".to_string())?.sock_path.clone();
+    if sock_path.exists() {
+        let _ = fs::remove_file(&sock_path);
+    }
+    let listener = UnixListener::bind(&sock_path).map_err(|err| format!("bind {}: {err}", sock_path.display()))?;
+    fs::set_permissions(&sock_path, fs::Permissions::from_mode(0o600))
+        .map_err(|err| format!("chmod {}: {err}", sock_path.display()))?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|err| format!("set nonblocking {}: {err}", sock_path.display()))?;
+    while !runtime.stop.load(Ordering::Relaxed) {
+        match listener.accept() {
+            Ok((stream, _addr)) => {
+                let next = runtime.clone();
+                thread::spawn(move || handle_conn(next, stream));
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => thread::sleep(Duration::from_millis(50)),
+            Err(err) => return Err(format!("accept {}: {err}", sock_path.display())),
+        }
+    }
+    Ok(())
+}
+
+fn handle_conn(runtime: BrokerRuntime, mut stream: UnixStream) {
+    let cloned = match stream.try_clone() {
+        Ok(value) => value,
+        Err(err) => {
+            let _ = send_json_line(&mut stream, &json!({"error": format!("clone stream: {err}")}));
+            return;
+        }
+    };
+    let mut reader = BufReader::new(cloned);
+    let mut line = String::new();
+    if reader.read_line(&mut line).ok().filter(|n| *n > 0).is_none() {
+        return;
+    }
+    let request = match serde_json::from_str::<Value>(line.trim()) {
+        Ok(value) => value,
+        Err(err) => {
+            let _ = send_json_line(&mut stream, &json!({"error": format!("invalid json: {err}")}));
+            return;
+        }
+    };
+    let cmd = request.get("cmd").and_then(Value::as_str).unwrap_or_default();
+    match cmd {
+        "state" => {
+            let response = runtime
+                .state
+                .lock()
+                .map(|state| json!({"busy": state.busy, "queue_len": 0, "token": state.token}))
+                .unwrap_or_else(|_| json!({"error": "no state"}));
+            let _ = send_json_line(&mut stream, &response);
+        }
+        "tail" => {
+            let response = runtime
+                .state
+                .lock()
+                .map(|state| json!({"tail": state.output_tail}))
+                .unwrap_or_else(|_| json!({"tail": ""}));
+            let _ = send_json_line(&mut stream, &response);
+        }
+        "send" => {
+            let Some(text) = request.get("text").and_then(Value::as_str).filter(|value| !value.trim().is_empty()) else {
+                let _ = send_json_line(&mut stream, &json!({"error": "text required"}));
+                return;
+            };
+            let enter = request
+                .get("enter_seq")
+                .and_then(Value::as_str)
+                .map(seq_bytes)
+                .unwrap_or_else(default_enter_seq);
+            let fd = {
+                let Ok(mut state) = runtime.state.lock() else {
+                    let _ = send_json_line(&mut stream, &json!({"error": "no state"}));
+                    return;
+                };
+                state.busy = true;
+                state.pty_master_fd
+            };
+            let _ = send_json_line(&mut stream, &json!({"queued": false, "queue_len": 0}));
+            let _ = inject_text(fd, text, &enter);
+        }
+        "keys" => {
+            let Some(seq) = request.get("seq").and_then(Value::as_str).filter(|value| !value.is_empty()) else {
+                let _ = send_json_line(&mut stream, &json!({"error": "seq required"}));
+                return;
+            };
+            let bytes = seq_bytes(seq);
+            let fd = match runtime.state.lock() {
+                Ok(state) => state.pty_master_fd,
+                Err(_) => {
+                    let _ = send_json_line(&mut stream, &json!({"error": "no state"}));
+                    return;
+                }
+            };
+            let response = json!({"ok": true, "queued": false, "n": bytes.len(), "key_queue_len": 0});
+            let _ = send_json_line(&mut stream, &response);
+            let _ = write_all_fd(fd, &bytes);
+        }
+        "shutdown" => {
+            let _ = send_json_line(&mut stream, &json!({"ok": true}));
+            runtime.stop.store(true, Ordering::Relaxed);
+        }
+        _ => {
+            let _ = send_json_line(&mut stream, &json!({"error": "unknown cmd"}));
+        }
+    }
+}
+
+fn spawn_pty_reader_thread(runtime: BrokerRuntime) {
+    thread::spawn(move || {
+        let fd = match runtime.state.lock() {
+            Ok(state) => state.pty_master_fd,
+            Err(_) => return,
+        };
+        let mut buf = [0u8; 4096];
+        while !runtime.stop.load(Ordering::Relaxed) {
+            let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+            if n <= 0 {
+                break;
+            }
+            let bytes = &buf[..n as usize];
+            let mut state = match runtime.state.lock() {
+                Ok(value) => value,
+                Err(_) => break,
+            };
+            if state.mirror_output {
+                let _ = std::io::stdout().write_all(bytes);
+                let _ = std::io::stdout().flush();
+            }
+            reply_to_terminal_queries(&mut state, bytes);
+            let text = String::from_utf8_lossy(bytes);
+            state.output_tail.push_str(&text);
+            if state.output_tail.len() > OUTPUT_TAIL_MAX {
+                let start = state.output_tail.len() - OUTPUT_TAIL_MAX;
+                state.output_tail = state.output_tail[start..].to_string();
+            }
+        }
+        runtime.stop.store(true, Ordering::Relaxed);
+    });
+}
+
+fn spawn_log_discovery_thread(runtime: BrokerRuntime) {
+    thread::spawn(move || {
+        while !runtime.stop.load(Ordering::Relaxed) {
+            let (pid, cwd, backend, current) = match runtime.state.lock() {
+                Ok(state) => (
+                    state.agent_pid,
+                    state.cwd.clone(),
+                    state.agent_backend.clone(),
+                    state.log_path.clone(),
+                ),
+                Err(_) => return,
+            };
+            if current.as_ref().map(|path| path.exists()).unwrap_or(false) {
+                thread::sleep(Duration::from_millis(250));
+                continue;
+            }
+            if let Some(path) = discover_open_log_for_process(pid, &cwd, &backend) {
+                if let Some(session_id) = session_id_from_rollout_path(&path) {
+                    if let Ok(mut state) = runtime.state.lock() {
+                        state.log_path = Some(path);
+                        state.session_id = Some(session_id);
+                        let _ = write_metadata(&state);
+                    }
+                }
+            }
+            thread::sleep(Duration::from_millis(250));
+        }
+    });
+}
+
+fn spawn_log_idle_thread(runtime: BrokerRuntime) {
+    thread::spawn(move || {
+        while !runtime.stop.load(Ordering::Relaxed) {
+            let log_path = match runtime.state.lock() {
+                Ok(state) => state.log_path.clone(),
+                Err(_) => return,
+            };
+            if let Some(path) = log_path.as_ref() {
+                if let Some(idle) = compute_idle_from_log(path) {
+                    if let Ok(mut state) = runtime.state.lock() {
+                        state.busy = !idle;
+                        if idle && state.resume_session_id.is_some() {
+                            state.resume_session_id = None;
+                            let _ = write_metadata(&state);
+                        }
+                    }
+                }
+            }
+            thread::sleep(Duration::from_millis(250));
+        }
+    });
+}
+
+fn write_metadata(state: &BrokerState) -> Result<(), String> {
+    if let Some(parent) = state.sock_path.parent() {
+        fs::create_dir_all(parent).map_err(|err| format!("create {}: {err}", parent.display()))?;
+    }
+    let meta_path = state.sock_path.with_extension("json");
+    let raw = serde_json::to_string(&state.metadata_value())
+        .map_err(|err| format!("serialize {}: {err}", meta_path.display()))?;
+    fs::write(&meta_path, raw).map_err(|err| format!("write {}: {err}", meta_path.display()))?;
+    fs::set_permissions(&meta_path, fs::Permissions::from_mode(0o600))
+        .map_err(|err| format!("chmod {}: {err}", meta_path.display()))
+}
+
+fn inject_text(fd: RawFd, text: &str, suffix: &[u8]) -> Result<(), String> {
+    let mut payload = Vec::with_capacity(BRACKETED_PASTE_START.len() + text.len() + BRACKETED_PASTE_END.len() + suffix.len());
+    payload.extend_from_slice(BRACKETED_PASTE_START);
+    payload.extend_from_slice(text.as_bytes());
+    payload.extend_from_slice(BRACKETED_PASTE_END);
+    payload.extend_from_slice(suffix);
+    write_all_fd(fd, &payload)
+}
+
+fn write_all_fd(fd: RawFd, mut data: &[u8]) -> Result<(), String> {
+    while !data.is_empty() {
+        let n = unsafe { libc::write(fd, data.as_ptr().cast(), data.len()) };
+        if n <= 0 {
+            return Err("write to pty failed".to_string());
+        }
+        data = &data[n as usize..];
+    }
+    Ok(())
+}
+
+fn send_json_line(stream: &mut UnixStream, value: &Value) -> Result<(), String> {
+    let mut raw = serde_json::to_vec(value).map_err(|err| format!("serialize socket response: {err}"))?;
+    raw.push(b'\n');
+    stream.write_all(&raw).map_err(|err| format!("write socket response: {err}"))
+}
+
+fn seq_bytes(raw: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut chars = raw.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            let mut buf = [0u8; 4];
+            out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+            continue;
+        }
+        match chars.next() {
+            Some('r') => out.push(b'\r'),
+            Some('n') => out.push(b'\n'),
+            Some('t') => out.push(b'\t'),
+            Some('\\') => out.push(b'\\'),
+            Some('x') => {
+                let hi = chars.next().and_then(|value| value.to_digit(16));
+                let lo = chars.next().and_then(|value| value.to_digit(16));
+                match (hi, lo) {
+                    (Some(hi), Some(lo)) => out.push(((hi << 4) + lo) as u8),
+                    _ => out.extend_from_slice(b"\\x"),
+                }
+            }
+            Some(other) => {
+                out.push(b'\\');
+                let mut buf = [0u8; 4];
+                out.extend_from_slice(other.encode_utf8(&mut buf).as_bytes());
+            }
+            None => out.push(b'\\'),
+        }
+    }
+    if out.is_empty() { vec![b'\r'] } else { out }
+}
+
+fn default_enter_seq() -> Vec<u8> {
+    env::var("CODEX_WEB_ENTER_SEQ")
+        .ok()
+        .map(|value| seq_bytes(&value))
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| vec![b'\r'])
+}
+
+fn reply_to_terminal_queries(state: &mut BrokerState, bytes: &[u8]) {
+    state.term_query_buf.extend_from_slice(bytes);
+    if state.term_query_buf.len() > 256 {
+        let keep_from = state.term_query_buf.len() - 256;
+        state.term_query_buf = state.term_query_buf[keep_from..].to_vec();
+    }
+    for (query, response) in [
+        (b"\x1b[5n".as_slice(), b"\x1b[0n".as_slice()),
+        (b"\x1b[6n".as_slice(), b"\x1b[1;1R".as_slice()),
+        (b"\x1b[c".as_slice(), b"\x1b[?1;2c".as_slice()),
+        (b"\x1b[>c".as_slice(), b"\x1b[>0;0;0c".as_slice()),
+        (b"\x1b[?u".as_slice(), b"\x1b[?1u".as_slice()),
+        (b"\x1b]10;?\x1b\\".as_slice(), b"\x1b]10;rgb:c0c0/c0c0/c0c0\x1b\\".as_slice()),
+        (b"\x1b]11;?\x1b\\".as_slice(), b"\x1b]11;rgb:0000/0000/0000\x1b\\".as_slice()),
+    ] {
+        if contains_bytes(&state.term_query_buf, query) {
+            let _ = write_all_fd(state.pty_master_fd, response);
+            state.term_query_buf.clear();
+        }
+    }
+}
+
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.windows(needle.len()).any(|window| window == needle)
+}
+
+fn session_id_from_rollout_path(path: &Path) -> Option<String> {
+    let name = path.file_name()?.to_str()?;
+    for part in name.split(|ch| ch == '-' || ch == '.') {
+        if part.len() == 12 && name.len() >= 36 {
+            break;
+        }
+    }
+    let bytes = name.as_bytes();
+    for idx in 0..bytes.len().saturating_sub(36) {
+        let candidate = &name[idx..idx + 36];
+        if is_uuid_like(candidate) {
+            return Some(candidate.to_ascii_lowercase());
+        }
+    }
+    None
+}
+
+fn is_uuid_like(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() != 36 {
+        return false;
+    }
+    for (idx, byte) in bytes.iter().enumerate() {
+        if matches!(idx, 8 | 13 | 18 | 23) {
+            if *byte != b'-' {
+                return false;
+            }
+        } else if !byte.is_ascii_hexdigit() {
+            return false;
+        }
+    }
+    true
+}
+
+fn open_pty(rows: u16, cols: u16) -> Result<(RawFd, RawFd), String> {
+    let mut master = 0;
+    let mut slave = 0;
+    let mut winsize = libc::winsize {
+        ws_row: rows,
+        ws_col: cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    let rc = unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            &mut winsize,
+        )
+    };
+    if rc != 0 {
+        return Err("openpty failed".to_string());
+    }
+    Ok((master, slave))
+}
+
+fn terminal_size() -> (u16, u16) {
+    (40, 120)
+}
+
+fn terminate_process_group(pid: i64) {
+    if pid <= 0 {
+        return;
+    }
+    unsafe {
+        libc::killpg(pid as libc::pid_t, libc::SIGTERM);
+    }
+    thread::sleep(Duration::from_millis(200));
+    unsafe {
+        libc::killpg(pid as libc::pid_t, libc::SIGKILL);
+    }
+}
+
+fn resume_session_id_from_args(args: &[String]) -> Option<String> {
+    args.windows(2)
+        .find(|pair| pair[0] == "resume")
+        .map(|pair| pair[1].trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn expand_path(raw: &str) -> Result<PathBuf, String> {
+    let value = raw.trim();
+    if value.is_empty() {
+        return Err("cwd required".to_string());
+    }
+    let path = if value == "~" {
+        home_dir()
+    } else if let Some(rest) = value.strip_prefix("~/") {
+        home_dir().join(rest)
+    } else {
+        PathBuf::from(value)
+    };
+    Ok(if path.is_absolute() {
+        path
+    } else {
+        env::current_dir().map_err(|err| format!("current dir: {err}"))?.join(path)
+    })
+}
+
+fn env_path(key: &str) -> Option<PathBuf> {
+    env::var(key)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+fn clean_env(key: &str) -> Option<String> {
+    env::var(key)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn home_dir() -> PathBuf {
+    env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("/"))
+}
+
+fn epoch_now() -> f64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs_f64())
+        .unwrap_or(0.0)
+}
+
+fn shell_quote(value: &str) -> String {
+    if value.is_empty() {
+        return "''".to_string();
+    }
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn shell_join(items: &[String]) -> String {
+    items.iter().map(|item| shell_quote(item)).collect::<Vec<_>>().join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_uuid_like, run_broker, seq_bytes, session_id_from_rollout_path, BrokerConfig};
+    use serde_json::{json, Value};
+    use std::fs;
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixStream;
+    use std::path::Path;
+    use std::path::PathBuf;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn broker_seq_bytes_decodes_python_style_escape_sequences() {
+        assert_eq!(seq_bytes("\\x1b"), vec![0x1b]);
+        assert_eq!(seq_bytes("hi\\r"), b"hi\r".to_vec());
+        assert_eq!(seq_bytes("\\n\\t\\\\"), b"\n\t\\".to_vec());
+    }
+
+    #[test]
+    fn broker_extracts_codex_session_id_from_rollout_filename() {
+        let path = Path::new("/tmp/rollout-2026-04-28T00-00-00-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee.jsonl");
+        assert_eq!(
+            session_id_from_rollout_path(path).as_deref(),
+            Some("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+        );
+        assert!(is_uuid_like("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"));
+    }
+
+    #[test]
+    fn rust_broker_serves_socket_state_tail_keys_and_shutdown() {
+        let app_dir = temp_app_dir("broker-socket");
+        let config = BrokerConfig {
+            cwd: app_dir.clone(),
+            agent_args: vec![
+                "-c".to_string(),
+                "printf READY; while true; do sleep 1; done".to_string(),
+            ],
+            app_dir: app_dir.clone(),
+            agent_backend: "codex".to_string(),
+            agent_bin: "sh".to_string(),
+            agent_home: app_dir.join("codex-home"),
+            owner: None,
+            mirror_output: false,
+        };
+        let handle = thread::spawn(move || run_broker(config));
+        let sock_path = wait_for_sock(&app_dir);
+        let state = socket_request(&sock_path, json!({"cmd":"state"}));
+        assert_eq!(state.get("queue_len").and_then(Value::as_i64), Some(0));
+        assert_eq!(state.get("busy").and_then(Value::as_bool), Some(false));
+
+        let tail = wait_for_tail(&sock_path);
+        assert!(tail.contains("READY"));
+
+        let keys = socket_request(&sock_path, json!({"cmd":"keys","seq":"\\x1b"}));
+        assert_eq!(keys.get("ok").and_then(Value::as_bool), Some(true));
+        assert_eq!(keys.get("n").and_then(Value::as_i64), Some(1));
+
+        let shutdown = socket_request(&sock_path, json!({"cmd":"shutdown"}));
+        assert_eq!(shutdown.get("ok").and_then(Value::as_bool), Some(true));
+        let result = handle.join().unwrap();
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    fn temp_app_dir(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "codoxear-rs-{name}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(path.join("socks")).unwrap();
+        path
+    }
+
+    fn wait_for_sock(app_dir: &Path) -> PathBuf {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            let socks = fs::read_dir(app_dir.join("socks"))
+                .unwrap()
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("sock"))
+                .collect::<Vec<_>>();
+            if let Some(path) = socks.into_iter().next() {
+                return path;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        panic!("broker socket was not published");
+    }
+
+    fn wait_for_tail(sock_path: &Path) -> String {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            let payload = socket_request(sock_path, json!({"cmd":"tail"}));
+            let tail = payload.get("tail").and_then(Value::as_str).unwrap_or_default().to_string();
+            if tail.contains("READY") {
+                return tail;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        panic!("broker tail never contained READY");
+    }
+
+    fn socket_request(sock_path: &Path, request: Value) -> Value {
+        let mut stream = UnixStream::connect(sock_path).unwrap();
+        let mut raw = serde_json::to_vec(&request).unwrap();
+        raw.push(b'\n');
+        stream.write_all(&raw).unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        serde_json::from_str(line.trim()).unwrap()
+    }
+}

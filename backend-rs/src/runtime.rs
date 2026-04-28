@@ -6090,6 +6090,40 @@ fn python_bin(repo_root: &Path) -> PathBuf {
     PathBuf::from("python3")
 }
 
+fn rust_broker_enabled() -> bool {
+    env::var("CODOXEAR_ENABLE_RUST_BROKER")
+        .ok()
+        .map(|value| value.trim() == "1")
+        .unwrap_or(false)
+}
+
+fn rust_broker_bin(repo_root: &Path) -> PathBuf {
+    if let Some(path) = env::var("CODOXEAR_RUST_BROKER_BIN").ok().map(|value| value.trim().to_string()).filter(|value| !value.is_empty()) {
+        return PathBuf::from(path);
+    }
+    if let Ok(exe) = env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            let sibling = parent.join("codoxear-broker-rs");
+            if sibling.exists() {
+                return sibling;
+            }
+            if parent.file_name().and_then(|name| name.to_str()) == Some("deps") {
+                if let Some(debug_dir) = parent.parent() {
+                    let debug_sibling = debug_dir.join("codoxear-broker-rs");
+                    if debug_sibling.exists() {
+                        return debug_sibling;
+                    }
+                }
+            }
+        }
+    }
+    repo_root
+        .join("backend-rs")
+        .join("target")
+        .join("release")
+        .join("codoxear-broker-rs")
+}
+
 fn expand_user_and_vars(raw: &str) -> PathBuf {
     let home = home_dir().unwrap_or_else(|| PathBuf::from("~"));
     let home_text = home.display().to_string();
@@ -6512,40 +6546,34 @@ pub fn create_session(config: &RuntimeConfig, request: CreateSessionRequest) -> 
         cwd_path.clone()
     };
 
-    let mut broker_args = vec![
-        "-m".to_string(),
-        "codoxear.broker".to_string(),
-        "--cwd".to_string(),
-        spawn_cwd.display().to_string(),
-        "--".to_string(),
-    ];
+    let mut agent_args = Vec::new();
     if backend_name == "codex" {
-        broker_args.push("-c".to_string());
-        broker_args.push(codex_trust_override_for_path(&spawn_cwd));
-        broker_args.push("--dangerously-bypass-approvals-and-sandbox".to_string());
+        agent_args.push("-c".to_string());
+        agent_args.push(codex_trust_override_for_path(&spawn_cwd));
+        agent_args.push("--dangerously-bypass-approvals-and-sandbox".to_string());
         if let Some(model) = request.model.as_deref() {
-            broker_args.push("--model".to_string());
-            broker_args.push(model.to_string());
+            agent_args.push("--model".to_string());
+            agent_args.push(model.to_string());
         }
         if let Some(reasoning_effort) = request.reasoning_effort.as_deref() {
-            broker_args.push("-c".to_string());
-            broker_args.push(format!("model_reasoning_effort=\"{}\"", reasoning_effort));
+            agent_args.push("-c".to_string());
+            agent_args.push(format!("model_reasoning_effort=\"{}\"", reasoning_effort));
         }
         if let Some(model_provider) = request.model_provider.as_deref() {
-            broker_args.push("-c".to_string());
-            broker_args.push(format!("model_provider=\"{}\"", model_provider));
+            agent_args.push("-c".to_string());
+            agent_args.push(format!("model_provider=\"{}\"", model_provider));
         }
         if let Some(preferred_auth_method) = request.preferred_auth_method.as_deref() {
-            broker_args.push("-c".to_string());
-            broker_args.push(format!("preferred_auth_method=\"{}\"", preferred_auth_method));
+            agent_args.push("-c".to_string());
+            agent_args.push(format!("preferred_auth_method=\"{}\"", preferred_auth_method));
         }
         if let Some(service_tier) = request.service_tier.as_deref() {
-            broker_args.push("-c".to_string());
-            broker_args.push(format!("service_tier=\"{}\"", service_tier));
+            agent_args.push("-c".to_string());
+            agent_args.push(format!("service_tier=\"{}\"", service_tier));
         }
         if let Some(resume_id) = resume_id {
-            broker_args.push("resume".to_string());
-            broker_args.push(resume_id.to_string());
+            agent_args.push("resume".to_string());
+            agent_args.push(resume_id.to_string());
         }
     } else {
         if request.preferred_auth_method.is_some() {
@@ -6555,20 +6583,20 @@ pub fn create_session(config: &RuntimeConfig, request: CreateSessionRequest) -> 
             return Err(CreateSessionError::bad_request("service_tier is not supported for pi"));
         }
         if let Some(model_provider) = request.model_provider.as_deref() {
-            broker_args.push("--provider".to_string());
-            broker_args.push(model_provider.to_string());
+            agent_args.push("--provider".to_string());
+            agent_args.push(model_provider.to_string());
         }
         if let Some(model) = request.model.as_deref() {
-            broker_args.push("--model".to_string());
-            broker_args.push(model.to_string());
+            agent_args.push("--model".to_string());
+            agent_args.push(model.to_string());
         }
         if let Some(reasoning_effort) = request.reasoning_effort.as_deref() {
-            broker_args.push("--thinking".to_string());
-            broker_args.push(reasoning_effort.to_string());
+            agent_args.push("--thinking".to_string());
+            agent_args.push(reasoning_effort.to_string());
         }
         if let Some((resume_id, resume_log_path)) = resume_target.as_ref() {
-            broker_args.push("--session".to_string());
-            broker_args.push(
+            agent_args.push("--session".to_string());
+            agent_args.push(
                 resume_log_path
                     .as_ref()
                     .map(|path| path.display().to_string())
@@ -6576,10 +6604,26 @@ pub fn create_session(config: &RuntimeConfig, request: CreateSessionRequest) -> 
             );
         }
     }
-    broker_args.extend(request.args.iter().filter(|value| !value.is_empty()).cloned());
+    agent_args.extend(request.args.iter().filter(|value| !value.is_empty()).cloned());
 
     let repo_root = repo_root().map_err(CreateSessionError::internal)?;
     let python_bin = python_bin(&repo_root);
+    let use_rust_broker = backend_name == "codex" && rust_broker_enabled();
+    let (broker_program, broker_args) = if use_rust_broker {
+        let mut args = vec!["--cwd".to_string(), spawn_cwd.display().to_string(), "--".to_string()];
+        args.extend(agent_args.iter().cloned());
+        (rust_broker_bin(&repo_root), args)
+    } else {
+        let mut args = vec![
+            "-m".to_string(),
+            "codoxear.broker".to_string(),
+            "--cwd".to_string(),
+            spawn_cwd.display().to_string(),
+            "--".to_string(),
+        ];
+        args.extend(agent_args.iter().cloned());
+        (python_bin.clone(), args)
+    };
     let tmux_session = tmux_session_name();
     let mut env_overrides = base_spawn_env_overrides(&backend_name, resume_id);
     if let Some(model_provider) = request.model_provider.as_deref() {
@@ -6629,7 +6673,7 @@ pub fn create_session(config: &RuntimeConfig, request: CreateSessionRequest) -> 
         if let Some(codex_bin) = env::var("CODEX_BIN").ok().map(|value| value.trim().to_string()).filter(|value| !value.is_empty()) {
             inline_argv.push(format!("CODEX_BIN={codex_bin}"));
         }
-        inline_argv.push(python_bin.display().to_string());
+        inline_argv.push(broker_program.display().to_string());
         inline_argv.extend(broker_args.iter().cloned());
         let shell_cmd = format!(
             "cd {} && exec {}",
@@ -6715,7 +6759,7 @@ pub fn create_session(config: &RuntimeConfig, request: CreateSessionRequest) -> 
     let mut child = spawn_command("setsid");
     child
         .current_dir(&repo_root)
-        .arg(&python_bin)
+        .arg(&broker_program)
         .args(broker_args.iter().map(String::as_str))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -6755,7 +6799,7 @@ pub fn delete_session(config: &RuntimeConfig, session_id: &str) -> Result<Value,
     Ok(json!({"ok": true}))
 }
 
-fn discover_open_log_for_process(root_pid: i64, cwd: &str, agent_backend: &str) -> Option<PathBuf> {
+pub(crate) fn discover_open_log_for_process(root_pid: i64, cwd: &str, agent_backend: &str) -> Option<PathBuf> {
     if root_pid <= 0 {
         return None;
     }
@@ -6962,7 +7006,7 @@ fn latest_token_update_from_log(path: &Path) -> Option<Value> {
     None
 }
 
-fn compute_idle_from_log(path: &Path) -> Option<bool> {
+pub(crate) fn compute_idle_from_log(path: &Path) -> Option<bool> {
     let size = file_len(path).ok()?;
     let records = read_positioned_records(path).ok()?;
     if records.is_empty() {
@@ -7923,8 +7967,8 @@ mod tests {
         load_changed_files_response, load_file_search_response, load_git_diff_response,
         load_git_file_versions_response, load_harness_response, load_messages_history,
         load_messages_live, load_messages_tail, load_sessions_response,
-        run_harness_sweep_once, run_queue_sweep_once, run_voice_scan_once,
-        voice_text_message_id, RuntimeConfig,
+        run_harness_sweep_once, run_queue_sweep_once, run_voice_scan_once, rust_broker_bin,
+        rust_broker_enabled, voice_text_message_id, RuntimeConfig,
     };
     use serde_json::Value;
     use std::collections::HashMap;
@@ -7932,7 +7976,7 @@ mod tests {
     use std::fs;
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixListener;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
     use std::sync::{Mutex, OnceLock};
     use std::thread;
@@ -8086,6 +8130,22 @@ mod tests {
             id,
             "6dfdb63d008010af119b758cf1c864942eedcbf4f33db478a27859ca557112f7"
         );
+    }
+
+    #[test]
+    fn rust_broker_launch_is_explicit_opt_in() {
+        let _guard = env_lock().lock().unwrap();
+        env::remove_var("CODOXEAR_ENABLE_RUST_BROKER");
+        env::remove_var("CODOXEAR_RUST_BROKER_BIN");
+        assert!(!rust_broker_enabled());
+        env::set_var("CODOXEAR_ENABLE_RUST_BROKER", "0");
+        assert!(!rust_broker_enabled());
+        env::set_var("CODOXEAR_ENABLE_RUST_BROKER", "1");
+        assert!(rust_broker_enabled());
+        env::set_var("CODOXEAR_RUST_BROKER_BIN", "/tmp/custom-codoxear-broker-rs");
+        assert_eq!(rust_broker_bin(Path::new("/repo")), PathBuf::from("/tmp/custom-codoxear-broker-rs"));
+        env::remove_var("CODOXEAR_ENABLE_RUST_BROKER");
+        env::remove_var("CODOXEAR_RUST_BROKER_BIN");
     }
 
     #[test]
