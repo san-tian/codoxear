@@ -3007,16 +3007,6 @@ export function App() {
                               <div className="workspaceHeader">
                                 <div className="workspaceTitleRow">
                                   <div className="workspaceTitle">{sessionDisplayName(session)}</div>
-                                  {hasDraft ? <span className="workspaceDraftMark" title="Draft saved" aria-label="Draft saved" /> : null}
-                                  <div
-                                    className={`status-dot ${
-                                      sessionIsQueuedWaiting(session)
-                                        ? "waiting"
-                                        : sessionIsRunning(session, sessionAwaitingReply, sessionStopSuppressed)
-                                          ? "running"
-                                          : "idle"
-                                    }`}
-                                  />
                                 </div>
                                 <div className="workspacePath">{session.git_branch ? session.git_branch : String(session.agent_backend || "codex").toUpperCase()}</div>
                                 <div className="workspaceMeta">
@@ -3028,6 +3018,20 @@ export function App() {
                               <div className="lastLine">{sessionLastLines[session.session_id] || session.session_id}</div>
                             </button>
                             <div className="workspaceMarkers">
+                              <div className="workspaceStateMarkers" role="group" aria-label="Session state markers">
+                                {hasDraft ? <span className="workspaceDraftMark" title="Draft saved" aria-label="Draft saved" /> : null}
+                                <span
+                                  className={`status-dot ${
+                                    sessionIsQueuedWaiting(session)
+                                      ? "waiting"
+                                      : sessionIsRunning(session, sessionAwaitingReply, sessionStopSuppressed)
+                                        ? "running"
+                                        : "idle"
+                                  }`}
+                                  title={sessionStatusText(session, sessionAwaitingReply, sessionStopSuppressed)}
+                                  aria-label={sessionStatusText(session, sessionAwaitingReply, sessionStopSuppressed)}
+                                />
+                              </div>
                               <button
                                 className={`workspaceMarkerBtn${importantMarked ? " active" : ""}`}
                                 type="button"

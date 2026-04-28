@@ -452,13 +452,12 @@ button:disabled {
   display: grid;
   gap: 4px;
   min-width: 0;
-  padding-right: 78px;
+  padding-right: 108px;
 }
 
 .workspaceTitleRow {
   display: flex;
   align-items: center;
-  gap: 8px;
   min-width: 0;
 }
 
@@ -504,12 +503,24 @@ button:disabled {
   right: 8px;
   display: inline-flex;
   align-items: center;
-  gap: 4px;
+  gap: 5px;
+  min-height: 26px;
+}
+
+.workspaceStateMarkers {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 7px;
+  min-width: 25px;
+  padding-right: 3px;
+  margin-right: 1px;
+  border-right: 1px solid rgba(148, 163, 184, 0.22);
 }
 
 .workspaceMarkerBtn {
-  width: 26px;
-  height: 26px;
+  width: 24px;
+  height: 24px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
