@@ -3,3 +3,4 @@ pub mod broker;
 pub mod models;
 pub mod routes;
 pub mod runtime;
+pub mod voice_worker;

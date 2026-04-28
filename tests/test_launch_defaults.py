@@ -69,26 +69,27 @@ class TestLaunchDefaults(unittest.TestCase):
             [server_module.signal.SIGTERM, server_module.signal.SIGINT],
         )
 
-    def test_local_daemon_uses_voice_runtime_python_companion(self) -> None:
+    def test_local_daemon_uses_rust_voice_worker(self) -> None:
         repo_root = Path(__file__).resolve().parents[1]
         script_path = repo_root / "scripts" / "codoxear-local"
         source = script_path.read_text(encoding="utf-8")
 
-        self.assertIn('"$PYTHON_BIN" -m codoxear.voice_runtime', source)
+        self.assertNotIn('"$PYTHON_BIN" -m codoxear.voice_runtime', source)
         self.assertNotIn('"$PYTHON_BIN" -m codoxear.server --runtime-only', source)
         self.assertNotIn('CODEX_WEB_DISABLE_HARNESS_SWEEP=1', source)
         self.assertNotIn('CODEX_WEB_DISABLE_QUEUE_SWEEP=1', source)
-        self.assertIn('CODEX_WEB_DISABLE_VOICE_SCAN=1', source)
+        self.assertNotIn('CODEX_WEB_DISABLE_VOICE_SCAN=1', source)
         self.assertIn('CODOXEAR_ENABLE_HARNESS_SWEEP=1', source)
         self.assertIn('CODOXEAR_ENABLE_QUEUE_SWEEP=1', source)
         self.assertIn('CODOXEAR_ENABLE_VOICE_SCAN=1', source)
+        self.assertIn('CODOXEAR_ENABLE_VOICE_WORKER=1', source)
         self.assertIn('BROKER_BIN="$ROOT_DIR/backend-rs/target/release/codoxear-broker-rs"', source)
         self.assertIn('CODOXEAR_ENABLE_RUST_BROKER=1', source)
         self.assertIn('CODOXEAR_RUST_BROKER_BIN="$BROKER_BIN"', source)
         self.assertIn('cargo build --release --bins', source)
         self.assertNotIn('CODEX_WEB_PORT=8744', source)
         self.assertNotIn('CODEX_WEB_NOVA_LEGACY_BASE=http://127.0.0.1:8744', source)
-        self.assertIn('runtime python pid', source)
+        self.assertNotIn('runtime python pid', source)
         self.assertNotIn('legacy python pid', source)
 
     def test_list_directory_suggestions_returns_children_for_existing_directory(self) -> None:

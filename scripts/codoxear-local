@@ -2,11 +2,9 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-WEB_PID_FILE="$ROOT_DIR/.tmp/codoxear-web.pid"
 RUST_PID_FILE="$ROOT_DIR/.tmp/codoxear-rust.pid"
-WEB_LOG_FILE="$ROOT_DIR/.tmp/codoxear-web.log"
+LEGACY_WEB_PID_FILE="$ROOT_DIR/.tmp/codoxear-web.pid"
 RUST_LOG_FILE="$ROOT_DIR/.tmp/codoxear-rust.log"
-PYTHON_BIN="$ROOT_DIR/.venv/bin/python"
 NOVA_BIN="$ROOT_DIR/backend-rs/target/release/codoxear-backend-rs"
 BROKER_BIN="$ROOT_DIR/backend-rs/target/release/codoxear-broker-rs"
 
@@ -19,10 +17,6 @@ USAGE
 require_runtime() {
   if [[ ! -f "$ROOT_DIR/.env" ]]; then
     echo "error: missing $ROOT_DIR/.env" >&2
-    exit 1
-  fi
-  if [[ ! -x "$PYTHON_BIN" ]]; then
-    echo "error: missing $PYTHON_BIN" >&2
     exit 1
   fi
   if [[ ! -x "$NOVA_BIN" ]]; then
@@ -61,8 +55,8 @@ running_pid() {
 start_server() {
   require_runtime
   mkdir -p "$ROOT_DIR/.tmp"
-  local web_pid rust_pid
-  if web_pid="$(running_pid "$WEB_PID_FILE")" || rust_pid="$(running_pid "$RUST_PID_FILE")"; then
+  local rust_pid legacy_pid
+  if rust_pid="$(running_pid "$RUST_PID_FILE")" || legacy_pid="$(running_pid "$LEGACY_WEB_PID_FILE")"; then
     echo "error: Codoxear already running" >&2
     exit 1
   fi
@@ -74,43 +68,36 @@ start_server() {
   set +a
 
   setsid env \
-    CODEX_WEB_DISABLE_VOICE_SCAN=1 \
-    "$PYTHON_BIN" -m codoxear.voice_runtime >>"$WEB_LOG_FILE" 2>&1 < /dev/null &
-  web_pid=$!
-  echo "$web_pid" > "$WEB_PID_FILE"
-
-  setsid env \
     CODOXEAR_BIND_HOST=127.0.0.1 \
     CODOXEAR_BIND_PORT=8743 \
     CODOXEAR_ENABLE_HARNESS_SWEEP=1 \
     CODOXEAR_ENABLE_QUEUE_SWEEP=1 \
     CODOXEAR_ENABLE_VOICE_SCAN=1 \
+    CODOXEAR_ENABLE_VOICE_WORKER=1 \
     CODOXEAR_ENABLE_RUST_BROKER=1 \
     CODOXEAR_RUST_BROKER_BIN="$BROKER_BIN" \
     "$NOVA_BIN" >>"$RUST_LOG_FILE" 2>&1 < /dev/null &
   rust_pid=$!
   echo "$rust_pid" > "$RUST_PID_FILE"
   sleep 2
-  if ! kill -0 "$rust_pid" 2>/dev/null || ! kill -0 "$web_pid" 2>/dev/null; then
-    rm -f "$WEB_PID_FILE" "$RUST_PID_FILE"
+  if ! kill -0 "$rust_pid" 2>/dev/null; then
+    rm -f "$RUST_PID_FILE"
     echo "error: Codoxear failed to start; check logs in $ROOT_DIR/.tmp" >&2
     exit 1
   fi
 
   echo "started Codoxear Nova"
   echo "public rust pid: $rust_pid"
-  echo "runtime python pid: $web_pid"
-  echo "web log: $WEB_LOG_FILE"
   echo "rust log: $RUST_LOG_FILE"
 }
 
 stop_server() {
   local failed=0
-  if ! running_pid "$WEB_PID_FILE" >/dev/null && ! running_pid "$RUST_PID_FILE" >/dev/null; then
+  if ! running_pid "$RUST_PID_FILE" >/dev/null && ! running_pid "$LEGACY_WEB_PID_FILE" >/dev/null; then
     echo "error: Codoxear is not running" >&2
     exit 1
   fi
-  for pid_file in "$WEB_PID_FILE" "$RUST_PID_FILE"; do
+  for pid_file in "$RUST_PID_FILE" "$LEGACY_WEB_PID_FILE"; do
     local pid=""
     if pid="$(running_pid "$pid_file" 2>/dev/null)"; then
       kill "$pid"
@@ -135,12 +122,10 @@ stop_server() {
 }
 
 status_server() {
-  local web_pid rust_pid
-  if web_pid="$(running_pid "$WEB_PID_FILE")" && rust_pid="$(running_pid "$RUST_PID_FILE")"; then
+  local rust_pid
+  if rust_pid="$(running_pid "$RUST_PID_FILE")"; then
     echo "running"
     echo "public rust pid: $rust_pid"
-    echo "runtime python pid: $web_pid"
-    echo "web log: $WEB_LOG_FILE"
     echo "rust log: $RUST_LOG_FILE"
     exit 0
   fi
@@ -156,7 +141,7 @@ case "${1:-}" in
     stop_server
     ;;
   restart)
-    if running_pid "$WEB_PID_FILE" >/dev/null || running_pid "$RUST_PID_FILE" >/dev/null; then
+    if running_pid "$RUST_PID_FILE" >/dev/null || running_pid "$LEGACY_WEB_PID_FILE" >/dev/null; then
       stop_server
     fi
     start_server
@@ -166,8 +151,8 @@ case "${1:-}" in
     ;;
   logs)
     mkdir -p "$ROOT_DIR/.tmp"
-    touch "$WEB_LOG_FILE" "$RUST_LOG_FILE"
-    exec tail -n 100 -f "$WEB_LOG_FILE" "$RUST_LOG_FILE"
+    touch "$RUST_LOG_FILE"
+    exec tail -n 100 -f "$RUST_LOG_FILE"
     ;;
   *)
     usage >&2
