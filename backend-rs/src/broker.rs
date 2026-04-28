@@ -81,6 +81,7 @@ struct BrokerConfig {
     agent_backend: String,
     agent_bin: String,
     agent_home: PathBuf,
+    sessions_dir: PathBuf,
     owner: Option<String>,
     mirror_output: bool,
 }
@@ -118,7 +119,7 @@ fn parse_args(args: Vec<String>) -> Result<BrokerConfig, String> {
             }
         }
     }
-    let agent_args = args[index..].to_vec();
+    let mut agent_args = args[index..].to_vec();
     let app_dir = default_app_dir()?;
     let agent_backend = env::var("CODEX_WEB_AGENT_BACKEND")
         .ok()
@@ -139,6 +140,10 @@ fn parse_args(args: Vec<String>) -> Result<BrokerConfig, String> {
             env_path("CODEX_HOME").unwrap_or_else(|| home_dir().join(".codex")),
         )
     };
+    let sessions_dir = agent_sessions_dir(&agent_backend, &agent_home);
+    if agent_backend == "pi" {
+        agent_args = ensure_pi_session_arg(&agent_args, &cwd, &sessions_dir)?;
+    }
     Ok(BrokerConfig {
         cwd,
         agent_args,
@@ -146,14 +151,15 @@ fn parse_args(args: Vec<String>) -> Result<BrokerConfig, String> {
         agent_backend,
         agent_bin,
         agent_home,
+        sessions_dir,
         owner: clean_env("CODEX_WEB_OWNER"),
         mirror_output: true,
     })
 }
 
-fn run_broker(config: BrokerConfig) -> Result<(), String> {
-    if config.agent_backend != "codex" {
-        return Err("codoxear-broker-rs currently supports Codex sessions only".to_string());
+fn run_broker(mut config: BrokerConfig) -> Result<(), String> {
+    if config.agent_backend == "pi" {
+        config.agent_args = ensure_pi_session_arg(&config.agent_args, &config.cwd, &config.sessions_dir)?;
     }
     let (rows, cols) = terminal_size();
     let (master_fd, slave_fd) = open_pty(rows, cols)?;
@@ -162,6 +168,12 @@ fn run_broker(config: BrokerConfig) -> Result<(), String> {
     fs::create_dir_all(&sock_dir).map_err(|err| format!("create {}: {err}", sock_dir.display()))?;
     let sock_path = sock_dir.join(format!("broker-{}.sock", std::process::id()));
     let start_ts = epoch_now();
+    let declared_log_path = session_log_path_from_args(&config.agent_args, &config.agent_backend, &config.sessions_dir);
+    let (initial_log_path, initial_session_id) = declared_log_path
+        .as_ref()
+        .filter(|path| path.exists())
+        .map(|path| (Some(path.clone()), session_id_from_log(path, &config.agent_backend)))
+        .unwrap_or((None, None));
     let state = BrokerState {
         agent_pid: i64::from(child.id()),
         pty_master_fd: master_fd,
@@ -170,12 +182,13 @@ fn run_broker(config: BrokerConfig) -> Result<(), String> {
         sock_path,
         agent_backend: config.agent_backend.clone(),
         owner: config.owner.clone(),
-        log_path: None,
-        session_id: None,
+        log_path: initial_log_path,
+        session_id: initial_session_id,
         busy: false,
         output_tail: String::new(),
         token: None,
-        resume_session_id: clean_env("CODEX_WEB_RESUME_SESSION_ID").or_else(|| resume_session_id_from_args(&config.agent_args)),
+        resume_session_id: clean_env("CODEX_WEB_RESUME_SESSION_ID")
+            .or_else(|| resume_session_id_from_args(&config.agent_args, &config.agent_backend, &config.sessions_dir)),
         model_provider: clean_env("CODEX_WEB_MODEL_PROVIDER"),
         preferred_auth_method: clean_env("CODEX_WEB_PREFERRED_AUTH_METHOD"),
         model: clean_env("CODEX_WEB_MODEL"),
@@ -250,10 +263,14 @@ fn spawn_agent(config: &BrokerConfig, slave_fd: RawFd, rows: u16, cols: u16) -> 
         .env("TERM", env::var("TERM").ok().filter(|value| !value.trim().is_empty()).unwrap_or_else(|| "xterm-256color".to_string()))
         .env("COLUMNS", cols.to_string())
         .env("LINES", rows.to_string())
-        .env("CODEX_HOME", &config.agent_home)
         .stdin(unsafe { Stdio::from(File::from_raw_fd(stdin_fd)) })
         .stdout(unsafe { Stdio::from(File::from_raw_fd(stdout_fd)) })
         .stderr(unsafe { Stdio::from(File::from_raw_fd(stderr_fd)) });
+    if config.agent_backend == "pi" {
+        command.env("PI_HOME", &config.agent_home).env_remove("CODEX_HOME");
+    } else {
+        command.env("CODEX_HOME", &config.agent_home).env_remove("PI_HOME");
+    }
     unsafe {
         command.pre_exec(move || {
             libc::setsid();
@@ -650,6 +667,26 @@ fn session_id_from_rollout_path(path: &Path) -> Option<String> {
     None
 }
 
+fn session_id_from_log(path: &Path, agent_backend: &str) -> Option<String> {
+    if agent_backend == "pi" {
+        let file = File::open(path).ok()?;
+        let mut reader = BufReader::new(file);
+        let mut line = String::new();
+        reader.read_line(&mut line).ok().filter(|n| *n > 0)?;
+        let value = serde_json::from_str::<Value>(line.trim()).ok()?;
+        if value.get("type").and_then(Value::as_str) != Some("session") {
+            return None;
+        }
+        return value
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+    }
+    session_id_from_rollout_path(path)
+}
+
 fn is_uuid_like(value: &str) -> bool {
     let bytes = value.as_bytes();
     if bytes.len() != 36 {
@@ -708,11 +745,109 @@ fn terminate_process_group(pid: i64) {
     }
 }
 
-fn resume_session_id_from_args(args: &[String]) -> Option<String> {
+fn resume_session_id_from_args(args: &[String], agent_backend: &str, sessions_dir: &Path) -> Option<String> {
+    if agent_backend == "pi" {
+        for pair in args.windows(2) {
+            if pair[0] != "--session" {
+                continue;
+            }
+            let raw = pair[1].trim();
+            if raw.is_empty() {
+                return None;
+            }
+            if raw.ends_with(".jsonl") {
+                return session_log_path_from_args(args, agent_backend, sessions_dir)
+                    .as_ref()
+                    .and_then(|path| session_id_from_log(path, agent_backend));
+            }
+            return Some(raw.to_string());
+        }
+        return None;
+    }
     args.windows(2)
         .find(|pair| pair[0] == "resume")
         .map(|pair| pair[1].trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+fn session_log_path_from_args(args: &[String], agent_backend: &str, sessions_dir: &Path) -> Option<PathBuf> {
+    if agent_backend != "pi" {
+        return None;
+    }
+    for pair in args.windows(2) {
+        if pair[0] != "--session" {
+            continue;
+        }
+        let raw = pair[1].trim();
+        if raw.is_empty() || !raw.ends_with(".jsonl") {
+            return None;
+        }
+        let path = expand_path(raw).ok()?;
+        if path.starts_with(sessions_dir) {
+            return Some(path);
+        }
+        return None;
+    }
+    None
+}
+
+fn ensure_pi_session_arg(args: &[String], cwd: &Path, sessions_dir: &Path) -> Result<Vec<String>, String> {
+    let mut out = args.to_vec();
+    if out.iter().any(|value| value == "--session") {
+        return Ok(out);
+    }
+    let Some(session_dir) = pi_session_dir_from_args(&out, cwd, sessions_dir)? else {
+        return Ok(out);
+    };
+    fs::create_dir_all(&session_dir).map_err(|err| format!("create {}: {err}", session_dir.display()))?;
+    out.push("--session".to_string());
+    out.push(pi_new_session_log_path(&session_dir).display().to_string());
+    Ok(out)
+}
+
+fn pi_session_dir_from_args(args: &[String], cwd: &Path, sessions_dir: &Path) -> Result<Option<PathBuf>, String> {
+    if args.iter().any(|value| value == "--no-session") {
+        return Ok(None);
+    }
+    for pair in args.windows(2) {
+        if pair[0] != "--session-dir" {
+            continue;
+        }
+        let raw = pair[1].trim();
+        if raw.is_empty() {
+            return Ok(None);
+        }
+        let path = expand_path(raw)?;
+        return Ok(Some(if path.is_absolute() {
+            path
+        } else {
+            cwd.join(path)
+        }));
+    }
+    Ok(Some(sessions_dir.join(pi_session_dir_name(&cwd.display().to_string()))))
+}
+
+fn pi_session_dir_name(cwd: &str) -> String {
+    let normalized = cwd
+        .trim_start_matches(['/', '\\'])
+        .replace(['/', '\\', ':'], "-");
+    format!("--{normalized}--")
+}
+
+fn pi_new_session_log_path(session_dir: &Path) -> PathBuf {
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0);
+    session_dir.join(format!("{}-{}.jsonl", now_ms, std::process::id()))
+}
+
+fn agent_sessions_dir(agent_backend: &str, agent_home: &Path) -> PathBuf {
+    if agent_backend == "pi" {
+        agent_home.join("agent").join("sessions")
+    } else {
+        agent_home.join("sessions")
+    }
 }
 
 fn expand_path(raw: &str) -> Result<PathBuf, String> {
@@ -774,8 +909,9 @@ fn shell_join(items: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_uuid_like, run_broker, scan_token_updates_from_log, seq_bytes, session_id_from_rollout_path,
-        trim_utf8_tail, BrokerConfig,
+        ensure_pi_session_arg, is_uuid_like, resume_session_id_from_args, run_broker,
+        scan_token_updates_from_log, seq_bytes, session_id_from_log, session_id_from_rollout_path,
+        session_log_path_from_args, trim_utf8_tail, BrokerConfig,
     };
     use serde_json::{json, Value};
     use std::fs;
@@ -864,6 +1000,38 @@ mod tests {
     }
 
     #[test]
+    fn rust_broker_injects_pi_session_path_for_new_sessions() {
+        let app_dir = temp_app_dir("broker-pi-session");
+        let sessions_dir = app_dir.join("pi-home").join("agent").join("sessions");
+        let args = ensure_pi_session_arg(
+            &["--model".to_string(), "gpt-5.4".to_string()],
+            Path::new("/tmp/pi-work"),
+            &sessions_dir,
+        )
+        .unwrap();
+        assert_eq!(&args[..2], ["--model", "gpt-5.4"]);
+        assert_eq!(args[2], "--session");
+        let session_path = PathBuf::from(&args[3]);
+        assert!(session_path.starts_with(sessions_dir.join("--tmp-pi-work--")));
+    }
+
+    #[test]
+    fn rust_broker_reads_pi_resume_session_id_from_log_arg() {
+        let app_dir = temp_app_dir("broker-pi-resume");
+        let sessions_dir = app_dir.join("pi-home").join("agent").join("sessions");
+        fs::create_dir_all(&sessions_dir).unwrap();
+        let log_path = sessions_dir.join("resume.jsonl");
+        fs::write(&log_path, r#"{"type":"session","id":"resume-a","cwd":"/tmp"}"#).unwrap();
+        let args = vec!["--session".to_string(), log_path.display().to_string()];
+        assert_eq!(
+            session_log_path_from_args(&args, "pi", &sessions_dir).as_deref(),
+            Some(log_path.as_path())
+        );
+        assert_eq!(session_id_from_log(&log_path, "pi").as_deref(), Some("resume-a"));
+        assert_eq!(resume_session_id_from_args(&args, "pi", &sessions_dir).as_deref(), Some("resume-a"));
+    }
+
+    #[test]
     fn rust_broker_serves_socket_state_tail_keys_and_shutdown() {
         let app_dir = temp_app_dir("broker-socket");
         let config = BrokerConfig {
@@ -876,6 +1044,7 @@ mod tests {
             agent_backend: "codex".to_string(),
             agent_bin: "sh".to_string(),
             agent_home: app_dir.join("codex-home"),
+            sessions_dir: app_dir.join("codex-home").join("sessions"),
             owner: None,
             mirror_output: false,
         };
@@ -892,6 +1061,38 @@ mod tests {
         assert_eq!(keys.get("ok").and_then(Value::as_bool), Some(true));
         assert_eq!(keys.get("n").and_then(Value::as_i64), Some(1));
 
+        let shutdown = socket_request(&sock_path, json!({"cmd":"shutdown"}));
+        assert_eq!(shutdown.get("ok").and_then(Value::as_bool), Some(true));
+        let result = handle.join().unwrap();
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[test]
+    fn rust_broker_serves_socket_for_pi_backend() {
+        let app_dir = temp_app_dir("broker-pi-socket");
+        let pi_home = app_dir.join("pi-home");
+        let config = BrokerConfig {
+            cwd: app_dir.clone(),
+            agent_args: vec![
+                "-c".to_string(),
+                "printf READY; while true; do sleep 1; done".to_string(),
+            ],
+            app_dir: app_dir.clone(),
+            agent_backend: "pi".to_string(),
+            agent_bin: "sh".to_string(),
+            agent_home: pi_home.clone(),
+            sessions_dir: pi_home.join("agent").join("sessions"),
+            owner: None,
+            mirror_output: false,
+        };
+        let handle = thread::spawn(move || run_broker(config));
+        let sock_path = wait_for_sock(&app_dir);
+        let meta: Value = serde_json::from_str(&fs::read_to_string(sock_path.with_extension("json")).unwrap()).unwrap();
+        assert_eq!(meta["agent_backend"], "pi");
+        assert!(meta["sock_path"].as_str().unwrap_or_default().ends_with(".sock"));
+
+        let tail = wait_for_tail(&sock_path);
+        assert!(tail.contains("READY"));
         let shutdown = socket_request(&sock_path, json!({"cmd":"shutdown"}));
         assert_eq!(shutdown.get("ok").and_then(Value::as_bool), Some(true));
         let result = handle.join().unwrap();

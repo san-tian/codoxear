@@ -6608,7 +6608,7 @@ pub fn create_session(config: &RuntimeConfig, request: CreateSessionRequest) -> 
 
     let repo_root = repo_root().map_err(CreateSessionError::internal)?;
     let python_bin = python_bin(&repo_root);
-    let use_rust_broker = backend_name == "codex" && rust_broker_enabled();
+    let use_rust_broker = rust_broker_enabled();
     let (broker_program, broker_args) = if use_rust_broker {
         let mut args = vec!["--cwd".to_string(), spawn_cwd.display().to_string(), "--".to_string()];
         args.extend(agent_args.iter().cloned());
@@ -6672,6 +6672,9 @@ pub fn create_session(config: &RuntimeConfig, request: CreateSessionRequest) -> 
         }
         if let Some(codex_bin) = env::var("CODEX_BIN").ok().map(|value| value.trim().to_string()).filter(|value| !value.is_empty()) {
             inline_argv.push(format!("CODEX_BIN={codex_bin}"));
+        }
+        if let Some(pi_bin) = env::var("PI_BIN").ok().map(|value| value.trim().to_string()).filter(|value| !value.is_empty()) {
+            inline_argv.push(format!("PI_BIN={pi_bin}"));
         }
         inline_argv.push(broker_program.display().to_string());
         inline_argv.extend(broker_args.iter().cloned());
