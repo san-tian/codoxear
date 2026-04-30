@@ -324,23 +324,25 @@ button:disabled {
   grid-template-columns: auto minmax(0, 1fr) auto;
   gap: 8px;
   align-items: center;
-  padding: 8px 9px;
+  padding: 8px 6px 8px 10px;
   text-align: left;
-  border: 1px solid transparent;
-  border-radius: 10px;
-  background: rgba(248, 250, 252, 0.86);
-  transition: border-color 140ms ease, background 140ms ease, box-shadow 140ms ease, transform 140ms ease;
+  border: 0;
+  border-left: 3px solid rgba(37, 99, 235, 0.36);
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  transition: border-color 140ms ease, background 140ms ease, color 140ms ease;
 }
 
 .workspaceGroup.is-drop-before .workspaceGroupHeader,
 .workspaceGroup.is-drop-after .workspaceGroupHeader {
-  border-color: rgba(37, 99, 235, 0.32);
-  box-shadow: 0 8px 24px rgba(37, 99, 235, 0.1);
+  border-left-color: rgba(37, 99, 235, 0.72);
+  background: rgba(37, 99, 235, 0.06);
 }
 
 .workspaceGroup.active .workspaceGroupHeader {
-  border-color: rgba(37, 99, 235, 0.18);
-  background: rgba(37, 99, 235, 0.07);
+  border-left-color: rgba(37, 99, 235, 0.82);
+  background: rgba(37, 99, 235, 0.055);
 }
 
 .workspaceDisclosure {
@@ -359,9 +361,9 @@ button:disabled {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-size: 12px;
-  font-weight: 750;
-  letter-spacing: 0.04em;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
   text-transform: uppercase;
 }
 
@@ -386,8 +388,9 @@ button:disabled {
   display: grid;
   gap: 8px;
   min-width: 0;
-  padding-left: 12px;
-  border-left: 1px solid rgba(15, 23, 42, 0.08);
+  margin-left: 7px;
+  padding-left: 13px;
+  border-left: 2px solid rgba(37, 99, 235, 0.13);
 }
 
 .workspace {
@@ -396,11 +399,19 @@ button:disabled {
   min-width: 0;
   display: grid;
   gap: 8px;
-  padding: 10px;
+  padding: 9px 10px;
   border: 1px solid var(--border);
-  border-radius: 12px;
+  border-radius: 9px;
   background: rgba(255, 255, 255, 0.96);
   transition: border-color 140ms ease, background 140ms ease, box-shadow 140ms ease, opacity 140ms ease, transform 140ms ease;
+}
+
+.workspace::before {
+  content: "";
+  position: absolute;
+  inset: 9px auto 9px -14px;
+  width: 7px;
+  border-top: 2px solid rgba(37, 99, 235, 0.16);
 }
 
 .workspace.is-drop-before,
@@ -412,6 +423,10 @@ button:disabled {
 .workspace.active {
   border-color: rgba(37, 99, 235, 0.4);
   background: var(--accent-soft);
+}
+
+.workspace.active::before {
+  border-top-color: rgba(37, 99, 235, 0.55);
 }
 
 .workspace.is-important {
@@ -558,7 +573,11 @@ button:disabled {
   min-height: 38px;
   gap: 0;
   padding: 6px 8px;
-  border-radius: 9px;
+  border-radius: 8px;
+}
+
+.app.compactSessionCards .workspace::before {
+  inset-block: 18px auto;
 }
 
 .app.compactSessionCards .workspaceSelect {
