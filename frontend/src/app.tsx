@@ -466,7 +466,7 @@ function sessionMarkerState(session: SessionSummary | null): SessionMarkerState 
 }
 
 function workspaceKeyForSession(session: SessionSummary) {
-  return String(session.cwd || "").trim() || "__unknown_workspace__";
+  return String(session.workspace_cwd || session.cwd || "").trim() || "__unknown_workspace__";
 }
 
 function workspaceTitle(cwd: string) {
@@ -3176,7 +3176,7 @@ export function App() {
                 <div className="titleRow">
                   <div id="threadTitle">{sessionDisplayName(selectedSession)}</div>
                   <div className="topMeta">
-                    <span className="status-chip">{selectedSession ? baseName(selectedSession.cwd) : "No workspace"}</span>
+                    <span className="status-chip">{selectedSession ? baseName(workspaceKeyForSession(selectedSession)) : "No workspace"}</span>
                     <span className={topSessionStatusClass}>{topSessionStatus}</span>
                     {tokenSummary ? <span className="status-chip" title={tokenSummary.title}>{tokenSummary.label}</span> : null}
                   </div>

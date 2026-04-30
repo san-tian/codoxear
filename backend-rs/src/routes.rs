@@ -2611,7 +2611,7 @@ mod tests {
         let broker_path = repo_root.join("fake-broker.sh");
         write_executable(
             &broker_path,
-            "#!/usr/bin/env bash\nset -euo pipefail\n{\n  printf 'PWD=%s\\n' \"$PWD\"\n  printf 'ARGV=%s\\n' \"$*\"\n  printf 'OWNER=%s\\n' \"${CODEX_WEB_OWNER-}\"\n  printf 'BACKEND=%s\\n' \"${CODEX_WEB_AGENT_BACKEND-}\"\n  printf 'MODEL=%s\\n' \"${CODEX_WEB_MODEL-}\"\n  printf 'EFFORT=%s\\n' \"${CODEX_WEB_REASONING_EFFORT-}\"\n} >> \"${CODOXEAR_TEST_LOG}\"\nsleep 30\n",
+            "#!/usr/bin/env bash\nset -euo pipefail\n{\n  printf 'PWD=%s\\n' \"$PWD\"\n  printf 'ARGV=%s\\n' \"$*\"\n  printf 'OWNER=%s\\n' \"${CODEX_WEB_OWNER-}\"\n  printf 'BACKEND=%s\\n' \"${CODEX_WEB_AGENT_BACKEND-}\"\n  printf 'WORKSPACE=%s\\n' \"${CODEX_WEB_WORKSPACE_CWD-}\"\n  printf 'MODEL=%s\\n' \"${CODEX_WEB_MODEL-}\"\n  printf 'EFFORT=%s\\n' \"${CODEX_WEB_REASONING_EFFORT-}\"\n} >> \"${CODOXEAR_TEST_LOG}\"\nsleep 30\n",
         );
         let _repo_root = EnvGuard::set("CODOXEAR_REPO_ROOT", repo_root.display().to_string());
         let _broker = EnvGuard::set(
@@ -2628,8 +2628,9 @@ mod tests {
                     .uri("/api/v1/sessions")
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(format!(
-                        r#"{{"cwd":"{}","model":"gpt-5.4","reasoning_effort":"xhigh"}}"#,
-                        cwd.display()
+                        r#"{{"cwd":"{}","workspace_cwd":"{}","model":"gpt-5.4","reasoning_effort":"xhigh"}}"#,
+                        cwd.display(),
+                        repo_root.display()
                     )))
                     .unwrap(),
             )
@@ -2648,6 +2649,7 @@ mod tests {
         assert!(log.contains(&format!("ARGV=--cwd {} --", cwd.display())));
         assert!(log.contains("OWNER=web"));
         assert!(log.contains("BACKEND=codex"));
+        assert!(log.contains(&format!("WORKSPACE={}", repo_root.display())));
         assert!(log.contains("MODEL=gpt-5.4"));
         assert!(log.contains("EFFORT=xhigh"));
 

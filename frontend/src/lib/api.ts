@@ -75,6 +75,7 @@ export const api = {
   },
   createSession(payload: {
     cwd: string;
+    workspace_cwd?: string | null;
     agent_backend: string;
     model_provider?: string | null;
     preferred_auth_method?: string | null;

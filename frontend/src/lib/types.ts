@@ -7,6 +7,7 @@ export type SessionSummary = {
   owned: boolean;
   transport: string | null;
   cwd: string;
+  workspace_cwd?: string | null;
   start_ts: number;
   updated_ts: number;
   log_path: string | null;

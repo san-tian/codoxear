@@ -164,6 +164,8 @@ struct SessionMeta {
     #[serde(default)]
     cwd: Option<String>,
     #[serde(default)]
+    workspace_cwd: Option<String>,
+    #[serde(default)]
     log_path: Option<String>,
     #[serde(default)]
     start_ts: Option<f64>,
@@ -197,6 +199,7 @@ struct BrokerState {
 #[derive(Debug, Clone)]
 pub struct CreateSessionRequest {
     pub cwd: String,
+    pub workspace_cwd: Option<String>,
     pub args: Vec<String>,
     pub agent_backend: String,
     pub resume_session_id: Option<String>,
@@ -1388,7 +1391,10 @@ pub fn load_preview_bootstrap(
             } else {
                 "idle".into()
             },
-            workspace: session.cwd,
+            workspace: session
+                .workspace_cwd
+                .clone()
+                .unwrap_or_else(|| session.cwd.clone()),
             transport: session.transport,
             tmux_session: session.tmux_session,
             tmux_window: session.tmux_window,
@@ -3040,6 +3046,7 @@ fn session_from_meta(
         agent_backend,
         owned: meta.owner.as_deref() == Some("web"),
         transport,
+        workspace_cwd: clean_optional(meta.workspace_cwd),
         cwd,
         start_ts,
         updated_ts,
@@ -6462,6 +6469,20 @@ pub fn create_session_request_from_payload(
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| CreateSessionError::bad_request_with_field("cwd required", "cwd"))?;
 
+    let workspace_cwd = match obj.get("workspace_cwd") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(value)) => {
+            let trimmed = value.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        }
+        _ => {
+            return Err(CreateSessionError::bad_request_with_field(
+                "workspace_cwd must be a string",
+                "workspace_cwd",
+            ))
+        }
+    };
+
     let (model_provider, preferred_auth_method, model, reasoning_effort, service_tier) =
         if agent_backend == "codex" {
             let defaults = read_codex_launch_defaults().map_err(CreateSessionError::bad_request)?;
@@ -6584,6 +6605,7 @@ pub fn create_session_request_from_payload(
 
     Ok(CreateSessionRequest {
         cwd,
+        workspace_cwd,
         args,
         agent_backend,
         resume_session_id,
@@ -6710,6 +6732,7 @@ fn apply_spawn_env(command: &mut Command, env_overrides: &HashMap<String, String
         "CODEX_WEB_MODEL",
         "CODEX_WEB_REASONING_EFFORT",
         "CODEX_WEB_SERVICE_TIER",
+        "CODEX_WEB_WORKSPACE_CWD",
         "CODEX_WEB_TRANSPORT",
         "CODEX_WEB_TMUX_SESSION",
         "CODEX_WEB_TMUX_WINDOW",
@@ -7406,6 +7429,12 @@ pub fn create_session(
         .map_err(CreateSessionError::bad_request)?;
     let cwd_path =
         resolve_dir_target(&request.cwd).map_err(|message| create_session_cwd_error(&message))?;
+    let workspace_cwd = request
+        .workspace_cwd
+        .as_deref()
+        .map(resolve_dir_target)
+        .transpose()
+        .map_err(|message| CreateSessionError::bad_request_with_field(message, "workspace_cwd"))?;
     if !cwd_path.exists() {
         fs::create_dir_all(&cwd_path).map_err(|err| {
             CreateSessionError::bad_request_with_field(
@@ -7560,6 +7589,12 @@ pub fn create_session(
         env_overrides.insert(
             "CODEX_WEB_SERVICE_TIER".to_string(),
             service_tier.to_string(),
+        );
+    }
+    if let Some(workspace_cwd) = workspace_cwd.as_ref() {
+        env_overrides.insert(
+            "CODEX_WEB_WORKSPACE_CWD".to_string(),
+            workspace_cwd.display().to_string(),
         );
     }
 
@@ -9207,6 +9242,7 @@ mod tests {
               "owner": "web",
               "transport": "tmux",
               "cwd": "/work/project",
+              "workspace_cwd": "/work",
               "log_path": "/logs/rollout-a.jsonl",
               "start_ts": 10.0,
               "updated_ts": 15.0,
@@ -9249,6 +9285,7 @@ mod tests {
         assert_eq!(session.agent_backend, "codex");
         assert!(session.owned);
         assert_eq!(session.transport.as_deref(), Some("tmux"));
+        assert_eq!(session.workspace_cwd.as_deref(), Some("/work"));
         assert_eq!(session.alias, "Alias A");
         assert_eq!(session.queue_len, 1);
         assert!(session.harness_enabled);

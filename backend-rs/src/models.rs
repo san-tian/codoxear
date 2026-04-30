@@ -74,6 +74,7 @@ pub struct ApiSessionSummary {
     pub owned: bool,
     pub transport: Option<String>,
     pub cwd: String,
+    pub workspace_cwd: Option<String>,
     pub start_ts: f64,
     pub updated_ts: f64,
     pub log_path: Option<String>,
