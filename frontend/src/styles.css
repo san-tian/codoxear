@@ -550,6 +550,54 @@ button:disabled {
   background: rgba(100, 116, 139, 0.12);
 }
 
+.app.compactSessionCards .workspaceSessions {
+  gap: 5px;
+}
+
+.app.compactSessionCards .workspace {
+  min-height: 38px;
+  gap: 0;
+  padding: 6px 8px;
+  border-radius: 9px;
+}
+
+.app.compactSessionCards .workspaceSelect {
+  min-height: 24px;
+  align-items: center;
+}
+
+.app.compactSessionCards .workspaceHeader {
+  gap: 0;
+  padding-right: 92px;
+}
+
+.app.compactSessionCards .workspaceTitle {
+  font-size: 12.5px;
+  line-height: 1.35;
+}
+
+.app.compactSessionCards .workspacePath,
+.app.compactSessionCards .workspaceMeta,
+.app.compactSessionCards .lastLine {
+  display: none;
+}
+
+.app.compactSessionCards .workspaceMarkers {
+  top: 50%;
+  right: 6px;
+  min-height: 22px;
+  transform: translateY(-50%);
+}
+
+.app.compactSessionCards .workspaceStateMarkers {
+  gap: 6px;
+}
+
+.app.compactSessionCards .workspaceMarkerBtn {
+  width: 22px;
+  height: 22px;
+}
+
 .status-dot {
   position: relative;
   width: 9px;

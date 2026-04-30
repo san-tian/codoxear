@@ -40,6 +40,7 @@ const SHOW_TOOL_CALLS_KEY = "codoxear.showToolCalls";
 const DESKTOP_NOTIFICATIONS_KEY = "codoxear.desktopNotificationsEnabled";
 const BUSY_SUBMIT_MODE_KEY = "codoxear.nova.busySubmitMode";
 const THEME_MODE_KEY = "codoxear.nova.theme";
+const COMPACT_SESSION_CARDS_KEY = "codoxear.nova.compactSessionCards";
 const SESSION_DRAFTS_KEY = "codoxear.nova.sessionDrafts";
 const NEW_SESSION_PREFERENCES_KEY = "codoxear.nova.newSessionPreferences";
 const SIDEBAR_WORKSPACE_ORDER_KEY = "codoxear.nova.sidebar.workspaceOrder";
@@ -139,6 +140,10 @@ function readBusySubmitMode(): BusySubmitMode {
 
 function readThemeMode(): ThemeMode {
   return readLocalStorage(THEME_MODE_KEY) === "light" ? "light" : "dark";
+}
+
+function readCompactSessionCards() {
+  return readLocalStorage(COMPACT_SESSION_CARDS_KEY) === "1";
 }
 
 function isMobileViewportWidth(width = window.innerWidth) {
@@ -1025,6 +1030,7 @@ export function App() {
   const [sessionContextMenu, setSessionContextMenu] = useState<{ sessionId: string; x: number; y: number } | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [themeMode, setThemeMode] = useState<ThemeMode>(() => readThemeMode());
+  const [compactSessionCards, setCompactSessionCards] = useState(() => readCompactSessionCards());
   const [voiceSettings, setVoiceSettings] = useState<VoiceSettingsResponse | null>(null);
   const [codexConfig, setCodexConfig] = useState<CodexConfigResponse | null>(null);
   const [voiceSettingsLoading, setVoiceSettingsLoading] = useState(false);
@@ -2698,6 +2704,10 @@ export function App() {
   }, [themeMode]);
 
   useEffect(() => {
+    writeLocalStorage(COMPACT_SESSION_CARDS_KEY, compactSessionCards ? "1" : null);
+  }, [compactSessionCards]);
+
+  useEffect(() => {
     const syncViewport = () => setMobileViewport(isMobileViewportWidth());
     syncViewport();
     window.addEventListener("resize", syncViewport);
@@ -2921,7 +2931,7 @@ export function App() {
     <>
       <div
         ref={appRef}
-        className={`app${showFilesPanel || showDetailsPanel ? " withRail" : ""}${sidebarCollapsed ? " sidebarCollapsed" : ""}${sidebarResizing ? " sidebarResizing" : ""}${mobileViewport ? " mobileLayout" : ""}${mobileSidebarOpen ? " mobileSidebarOpen" : ""}`}
+        className={`app${showFilesPanel || showDetailsPanel ? " withRail" : ""}${sidebarCollapsed ? " sidebarCollapsed" : ""}${sidebarResizing ? " sidebarResizing" : ""}${mobileViewport ? " mobileLayout" : ""}${mobileSidebarOpen ? " mobileSidebarOpen" : ""}${compactSessionCards ? " compactSessionCards" : ""}`}
         style={appStyle}
         onClick={() => setSessionContextMenu(null)}
       >
@@ -3802,6 +3812,14 @@ export function App() {
                     Light
                   </button>
                 </div>
+                <label className="toggleRow">
+                  <input
+                    type="checkbox"
+                    checked={compactSessionCards}
+                    onChange={(event) => setCompactSessionCards((event.currentTarget as HTMLInputElement).checked)}
+                  />
+                  <span>Compact session cards</span>
+                </label>
                 <div className="detailSectionHeader">Voice</div>
                 <label className="field">
                   <span>TTS base URL</span>
