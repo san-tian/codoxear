@@ -435,15 +435,15 @@ button:disabled {
 }
 
 .workspace.is-shelved {
-  opacity: 0.9;
-  border-color: rgba(148, 163, 184, 0.12);
-  background: rgba(248, 250, 252, 0.32);
+  opacity: 1;
+  border-color: var(--border);
+  background: rgba(255, 255, 255, 0.96);
   box-shadow: none;
 }
 
 .workspace.is-shelved.active {
-  opacity: 0.95;
-  background: rgba(219, 234, 254, 0.3);
+  opacity: 1;
+  background: var(--accent-soft);
 }
 
 .workspaceSelect {
@@ -560,9 +560,9 @@ button:disabled {
 }
 
 .workspaceMarkerBtn.shelveMarker.active {
-  color: rgba(100, 116, 139, 0.46);
+  color: rgba(100, 116, 139, 0.28);
   border-color: transparent;
-  background: rgba(100, 116, 139, 0.045);
+  background: transparent;
 }
 
 .app.compactSessionCards .workspaceSessions {
