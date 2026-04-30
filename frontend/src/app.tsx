@@ -397,14 +397,16 @@ function transcriptEventVisibleWithToolsHidden(event: UiTranscriptEvent) {
   return event.meta.trim() !== "narration";
 }
 
-function partitionImportantFirst<T>(items: T[], isImportant: (item: T) => boolean) {
+function partitionSidebarOrder<T>(items: T[], isImportant: (item: T) => boolean, isShelved: (item: T) => boolean) {
   const important: T[] = [];
   const regular: T[] = [];
+  const shelved: T[] = [];
   items.forEach((item) => {
-    if (isImportant(item)) important.push(item);
+    if (isShelved(item)) shelved.push(item);
+    else if (isImportant(item)) important.push(item);
     else regular.push(item);
   });
-  return [...important, ...regular];
+  return [...important, ...regular, ...shelved];
 }
 
 function uniqueStringsInOrder(values: string[]) {
@@ -1141,12 +1143,17 @@ export function App() {
     });
     const orderedGroups = applyStoredOrder(fallbackSortedGroups, workspaceOrder, (group) => group.key).map((group) => ({
       ...group,
-      sessions: partitionImportantFirst(
+      sessions: partitionSidebarOrder(
         applyStoredOrder(group.sessions, sessionOrderByWorkspace[group.key] || [], (session) => session.session_id),
         (session) => sessionIsImportant(session),
+        (session) => sessionIsShelved(session),
       ),
     }));
-    return partitionImportantFirst(orderedGroups, (group) => group.sessions.some((session) => sessionIsImportant(session)));
+    return partitionSidebarOrder(
+      orderedGroups,
+      (group) => group.sessions.some((session) => sessionIsImportant(session) && !sessionIsShelved(session)),
+      (group) => group.sessions.length > 0 && group.sessions.every((session) => sessionIsShelved(session)),
+    );
   }, [interruptingSessionId, selectedSessionAwaitingReplyId, selectedSessionId, sessionOrderByWorkspace, sessions, workspaceOrder]);
   const groupedSessions = workspaceGroups;
   const currentNewSessionDefaults = useMemo(
@@ -2173,7 +2180,13 @@ export function App() {
       );
       const nextWorkspaceKeys = uniqueStringsInOrder(nextSessions.map((item) => workspaceKeyForSession(item)));
       const nextImportantWorkspaceKeySet = new Set(
-        nextSessions.filter((item) => sessionIsImportant(item)).map((item) => workspaceKeyForSession(item)),
+        nextSessions.filter((item) => sessionIsImportant(item) && !sessionIsShelved(item)).map((item) => workspaceKeyForSession(item)),
+      );
+      const nextShelvedWorkspaceKeySet = new Set(
+        nextWorkspaceKeys.filter((key) => {
+          const workspaceSessions = nextSessions.filter((item) => workspaceKeyForSession(item) === key);
+          return workspaceSessions.length > 0 && workspaceSessions.every((item) => sessionIsShelved(item));
+        }),
       );
       setSessions(nextSessions);
       if (nextState === "important") {
@@ -2194,7 +2207,11 @@ export function App() {
           ...current.filter((key) => nextWorkspaceKeys.includes(key)),
           ...nextWorkspaceKeys,
         ]);
-        return partitionImportantFirst(normalized, (key) => nextImportantWorkspaceKeySet.has(key));
+        return partitionSidebarOrder(
+          normalized,
+          (key) => nextImportantWorkspaceKeySet.has(key),
+          (key) => nextShelvedWorkspaceKeySet.has(key),
+        );
       });
       await refreshSessions({ preserveSelection: true });
       pushToast(nextState === "important" ? "Starred session" : "Session star cleared");
