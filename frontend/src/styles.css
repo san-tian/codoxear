@@ -560,9 +560,16 @@ button:disabled {
 }
 
 .workspaceMarkerBtn.shelveMarker.active {
-  color: rgba(100, 116, 139, 0.28);
+  color: var(--muted);
+  opacity: 0.22;
   border-color: transparent;
   background: transparent;
+}
+
+.workspace:hover .workspaceMarkerBtn.shelveMarker.active,
+.workspace.active .workspaceMarkerBtn.shelveMarker.active,
+.workspaceMarkerBtn.shelveMarker.active:focus-visible {
+  opacity: 0.52;
 }
 
 .app.compactSessionCards .workspaceSessions {
