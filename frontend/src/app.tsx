@@ -413,6 +413,10 @@ function uniqueStringsInOrder(values: string[]) {
   return out;
 }
 
+function sameStringList(left: string[], right: string[]) {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
 function sleep(ms: number) {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
@@ -1465,6 +1469,34 @@ export function App() {
     }
   }
 
+  function pinSidebarOrderForSessions(nextSessions: SessionSummary[]) {
+    const nextWorkspaceKeys = uniqueStringsInOrder(nextSessions.map((session) => workspaceKeyForSession(session)));
+    setWorkspaceOrder((current) => {
+      const next = uniqueStringsInOrder([
+        ...current.filter((workspaceKey) => nextWorkspaceKeys.includes(workspaceKey)),
+        ...nextWorkspaceKeys,
+      ]);
+      return sameStringList(current, next) ? current : next;
+    });
+    setSessionOrderByWorkspace((current) => {
+      const sessionsByWorkspace = new Map<string, string[]>();
+      nextSessions.forEach((session) => {
+        const workspaceKey = workspaceKeyForSession(session);
+        sessionsByWorkspace.set(workspaceKey, [...(sessionsByWorkspace.get(workspaceKey) || []), session.session_id]);
+      });
+      const next: SidebarSessionOrder = {};
+      let changed = Object.keys(current).some((workspaceKey) => !sessionsByWorkspace.has(workspaceKey) && (current[workspaceKey] || []).length > 0);
+      sessionsByWorkspace.forEach((sessionIds, workspaceKey) => {
+        next[workspaceKey] = uniqueStringsInOrder([
+          ...(current[workspaceKey] || []).filter((sessionId) => sessionIds.includes(sessionId)),
+          ...sessionIds,
+        ]);
+        if (!sameStringList(current[workspaceKey] || [], next[workspaceKey])) changed = true;
+      });
+      return changed ? next : current;
+    });
+  }
+
   function promoteOpenedSession(session: SessionSummary, previousSessions: SessionSummary[], nextSessions: SessionSummary[]) {
     const workspaceKey = workspaceKeyForSession(session);
     const workspaceAlreadyOpen = previousSessions.some(
@@ -1566,6 +1598,7 @@ export function App() {
       if (!orderedSessionIds.has(sessionId)) delete sessionViewCacheRef.current[sessionId];
     });
     setSessions(ordered);
+    pinSidebarOrderForSessions(ordered);
     setRecentCwds(Array.isArray(payload.recent_cwds) ? payload.recent_cwds : []);
     setNewSessionDefaults(payload.new_session_defaults || null);
     setTmuxAvailable(Boolean(payload.tmux_available));
