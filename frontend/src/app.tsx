@@ -58,6 +58,7 @@ const DETAIL_RAIL_WIDTH_PX = 360;
 const DETAIL_RAIL_STACK_BREAKPOINT_PX = 1080;
 const MOBILE_SIDEBAR_BREAKPOINT_PX = 860;
 const IMPORTANT_PRIORITY_OFFSET = 0.85;
+const PENDING_PRIORITY_OFFSET = -0.85;
 const SHELVE_FOR_NOW_SECONDS = 24 * 60 * 60;
 
 type BusySubmitMode = "queue" | "interrupt";
@@ -75,7 +76,7 @@ type NewSessionPreferences = {
   tmux?: boolean;
   backends?: Partial<Record<AgentBackend, NewSessionBackendPreferences>>;
 };
-type SessionMarkerState = "default" | "important";
+type SessionMarkerState = "normal" | "star" | "snooze" | "pending";
 type SidebarSessionOrder = Record<string, string[]>;
 type SidebarDragEvent = JSX.TargetedDragEvent<HTMLElement>;
 type SidebarContextMenuEvent = JSX.TargetedMouseEvent<HTMLElement>;
@@ -384,6 +385,10 @@ function sessionIsImportant(session: SessionSummary | null) {
   return Boolean(session && Number(session.priority_offset || 0) >= 0.5);
 }
 
+function sessionIsPending(session: SessionSummary | null) {
+  return Boolean(session && Number(session.priority_offset || 0) <= -0.5 && !sessionIsShelved(session));
+}
+
 function sessionIsShelved(session: SessionSummary | null) {
   if (!session) return false;
   if (session.snoozed) return true;
@@ -462,9 +467,31 @@ function sessionStatusText(session: SessionSummary, awaitingReply = false, stopS
 }
 
 function sessionMarkerState(session: SessionSummary | null): SessionMarkerState {
-  if (!session) return "default";
-  if (sessionIsImportant(session)) return "important";
-  return "default";
+  if (!session) return "normal";
+  if (sessionIsShelved(session)) return "snooze";
+  if (sessionIsImportant(session)) return "star";
+  if (sessionIsPending(session)) return "pending";
+  return "normal";
+}
+
+function nextSessionMarkerState(state: SessionMarkerState): SessionMarkerState {
+  if (state === "normal") return "star";
+  if (state === "star") return "pending";
+  if (state === "pending") return "snooze";
+  return "normal";
+}
+
+function sessionMarkerLabel(state: SessionMarkerState) {
+  if (state === "star") return "Star";
+  if (state === "snooze") return "Snooze";
+  if (state === "pending") return "Pending";
+  return "Normal";
+}
+
+function sessionMarkerIcon(state: SessionMarkerState) {
+  if (state === "snooze") return "snooze";
+  if (state === "pending") return "pending";
+  return "star";
 }
 
 function workspaceKeyForSession(session: SessionSummary) {
@@ -759,6 +786,13 @@ function icon(name: string) {
           <path d="M8 5.2V8l2 1.2" />
           <path d="M4.5 2.8 3.2 4.1" />
           <path d="M11.5 2.8 12.8 4.1" />
+        </svg>
+      );
+    case "pending":
+      return (
+        <svg {...common}>
+          <circle cx="8" cy="8" r="4.8" />
+          <path d="M5.5 8h5" />
         </svg>
       );
     case "file":
@@ -2145,7 +2179,8 @@ export function App() {
 
   async function handleSessionMarker(session: SessionSummary, nextState: SessionMarkerState) {
     if (!session || sessionMarkerBusyId === session.session_id) return;
-    const priorityOffset = nextState === "important" ? IMPORTANT_PRIORITY_OFFSET : 0;
+    const priorityOffset = nextState === "star" ? IMPORTANT_PRIORITY_OFFSET : nextState === "pending" ? PENDING_PRIORITY_OFFSET : 0;
+    const nextSnoozeUntil = nextState === "snooze" ? Math.floor(Date.now() / 1000) + SHELVE_FOR_NOW_SECONDS : null;
     const workspaceKey = workspaceKeyForSession(session);
     const currentWorkspace = groupedSessions.find((group) => group.key === workspaceKey) || null;
     const workspaceHadImportantBefore = currentWorkspace ? currentWorkspace.sessions.some((item) => sessionIsImportant(item)) : false;
@@ -2161,7 +2196,7 @@ export function App() {
       const result = await api.editSession(session.session_id, {
         name: String(session.alias || ""),
         priority_offset: priorityOffset,
-        snooze_until: session.snooze_until ?? null,
+        snooze_until: nextSnoozeUntil,
         dependency_session_id: session.dependency_session_id ?? null,
       });
       const resultSnoozeUntil = result.snooze_until ?? null;
@@ -2189,7 +2224,7 @@ export function App() {
         }),
       );
       setSessions(nextSessions);
-      if (nextState === "important") {
+      if (nextState === "star") {
         if (!workspaceHadImportantBefore) {
           setWorkspaceOrder((current) => insertOrderedKeyAfterAnchors(current, workspaceKey, starredWorkspaceKeys));
         }
@@ -2214,46 +2249,9 @@ export function App() {
         );
       });
       await refreshSessions({ preserveSelection: true });
-      pushToast(nextState === "important" ? "Starred session" : "Session star cleared");
+      pushToast(`Session marker: ${sessionMarkerLabel(nextState)}`);
     } catch (error) {
       setErrorText(error instanceof Error ? error.message : "Unable to update session marker");
-    } finally {
-      setSessionMarkerBusyId("");
-    }
-  }
-
-  async function handleSessionShelve(session: SessionSummary, nextShelved: boolean) {
-    if (!session || sessionMarkerBusyId === session.session_id) return;
-    setSessionContextMenu(null);
-    setSessionMarkerBusyId(session.session_id);
-    const nextSnoozeUntil = nextShelved ? Math.floor(Date.now() / 1000) + SHELVE_FOR_NOW_SECONDS : null;
-    try {
-      const result = await api.editSession(session.session_id, {
-        name: String(session.alias || ""),
-        priority_offset: Number(session.priority_offset || 0),
-        snooze_until: nextSnoozeUntil,
-        dependency_session_id: session.dependency_session_id ?? null,
-      });
-      const resultSnoozeUntil = result.snooze_until ?? null;
-      setSessions((current) =>
-        current.map((item) =>
-          item.session_id === session.session_id
-            ? {
-                ...item,
-                alias: String(result.alias || ""),
-                priority_offset: Number(result.priority_offset || 0),
-                snooze_until: resultSnoozeUntil,
-                dependency_session_id: result.dependency_session_id ?? null,
-                blocked: Boolean(result.dependency_session_id),
-                snoozed: Boolean(resultSnoozeUntil && resultSnoozeUntil > Date.now() / 1000),
-              }
-            : item,
-        ),
-      );
-      await refreshSessions({ preserveSelection: true });
-      pushToast(nextShelved ? "Session shelved" : "Session unshelved");
-    } catch (error) {
-      setErrorText(error instanceof Error ? error.message : "Unable to update session shelf");
     } finally {
       setSessionMarkerBusyId("");
     }
@@ -3045,8 +3043,10 @@ export function App() {
                     <div className="workspaceSessions">
                       {group.sessions.map((session) => {
                         const markerState = sessionMarkerState(session);
-                        const importantMarked = markerState === "important";
-                        const shelvedMarked = sessionIsShelved(session);
+                        const nextMarkerState = nextSessionMarkerState(markerState);
+                        const importantMarked = markerState === "star";
+                        const pendingMarked = markerState === "pending";
+                        const shelvedMarked = markerState === "snooze";
                         const hasDraft = Boolean((sessionDrafts[session.session_id] || "").trim());
                         const markerBusy = sessionMarkerBusyId === session.session_id;
                         const sessionAwaitingReply = session.session_id === selectedSessionAwaitingReplyId;
@@ -3058,7 +3058,7 @@ export function App() {
                         return (
                           <div
                             key={session.session_id}
-                            className={`workspace${selectedSessionId === session.session_id ? " active" : ""}${draggingSession?.sessionId === session.session_id ? " is-dragging" : ""}${importantMarked ? " is-important" : ""}${shelvedMarked ? " is-shelved" : ""}${sessionDropClass}`}
+                            className={`workspace${selectedSessionId === session.session_id ? " active" : ""}${draggingSession?.sessionId === session.session_id ? " is-dragging" : ""}${importantMarked ? " is-important" : ""}${pendingMarked ? " is-pending" : ""}${shelvedMarked ? " is-shelved" : ""}${sessionDropClass}`}
                             draggable
                             onDragStart={(event) => handleSessionDragStart(event, group.key, session.session_id)}
                             onDragOver={(event) => handleSessionDragOver(event, group.key, session.session_id)}
@@ -3099,34 +3099,20 @@ export function App() {
                                 />
                               </div>
                               <button
-                                className={`workspaceMarkerBtn${importantMarked ? " active" : ""}`}
+                                className={`workspaceMarkerBtn marker-${markerState}${markerState !== "normal" ? " active" : ""}`}
                                 type="button"
-                                title={importantMarked ? "Clear star" : "Star session"}
-                                aria-pressed={importantMarked}
+                                title={`${sessionMarkerLabel(markerState)} marker. Click for ${sessionMarkerLabel(nextMarkerState)}.`}
+                                aria-label={`${sessionMarkerLabel(markerState)} marker. Click for ${sessionMarkerLabel(nextMarkerState)}.`}
+                                aria-pressed={markerState !== "normal"}
                                 disabled={markerBusy}
                                 draggable={false}
                                 onPointerDown={(event) => event.stopPropagation()}
                                 onClick={(event) => {
                                   event.stopPropagation();
-                                  void handleSessionMarker(session, importantMarked ? "default" : "important");
+                                  void handleSessionMarker(session, nextMarkerState);
                                 }}
                               >
-                                {icon("star")}
-                              </button>
-                              <button
-                                className={`workspaceMarkerBtn shelveMarker${shelvedMarked ? " active" : ""}`}
-                                type="button"
-                                title={shelvedMarked ? "Unshelve session" : "Shelve session"}
-                                aria-pressed={shelvedMarked}
-                                disabled={markerBusy}
-                                draggable={false}
-                                onPointerDown={(event) => event.stopPropagation()}
-                                onClick={(event) => {
-                                  event.stopPropagation();
-                                  void handleSessionShelve(session, !shelvedMarked);
-                                }}
-                              >
-                                {icon("snooze")}
+                                {icon(sessionMarkerIcon(markerState))}
                               </button>
                             </div>
                           </div>
@@ -3513,16 +3499,11 @@ export function App() {
           <button
             type="button"
             disabled={sessionMarkerBusyId === contextMenuSession.session_id}
-            onClick={() => void handleSessionMarker(contextMenuSession, sessionMarkerState(contextMenuSession) === "important" ? "default" : "important")}
+            onClick={() => void handleSessionMarker(contextMenuSession, nextSessionMarkerState(sessionMarkerState(contextMenuSession)))}
           >
-            {sessionMarkerState(contextMenuSession) === "important" ? "Clear star" : "Star session"}
-          </button>
-          <button
-            type="button"
-            disabled={sessionMarkerBusyId === contextMenuSession.session_id}
-            onClick={() => void handleSessionShelve(contextMenuSession, !sessionIsShelved(contextMenuSession))}
-          >
-            {sessionIsShelved(contextMenuSession) ? "Unshelve session" : "Shelve session"}
+            Marker: {sessionMarkerLabel(sessionMarkerState(contextMenuSession))}
+            {" -> "}
+            {sessionMarkerLabel(nextSessionMarkerState(sessionMarkerState(contextMenuSession)))}
           </button>
           <button type="button" onClick={() => openRenameDialog(contextMenuSession)}>
             Rename

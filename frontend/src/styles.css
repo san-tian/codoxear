@@ -553,26 +553,37 @@ button:disabled {
   background: rgba(148, 163, 184, 0.12);
 }
 
+.workspace.is-pending {
+  border-color: rgba(245, 158, 11, 0.18);
+}
+
 .workspaceMarkerBtn.active {
-  color: #b45309;
   border-color: transparent;
   background: transparent;
 }
 
-.workspaceMarkerBtn.shelveMarker.active {
+.workspaceMarkerBtn.marker-star.active {
+  color: #b45309;
+}
+
+.workspaceMarkerBtn.marker-pending.active {
+  color: rgba(245, 158, 11, 0.68);
+}
+
+.workspaceMarkerBtn.marker-snooze.active {
   color: var(--muted);
   opacity: 0;
   border-color: transparent;
   background: transparent;
 }
 
-.workspace:hover .workspaceMarkerBtn.shelveMarker.active,
-.workspaceMarkerBtn.shelveMarker.active:focus-visible {
+.workspace:hover .workspaceMarkerBtn.marker-snooze.active,
+.workspaceMarkerBtn.marker-snooze.active:focus-visible {
   opacity: 0.16;
   background: transparent;
 }
 
-.workspace.active .workspaceMarkerBtn.shelveMarker.active {
+.workspace.active .workspaceMarkerBtn.marker-snooze.active {
   opacity: 0.1;
   background: transparent;
 }
