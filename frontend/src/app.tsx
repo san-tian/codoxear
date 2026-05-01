@@ -77,6 +77,7 @@ type NewSessionPreferences = {
   backends?: Partial<Record<AgentBackend, NewSessionBackendPreferences>>;
 };
 type SessionMarkerState = "normal" | "star" | "snooze" | "pending";
+const SESSION_MARKER_STATES: SessionMarkerState[] = ["normal", "star", "pending", "snooze"];
 type SidebarSessionOrder = Record<string, string[]>;
 type SidebarDragEvent = JSX.TargetedDragEvent<HTMLElement>;
 type SidebarContextMenuEvent = JSX.TargetedMouseEvent<HTMLElement>;
@@ -2941,6 +2942,7 @@ export function App() {
       />
     );
   }
+  const contextMenuMarkerState = sessionMarkerState(contextMenuSession);
 
   return (
     <>
@@ -3496,15 +3498,26 @@ export function App() {
           onClick={(event) => event.stopPropagation()}
           onContextMenu={(event) => event.preventDefault()}
       >
-          <button
-            type="button"
-            disabled={sessionMarkerBusyId === contextMenuSession.session_id}
-            onClick={() => void handleSessionMarker(contextMenuSession, nextSessionMarkerState(sessionMarkerState(contextMenuSession)))}
-          >
-            Marker: {sessionMarkerLabel(sessionMarkerState(contextMenuSession))}
-            {" -> "}
-            {sessionMarkerLabel(nextSessionMarkerState(sessionMarkerState(contextMenuSession)))}
-          </button>
+          <div className="sessionContextMenuSection">
+            <div className="sessionContextMenuLabel">Marker</div>
+            <div className="sessionMarkerChoices" role="group" aria-label="Set session marker">
+              {SESSION_MARKER_STATES.map((state) => {
+                const selected = contextMenuMarkerState === state;
+                return (
+                  <button
+                    key={state}
+                    className={`sessionMarkerChoice marker-${state}${selected ? " active" : ""}`}
+                    type="button"
+                    aria-pressed={selected}
+                    disabled={selected || sessionMarkerBusyId === contextMenuSession.session_id}
+                    onClick={() => void handleSessionMarker(contextMenuSession, state)}
+                  >
+                    {sessionMarkerLabel(state)}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
           <button type="button" onClick={() => openRenameDialog(contextMenuSession)}>
             Rename
           </button>
