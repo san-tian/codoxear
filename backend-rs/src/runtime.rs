@@ -6726,6 +6726,9 @@ fn base_spawn_env_overrides(
 }
 
 fn apply_spawn_env(command: &mut Command, env_overrides: &HashMap<String, String>) {
+    for key in ["TMUX", "TMUX_PANE"] {
+        command.env_remove(key);
+    }
     for key in [
         "CODEX_WEB_MODEL_PROVIDER",
         "CODEX_WEB_PREFERRED_AUTH_METHOD",

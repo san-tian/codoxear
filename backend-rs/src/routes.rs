@@ -2791,7 +2791,7 @@ mod tests {
         let tmux_path = repo_root.join("fake-tmux.sh");
         write_executable(
             &tmux_path,
-            "#!/usr/bin/env bash\nset -euo pipefail\ncmd=\"${1-}\"\nif [[ \"$cmd\" == \"-V\" ]]; then\n  echo 'tmux 3.4'\n  exit 0\nfi\nif [[ \"$cmd\" == \"has-session\" ]]; then\n  exit 1\nfi\nif [[ \"$cmd\" == \"new-session\" || \"$cmd\" == \"new-window\" ]]; then\n  shell_cmd=\"${@: -1}\"\n  printf 'SHELL=%s\\n' \"$shell_cmd\" >> \"${CODOXEAR_TEST_TMUX_LOG}\"\n  nonce=$(printf '%s' \"$shell_cmd\" | sed -n 's/.*CODEX_WEB_SPAWN_NONCE=\\([^ ]*\\).*/\\1/p')\n  printf '{\"spawn_nonce\":\"%s\",\"broker_pid\":7777}\\n' \"$nonce\" > \"${CODOXEAR_APP_DIR}/socks/spawn.json\"\n  printf '%%8\\n'\n  exit 0\nfi\nif [[ \"$cmd\" == \"capture-pane\" ]]; then\n  printf 'booting\\n'\n  exit 0\nfi\nexit 1\n",
+            "#!/usr/bin/env bash\nset -euo pipefail\ncmd=\"${1-}\"\nif [[ \"$cmd\" == \"-V\" ]]; then\n  echo 'tmux 3.4'\n  exit 0\nfi\nif [[ \"$cmd\" == \"has-session\" ]]; then\n  exit 1\nfi\nif [[ \"$cmd\" == \"new-session\" || \"$cmd\" == \"new-window\" ]]; then\n  shell_cmd=\"${@: -1}\"\n  printf 'SHELL=%s\\nTMUX=%s\\nTMUX_PANE=%s\\n' \"$shell_cmd\" \"${TMUX-}\" \"${TMUX_PANE-}\" >> \"${CODOXEAR_TEST_TMUX_LOG}\"\n  nonce=$(printf '%s' \"$shell_cmd\" | sed -n 's/.*CODEX_WEB_SPAWN_NONCE=\\([^ ]*\\).*/\\1/p')\n  printf '{\"spawn_nonce\":\"%s\",\"broker_pid\":7777}\\n' \"$nonce\" > \"${CODOXEAR_APP_DIR}/socks/spawn.json\"\n  printf '%%8\\n'\n  exit 0\nfi\nif [[ \"$cmd\" == \"capture-pane\" ]]; then\n  printf 'booting\\n'\n  exit 0\nfi\nexit 1\n",
         );
         let _app_dir = EnvGuard::set("CODOXEAR_APP_DIR", app_dir.display().to_string());
         let _repo_root = EnvGuard::set("CODOXEAR_REPO_ROOT", repo_root.display().to_string());
@@ -2832,6 +2832,8 @@ mod tests {
         assert!(log.contains("CODEX_WEB_TRANSPORT=tmux"));
         assert!(log.contains("CODEX_WEB_TMUX_SESSION=codoxear"));
         assert!(log.contains("fake-broker-rs"));
+        assert!(log.contains("TMUX=\n"));
+        assert!(log.contains("TMUX_PANE=\n"));
     }
 
     #[tokio::test]
