@@ -2801,6 +2801,7 @@ mod tests {
         );
         let _tmux = EnvGuard::set("CODOXEAR_TMUX_BIN", tmux_path.display().to_string());
         let _tmux_log = EnvGuard::set("CODOXEAR_TEST_TMUX_LOG", tmux_log.display().to_string());
+        let _tmux_session = EnvGuard::set("CODEX_WEB_TMUX_SESSION", "legacy-codoxear");
         let app = router(build_state_from_config(RuntimeConfig { app_dir }).unwrap());
 
         let response = app
@@ -2822,7 +2823,8 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
         let payload: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(payload["broker_pid"], 7777);
-        assert_eq!(payload["tmux_session"], "codoxear");
+        let tmux_session = payload["tmux_session"].as_str().unwrap();
+        assert!(tmux_session.starts_with("codoxear-workspace-"));
         assert!(payload["tmux_window"]
             .as_str()
             .unwrap()
@@ -2830,10 +2832,67 @@ mod tests {
 
         let log = fs::read_to_string(&tmux_log).unwrap();
         assert!(log.contains("CODEX_WEB_TRANSPORT=tmux"));
-        assert!(log.contains("CODEX_WEB_TMUX_SESSION=codoxear"));
+        assert!(log.contains(&format!("CODEX_WEB_TMUX_SESSION={tmux_session}")));
         assert!(log.contains("fake-broker-rs"));
         assert!(log.contains("TMUX=\n"));
         assert!(log.contains("TMUX_PANE=\n"));
+    }
+
+    #[tokio::test]
+    async fn session_create_route_uses_workspace_cwd_for_tmux_session() {
+        let _guard = env_lock().lock().unwrap();
+        let app_dir = temp_app_dir("create-tmux-workspace");
+        let repo_root = temp_dir("repo-root-tmux-workspace");
+        let workspace_cwd = repo_root.join("workspace-root");
+        let cwd = workspace_cwd.join("nested").join("task");
+        fs::create_dir_all(&cwd).unwrap();
+        let tmux_log = repo_root.join("tmux.log");
+        let tmux_path = repo_root.join("fake-tmux.sh");
+        write_executable(
+            &tmux_path,
+            "#!/usr/bin/env bash\nset -euo pipefail\ncmd=\"${1-}\"\nif [[ \"$cmd\" == \"-V\" ]]; then\n  echo 'tmux 3.4'\n  exit 0\nfi\nif [[ \"$cmd\" == \"has-session\" ]]; then\n  exit 1\nfi\nif [[ \"$cmd\" == \"new-session\" || \"$cmd\" == \"new-window\" ]]; then\n  shell_cmd=\"${@: -1}\"\n  printf 'SHELL=%s\\n' \"$shell_cmd\" >> \"${CODOXEAR_TEST_TMUX_LOG}\"\n  nonce=$(printf '%s' \"$shell_cmd\" | sed -n 's/.*CODEX_WEB_SPAWN_NONCE=\\([^ ]*\\).*/\\1/p')\n  printf '{\"spawn_nonce\":\"%s\",\"broker_pid\":8888}\\n' \"$nonce\" > \"${CODOXEAR_APP_DIR}/socks/spawn.json\"\n  printf '%%9\\n'\n  exit 0\nfi\nexit 1\n",
+        );
+        let _app_dir = EnvGuard::set("CODOXEAR_APP_DIR", app_dir.display().to_string());
+        let _repo_root = EnvGuard::set("CODOXEAR_REPO_ROOT", repo_root.display().to_string());
+        let _broker = EnvGuard::set(
+            "CODOXEAR_RUST_BROKER_BIN",
+            repo_root.join("fake-broker-rs").display().to_string(),
+        );
+        let _tmux = EnvGuard::set("CODOXEAR_TMUX_BIN", tmux_path.display().to_string());
+        let _tmux_log = EnvGuard::set("CODOXEAR_TEST_TMUX_LOG", tmux_log.display().to_string());
+        let _tmux_session = EnvGuard::set("CODEX_WEB_TMUX_SESSION", "legacy-codoxear");
+        let app = router(build_state_from_config(RuntimeConfig { app_dir }).unwrap());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/sessions")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(format!(
+                        r#"{{"cwd":"{}","workspace_cwd":"{}","create_in_tmux":true}}"#,
+                        cwd.display(),
+                        workspace_cwd.display()
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let payload: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["broker_pid"], 8888);
+        let tmux_session = payload["tmux_session"].as_str().unwrap();
+        assert!(tmux_session.starts_with("codoxear-workspace-root-"));
+        assert!(!tmux_session.contains("task"));
+
+        let log = fs::read_to_string(&tmux_log).unwrap();
+        assert!(log.contains(&format!("CODEX_WEB_TMUX_SESSION={tmux_session}")));
+        assert!(log.contains(&format!(
+            "CODEX_WEB_WORKSPACE_CWD={}",
+            workspace_cwd.display()
+        )));
     }
 
     #[tokio::test]

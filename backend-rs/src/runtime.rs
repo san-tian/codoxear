@@ -344,7 +344,7 @@ pub fn load_sessions_response(config: &RuntimeConfig) -> Result<ApiSessionsRespo
         recent_cwds,
         new_session_defaults: new_session_defaults()?,
         tmux_available: tmux_available(),
-        tmux_session_name: Some("codoxear".to_string()),
+        tmux_session_name: None,
     })
 }
 
@@ -6685,12 +6685,18 @@ fn codex_trust_override_for_path(path: &Path) -> String {
     )
 }
 
-fn tmux_session_name() -> String {
-    env::var("CODEX_WEB_TMUX_SESSION")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "codoxear".to_string())
+fn tmux_session_name_for_cwd(cwd: &Path) -> String {
+    let label = cwd
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("workspace");
+    let slug = safe_filename(label, "workspace")
+        .chars()
+        .take(48)
+        .collect::<String>();
+    let digest = Sha256::digest(cwd.display().to_string().as_bytes());
+    let hash = format!("{:x}", digest).chars().take(10).collect::<String>();
+    format!("codoxear-{slug}-{hash}")
 }
 
 fn next_spawn_nonce() -> String {
@@ -7565,7 +7571,6 @@ pub fn create_session(
         "--".to_string(),
     ];
     broker_args.extend(agent_args.iter().cloned());
-    let tmux_session = tmux_session_name();
     let mut env_overrides = base_spawn_env_overrides(&backend_name, resume_id);
     if let Some(model_provider) = request.model_provider.as_deref() {
         env_overrides.insert(
@@ -7607,6 +7612,8 @@ pub fn create_session(
                 "tmux is unavailable on this host",
             ));
         }
+        let tmux_cwd = workspace_cwd.as_deref().unwrap_or(&cwd_path);
+        let tmux_session = tmux_session_name_for_cwd(tmux_cwd);
         let spawn_nonce = next_spawn_nonce();
         let tmux_window = safe_filename(
             &format!(

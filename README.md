@@ -127,7 +127,7 @@ tailscale serve status
 - Desktop Linux: start Codex or Pi in your GUI terminal emulator, then continue the same live session on your phone or a laptop browser.
 - Headless Linux: start Codex or Pi inside `tmux`, then attach from your phone or a laptop browser. This avoids using a mobile terminal emulator for TUI interaction (for example Termius).
 - Web-owned sessions: start a new Codex or Pi session from the Codoxear UI, use it from mobile, and kill it from the UI when finished.
-- Web-owned tmux sessions: start a new Codex or Pi session from the Codoxear UI with `Create in tmux` enabled to run it inside tmux session `codoxear` for shell-side observability.
+- Web-owned tmux sessions: start a new Codex or Pi session from the Codoxear UI with `Create in tmux` enabled to run it inside a stable tmux session derived from the session workspace/cwd for shell-side observability. Sessions in the same workspace share one tmux session and use separate tmux windows.
 - When a tmux-backed session is selected, the top bar shows a tmux button that copies the exact `tmux attach-session ...` command for reconnecting to that session from a terminal.
 - The Nova preview shell also exposes a `Copy tmux attach` button for tmux-backed sessions, using the same `tmux attach-session ...` command shape.
 
@@ -137,7 +137,7 @@ Codoxear shows three kinds of sessions:
 
 - Terminal-owned: sessions started from your local terminal via `codox` or `piox` (the broker wrappers). They are marked `T` in the UI.
 - Web-owned: sessions started from the Codoxear UI ("New session"). They are marked `W` in the UI.
-- Web-owned tmux: sessions started from the Codoxear UI with `Create in tmux` enabled. They are marked with the tmux split-pane icon in the UI and run under tmux session `codoxear`.
+- Web-owned tmux: sessions started from the Codoxear UI with `Create in tmux` enabled. They are marked with the tmux split-pane icon in the UI and run under a tmux session derived from `workspace_cwd` when present, otherwise from the real `cwd`; each browser session gets its own tmux window.
 
 The current UI offers Delete for all session kinds. Delete sends a shutdown request to the underlying broker, so deleting a terminal-owned session also stops the corresponding terminal session.
 
