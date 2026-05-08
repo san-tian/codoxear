@@ -475,6 +475,88 @@ function itemStatusClass(status: string | undefined) {
   return normalized ? ` is-${normalized}` : "";
 }
 
+type MessageBodySegment =
+  | { kind: "text"; text: string }
+  | { kind: "attachment"; index: string; path: string; filename: string; extension: string };
+
+function cleanAttachmentFilename(path: string) {
+  const basename = path.split(/[\\/]/).filter(Boolean).pop() || path || "attachment";
+  return basename.replace(/^\d{10,}_/, "") || basename;
+}
+
+function attachmentExtension(filename: string) {
+  const match = filename.match(/\.([A-Za-z0-9]{1,12})$/);
+  return match ? match[1].toLocaleUpperCase() : "FILE";
+}
+
+function parseMessageBodySegments(body: string): MessageBodySegment[] {
+  const segments: MessageBodySegment[] = [];
+  const textLines: string[] = [];
+  const flushText = () => {
+    const text = textLines.join("\n").trim();
+    if (text) segments.push({ kind: "text", text });
+    textLines.length = 0;
+  };
+  String(body || "")
+    .split(/\r?\n/)
+    .forEach((line) => {
+      const match = line.match(/^\s*Attachment\s+(\d+)\s*:\s*(.+?)\s*$/i);
+      if (!match) {
+        textLines.push(line);
+        return;
+      }
+      flushText();
+      const path = match[2].trim();
+      const filename = cleanAttachmentFilename(path);
+      segments.push({
+        kind: "attachment",
+        index: match[1],
+        path,
+        filename,
+        extension: attachmentExtension(filename),
+      });
+    });
+  flushText();
+  return segments;
+}
+
+function AttachmentBlock(props: { segment: Extract<MessageBodySegment, { kind: "attachment" }> }) {
+  const { segment } = props;
+  return (
+    <div className="attachment-card" title={segment.path}>
+      <div className="attachment-filemark" aria-hidden="true">
+        <span>{segment.extension}</span>
+      </div>
+      <div className="attachment-main">
+        <div className="attachment-title-row">
+          <span className="attachment-title">{segment.filename}</span>
+          <span className="attachment-index">Attachment {segment.index}</span>
+        </div>
+        <div className="attachment-path">{segment.path}</div>
+      </div>
+    </div>
+  );
+}
+
+function RichMessageBody(props: { body: string; className?: string }) {
+  const segments = parseMessageBodySegments(props.body);
+  if (!segments.length) return null;
+  if (segments.length === 1 && segments[0].kind === "text") {
+    return <MarkdownBlock text={segments[0].text} className={props.className || "message-body markdown-body"} />;
+  }
+  return (
+    <div className="message-body rich-message-body">
+      {segments.map((segment, index) =>
+        segment.kind === "attachment" ? (
+          <AttachmentBlock segment={segment} key={`attachment-${segment.index}-${index}`} />
+        ) : (
+          <MarkdownBlock text={segment.text} className={props.className || "message-body markdown-body"} key={`text-${index}`} />
+        ),
+      )}
+    </div>
+  );
+}
+
 function ExtensionProgress(props: { event: UiTranscriptEvent }) {
   const { event } = props;
   const total = event.progressTotal;
@@ -513,7 +595,7 @@ function ExtensionProgress(props: { event: UiTranscriptEvent }) {
           ))}
         </ol>
       ) : null}
-      {event.body ? <MarkdownBlock text={event.body} className="message-body markdown-body extension-body" /> : null}
+      {event.body ? <RichMessageBody body={event.body} className="message-body markdown-body extension-body" /> : null}
     </div>
   );
 }
@@ -527,17 +609,17 @@ function ToolEventDetails(props: { event: UiTranscriptEvent }) {
       <div className="tool-pair">
         <section className="tool-part">
           <div className="tool-part-label">Call</div>
-          <MarkdownBlock text={toolCallBody} className="message-body markdown-body" />
+          <RichMessageBody body={toolCallBody} className="message-body markdown-body" />
         </section>
         <section className="tool-part">
           <div className="tool-part-label">Result</div>
-          <MarkdownBlock text={toolResultBody} className="message-body markdown-body" />
+          <RichMessageBody body={toolResultBody} className="message-body markdown-body" />
         </section>
       </div>
     );
   }
   const body = toolResultBody || toolCallBody || String(event.body || "").trim();
-  return body ? <MarkdownBlock text={body} className="message-body markdown-body" /> : null;
+  return body ? <RichMessageBody body={body} className="message-body markdown-body" /> : null;
 }
 
 function answerTextForAskUser(event: UiTranscriptEvent, values: string[], freeform: string, bridgeAnswers: Record<string, string | string[]>) {
@@ -612,7 +694,7 @@ function AskUserPrompt(props: {
       onClick={(clickEvent) => clickEvent.stopPropagation()}
       onKeyDown={(keyEvent) => keyEvent.stopPropagation()}
     >
-      {event.askContext ? <MarkdownBlock text={event.askContext} className="message-body markdown-body ask-user-context" /> : null}
+      {event.askContext ? <RichMessageBody body={event.askContext} className="message-body markdown-body ask-user-context" /> : null}
       {event.askQuestion ? <div className="ask-user-question">{event.askQuestion}</div> : null}
 
       {questions.length ? (
@@ -753,7 +835,7 @@ export function TranscriptEventRow(props: {
             {event.kind === "extension" ? <ExtensionProgress event={event} /> : null}
             {event.kind === "ask_user" ? <AskUserPrompt event={event} onRespond={onAskUserRespond} /> : null}
             {event.kind === "tool" ? <ToolEventDetails event={event} /> : null}
-            {event.kind !== "extension" && event.kind !== "ask_user" && event.kind !== "tool" && event.body ? <MarkdownBlock text={event.body} className="message-body markdown-body" /> : null}
+            {event.kind !== "extension" && event.kind !== "ask_user" && event.kind !== "tool" && event.body ? <RichMessageBody body={event.body} className="message-body markdown-body" /> : null}
             {collapsible && event.meta ? <div className="message-meta">{event.meta}</div> : null}
             {showMessageFooter ? (
               <div className="message-footer">

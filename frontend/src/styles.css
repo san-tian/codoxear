@@ -1358,6 +1358,98 @@ button.primary {
   letter-spacing: -0.01em;
 }
 
+.rich-message-body {
+  gap: 9px;
+}
+
+.rich-message-body > .message-body {
+  min-width: 0;
+}
+
+.attachment-card {
+  display: grid;
+  grid-template-columns: 42px minmax(0, 1fr);
+  gap: 10px;
+  align-items: center;
+  max-width: min(100%, 620px);
+  padding: 9px 10px;
+  border: 1px solid rgba(159, 193, 255, 0.18);
+  border-radius: 8px;
+  background: linear-gradient(180deg, rgba(159, 193, 255, 0.1), rgba(21, 27, 37, 0.76));
+}
+
+.attachment-filemark {
+  width: 42px;
+  height: 42px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid rgba(159, 193, 255, 0.24);
+  border-radius: 8px;
+  background: rgba(216, 222, 233, 0.06);
+  color: var(--accent);
+  font-size: 10px;
+  font-weight: 800;
+  line-height: 1;
+}
+
+.attachment-main {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+}
+
+.attachment-title-row {
+  display: flex;
+  min-width: 0;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.attachment-title {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 1.25;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.attachment-index {
+  flex: 0 0 auto;
+  color: rgba(159, 193, 255, 0.72);
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1.2;
+}
+
+.attachment-path {
+  overflow: hidden;
+  color: var(--muted);
+  font-family: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+:root[data-theme="light"] .attachment-card {
+  border-color: rgba(37, 99, 235, 0.16);
+  background: linear-gradient(180deg, rgba(239, 246, 255, 0.68), rgba(248, 250, 252, 0.92));
+}
+
+:root[data-theme="light"] .attachment-filemark {
+  border-color: rgba(37, 99, 235, 0.22);
+  background: rgba(255, 255, 255, 0.82);
+  color: rgba(29, 78, 216, 0.84);
+}
+
+:root[data-theme="light"] .attachment-index {
+  color: rgba(37, 99, 235, 0.66);
+}
+
 .markdown-body {
   display: block;
 }
