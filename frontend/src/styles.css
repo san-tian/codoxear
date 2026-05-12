@@ -1875,6 +1875,72 @@ button.primary {
   margin-top: 2px;
 }
 
+.goal-panel {
+  display: grid;
+  gap: 9px;
+  max-width: 760px;
+  border: 1px solid rgba(15, 118, 110, 0.12);
+  border-radius: 8px;
+  padding: 12px;
+  background: rgba(15, 118, 110, 0.045);
+}
+
+.goal-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.goal-label {
+  color: rgba(15, 23, 42, 0.48);
+  font-size: 11px;
+  font-weight: 750;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.goal-objective {
+  color: rgba(15, 23, 42, 0.86);
+  font-size: 14px;
+  font-weight: 650;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.goal-metrics {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.goal-metric {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 5px;
+  min-height: 24px;
+  border: 1px solid rgba(15, 23, 42, 0.08);
+  border-radius: 999px;
+  padding: 3px 8px;
+  background: rgba(255, 255, 255, 0.42);
+  color: rgba(15, 23, 42, 0.52);
+  font-size: 11px;
+  line-height: 1.2;
+}
+
+.goal-metric strong {
+  color: rgba(15, 23, 42, 0.76);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.goal-report {
+  color: rgba(15, 23, 42, 0.6);
+  font-size: 12px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
 .message-summary {
   overflow: hidden;
   color: rgba(15, 23, 42, 0.58);
@@ -3068,6 +3134,33 @@ select,
   background: transparent;
 }
 
+.goal-panel {
+  border-color: rgba(45, 212, 191, 0.16);
+  background: rgba(45, 212, 191, 0.055);
+}
+
+.goal-label {
+  color: rgba(216, 222, 233, 0.54);
+}
+
+.goal-objective {
+  color: rgba(216, 222, 233, 0.92);
+}
+
+.goal-metric {
+  border-color: rgba(226, 232, 240, 0.1);
+  background: rgba(226, 232, 240, 0.045);
+  color: rgba(216, 222, 233, 0.58);
+}
+
+.goal-metric strong {
+  color: rgba(216, 222, 233, 0.86);
+}
+
+.goal-report {
+  color: rgba(216, 222, 233, 0.64);
+}
+
 .is-collapsible:hover .message-main,
 .event-question .message-main {
   background: transparent;
@@ -3334,6 +3427,33 @@ button.primary,
 
 :root[data-theme="light"] .extension-item-mark {
   border-color: rgba(15, 23, 42, 0.22);
+}
+
+:root[data-theme="light"] .goal-panel {
+  border-color: rgba(15, 118, 110, 0.12);
+  background: rgba(15, 118, 110, 0.045);
+}
+
+:root[data-theme="light"] .goal-label {
+  color: rgba(15, 23, 42, 0.48);
+}
+
+:root[data-theme="light"] .goal-objective {
+  color: rgba(15, 23, 42, 0.86);
+}
+
+:root[data-theme="light"] .goal-metric {
+  border-color: rgba(15, 23, 42, 0.08);
+  background: rgba(255, 255, 255, 0.42);
+  color: rgba(15, 23, 42, 0.52);
+}
+
+:root[data-theme="light"] .goal-metric strong {
+  color: rgba(15, 23, 42, 0.76);
+}
+
+:root[data-theme="light"] .goal-report {
+  color: rgba(15, 23, 42, 0.6);
 }
 
 :root[data-theme="light"] .icon-btn.primary,

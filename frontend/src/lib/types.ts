@@ -165,6 +165,12 @@ export type RawChatEvent =
       progress_current?: number;
       progress_total?: number;
       progress_label?: string;
+      goal_objective?: string;
+      goal_token_budget?: number;
+      goal_tokens_used?: number;
+      goal_tokens_remaining?: number;
+      goal_elapsed_seconds?: number;
+      goal_completion_report?: string;
       items?: TranscriptExtensionItem[];
     };
 
@@ -224,6 +230,12 @@ export type UiTranscriptEvent = {
   progressCurrent?: number;
   progressTotal?: number;
   progressLabel?: string;
+  goalObjective?: string;
+  goalTokenBudget?: number;
+  goalTokensUsed?: number;
+  goalTokensRemaining?: number;
+  goalElapsedSeconds?: number;
+  goalCompletionReport?: string;
   items?: TranscriptExtensionItem[];
   askQuestion?: string;
   askContext?: string;

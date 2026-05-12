@@ -128,7 +128,8 @@ function normalizeAskOption(option: AskUserOptionInput, index: number): AskUserO
 function isTodoExtensionEvent(raw: Extract<RawChatEvent, { type: "extension" }>) {
   const title = typeof raw.title === "string" ? raw.title.trim().toLocaleLowerCase() : "";
   const source = typeof raw.source === "string" ? raw.source.trim().toLocaleLowerCase() : "";
-  return title === "todo" || source === "codex";
+  const extensionKind = typeof raw.extension_kind === "string" ? raw.extension_kind.trim().toLocaleLowerCase() : "";
+  return extensionKind !== "goal" && (title === "todo" || source === "codex");
 }
 
 function normalizeAskOptions(options: unknown): AskUserOption[] {
@@ -299,6 +300,12 @@ function normalizeEvent(raw: RawChatEvent, index: number, knownToolTitles: Map<s
       progressCurrent: numberOrUndefined(raw.progress_current),
       progressTotal: numberOrUndefined(raw.progress_total),
       progressLabel: typeof raw.progress_label === "string" ? raw.progress_label : "",
+      goalObjective: typeof raw.goal_objective === "string" ? raw.goal_objective : "",
+      goalTokenBudget: numberOrUndefined(raw.goal_token_budget),
+      goalTokensUsed: numberOrUndefined(raw.goal_tokens_used),
+      goalTokensRemaining: numberOrUndefined(raw.goal_tokens_remaining),
+      goalElapsedSeconds: numberOrUndefined(raw.goal_elapsed_seconds),
+      goalCompletionReport: typeof raw.goal_completion_report === "string" ? raw.goal_completion_report : "",
       items,
     };
   }
@@ -470,6 +477,21 @@ function statusLabel(status: string) {
   return value || "status";
 }
 
+function formatCompactNumber(value: number | undefined) {
+  if (!(typeof value === "number" && Number.isFinite(value))) return "";
+  return Math.round(value).toLocaleString();
+}
+
+function formatElapsed(value: number | undefined) {
+  if (!(typeof value === "number" && Number.isFinite(value) && value >= 0)) return "";
+  const seconds = Math.round(value);
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  if (hours > 0) return `${hours}h ${minutes}m`;
+  if (minutes > 0) return `${minutes}m`;
+  return `${seconds}s`;
+}
+
 function itemStatusClass(status: string | undefined) {
   const normalized = String(status || "").trim().replace(/_/g, "-");
   return normalized ? ` is-${normalized}` : "";
@@ -595,6 +617,42 @@ function ExtensionProgress(props: { event: UiTranscriptEvent }) {
           ))}
         </ol>
       ) : null}
+      {event.body ? <RichMessageBody body={event.body} className="message-body markdown-body extension-body" /> : null}
+    </div>
+  );
+}
+
+function GoalMetric(props: { label: string; value: string }) {
+  if (!props.value) return null;
+  return (
+    <span className="goal-metric">
+      <span>{props.label}</span>
+      <strong>{props.value}</strong>
+    </span>
+  );
+}
+
+function GoalPanel(props: { event: UiTranscriptEvent }) {
+  const { event } = props;
+  const objective = String(event.goalObjective || event.summary || "").trim();
+  const used = formatCompactNumber(event.goalTokensUsed);
+  const budget = formatCompactNumber(event.goalTokenBudget);
+  const remaining = formatCompactNumber(event.goalTokensRemaining);
+  const elapsed = formatElapsed(event.goalElapsedSeconds);
+  return (
+    <div className="goal-panel">
+      <div className="goal-head">
+        <span className="goal-label">Goal</span>
+        {event.status ? <span className={`extension-status${itemStatusClass(event.status)}`}>{statusLabel(event.status)}</span> : null}
+      </div>
+      {objective ? <div className="goal-objective">{objective}</div> : null}
+      <div className="goal-metrics">
+        <GoalMetric label="Used" value={used} />
+        <GoalMetric label="Budget" value={budget || "unbounded"} />
+        <GoalMetric label="Left" value={remaining} />
+        <GoalMetric label="Elapsed" value={elapsed} />
+      </div>
+      {event.goalCompletionReport ? <div className="goal-report">{event.goalCompletionReport}</div> : null}
       {event.body ? <RichMessageBody body={event.body} className="message-body markdown-body extension-body" /> : null}
     </div>
   );
@@ -832,7 +890,8 @@ export function TranscriptEventRow(props: {
                 <span className="message-fold is-open" aria-label="Hide details" title="Hide details" />
               </div>
             ) : null}
-            {event.kind === "extension" ? <ExtensionProgress event={event} /> : null}
+            {event.kind === "extension" && event.extensionKind === "goal" ? <GoalPanel event={event} /> : null}
+            {event.kind === "extension" && event.extensionKind !== "goal" ? <ExtensionProgress event={event} /> : null}
             {event.kind === "ask_user" ? <AskUserPrompt event={event} onRespond={onAskUserRespond} /> : null}
             {event.kind === "tool" ? <ToolEventDetails event={event} /> : null}
             {event.kind !== "extension" && event.kind !== "ask_user" && event.kind !== "tool" && event.body ? <RichMessageBody body={event.body} className="message-body markdown-body" /> : null}
