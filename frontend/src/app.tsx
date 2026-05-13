@@ -1072,6 +1072,7 @@ function ShareWorkspace(props: {
   onInterrupt: () => void | Promise<void>;
   onLoadOlder: () => void | Promise<void>;
   onSelectFile: (path: string) => void;
+  onCopyText: (event: UiTranscriptEvent) => void | Promise<void>;
 }) {
   const session = props.share.sessions.find((item) => item.session_id === props.sessionId) || props.share.sessions[0] || null;
   return (
@@ -1137,6 +1138,7 @@ function ShareWorkspace(props: {
                       index={index}
                       collapsed={false}
                       onToggle={() => {}}
+                      onCopyText={props.onCopyText}
                       attachmentHref={(path) =>
                         `/share/${encodeURIComponent(props.share.share_id)}/sessions/${encodeURIComponent(props.sessionId)}/file/download?path=${encodeURIComponent(path)}`
                       }
@@ -2240,6 +2242,20 @@ export function App() {
       pushToast("Copied tmux attach command");
     } catch (error) {
       setErrorText(error instanceof Error ? error.message : "Unable to copy tmux command");
+    }
+  }
+
+  async function copyTranscriptEvent(event: UiTranscriptEvent) {
+    const text = String(event.body || "");
+    if (!text.trim()) {
+      pushToast("Nothing to copy");
+      return;
+    }
+    try {
+      await copyToClipboard(text);
+      pushToast(event.kind === "user" ? "Copied input" : "Copied reply");
+    } catch (error) {
+      setErrorText(error instanceof Error ? error.message : "Unable to copy message");
     }
   }
 
@@ -3420,6 +3436,7 @@ export function App() {
         onInterrupt={handleShareInterrupt}
         onLoadOlder={loadShareOlder}
         onSelectFile={(path) => void selectShareFile(path)}
+        onCopyText={copyTranscriptEvent}
       />
     );
   }
@@ -3787,6 +3804,7 @@ export function App() {
                           collapsed={collapsed}
                           onToggle={toggleTranscriptEvent}
                           onAskUserRespond={handleAskUserRespond}
+                          onCopyText={copyTranscriptEvent}
                         />
                       );
                     })}

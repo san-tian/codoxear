@@ -472,6 +472,19 @@ function eventClassName(kind: UiTranscriptEvent["kind"]) {
   }
 }
 
+function CopyIcon() {
+  return (
+    <svg viewBox="0 0 16 16" aria-hidden="true">
+      <rect x="5" y="2.75" width="7.5" height="9" rx="1.35" />
+      <path d="M3.5 5.25h-.35a1.35 1.35 0 0 0-1.35 1.35v5.65a1.35 1.35 0 0 0 1.35 1.35H8.8a1.35 1.35 0 0 0 1.35-1.35v-.35" />
+    </svg>
+  );
+}
+
+function canCopyEvent(event: UiTranscriptEvent) {
+  return (event.kind === "user" || event.kind === "assistant") && Boolean(String(event.body || "").trim());
+}
+
 function statusLabel(status: string) {
   const value = status.replace(/_/g, " ").trim();
   return value || "status";
@@ -853,12 +866,16 @@ export function TranscriptEventRow(props: {
   collapsed: boolean;
   onToggle: (event: UiTranscriptEvent) => void;
   onAskUserRespond?: (event: UiTranscriptEvent, text: string) => Promise<void>;
+  onCopyText?: (event: UiTranscriptEvent) => void | Promise<void>;
   attachmentHref?: (path: string) => string | undefined;
 }) {
   const { event, events, index, collapsed, onToggle, onAskUserRespond } = props;
   const collapsible = isCollapsibleEvent(event.kind);
   const showMessageSide = shouldShowMessageSide(events, index);
   const showMessageFooter = shouldShowMessageFooter(events, index, collapsible);
+  const canCopy = Boolean(props.onCopyText && canCopyEvent(event));
+  const showFooter = showMessageFooter || canCopy;
+  const copyLabel = event.kind === "user" ? "Copy input" : "Copy reply";
   const label = event.title || event.kind.replace("_", " ");
 
   return (
@@ -904,10 +921,24 @@ export function TranscriptEventRow(props: {
             {event.kind === "tool" ? <ToolEventDetails event={event} attachmentHref={props.attachmentHref} /> : null}
             {event.kind !== "extension" && event.kind !== "ask_user" && event.kind !== "tool" && event.body ? <RichMessageBody body={event.body} className="message-body markdown-body" attachmentHref={props.attachmentHref} /> : null}
             {collapsible && event.meta ? <div className="message-meta">{event.meta}</div> : null}
-            {showMessageFooter ? (
+            {showFooter ? (
               <div className="message-footer">
                 {event.meta ? <span className="message-meta">{event.meta}</span> : null}
                 {event.ts ? <span className="message-time">{formatTime(event.ts)}</span> : null}
+                {canCopy ? (
+                  <button
+                    className="message-copy-btn"
+                    type="button"
+                    title={copyLabel}
+                    aria-label={copyLabel}
+                    onClick={(clickEvent) => {
+                      clickEvent.stopPropagation();
+                      void props.onCopyText?.(event);
+                    }}
+                  >
+                    <CopyIcon />
+                  </button>
+                ) : null}
               </div>
             ) : null}
           </>

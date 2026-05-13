@@ -1267,8 +1267,43 @@ button.primary {
   display: flex;
   align-items: baseline;
   justify-content: flex-start;
+  flex-wrap: wrap;
   gap: 8px;
   margin-top: 8px;
+}
+
+.message-copy-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  color: var(--muted);
+  background: transparent;
+  cursor: pointer;
+  opacity: 0.66;
+  transition: color 0.14s ease, background 0.14s ease, border-color 0.14s ease, opacity 0.14s ease;
+}
+
+.message-copy-btn:hover,
+.message-copy-btn:focus-visible {
+  color: var(--text);
+  background: var(--panel-muted);
+  border-color: var(--border);
+  opacity: 1;
+}
+
+.message-copy-btn svg {
+  width: 13px;
+  height: 13px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.6;
+  stroke-linejoin: round;
 }
 
 .message-fold {
