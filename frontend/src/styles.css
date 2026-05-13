@@ -2796,16 +2796,6 @@ button.primary {
   color: var(--muted);
 }
 
-.sharePolicyNote {
-  padding: 10px 12px;
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  color: var(--muted);
-  background: var(--panel-muted);
-  font-size: 13px;
-  line-height: 1.45;
-}
-
 .error-inline {
   padding: 10px 12px;
   border: 1px solid rgba(185, 28, 28, 0.18);

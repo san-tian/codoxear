@@ -4493,7 +4493,6 @@ export function App() {
                   ))}
                 </div>
               </div>
-              <div className="sharePolicyNote">Interrupt, file browsing, and attachment downloads are enabled. Shared session nicknames use the main session names.</div>
               {shareCreateResult ? (
                 <div className="shareResult">
                   <label className="field">
