@@ -1323,6 +1323,8 @@ export function App() {
   const [fileSearchEntries, setFileSearchEntries] = useState<FileEntry[]>([]);
   const [fileSearchLoading, setFileSearchLoading] = useState(false);
   const [filesLoading, setFilesLoading] = useState(false);
+  const [fileOpenLoading, setFileOpenLoading] = useState(false);
+  const [fileOpenError, setFileOpenError] = useState("");
   const [activeFilePath, setActiveFilePath] = useState("");
   const [activeFile, setActiveFile] = useState<FileReadResponse | null>(null);
   const [queueOpen, setQueueOpen] = useState(false);
@@ -2260,6 +2262,7 @@ export function App() {
     if (!sessionId) return;
     const session = sessions.find((item) => item.session_id === sessionId) || null;
     setFilesLoading(true);
+    setFileOpenError("");
     let changedFiles: ChangedFilesResponse | null = null;
     try {
       changedFiles = await api.fetchChangedFiles(sessionId);
@@ -2280,14 +2283,24 @@ export function App() {
 
   async function openFile(path: string) {
     if (!selectedSessionRef.current || !path) return;
+    const sessionId = selectedSessionRef.current;
     setActiveFilePath(path);
+    setActiveFile(null);
+    setFileOpenError("");
+    setFileOpenLoading(true);
     try {
-      const data = await api.readSessionFile(selectedSessionRef.current, path);
-      if (selectedSessionRef.current !== selectedSessionId && selectedSessionId) return;
+      const data = await api.readSessionFile(sessionId, path);
+      if (selectedSessionRef.current !== sessionId) return;
       setActiveFile(data);
       setErrorText("");
     } catch (error) {
-      setErrorText(error instanceof Error ? error.message : "Unable to open file");
+      const message = error instanceof Error ? error.message : "Unable to open file";
+      setFileOpenError(message);
+      setErrorText(message);
+    } finally {
+      if (selectedSessionRef.current === sessionId) {
+        setFileOpenLoading(false);
+      }
     }
   }
 
@@ -3269,6 +3282,8 @@ export function App() {
     setFileEntries([]);
     setFileSearchQuery("");
     setFileSearchEntries([]);
+    setFileOpenLoading(false);
+    setFileOpenError("");
     setActiveFile(null);
     setActiveFilePath("");
     setCollapsedEvents({});
@@ -3837,11 +3852,13 @@ export function App() {
                       <button className="secondaryBtn" type="submit" disabled={fileSearchLoading || !fileSearchQuery.trim()}>
                         {fileSearchLoading ? "Searching…" : "Search"}
                       </button>
-                      <button className="secondaryBtn" type="button" disabled={!fileSearchQuery.trim()} onClick={() => void openFile(fileSearchQuery.trim())}>
-                        Open
+                      <button className="secondaryBtn" type="button" disabled={fileOpenLoading || !fileSearchQuery.trim()} onClick={() => void openFile(fileSearchQuery.trim())}>
+                        {fileOpenLoading ? "Opening..." : "Open"}
                       </button>
                     </form>
                     {filesLoading ? <div className="muted">Loading files…</div> : null}
+                    {fileOpenError ? <div className="fileOpenError">{fileOpenError}</div> : null}
+                    {fileOpenLoading ? <div className="muted">Opening {activeFilePath}...</div> : null}
                     <div className="fileList">
                       {visibleFileEntries.map((entry) => (
                         <button

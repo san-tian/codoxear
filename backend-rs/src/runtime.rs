@@ -2594,7 +2594,16 @@ pub fn load_changed_files_response(
 ) -> Result<ApiChangedFilesResponse, String> {
     let session = find_session(config, session_id)?;
     let cwd = resolve_search_root(&session.cwd)?;
-    ensure_git_repo(&cwd)?;
+    if git_repo_root(&cwd).is_none() {
+        return Ok(ApiChangedFilesResponse {
+            ok: true,
+            cwd: cwd.display().to_string(),
+            files: Vec::new(),
+            entries: Vec::new(),
+            unstaged: Vec::new(),
+            staged: Vec::new(),
+        });
+    }
 
     let unstaged = normalize_git_path_list(
         &run_git_capture(
@@ -10609,6 +10618,34 @@ name = "CRS"
             .unwrap();
         assert_eq!(staged.additions, Some(1));
         assert_eq!(staged.deletions, Some(0));
+    }
+
+    #[test]
+    fn changed_files_returns_empty_for_non_git_cwd() {
+        let app_dir = temp_app_dir("changed-files-non-git");
+        let workspace_dir = app_dir.join("workspace");
+        fs::create_dir_all(&workspace_dir).unwrap();
+        fs::write(workspace_dir.join("notes.txt"), "plain workspace\n").unwrap();
+        fs::write(app_dir.join("socks").join("sid-plain.sock"), "").unwrap();
+        fs::write(
+            app_dir.join("socks").join("sid-plain.json"),
+            format!(
+                r#"{{"session_id":"thread-plain","codex_pid":{},"broker_pid":{},"cwd":"{}","start_ts":1.0}}"#,
+                std::process::id(),
+                std::process::id(),
+                workspace_dir.display(),
+            ),
+        )
+        .unwrap();
+
+        let response =
+            load_changed_files_response(&RuntimeConfig { app_dir }, "sid-plain").unwrap();
+
+        assert_eq!(response.cwd, workspace_dir.display().to_string());
+        assert!(response.files.is_empty());
+        assert!(response.entries.is_empty());
+        assert!(response.unstaged.is_empty());
+        assert!(response.staged.is_empty());
     }
 
     #[test]

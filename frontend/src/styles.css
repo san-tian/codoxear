@@ -2017,6 +2017,17 @@ button.primary {
   gap: 8px;
 }
 
+.fileOpenError {
+  padding: 8px 10px;
+  border: 1px solid rgba(239, 68, 68, 0.22);
+  border-radius: 8px;
+  background: rgba(239, 68, 68, 0.08);
+  color: #fca5a5;
+  font-size: 12px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
 .fileEntry {
   width: 100%;
   padding: 10px;
