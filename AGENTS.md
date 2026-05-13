@@ -3,6 +3,7 @@
 ## Startup
 
 - Read this file first.
+- Read `docs/CONTEXT.md` for the public documentation index.
 - Then read every repo Feature doc whose hook keywords match the task.
 - Treat repo `docs/features/` and `docs/designs/` as the public project documentation source.
 - If a private operator memory exists outside the repository, treat it as private working memory for records and workflow notes only.
@@ -17,7 +18,7 @@
 
 ## Default Workflow
 
-1. Read — read this `AGENTS.md` and every repo Feature doc under `docs/features/` whose hook keywords in the Feature Index match the current task. If private operator memory is available, read relevant work records or workflow notes from there without copying private content into the repo.
+1. Read — read this `AGENTS.md`, `docs/CONTEXT.md`, and every repo Feature doc under `docs/features/` whose hook keywords in the Feature Index match the current task. If private operator memory is available, read relevant work records or workflow notes from there without copying private content into the repo.
 2. Code — modify only files relevant to the request. Do not write fallbacks or safety nets.
 3. Test — run the check closest to the change. If none exists, explain why and provide manual verification steps.
 4. Update docs — sync the relevant `docs/features/<feature>.md` or `docs/designs/<design>.md`, update the Feature/Documentation Index if docs were added/renamed, and update private work records outside the repo when available.
@@ -49,7 +50,8 @@
 
 ## Documentation Index
 
-- `docs/README.md` — public documentation entrypoint.
+- `docs/CONTEXT.md` — public documentation index and project context.
+- `docs/README.md` — short pointer to the documentation index.
 - `docs/features/server-and-api.md` — Rust web server, auth, API route families, and route verification.
 - `docs/features/session-and-broker.md` — Broker/session lifecycle, PTY/socket flow, tmux ownership, queue, and resume behavior.
 - `docs/features/ui.md` — Browser UI surface, legacy static assets, notification service worker, and manual UI checks.
