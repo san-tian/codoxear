@@ -74,6 +74,7 @@ type ThemeMode = "dark" | "light";
 type AgentBackend = "codex" | "pi";
 type TokenSummary = { label: string; title: string };
 type ShareDraftSession = { session_id: string; label: string; checked: boolean };
+type ManagedShareSet = ShareSet & { share_password?: string };
 type NewSessionBackendPreferences = {
   provider?: string;
   model?: string;
@@ -479,6 +480,26 @@ function absoluteShareUrl(path: string) {
 
 function shareInvitationText(result: ShareCreateResponse) {
   return [`URL: ${absoluteShareUrl(result.share_url)}`, `Password: ${result.share_password}`].join("\n");
+}
+
+function shareSetUrl(share: ShareSet) {
+  return `/share/${encodeURIComponent(share.share_id)}/`;
+}
+
+function shareSetCopyText(share: ManagedShareSet) {
+  const lines = [`URL: ${absoluteShareUrl(shareSetUrl(share))}`];
+  if (share.share_password) lines.push(`Password: ${share.share_password}`);
+  else if (share.password_hint) lines.push(`Password hint: ${share.password_hint}`);
+  return lines.join("\n");
+}
+
+function formatShareExpiry(expiresAt: number) {
+  if (!(expiresAt > 0)) return "";
+  const delta = expiresAt - Date.now() / 1000;
+  if (delta <= 0) return "expired";
+  if (delta < 3600) return `${Math.max(1, Math.ceil(delta / 60))}m left`;
+  if (delta < 86400) return `${Math.max(1, Math.ceil(delta / 3600))}h left`;
+  return `${Math.max(1, Math.ceil(delta / 86400))}d left`;
 }
 
 function sessionIsStarting(session: SessionSummary | null) {
@@ -1329,6 +1350,9 @@ export function App() {
   const [shareCreateBusy, setShareCreateBusy] = useState(false);
   const [shareCreateError, setShareCreateError] = useState("");
   const [shareCreateResult, setShareCreateResult] = useState<ShareCreateResponse | null>(null);
+  const [managedShares, setManagedShares] = useState<ManagedShareSet[]>([]);
+  const [managedSharesLoading, setManagedSharesLoading] = useState(false);
+  const [deletingShareId, setDeletingShareId] = useState("");
   const [sessionContextMenu, setSessionContextMenu] = useState<{ sessionId: string; x: number; y: number } | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [themeMode, setThemeMode] = useState<ThemeMode>(() => readThemeMode());
@@ -2315,6 +2339,49 @@ export function App() {
     }
   }
 
+  async function refreshManagedShares() {
+    setManagedSharesLoading(true);
+    try {
+      const response = await api.fetchShareLinks();
+      setManagedShares((current) => {
+        const passwordById = new Map(current.map((share) => [share.share_id, share.share_password || ""]));
+        if (shareCreateResult?.share_password) passwordById.set(shareCreateResult.share_id, shareCreateResult.share_password);
+        return (response.shares || []).map((share) => ({
+          ...share,
+          share_password: passwordById.get(share.share_id) || undefined,
+        }));
+      });
+    } catch (error) {
+      setShareCreateError(error instanceof Error ? error.message : "Unable to load share links");
+    } finally {
+      setManagedSharesLoading(false);
+    }
+  }
+
+  async function copyManagedShare(share: ManagedShareSet) {
+    try {
+      await copyToClipboard(shareSetCopyText(share));
+      pushToast(share.share_password ? "Share invite copied" : "Share URL copied");
+    } catch (error) {
+      setShareCreateError(error instanceof Error ? error.message : "Unable to copy share");
+    }
+  }
+
+  async function deleteManagedShare(shareId: string) {
+    setDeletingShareId(shareId);
+    setShareCreateError("");
+    try {
+      await api.deleteShareLink(shareId);
+      setManagedShares((current) => current.filter((share) => share.share_id !== shareId));
+      if (shareCreateResult?.share_id === shareId) setShareCreateResult(null);
+      pushToast("Share closed");
+    } catch (error) {
+      setShareCreateError(error instanceof Error ? error.message : "Unable to close share");
+    } finally {
+      setDeletingShareId("");
+    }
+  }
+
   function openShareCreateDialog() {
     if (!selectedSession) return;
     const sameWorkspace = sessions.filter((session) => workspaceKeyForSession(session) === workspaceKeyForSession(selectedSession));
@@ -2329,6 +2396,7 @@ export function App() {
     setShareCreateError("");
     setShareCreateResult(null);
     setShareCreateOpen(true);
+    void refreshManagedShares();
   }
 
   function toggleShareDraftSession(sessionId: string) {
@@ -2359,6 +2427,24 @@ export function App() {
       });
       setShareCreateExpiresHours(expiresInHours);
       setShareCreateResult(response);
+      setManagedShares((current) => {
+        const nextShare: ManagedShareSet = {
+          share_id: response.share_id,
+          label: response.share_label,
+          password_hash: "",
+          password_hint: response.share_password.slice(0, 4),
+          expires_at: response.expires_at,
+          created_at: Date.now() / 1000,
+          updated_at: Date.now() / 1000,
+          allow_interrupt: true,
+          allow_files: true,
+          allow_attachment_downloads: true,
+          session_ids: response.sessions.map((session) => session.session_id),
+          sessions: response.sessions,
+          share_password: response.share_password,
+        };
+        return [nextShare, ...current.filter((share) => share.share_id !== response.share_id)];
+      });
       pushToast("Share link created");
     } catch (error) {
       setShareCreateError(error instanceof Error ? error.message : "Unable to create share link");
@@ -4447,7 +4533,7 @@ export function App() {
 
       {shareCreateOpen ? (
         <div className="modalBackdrop" onClick={() => setShareCreateOpen(false)}>
-          <div className="modalCard compactModal" onClick={(event) => event.stopPropagation()}>
+          <div className="modalCard shareManageModal" onClick={(event) => event.stopPropagation()}>
             <div className="modalHeader">
               <div>Share sessions</div>
               <button className="icon-btn" type="button" onClick={() => setShareCreateOpen(false)}>
@@ -4508,6 +4594,52 @@ export function App() {
                   </button>
                 </div>
               ) : null}
+              <section className="shareManager">
+                <div className="shareManagerHeader">
+                  <div>
+                    <strong>Created shares</strong>
+                    <span>{managedShares.length ? `${managedShares.length} active` : "No active share sets"}</span>
+                  </div>
+                  <button className="secondaryBtn" type="button" disabled={managedSharesLoading} onClick={() => void refreshManagedShares()}>
+                    {managedSharesLoading ? "Refreshing..." : "Refresh"}
+                  </button>
+                </div>
+                <div className="shareManagerList">
+                  {managedShares.map((share) => (
+                    <article className="shareManagerItem" key={share.share_id}>
+                      <div className="shareManagerMain">
+                        <div className="shareManagerTitleRow">
+                          <strong>{share.label || "Shared sessions"}</strong>
+                          <span className={`shareExpiry${share.expires_at <= Date.now() / 1000 ? " expired" : ""}`}>{formatShareExpiry(share.expires_at)}</span>
+                        </div>
+                        <div className="shareManagerMeta">
+                          <span>{share.sessions.length} session{share.sessions.length === 1 ? "" : "s"}</span>
+                          <span>{share.share_id}</span>
+                          {share.password_hint ? <span>hint {share.password_hint}</span> : null}
+                        </div>
+                      </div>
+                      <div className="shareManagerActions">
+                        <a className="secondaryBtn" href={shareSetUrl(share)} target="_blank" rel="noreferrer">
+                          Open
+                        </a>
+                        <button className="secondaryBtn" type="button" onClick={() => void copyManagedShare(share)}>
+                          Copy
+                        </button>
+                        <button
+                          className="icon-btn danger"
+                          type="button"
+                          title="Close share"
+                          disabled={deletingShareId === share.share_id}
+                          onClick={() => void deleteManagedShare(share.share_id)}
+                        >
+                          {icon("trash")}
+                        </button>
+                      </div>
+                    </article>
+                  ))}
+                  {!managedShares.length ? <div className="shareManagerEmpty">Created share sets will appear here.</div> : null}
+                </div>
+              </section>
               {shareCreateError ? <div className="error-inline">{shareCreateError}</div> : null}
               <div className="modalActions">
                 <button className="secondaryBtn" type="button" onClick={() => setShareCreateOpen(false)}>

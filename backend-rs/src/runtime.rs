@@ -6954,6 +6954,31 @@ pub fn update_share_sessions(
     Ok(share)
 }
 
+pub fn list_share_sets(config: &RuntimeConfig) -> Result<Vec<ApiShareSet>, String> {
+    let shares = read_share_store(config)?;
+    let mut out = Vec::new();
+    for share in shares.values() {
+        if let Ok(value) = share_set_from_record(config, share) {
+            out.push(value);
+        }
+    }
+    out.sort_by(|left, right| {
+        right
+            .updated_at
+            .partial_cmp(&left.updated_at)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    Ok(out)
+}
+
+pub fn delete_share_set(config: &RuntimeConfig, share_id: &str) -> Result<(), String> {
+    let mut shares = read_share_store(config)?;
+    if shares.remove(share_id).is_none() {
+        return Err("unknown share".to_string());
+    }
+    write_share_store(config, &shares)
+}
+
 pub fn load_share_set(config: &RuntimeConfig, share_id: &str) -> Result<ApiShareSet, String> {
     let shares = read_share_store(config)?;
     let Some(share) = shares.get(share_id) else {

@@ -2,12 +2,13 @@ use crate::app_state::{epoch_now, AppState};
 use crate::models::{
     ApiChangedFilesResponse, ApiDiagnosticsResponse, ApiFileSearchResponse, ApiGitDiffResponse,
     ApiGitFileVersionsResponse, ApiHarnessResponse, ApiQueueResponse, ApiShareCreateResponse,
-    ApiShareFilesResponse, ApiShareSet, EventKind, LiveEvent, SendMessagePayload, TranscriptEvent,
+    ApiShareFilesResponse, ApiShareListResponse, ApiShareSet, EventKind, LiveEvent,
+    SendMessagePayload, TranscriptEvent,
 };
 use crate::runtime::{
     create_session, create_session_request_from_payload, create_share_set,
-    default_file_search_limit, delete_queue_item, delete_session, edit_session,
-    enqueue_session_message, inject_session_attachment, interrupt_session,
+    default_file_search_limit, delete_queue_item, delete_session, delete_share_set, edit_session,
+    enqueue_session_message, inject_session_attachment, interrupt_session, list_share_sets,
     load_audio_playlist_bytes, load_audio_segment_bytes, load_changed_files_response,
     load_codex_config_response, load_cwd_suggestions_response, load_diagnostics_response,
     load_file_blob, load_file_download_bytes, load_file_read_response, load_file_search_response,
@@ -101,10 +102,10 @@ pub fn router(state: AppState) -> Router {
             post(share_session_interrupt),
         )
         .route("/share/:share_id/login", post(share_login))
-        .route("/api/v1/share-links", post(share_create))
+        .route("/api/v1/share-links", get(share_list).post(share_create))
         .route(
             "/api/v1/share-links/:share_id",
-            get(share_get).post(share_update),
+            get(share_get).post(share_update).delete(share_delete),
         )
         .route("/api/v1/share-links/:share_id/login", post(share_login))
         .route("/service-worker.js", get(service_worker))
@@ -1374,6 +1375,19 @@ async fn share_page() -> Result<Response, (StatusCode, String)> {
     static_file_response(load_nova_shell_file("index.html"), true)
 }
 
+async fn share_list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<ApiShareListResponse>, (StatusCode, String)> {
+    match request_is_authenticated(&headers, &state.config.app_dir) {
+        Ok(true) => {}
+        Ok(false) => return Err((StatusCode::UNAUTHORIZED, "unauthorized".to_string())),
+        Err(message) => return Err((StatusCode::INTERNAL_SERVER_ERROR, message)),
+    }
+    let shares = list_share_sets(&state.config).map_err(route_error)?;
+    Ok(Json(ApiShareListResponse { ok: true, shares }))
+}
+
 async fn share_create(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1507,6 +1521,21 @@ async fn share_update(
     update_share_sessions(&state.config, &share_id, label, &session_ids, &nicknames)
         .map(Json)
         .map_err(|message| (StatusCode::BAD_REQUEST, message))
+}
+
+async fn share_delete(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(share_id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    match request_is_authenticated(&headers, &state.config.app_dir) {
+        Ok(true) => {}
+        Ok(false) => return Err((StatusCode::UNAUTHORIZED, "unauthorized".to_string())),
+        Err(message) => return Err((StatusCode::INTERNAL_SERVER_ERROR, message)),
+    }
+    delete_share_set(&state.config, &share_id)
+        .map(|_| Json(json!({ "ok": true, "share_id": share_id })))
+        .map_err(|message| (StatusCode::NOT_FOUND, message))
 }
 
 async fn share_login(
@@ -3304,6 +3333,93 @@ mod tests {
         assert_eq!(payload["sessions"][0]["session_id"], "sid-route");
         assert_eq!(payload["sessions"][0]["thread_id"], "thread-route");
         assert_eq!(payload["sessions"][0]["agent_backend"], "pi");
+    }
+
+    #[tokio::test]
+    async fn share_link_owner_routes_list_and_delete_sets() {
+        let _guard = env_lock().lock().unwrap();
+        let app_dir = temp_app_dir("share-links-owner");
+        fs::write(app_dir.join("socks").join("sid-share.sock"), "").unwrap();
+        fs::write(
+            app_dir.join("socks").join("sid-share.json"),
+            r#"{"session_id":"thread-share","codex_pid":1,"broker_pid":2,"agent_backend":"codex","cwd":"/repo","start_ts":11.0}"#,
+        )
+        .unwrap();
+        let _password = EnvGuard::set("CODEX_WEB_PASSWORD", "topsecret");
+        let app = router(build_state_from_config(RuntimeConfig { app_dir }).unwrap());
+        let cookie = login_cookie(&app).await;
+
+        let created = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/share-links")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::from(
+                        r#"{"label":"Managed share","session_ids":["sid-share"],"expires_in_hours":24}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::OK);
+        let created_body = to_bytes(created.into_body(), usize::MAX).await.unwrap();
+        let created_payload: Value = serde_json::from_slice(&created_body).unwrap();
+        let share_id = created_payload["share_id"].as_str().unwrap();
+
+        let listed = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/share-links")
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(listed.status(), StatusCode::OK);
+        let listed_body = to_bytes(listed.into_body(), usize::MAX).await.unwrap();
+        let listed_payload: Value = serde_json::from_slice(&listed_body).unwrap();
+        assert_eq!(listed_payload["ok"], true);
+        assert_eq!(listed_payload["shares"].as_array().unwrap().len(), 1);
+        assert_eq!(listed_payload["shares"][0]["share_id"], share_id);
+        assert_eq!(listed_payload["shares"][0]["label"], "Managed share");
+
+        let deleted = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/v1/share-links/{share_id}"))
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(deleted.status(), StatusCode::OK);
+
+        let listed_after = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/share-links")
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let listed_after_body = to_bytes(listed_after.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let listed_after_payload: Value = serde_json::from_slice(&listed_after_body).unwrap();
+        assert!(listed_after_payload["shares"]
+            .as_array()
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]

@@ -2566,6 +2566,10 @@ button.primary {
   width: min(420px, calc(100vw - 28px));
 }
 
+.shareManageModal {
+  width: min(560px, calc(100vw - 28px));
+}
+
 .modalHeader {
   display: flex;
   align-items: center;
@@ -2804,6 +2808,122 @@ button.primary {
   color: var(--muted);
   font-size: 12px;
   line-height: 1.25;
+}
+
+.shareManager {
+  display: grid;
+  gap: 10px;
+  padding-top: 2px;
+}
+
+.shareManagerHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.shareManagerHeader > div {
+  display: grid;
+  gap: 2px;
+}
+
+.shareManagerHeader strong {
+  font-size: 13px;
+}
+
+.shareManagerHeader span,
+.shareManagerMeta,
+.shareManagerEmpty {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.shareManagerList {
+  display: grid;
+  gap: 8px;
+  max-height: 240px;
+  overflow: auto;
+}
+
+.shareManagerItem {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--panel-muted);
+}
+
+.shareManagerMain {
+  min-width: 0;
+  display: grid;
+  gap: 5px;
+}
+
+.shareManagerTitleRow {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.shareManagerTitleRow strong {
+  min-width: 0;
+  overflow: hidden;
+  font-size: 14px;
+  line-height: 1.25;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.shareExpiry {
+  flex: 0 0 auto;
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: rgba(22, 163, 74, 0.12);
+  color: rgba(22, 101, 52, 0.94);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.shareExpiry.expired {
+  background: rgba(148, 163, 184, 0.16);
+  color: var(--muted);
+}
+
+.shareManagerMeta {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.shareManagerActions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.shareManagerActions .secondaryBtn {
+  min-width: 0;
+  height: 34px;
+  padding-inline: 10px;
+  text-decoration: none;
+}
+
+.shareManagerActions .icon-btn {
+  width: 34px;
+  height: 34px;
+  border-radius: 10px;
+}
+
+.shareManagerEmpty {
+  padding: 10px 12px;
+  border: 1px dashed var(--border);
+  border-radius: 10px;
 }
 
 .error-inline {
@@ -3198,6 +3318,15 @@ button.primary {
   .modalHeader {
     align-items: flex-start;
     gap: 8px;
+  }
+
+  .shareManagerItem {
+    grid-template-columns: 1fr;
+  }
+
+  .shareManagerActions {
+    justify-content: flex-start;
+    flex-wrap: wrap;
   }
 }
 

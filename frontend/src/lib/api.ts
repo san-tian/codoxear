@@ -16,6 +16,7 @@ import type {
   ResumeCandidatesResponse,
   ShareCreateResponse,
   ShareFilesResponse,
+  ShareListResponse,
   ShareLoginResponse,
   ShareMessageResponse,
   ShareSet,
@@ -274,6 +275,9 @@ export const api = {
       body: JSON.stringify(payload),
     });
   },
+  fetchShareLinks(): Promise<ShareListResponse> {
+    return readJson<ShareListResponse>("/api/v1/share-links");
+  },
   fetchShareLink(shareId: string): Promise<ShareSet> {
     return readJson<ShareSet>(`/api/v1/share-links/${encodeURIComponent(shareId)}`);
   },
@@ -284,6 +288,11 @@ export const api = {
     return readJson<ShareSet>(`/api/v1/share-links/${encodeURIComponent(shareId)}`, {
       method: "POST",
       body: JSON.stringify(payload),
+    });
+  },
+  deleteShareLink(shareId: string): Promise<{ ok: true; share_id: string }> {
+    return readJson<{ ok: true; share_id: string }>(`/api/v1/share-links/${encodeURIComponent(shareId)}`, {
+      method: "DELETE",
     });
   },
   loginShareLink(shareId: string, password: string): Promise<ShareLoginResponse> {

@@ -267,6 +267,12 @@ pub struct ApiShareCreateResponse {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
+pub struct ApiShareListResponse {
+    pub ok: bool,
+    pub shares: Vec<ApiShareSet>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ApiShareMessageSession {
     pub session_id: String,
     pub title: String,

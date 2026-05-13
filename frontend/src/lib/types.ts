@@ -503,6 +503,11 @@ export type ShareCreateResponse = {
   sessions: ShareSessionRef[];
 };
 
+export type ShareListResponse = {
+  ok: true;
+  shares: ShareSet[];
+};
+
 export type ShareMessageSession = {
   session_id: string;
   title: string;
