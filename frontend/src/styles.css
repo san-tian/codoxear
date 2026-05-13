@@ -114,7 +114,7 @@ button:disabled {
 }
 
 .shareApp {
-  grid-template-columns: var(--sidebar-w) minmax(0, 1fr);
+  grid-template-columns: minmax(220px, 300px) minmax(0, 1fr);
 }
 
 .app.sidebarCollapsed,
@@ -1804,7 +1804,7 @@ button.primary {
   display: grid;
   gap: 10px;
   width: 100%;
-  max-width: 760px;
+  max-width: min(100%, 760px);
   padding-left: 12px;
   box-sizing: border-box;
   justify-items: start;
@@ -1814,6 +1814,7 @@ button.primary {
   display: grid;
   gap: 6px;
   width: 100%;
+  min-width: 0;
   justify-items: start;
 }
 
@@ -1827,6 +1828,7 @@ button.primary {
 
 .tool-part .message-body {
   width: 100%;
+  min-width: 0;
 }
 
 .extension-panel {
@@ -2955,6 +2957,43 @@ button.primary {
 
   .mobileSidebarCloseBtn {
     display: inline-flex;
+  }
+
+  .shareApp {
+    grid-template-columns: 1fr;
+    grid-template-rows: auto minmax(0, 1fr);
+  }
+
+  .shareApp .shareSidebar {
+    max-height: 34vh;
+    border-right: 0;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .shareApp .shareSidebar header {
+    padding: 10px 12px;
+  }
+
+  .shareApp .shareSessions {
+    display: flex;
+    gap: 8px;
+    overflow-x: auto;
+    padding: 8px 12px 10px;
+    overscroll-behavior-x: contain;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+  }
+
+  .shareApp .shareSessions::-webkit-scrollbar {
+    display: none;
+  }
+
+  .shareApp .shareSession {
+    flex: 0 0 min(260px, calc(100vw - 24px));
+  }
+
+  .shareMain {
+    min-height: 0;
   }
 
   .chat {

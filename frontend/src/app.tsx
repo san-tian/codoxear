@@ -1097,6 +1097,8 @@ function ShareWorkspace(props: {
   onCopyText: (event: UiTranscriptEvent) => void | Promise<void>;
 }) {
   const session = props.share.sessions.find((item) => item.session_id === props.sessionId) || props.share.sessions[0] || null;
+  const shareFiles = props.share.allow_files ? props.files?.files || [] : [];
+  const showFileRail = props.share.allow_files && (shareFiles.length > 0 || Boolean(props.selectedFile));
   return (
     <div className="app shareApp">
       <aside className="sidebar shareSidebar">
@@ -1171,12 +1173,12 @@ function ShareWorkspace(props: {
               </div>
             </div>
           </div>
-          <aside className="detailRail">
-            {props.share.allow_files ? (
+          {showFileRail ? (
+          <aside className="detailRail shareDetailRail">
             <section className="detailSection fileSection">
               <div className="detailSectionHeader">Files</div>
               <div className="fileList">
-                {(props.files?.files || []).map((entry) => {
+                {shareFiles.map((entry) => {
                   const path = String(entry.path || entry.rel || "");
                   if (!path) return null;
                   return (
@@ -1205,8 +1207,8 @@ function ShareWorkspace(props: {
                 </div>
               ) : null}
             </section>
-            ) : null}
           </aside>
+          ) : null}
         </div>
         <div className="composer">
           <form
