@@ -1488,6 +1488,41 @@ button.primary {
   min-width: 0;
 }
 
+.mentionedFiles {
+  display: flex;
+  max-width: min(100%, 620px);
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.mentionedFileBtn {
+  min-width: 0;
+  height: 28px;
+  padding: 0 9px;
+  border: 1px solid rgba(159, 193, 255, 0.2);
+  border-radius: 7px;
+  background: rgba(159, 193, 255, 0.08);
+  color: var(--accent);
+  font-family: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+  font-size: 12px;
+  line-height: 1;
+}
+
+.mentionedFileBtn span {
+  display: block;
+  max-width: min(240px, 48vw);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mentionedFileBtn:hover:not(:disabled),
+.mentionedFileBtn:focus-visible {
+  border-color: rgba(159, 193, 255, 0.42);
+  background: rgba(159, 193, 255, 0.14);
+}
+
 .attachment-card {
   display: grid;
   grid-template-columns: 42px minmax(0, 1fr);
@@ -1560,6 +1595,12 @@ button.primary {
 :root[data-theme="light"] .attachment-card {
   border-color: rgba(37, 99, 235, 0.16);
   background: linear-gradient(180deg, rgba(239, 246, 255, 0.68), rgba(248, 250, 252, 0.92));
+}
+
+:root[data-theme="light"] .mentionedFileBtn {
+  border-color: rgba(37, 99, 235, 0.16);
+  background: rgba(37, 99, 235, 0.06);
+  color: var(--accent);
 }
 
 :root[data-theme="light"] .attachment-filemark {

@@ -514,6 +514,62 @@ type MessageBodySegment =
   | { kind: "text"; text: string }
   | { kind: "attachment"; index: string; path: string; filename: string; extension: string };
 
+type FilePathCandidate = { path: string; label: string };
+
+const FILE_PATH_PATTERN =
+  /(?:^|[\s([`"'])((?:~|\.{1,2}|\/)?(?:[A-Za-z0-9_.@+-]+\/)+(?:[A-Za-z0-9_.@+-]+)(?::\d+(?::\d+)?)?)(?=$|[\s)\]'",;.!?`])/g;
+
+function normalizeMentionedFilePath(rawPath: string) {
+  return String(rawPath || "")
+    .trim()
+    .replace(/^["'`([{]+/, "")
+    .replace(/[)"'`\]},;.!?]+$/, "")
+    .replace(/:\d+(?::\d+)?$/, "");
+}
+
+function filePathLabel(path: string) {
+  const parts = path.split("/").filter(Boolean);
+  if (parts.length <= 2) return path;
+  return `${parts[parts.length - 2]}/${parts[parts.length - 1]}`;
+}
+
+function isLikelyFilePath(path: string) {
+  const parts = path.split("/").filter(Boolean);
+  const filename = parts[parts.length - 1] || "";
+  if (!filename || filename === "." || filename === "..") return false;
+  if (/\.[A-Za-z0-9]{1,12}$/.test(filename)) return true;
+  const extensionlessFilenames = [
+    "AGENTS",
+    "Dockerfile",
+    "Makefile",
+    "Rakefile",
+    "Gemfile",
+    "Procfile",
+    "LICENSE",
+    "README",
+    "CHANGELOG",
+  ];
+  const parent = parts[parts.length - 2] || "";
+  return extensionlessFilenames.includes(filename) && !extensionlessFilenames.includes(parent);
+}
+
+function mentionedFilePathCandidates(text: string): FilePathCandidate[] {
+  const out: FilePathCandidate[] = [];
+  const seen = new Set<string>();
+  for (const match of String(text || "").matchAll(FILE_PATH_PATTERN)) {
+    const raw = match[1] || "";
+    if (/^[a-z][a-z0-9+.-]*:\/\//i.test(raw)) continue;
+    const path = normalizeMentionedFilePath(raw);
+    if (!path || seen.has(path)) continue;
+    if (!path.includes("/") || path.endsWith("/")) continue;
+    if (!isLikelyFilePath(path)) continue;
+    seen.add(path);
+    out.push({ path, label: filePathLabel(path) });
+    if (out.length >= 6) break;
+  }
+  return out;
+}
+
 function cleanAttachmentFilename(path: string) {
   const basename = path.split(/[\\/]/).filter(Boolean).pop() || path || "attachment";
   return basename.replace(/^\d{10,}_/, "") || basename;
@@ -580,11 +636,49 @@ function AttachmentBlock(props: { segment: Extract<MessageBodySegment, { kind: "
   );
 }
 
-function RichMessageBody(props: { body: string; className?: string; attachmentHref?: (path: string) => string | undefined }) {
+function MentionedFileLinks(props: { body: string; onOpenPath?: (path: string) => void | Promise<void> }) {
+  if (!props.onOpenPath) return null;
+  const candidates = mentionedFilePathCandidates(props.body);
+  if (!candidates.length) return null;
+  return (
+    <div className="mentionedFiles" aria-label="Mentioned files">
+      {candidates.map((candidate) => (
+        <button
+          className="mentionedFileBtn"
+          type="button"
+          title={candidate.path}
+          key={candidate.path}
+          onClick={(event) => {
+            event.stopPropagation();
+            void props.onOpenPath?.(candidate.path);
+          }}
+        >
+          <span>{candidate.label}</span>
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function RichMessageBody(props: {
+  body: string;
+  className?: string;
+  attachmentHref?: (path: string) => string | undefined;
+  onOpenPath?: (path: string) => void | Promise<void>;
+}) {
   const segments = parseMessageBodySegments(props.body);
   if (!segments.length) return null;
+  const mentionableBody = segments
+    .filter((segment): segment is Extract<MessageBodySegment, { kind: "text" }> => segment.kind === "text")
+    .map((segment) => segment.text)
+    .join("\n");
   if (segments.length === 1 && segments[0].kind === "text") {
-    return <MarkdownBlock text={segments[0].text} className={props.className || "message-body markdown-body"} />;
+    return (
+      <>
+        <MarkdownBlock text={segments[0].text} className={props.className || "message-body markdown-body"} />
+        <MentionedFileLinks body={mentionableBody} onOpenPath={props.onOpenPath} />
+      </>
+    );
   }
   return (
     <div className="message-body rich-message-body">
@@ -595,11 +689,16 @@ function RichMessageBody(props: { body: string; className?: string; attachmentHr
           <MarkdownBlock text={segment.text} className={props.className || "message-body markdown-body"} key={`text-${index}`} />
         ),
       )}
+      <MentionedFileLinks body={mentionableBody} onOpenPath={props.onOpenPath} />
     </div>
   );
 }
 
-function ExtensionProgress(props: { event: UiTranscriptEvent; attachmentHref?: (path: string) => string | undefined }) {
+function ExtensionProgress(props: {
+  event: UiTranscriptEvent;
+  attachmentHref?: (path: string) => string | undefined;
+  onOpenPath?: (path: string) => void | Promise<void>;
+}) {
   const { event } = props;
   const total = event.progressTotal;
   const current = event.progressCurrent;
@@ -637,7 +736,7 @@ function ExtensionProgress(props: { event: UiTranscriptEvent; attachmentHref?: (
           ))}
         </ol>
       ) : null}
-      {event.body ? <RichMessageBody body={event.body} className="message-body markdown-body extension-body" attachmentHref={props.attachmentHref} /> : null}
+      {event.body ? <RichMessageBody body={event.body} className="message-body markdown-body extension-body" attachmentHref={props.attachmentHref} onOpenPath={props.onOpenPath} /> : null}
     </div>
   );
 }
@@ -652,7 +751,11 @@ function GoalMetric(props: { label: string; value: string }) {
   );
 }
 
-function GoalPanel(props: { event: UiTranscriptEvent; attachmentHref?: (path: string) => string | undefined }) {
+function GoalPanel(props: {
+  event: UiTranscriptEvent;
+  attachmentHref?: (path: string) => string | undefined;
+  onOpenPath?: (path: string) => void | Promise<void>;
+}) {
   const { event } = props;
   const objective = String(event.goalObjective || event.summary || "").trim();
   const used = formatCompactNumber(event.goalTokensUsed);
@@ -673,12 +776,16 @@ function GoalPanel(props: { event: UiTranscriptEvent; attachmentHref?: (path: st
         <GoalMetric label="Elapsed" value={elapsed} />
       </div>
       {event.goalCompletionReport ? <div className="goal-report">{event.goalCompletionReport}</div> : null}
-      {event.body ? <RichMessageBody body={event.body} className="message-body markdown-body extension-body" attachmentHref={props.attachmentHref} /> : null}
+      {event.body ? <RichMessageBody body={event.body} className="message-body markdown-body extension-body" attachmentHref={props.attachmentHref} onOpenPath={props.onOpenPath} /> : null}
     </div>
   );
 }
 
-function ToolEventDetails(props: { event: UiTranscriptEvent; attachmentHref?: (path: string) => string | undefined }) {
+function ToolEventDetails(props: {
+  event: UiTranscriptEvent;
+  attachmentHref?: (path: string) => string | undefined;
+  onOpenPath?: (path: string) => void | Promise<void>;
+}) {
   const { event } = props;
   const toolCallBody = String(event.toolCallBody || "").trim();
   const toolResultBody = String(event.toolResultBody || "").trim();
@@ -687,17 +794,17 @@ function ToolEventDetails(props: { event: UiTranscriptEvent; attachmentHref?: (p
       <div className="tool-pair">
         <section className="tool-part">
           <div className="tool-part-label">Call</div>
-          <RichMessageBody body={toolCallBody} className="message-body markdown-body" attachmentHref={props.attachmentHref} />
+          <RichMessageBody body={toolCallBody} className="message-body markdown-body" attachmentHref={props.attachmentHref} onOpenPath={props.onOpenPath} />
         </section>
         <section className="tool-part">
           <div className="tool-part-label">Result</div>
-          <RichMessageBody body={toolResultBody} className="message-body markdown-body" attachmentHref={props.attachmentHref} />
+          <RichMessageBody body={toolResultBody} className="message-body markdown-body" attachmentHref={props.attachmentHref} onOpenPath={props.onOpenPath} />
         </section>
       </div>
     );
   }
   const body = toolResultBody || toolCallBody || String(event.body || "").trim();
-  return body ? <RichMessageBody body={body} className="message-body markdown-body" attachmentHref={props.attachmentHref} /> : null;
+  return body ? <RichMessageBody body={body} className="message-body markdown-body" attachmentHref={props.attachmentHref} onOpenPath={props.onOpenPath} /> : null;
 }
 
 function answerTextForAskUser(event: UiTranscriptEvent, values: string[], freeform: string, bridgeAnswers: Record<string, string | string[]>) {
@@ -868,6 +975,7 @@ export function TranscriptEventRow(props: {
   onAskUserRespond?: (event: UiTranscriptEvent, text: string) => Promise<void>;
   onCopyText?: (event: UiTranscriptEvent) => void | Promise<void>;
   attachmentHref?: (path: string) => string | undefined;
+  onOpenPath?: (path: string) => void | Promise<void>;
 }) {
   const { event, events, index, collapsed, onToggle, onAskUserRespond } = props;
   const collapsible = isCollapsibleEvent(event.kind);
@@ -915,11 +1023,11 @@ export function TranscriptEventRow(props: {
                 <span className="message-fold is-open" aria-label="Hide details" title="Hide details" />
               </div>
             ) : null}
-            {event.kind === "extension" && event.extensionKind === "goal" ? <GoalPanel event={event} attachmentHref={props.attachmentHref} /> : null}
-            {event.kind === "extension" && event.extensionKind !== "goal" ? <ExtensionProgress event={event} attachmentHref={props.attachmentHref} /> : null}
+            {event.kind === "extension" && event.extensionKind === "goal" ? <GoalPanel event={event} attachmentHref={props.attachmentHref} onOpenPath={props.onOpenPath} /> : null}
+            {event.kind === "extension" && event.extensionKind !== "goal" ? <ExtensionProgress event={event} attachmentHref={props.attachmentHref} onOpenPath={props.onOpenPath} /> : null}
             {event.kind === "ask_user" ? <AskUserPrompt event={event} onRespond={onAskUserRespond} /> : null}
-            {event.kind === "tool" ? <ToolEventDetails event={event} attachmentHref={props.attachmentHref} /> : null}
-            {event.kind !== "extension" && event.kind !== "ask_user" && event.kind !== "tool" && event.body ? <RichMessageBody body={event.body} className="message-body markdown-body" attachmentHref={props.attachmentHref} /> : null}
+            {event.kind === "tool" ? <ToolEventDetails event={event} attachmentHref={props.attachmentHref} onOpenPath={props.onOpenPath} /> : null}
+            {event.kind !== "extension" && event.kind !== "ask_user" && event.kind !== "tool" && event.body ? <RichMessageBody body={event.body} className="message-body markdown-body" attachmentHref={props.attachmentHref} onOpenPath={props.onOpenPath} /> : null}
             {collapsible && event.meta ? <div className="message-meta">{event.meta}</div> : null}
             {showFooter ? (
               <div className="message-footer">

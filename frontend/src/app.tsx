@@ -1135,6 +1135,7 @@ function ShareWorkspace(props: {
   onInterrupt: () => void | Promise<void>;
   onLoadOlder: () => void | Promise<void>;
   onSelectFile: (path: string) => void;
+  onOpenMentionedFile: (path: string) => void | Promise<void>;
   onCopyText: (event: UiTranscriptEvent) => void | Promise<void>;
 }) {
   const session = props.share.sessions.find((item) => item.session_id === props.sessionId) || props.share.sessions[0] || null;
@@ -1204,6 +1205,7 @@ function ShareWorkspace(props: {
                       collapsed={false}
                       onToggle={() => {}}
                       onCopyText={props.onCopyText}
+                      onOpenPath={props.onOpenMentionedFile}
                       attachmentHref={(path) =>
                         `/share/${encodeURIComponent(props.share.share_id)}/sessions/${encodeURIComponent(props.sessionId)}/file/download?path=${encodeURIComponent(path)}`
                       }
@@ -2562,6 +2564,15 @@ export function App() {
     }
   }
 
+  async function openMentionedFile(path: string) {
+    const trimmed = path.trim();
+    if (!selectedSessionRef.current || !trimmed) return;
+    setShowFilesPanel(true);
+    setShowDetailsPanel(false);
+    setFileSearchQuery(trimmed);
+    await openFile(trimmed);
+  }
+
   async function searchFiles(query = fileSearchQuery) {
     const sessionId = selectedSessionRef.current;
     const trimmed = query.trim();
@@ -3722,6 +3733,7 @@ export function App() {
         onInterrupt={handleShareInterrupt}
         onLoadOlder={loadShareOlder}
         onSelectFile={(path) => void selectShareFile(path)}
+        onOpenMentionedFile={(path) => void selectShareFile(path.trim())}
         onCopyText={copyTranscriptEvent}
       />
     );
@@ -4106,6 +4118,7 @@ export function App() {
                           onToggle={toggleTranscriptEvent}
                           onAskUserRespond={handleAskUserRespond}
                           onCopyText={copyTranscriptEvent}
+                          onOpenPath={openMentionedFile}
                         />
                       );
                     })}
