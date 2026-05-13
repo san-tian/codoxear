@@ -50,6 +50,7 @@ const FILE_SEARCH_TIMEOUT_SECONDS: f64 = 0.75;
 const FILE_SEARCH_MAX_CANDIDATES: usize = 200000;
 const GIT_DIFF_MAX_BYTES: usize = 800 * 1024;
 const GIT_DIFF_TIMEOUT_SECONDS: f64 = 4.0;
+const VERSION_STATUS_TIMEOUT_SECONDS: f64 = 4.0;
 const GIT_CHANGED_FILES_MAX: usize = 400;
 const LOCAL_SERVICE_RESTART_DELAY_SECONDS: f64 = 0.75;
 const TERMINAL_INTERRUPT_SEQ: &str = "\\x03";
@@ -381,6 +382,58 @@ pub fn load_cwd_suggestions_response(
 
 pub fn repo_root_dir() -> Result<PathBuf, String> {
     repo_root()
+}
+
+pub fn load_version_status_response() -> Result<Value, String> {
+    let repo = repo_root()?;
+    let timeout = Duration::from_secs_f64(VERSION_STATUS_TIMEOUT_SECONDS);
+    let local_head = run_git_capture(&repo, &["rev-parse", "HEAD"], timeout, 4096)?
+        .trim()
+        .to_string();
+    let local_branch = run_git_capture(&repo, &["branch", "--show-current"], timeout, 4096)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let (remote, remote_ref) = resolve_update_remote_ref(&repo)?;
+    let remote_output =
+        run_git_capture(&repo, &["ls-remote", &remote, &remote_ref], timeout, 8192)?;
+    let remote_head = remote_output
+        .lines()
+        .filter_map(|line| line.split_whitespace().next())
+        .find(|value| !value.trim().is_empty())
+        .unwrap_or("")
+        .to_string();
+    if remote_head.is_empty() {
+        return Err(format!(
+            "remote {remote}/{remote_ref} did not return a head commit"
+        ));
+    }
+    let has_remote_head = Command::new("git")
+        .current_dir(&repo)
+        .args(["cat-file", "-e", &format!("{remote_head}^{{commit}}")])
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false);
+    let update_available = if has_remote_head {
+        !Command::new("git")
+            .current_dir(&repo)
+            .args(["merge-base", "--is-ancestor", &remote_head, &local_head])
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    } else {
+        local_head != remote_head
+    };
+    Ok(json!({
+        "ok": true,
+        "update_available": update_available,
+        "local_head": local_head,
+        "local_branch": local_branch,
+        "remote": remote,
+        "remote_ref": remote_ref,
+        "remote_head": remote_head,
+        "checked_at": epoch_now(),
+    }))
 }
 
 pub fn load_nova_shell_file(path: &str) -> Result<(Vec<u8>, String), String> {
@@ -4458,6 +4511,59 @@ fn git_repo_root(cwd: &Path) -> Option<PathBuf> {
         return None;
     }
     Some(PathBuf::from(trimmed))
+}
+
+fn resolve_update_remote_ref(repo: &Path) -> Result<(String, String), String> {
+    let configured_remote = env::var("CODOXEAR_UPDATE_REMOTE")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let configured_ref = env::var("CODOXEAR_UPDATE_REF")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    if let (Some(remote), Some(remote_ref)) = (configured_remote.clone(), configured_ref.clone()) {
+        return Ok((remote, remote_ref));
+    }
+
+    let remotes_text = run_git_capture(
+        repo,
+        &["remote"],
+        Duration::from_secs_f64(VERSION_STATUS_TIMEOUT_SECONDS),
+        8192,
+    )?;
+    let remotes = remotes_text
+        .lines()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    let remote = configured_remote.unwrap_or_else(|| {
+        if remotes.iter().any(|value| *value == "upstream") {
+            "upstream".to_string()
+        } else if remotes.iter().any(|value| *value == "origin") {
+            "origin".to_string()
+        } else {
+            remotes.first().copied().unwrap_or("origin").to_string()
+        }
+    });
+    let remote_ref = configured_ref.unwrap_or_else(|| {
+        run_git_capture(
+            repo,
+            &[
+                "symbolic-ref",
+                "--quiet",
+                "--short",
+                &format!("refs/remotes/{remote}/HEAD"),
+            ],
+            Duration::from_secs_f64(VERSION_STATUS_TIMEOUT_SECONDS),
+            4096,
+        )
+        .ok()
+        .and_then(|text| text.trim().rsplit('/').next().map(str::to_string))
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "main".to_string())
+    });
+    Ok((remote, remote_ref))
 }
 
 fn search_walk_relative_files(

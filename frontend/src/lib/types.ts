@@ -53,6 +53,17 @@ export type MeResponse = {
   server_pid: number;
 };
 
+export type VersionStatusResponse = {
+  ok: true;
+  update_available: boolean;
+  local_head: string;
+  local_branch: string;
+  remote: string;
+  remote_ref: string;
+  remote_head: string;
+  checked_at: number;
+};
+
 export type CwdSuggestion = {
   value: string;
   label: string;

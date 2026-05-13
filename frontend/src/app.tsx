@@ -29,6 +29,7 @@ import type {
   ShareSet,
   SessionSummary,
   UiTranscriptEvent,
+  VersionStatusResponse,
   VoiceSettingsResponse,
 } from "./lib/types";
 
@@ -38,6 +39,7 @@ const POLL_IDLE_MS = 1400;
 const POLL_BUSY_MS = 700;
 const SESSION_REFRESH_MS = 12000;
 const NOTIFICATION_POLL_MS = 5000;
+const VERSION_STATUS_POLL_MS = 10 * 60 * 1000;
 const ATTACH_UPLOAD_MAX_BYTES = 16 * 1024 * 1024;
 const SELECTED_SESSION_KEY = "codoxear.nova.selected";
 const SHOW_TOOL_CALLS_KEY = "codoxear.showToolCalls";
@@ -1233,6 +1235,7 @@ export function App() {
   const shareMode = Boolean(shareTarget);
   const [authState, setAuthState] = useState<"loading" | "login" | "ready">("loading");
   const [loadingText, setLoadingText] = useState("Loading workspace…");
+  const [versionStatus, setVersionStatus] = useState<VersionStatusResponse | null>(null);
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
   const [collapsedWorkspaces, setCollapsedWorkspaces] = useState<Record<string, boolean>>({});
   const [selectedSessionId, setSelectedSessionId] = useState("");
@@ -1395,6 +1398,9 @@ export function App() {
     () => sessions.find((session) => session.session_id === selectedSessionId) || null,
     [sessions, selectedSessionId],
   );
+  const updateBadgeTitle = versionStatus?.update_available
+    ? `New upstream version available from ${versionStatus.remote}/${versionStatus.remote_ref}`
+    : "";
   const selectedShareSessionCount = shareCreateSessions.filter((session) => session.checked).length;
 
   async function loadShareSession(nextSessionId = shareSessionId) {
@@ -2142,6 +2148,14 @@ export function App() {
     const current = preserveSelection ? selectedSessionRef.current || stored : stored;
     const nextSelected = ordered.some((item) => item.session_id === current) ? current : ordered[0].session_id;
     selectSession(nextSelected);
+  }
+
+  async function refreshVersionStatus() {
+    try {
+      setVersionStatus(await api.fetchVersionStatus());
+    } catch {
+      setVersionStatus(null);
+    }
   }
 
   function schedulePoll(delayMs: number) {
@@ -3446,6 +3460,15 @@ export function App() {
   }, [authState]);
 
   useEffect(() => {
+    if (authState !== "ready") return;
+    void refreshVersionStatus();
+    const timer = window.setInterval(() => {
+      void refreshVersionStatus();
+    }, VERSION_STATUS_POLL_MS);
+    return () => window.clearInterval(timer);
+  }, [authState]);
+
+  useEffect(() => {
     if (!showDetailsPanel || !selectedSessionId) return;
     void loadDiagnostics(selectedSessionId);
   }, [showDetailsPanel, selectedSessionId]);
@@ -3564,7 +3587,12 @@ export function App() {
           <header>
             <div className="title">
               <span className="sidebarLogoDot" />
-              Codoxear Nova
+              <span>Codoxear Nova</span>
+              {versionStatus?.update_available ? (
+                <span className="updateBadge" title={updateBadgeTitle} aria-label={updateBadgeTitle}>
+                  NEW
+                </span>
+              ) : null}
             </div>
             <div className="actions">
               {mobileViewport ? (

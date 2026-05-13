@@ -16,10 +16,11 @@ use crate::runtime::{
     load_notification_feed_response, load_notification_message_response,
     load_notification_subscriptions_response, load_nova_shell_file, load_queue_response,
     load_resume_candidates_response, load_sessions_response, load_share_set,
-    load_voice_settings_response, login_share_set, move_queue_item, normalize_backend,
-    rename_session, resolve_dir_target, save_codex_config_response, save_file_write_response,
-    save_voice_settings_response, schedule_local_service_restart_response, send_session_message,
-    set_harness_config, share_file_entries, toggle_notification_subscription_response,
+    load_version_status_response, load_voice_settings_response, login_share_set, move_queue_item,
+    normalize_backend, rename_session, resolve_dir_target, save_codex_config_response,
+    save_file_write_response, save_voice_settings_response,
+    schedule_local_service_restart_response, send_session_message, set_harness_config,
+    share_file_entries, toggle_notification_subscription_response,
     update_audio_listener_heartbeat_response, update_queue_item, update_share_sessions,
     upsert_notification_subscription_response, FileWriteError,
 };
@@ -114,6 +115,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/health", get(health))
         .route("/api/v1/bootstrap", get(bootstrap))
         .route("/api/v1/me", get(me))
+        .route("/api/v1/version_status", get(version_status))
         .route(
             "/api/v1/session_resume_candidates",
             get(session_resume_candidates),
@@ -228,6 +230,7 @@ fn public_api_router(state: AppState) -> Router<AppState> {
     let protected = Router::new()
         .route("/bootstrap", get(bootstrap))
         .route("/me", get(me))
+        .route("/version_status", get(version_status))
         .route("/session_resume_candidates", get(session_resume_candidates))
         .route("/cwd_suggestions", get(cwd_suggestions))
         .route(
@@ -415,6 +418,12 @@ async fn bootstrap(State(state): State<AppState>) -> Json<crate::models::Bootstr
 
 async fn me() -> Json<Value> {
     Json(json!({ "ok": true, "server_pid": i64::from(process::id()) }))
+}
+
+async fn version_status() -> Result<Json<Value>, (StatusCode, String)> {
+    load_version_status_response()
+        .map(Json)
+        .map_err(|message| (StatusCode::INTERNAL_SERVER_ERROR, message))
 }
 
 async fn sessions(
@@ -2341,6 +2350,106 @@ mod tests {
         let payload: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(payload["ok"], true);
         assert!(payload["server_pid"].as_i64().unwrap() > 0);
+    }
+
+    #[tokio::test]
+    async fn version_status_route_reports_remote_update() {
+        let _guard = env_lock().lock().unwrap();
+        let repo = temp_dir("version-status-repo");
+        assert!(std::process::Command::new("git")
+            .current_dir(&repo)
+            .args(["init", "-q", "-b", "main"])
+            .status()
+            .unwrap()
+            .success());
+        assert!(std::process::Command::new("git")
+            .current_dir(&repo)
+            .args(["config", "user.email", "codoxear@example.test"])
+            .status()
+            .unwrap()
+            .success());
+        assert!(std::process::Command::new("git")
+            .current_dir(&repo)
+            .args(["config", "user.name", "Codoxear Test"])
+            .status()
+            .unwrap()
+            .success());
+        fs::write(repo.join("README.md"), "local\n").unwrap();
+        assert!(std::process::Command::new("git")
+            .current_dir(&repo)
+            .args(["add", "README.md"])
+            .status()
+            .unwrap()
+            .success());
+        assert!(std::process::Command::new("git")
+            .current_dir(&repo)
+            .args(["commit", "-q", "-m", "local"])
+            .status()
+            .unwrap()
+            .success());
+        let remote = temp_dir("version-status-remote");
+        assert!(std::process::Command::new("git")
+            .current_dir(&remote)
+            .args(["init", "-q", "-b", "main"])
+            .status()
+            .unwrap()
+            .success());
+        assert!(std::process::Command::new("git")
+            .current_dir(&remote)
+            .args(["config", "user.email", "codoxear@example.test"])
+            .status()
+            .unwrap()
+            .success());
+        assert!(std::process::Command::new("git")
+            .current_dir(&remote)
+            .args(["config", "user.name", "Codoxear Test"])
+            .status()
+            .unwrap()
+            .success());
+        fs::write(remote.join("README.md"), "remote\n").unwrap();
+        assert!(std::process::Command::new("git")
+            .current_dir(&remote)
+            .args(["add", "README.md"])
+            .status()
+            .unwrap()
+            .success());
+        assert!(std::process::Command::new("git")
+            .current_dir(&remote)
+            .args(["commit", "-q", "-m", "remote"])
+            .status()
+            .unwrap()
+            .success());
+        assert!(std::process::Command::new("git")
+            .current_dir(&repo)
+            .args(["remote", "add", "upstream", remote.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success());
+        let _repo_root = EnvGuard::set("CODOXEAR_REPO_ROOT", repo.display().to_string());
+        let _remote = EnvGuard::set("CODOXEAR_UPDATE_REMOTE", "upstream");
+        let _remote_ref = EnvGuard::set("CODOXEAR_UPDATE_REF", "main");
+        let app = router(
+            build_state_from_config(RuntimeConfig {
+                app_dir: temp_app_dir("version-status"),
+            })
+            .unwrap(),
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/version_status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["ok"], true);
+        assert_eq!(payload["update_available"], true);
+        assert_eq!(payload["remote"], "upstream");
+        assert_eq!(payload["remote_ref"], "main");
     }
 
     #[tokio::test]

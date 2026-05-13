@@ -21,6 +21,7 @@ import type {
   ShareSet,
   SessionsResponse,
   TailResponse,
+  VersionStatusResponse,
   VoiceSettingsResponse,
 } from "./types";
 
@@ -53,6 +54,9 @@ async function readJson<T>(path: string, init?: RequestInit): Promise<T> {
 export const api = {
   me(): Promise<MeResponse> {
     return readJson<MeResponse>("/api/me");
+  },
+  fetchVersionStatus(): Promise<VersionStatusResponse> {
+    return readJson<VersionStatusResponse>("/api/version_status");
   },
   login(password: string): Promise<{ ok: true }> {
     return readJson<{ ok: true }>("/api/login", {

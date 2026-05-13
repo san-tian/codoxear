@@ -185,8 +185,16 @@ button:disabled {
   display: inline-flex;
   align-items: center;
   gap: 8px;
+  min-width: 0;
   font-weight: 650;
   letter-spacing: 0.01em;
+}
+
+.title > span:not(.sidebarLogoDot):not(.updateBadge) {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .sidebarLogoDot {
@@ -195,6 +203,23 @@ button:disabled {
   border-radius: 999px;
   background: linear-gradient(135deg, #1d4ed8, #60a5fa);
   box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.55);
+}
+
+.updateBadge {
+  flex: 0 0 auto;
+  min-height: 17px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 5px;
+  border: 1px solid rgba(37, 99, 235, 0.38);
+  border-radius: 999px;
+  background: rgba(37, 99, 235, 0.12);
+  color: #1d4ed8;
+  font-size: 10px;
+  font-weight: 800;
+  line-height: 1;
+  letter-spacing: 0.04em;
 }
 
 .actions,
@@ -3249,6 +3274,12 @@ select,
 .sidebarLogoDot {
   background: linear-gradient(135deg, #80a7ff, #e6edf8);
   box-shadow: 0 0 18px rgba(128, 167, 255, 0.38), inset 0 0 0 1px rgba(255, 255, 255, 0.42);
+}
+
+.updateBadge {
+  border-color: rgba(159, 193, 255, 0.42);
+  background: rgba(159, 193, 255, 0.16);
+  color: #c8dcff;
 }
 
 .workspaceDisclosure,
