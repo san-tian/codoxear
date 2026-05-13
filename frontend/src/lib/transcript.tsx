@@ -636,6 +636,25 @@ function AttachmentBlock(props: { segment: Extract<MessageBodySegment, { kind: "
   );
 }
 
+export function WorkingIndicator(props: { label: string; tone?: "working" | "waiting" }) {
+  const { label, tone = "working" } = props;
+  return (
+    <article className={`msg event-working workingRow${tone === "waiting" ? " is-waiting" : ""}`} role="status" aria-live="polite" aria-label={label}>
+      <div className="message-side is-hidden" />
+      <div className="message-main">
+        <div className="workingIndicator">
+          <span className="workingDots" aria-hidden="true">
+            <span className="workingDot" />
+            <span className="workingDot" />
+            <span className="workingDot" />
+          </span>
+          <span className="workingLabel">{label}</span>
+        </div>
+      </div>
+    </article>
+  );
+}
+
 function MentionedFileLinks(props: { body: string; onOpenPath?: (path: string) => void | Promise<void> }) {
   if (!props.onOpenPath) return null;
   const candidates = mentionedFilePathCandidates(props.body);
