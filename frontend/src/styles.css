@@ -113,6 +113,10 @@ button:disabled {
   grid-template-columns: var(--sidebar-w) var(--sidebar-resizer-w) minmax(0, 1fr);
 }
 
+.shareApp {
+  grid-template-columns: var(--sidebar-w) minmax(0, 1fr);
+}
+
 .app.sidebarCollapsed,
 .app.sidebarCollapsed.withRail {
   grid-template-columns: minmax(0, 1fr);
@@ -533,6 +537,35 @@ button:disabled {
   white-space: nowrap;
   font-size: 13px;
   font-weight: 650;
+}
+
+.shareSession {
+  gap: 0;
+  min-height: 54px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: rgba(255, 255, 255, 0.96);
+  transition: border-color 140ms ease, background 140ms ease, box-shadow 140ms ease;
+}
+
+.shareSession:hover {
+  border-color: rgba(37, 99, 235, 0.28);
+  background: var(--panel-muted);
+}
+
+.shareSession.active {
+  border-color: rgba(37, 99, 235, 0.4);
+  background: var(--accent-soft);
+}
+
+.shareSession .workspaceHeader {
+  padding-right: 0;
+}
+
+.shareSession .workspaceMeta {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .workspaceDraftMark {
@@ -3191,12 +3224,22 @@ select,
 
 .workspaceGroup.active .workspaceGroupHeader,
 .workspace.active,
+.shareSession.active,
 .icon-btn.active,
 .backendTab.active,
 .resumeChoice.active,
 .fileEntry.active {
   border-color: rgba(159, 193, 255, 0.42);
   background: var(--accent-soft);
+}
+
+.shareSession {
+  background: var(--panel);
+}
+
+.shareSession:hover {
+  border-color: rgba(159, 193, 255, 0.3);
+  background: var(--panel-muted);
 }
 
 .workspaceSessions {
