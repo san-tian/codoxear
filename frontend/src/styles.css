@@ -2694,6 +2694,58 @@ button.primary {
   color: var(--accent);
 }
 
+.shareSessionChoices,
+.shareResult {
+  display: grid;
+  gap: 8px;
+}
+
+.shareSessionChoices {
+  max-height: 220px;
+  overflow: auto;
+}
+
+.shareSessionChoice {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--panel-muted);
+}
+
+.shareSessionChoice input {
+  flex: 0 0 auto;
+  margin-top: 2px;
+}
+
+.shareSessionChoice span {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+}
+
+.shareSessionChoice strong,
+.shareSessionChoice small {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.shareSessionChoice small {
+  color: var(--muted);
+}
+
+.sharePolicyNote {
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  color: var(--muted);
+  background: var(--panel-muted);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
 .error-inline {
   padding: 10px 12px;
   border: 1px solid rgba(185, 28, 28, 0.18);

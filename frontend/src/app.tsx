@@ -23,6 +23,7 @@ import type {
   QueueResponse,
   QueueItem,
   ResumeCandidate,
+  ShareCreateResponse,
   ShareFilesResponse,
   ShareLoginResponse,
   ShareSet,
@@ -70,6 +71,7 @@ type BusySubmitMode = "queue" | "interrupt";
 type ThemeMode = "dark" | "light";
 type AgentBackend = "codex" | "pi";
 type TokenSummary = { label: string; title: string };
+type ShareDraftSession = { session_id: string; label: string; checked: boolean };
 type NewSessionBackendPreferences = {
   provider?: string;
   model?: string;
@@ -469,6 +471,14 @@ function sessionDisplayName(session: SessionSummary | null) {
   return session.session_id;
 }
 
+function absoluteShareUrl(path: string) {
+  return new URL(path, window.location.origin).toString();
+}
+
+function shareInvitationText(result: ShareCreateResponse) {
+  return [`URL: ${absoluteShareUrl(result.share_url)}`, `Password: ${result.share_password}`].join("\n");
+}
+
 function sessionIsStarting(session: SessionSummary | null) {
   return Boolean(session && session.owned && !session.log_path);
 }
@@ -786,6 +796,16 @@ function icon(name: string) {
           <rect x="2.8" y="3" width="10.4" height="10" rx="1.5" />
           <path d="M8 3v10" />
           <path d="M8 8h5.2" />
+        </svg>
+      );
+    case "share":
+      return (
+        <svg {...common}>
+          <circle cx="5" cy="8" r="1.7" />
+          <circle cx="11.2" cy="4.4" r="1.7" />
+          <circle cx="11.2" cy="11.6" r="1.7" />
+          <path d="m6.5 7.1 3.2-1.8" />
+          <path d="m6.5 8.9 3.2 1.8" />
         </svg>
       );
     case "edit":
@@ -1297,6 +1317,13 @@ export function App() {
   const [renameName, setRenameName] = useState("");
   const [renameBusy, setRenameBusy] = useState(false);
   const [renameError, setRenameError] = useState("");
+  const [shareCreateOpen, setShareCreateOpen] = useState(false);
+  const [shareCreateLabel, setShareCreateLabel] = useState("");
+  const [shareCreateExpiresHours, setShareCreateExpiresHours] = useState(24);
+  const [shareCreateSessions, setShareCreateSessions] = useState<ShareDraftSession[]>([]);
+  const [shareCreateBusy, setShareCreateBusy] = useState(false);
+  const [shareCreateError, setShareCreateError] = useState("");
+  const [shareCreateResult, setShareCreateResult] = useState<ShareCreateResponse | null>(null);
   const [sessionContextMenu, setSessionContextMenu] = useState<{ sessionId: string; x: number; y: number } | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [themeMode, setThemeMode] = useState<ThemeMode>(() => readThemeMode());
@@ -1366,6 +1393,7 @@ export function App() {
     () => sessions.find((session) => session.session_id === selectedSessionId) || null,
     [sessions, selectedSessionId],
   );
+  const selectedShareSessionCount = shareCreateSessions.filter((session) => session.checked).length;
 
   async function loadShareSession(nextSessionId = shareSessionId) {
     if (!shareTarget || !nextSessionId) return;
@@ -2256,6 +2284,68 @@ export function App() {
       pushToast(event.kind === "user" ? "Copied input" : "Copied reply");
     } catch (error) {
       setErrorText(error instanceof Error ? error.message : "Unable to copy message");
+    }
+  }
+
+  async function copyShareInvitation() {
+    if (!shareCreateResult) return;
+    try {
+      await copyToClipboard(shareInvitationText(shareCreateResult));
+      pushToast("Share invite copied");
+    } catch (error) {
+      setShareCreateError(error instanceof Error ? error.message : "Unable to copy share invite");
+    }
+  }
+
+  function openShareCreateDialog() {
+    if (!selectedSession) return;
+    const sameWorkspace = sessions.filter((session) => workspaceKeyForSession(session) === workspaceKeyForSession(selectedSession));
+    const candidates = (sameWorkspace.length ? sameWorkspace : sessions).map((session) => ({
+      session_id: session.session_id,
+      label: sessionDisplayName(session),
+      checked: session.session_id === selectedSession.session_id,
+    }));
+    setShareCreateSessions(candidates);
+    setShareCreateLabel(sessionDisplayName(selectedSession));
+    setShareCreateExpiresHours(24);
+    setShareCreateError("");
+    setShareCreateResult(null);
+    setShareCreateOpen(true);
+  }
+
+  function toggleShareDraftSession(sessionId: string) {
+    setShareCreateSessions((current) =>
+      current.map((session) => (session.session_id === sessionId ? { ...session, checked: !session.checked } : session)),
+    );
+  }
+
+  async function handleCreateShareLink() {
+    const selected = shareCreateSessions.filter((session) => session.checked);
+    if (!selected.length) {
+      setShareCreateError("Select at least one session");
+      return;
+    }
+    const expiresInHours = Math.max(1, Math.min(24 * 30, Math.round(Number(shareCreateExpiresHours) || 24)));
+    setShareCreateBusy(true);
+    setShareCreateError("");
+    try {
+      const nicknames = Object.fromEntries(selected.map((session) => [session.session_id, session.label]));
+      const response = await api.createShareLink({
+        label: shareCreateLabel.trim() || selected[0]?.label || "Shared sessions",
+        session_ids: selected.map((session) => session.session_id),
+        nicknames,
+        expires_in_hours: expiresInHours,
+        allow_interrupt: true,
+        allow_files: true,
+        allow_attachment_downloads: true,
+      });
+      setShareCreateExpiresHours(expiresInHours);
+      setShareCreateResult(response);
+      pushToast("Share link created");
+    } catch (error) {
+      setShareCreateError(error instanceof Error ? error.message : "Unable to create share link");
+    } finally {
+      setShareCreateBusy(false);
     }
   }
 
@@ -3729,6 +3819,16 @@ export function App() {
                 {mobileViewport ? <span>Close</span> : null}
               </button>
               <button
+                className={mobileViewport ? "actionBtn mobileActionBtn" : "icon-btn"}
+                type="button"
+                title={selectedSession ? "Share session set" : "No session selected"}
+                disabled={!selectedSession}
+                onClick={openShareCreateDialog}
+              >
+                {icon("share")}
+                {mobileViewport ? <span>Share</span> : null}
+              </button>
+              <button
                 className={mobileViewport ? `actionBtn mobileActionBtn${tmuxCommand ? " active" : ""}` : `icon-btn${tmuxCommand ? " active" : ""}`}
                 type="button"
                 title={tmuxCommand || "No tmux attach command for this session"}
@@ -4300,6 +4400,84 @@ export function App() {
                 </button>
                 <button className="primary" type="submit" disabled={renameBusy}>
                   {renameBusy ? "Saving..." : "Save"}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      ) : null}
+
+      {shareCreateOpen ? (
+        <div className="modalBackdrop" onClick={() => setShareCreateOpen(false)}>
+          <div className="modalCard compactModal" onClick={(event) => event.stopPropagation()}>
+            <div className="modalHeader">
+              <div>Share sessions</div>
+              <button className="icon-btn" type="button" onClick={() => setShareCreateOpen(false)}>
+                {icon("close")}
+              </button>
+            </div>
+            <form
+              className="formGrid"
+              onSubmit={(event) => {
+                event.preventDefault();
+                void handleCreateShareLink();
+              }}
+            >
+              <label className="field">
+                <span>Share set name</span>
+                <input
+                  value={shareCreateLabel}
+                  onInput={(event) => setShareCreateLabel((event.currentTarget as HTMLInputElement).value)}
+                  placeholder={selectedSession ? sessionDisplayName(selectedSession) : "Shared sessions"}
+                />
+              </label>
+              <label className="field">
+                <span>Expires in hours</span>
+                <input
+                  type="number"
+                  min="1"
+                  max="720"
+                  value={String(shareCreateExpiresHours)}
+                  onInput={(event) => setShareCreateExpiresHours(Number((event.currentTarget as HTMLInputElement).value) || 24)}
+                />
+              </label>
+              <div className="field">
+                <span>Sessions</span>
+                <div className="shareSessionChoices">
+                  {shareCreateSessions.map((session) => (
+                    <label className="shareSessionChoice" key={session.session_id}>
+                      <input type="checkbox" checked={session.checked} onChange={() => toggleShareDraftSession(session.session_id)} />
+                      <span>
+                        <strong>{session.label}</strong>
+                        <small>{session.session_id}</small>
+                      </span>
+                    </label>
+                  ))}
+                </div>
+              </div>
+              <div className="sharePolicyNote">Interrupt, file browsing, and attachment downloads are enabled. Shared session nicknames use the main session names.</div>
+              {shareCreateResult ? (
+                <div className="shareResult">
+                  <label className="field">
+                    <span>URL</span>
+                    <input readOnly value={absoluteShareUrl(shareCreateResult.share_url)} onFocus={(event) => event.currentTarget.select()} />
+                  </label>
+                  <label className="field">
+                    <span>Temporary password</span>
+                    <input readOnly value={shareCreateResult.share_password} onFocus={(event) => event.currentTarget.select()} />
+                  </label>
+                  <button className="secondaryBtn" type="button" onClick={() => void copyShareInvitation()}>
+                    Copy invite
+                  </button>
+                </div>
+              ) : null}
+              {shareCreateError ? <div className="error-inline">{shareCreateError}</div> : null}
+              <div className="modalActions">
+                <button className="secondaryBtn" type="button" onClick={() => setShareCreateOpen(false)}>
+                  Close
+                </button>
+                <button className="primary" type="submit" disabled={shareCreateBusy || !selectedShareSessionCount}>
+                  {shareCreateBusy ? "Creating..." : shareCreateResult ? "Create another" : "Create share"}
                 </button>
               </div>
             </form>
