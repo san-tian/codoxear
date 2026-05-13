@@ -11,6 +11,7 @@ import {
   normalizeEvents,
   previewFromEvents,
 } from "./lib/transcript";
+import { isAwaitingAssistantReply } from "./lib/session-status";
 import type {
   ChangedFilesResponse,
   CodexConfigResponse,
@@ -1090,6 +1091,7 @@ export function App() {
   const [loadingOlder, setLoadingOlder] = useState(false);
   const [errorText, setErrorText] = useState("");
   const [sessionDrafts, setSessionDrafts] = useState<Record<string, string>>(() => readStoredSessionDrafts());
+  const [closedTurnTsBySession, setClosedTurnTsBySession] = useState<Record<string, number>>({});
   const [busySubmitMode, setBusySubmitMode] = useState<BusySubmitMode>(() => readBusySubmitMode());
   const [toastText, setToastText] = useState("");
   const [loginPassword, setLoginPassword] = useState("");
@@ -1472,17 +1474,9 @@ export function App() {
     [renameSessionId, selectedSession, sessions],
   );
   const awaitingAssistantReply = useMemo(() => {
-    if (!selectedSession || queueLen) return false;
-    let latestUserTs = 0;
-    let latestAssistantTs = 0;
-    for (const event of transcript) {
-      const ts = Number(event.ts || 0);
-      if (!Number.isFinite(ts) || ts <= 0) continue;
-      if (event.kind === "user") latestUserTs = Math.max(latestUserTs, ts);
-      if (event.kind === "assistant") latestAssistantTs = Math.max(latestAssistantTs, ts);
-    }
-    return latestUserTs > latestAssistantTs;
-  }, [queueLen, selectedSession, transcript]);
+    if (!selectedSession) return false;
+    return isAwaitingAssistantReply(transcript, queueLen, closedTurnTsBySession[selectedSessionId] || 0);
+  }, [closedTurnTsBySession, queueLen, selectedSession, selectedSessionId, transcript]);
   const selectedSessionAwaitingReplyId =
     awaitingAssistantReply && selectedSessionId && interruptingSessionId !== selectedSessionId ? selectedSessionId : "";
   const workspaceGroups = useMemo(() => {
@@ -1947,6 +1941,7 @@ export function App() {
     has_older?: boolean;
     busy: boolean;
     queue_len: number;
+    turn_end?: boolean;
     turn_aborted?: boolean;
     token?: Record<string, unknown> | null;
   }, sessionId = selectedSessionRef.current, transcriptEvents?: UiTranscriptEvent[]) {
@@ -1979,6 +1974,9 @@ export function App() {
         queueLen: nextQueueLen,
         tokenSummary: nextTokenSummary,
       });
+      if (data.turn_end || data.turn_aborted) {
+        setClosedTurnTsBySession((current) => ({ ...current, [sessionId]: Date.now() / 1000 }));
+      }
     }
     if (sessionId && (!data.busy || data.turn_aborted)) {
       setInterruptingSessionId((current) => (current === sessionId ? "" : current));
