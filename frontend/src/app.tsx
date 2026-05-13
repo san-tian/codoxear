@@ -73,7 +73,7 @@ type BusySubmitMode = "queue" | "interrupt";
 type ThemeMode = "dark" | "light";
 type AgentBackend = "codex" | "pi";
 type TokenSummary = { label: string; title: string };
-type ShareDraftSession = { session_id: string; label: string; checked: boolean };
+type ShareDraftSession = { session_id: string; label: string; workspace: string; cwd: string; checked: boolean };
 type ManagedShareSet = ShareSet & { share_password?: string };
 type NewSessionBackendPreferences = {
   provider?: string;
@@ -2384,12 +2384,16 @@ export function App() {
 
   function openShareCreateDialog() {
     if (!selectedSession) return;
-    const sameWorkspace = sessions.filter((session) => workspaceKeyForSession(session) === workspaceKeyForSession(selectedSession));
-    const candidates = (sameWorkspace.length ? sameWorkspace : sessions).map((session) => ({
-      session_id: session.session_id,
-      label: sessionDisplayName(session),
-      checked: session.session_id === selectedSession.session_id,
-    }));
+    const candidates = sortSessions(sessions).map((session) => {
+      const workspaceCwd = workspaceKeyForSession(session);
+      return {
+        session_id: session.session_id,
+        label: sessionDisplayName(session),
+        workspace: workspaceTitle(workspaceCwd),
+        cwd: workspaceCwd === "__unknown_workspace__" ? "" : workspaceCwd,
+        checked: session.session_id === selectedSession.session_id,
+      };
+    });
     setShareCreateSessions(candidates);
     setShareCreateLabel(sessionDisplayName(selectedSession));
     setShareCreateExpiresHours(24);
@@ -4573,7 +4577,11 @@ export function App() {
                       <input type="checkbox" checked={session.checked} onChange={() => toggleShareDraftSession(session.session_id)} />
                       <span>
                         <strong>{session.label}</strong>
-                        <small>{session.session_id}</small>
+                        <small>
+                          <span>{session.workspace}</span>
+                          <span>{session.session_id}</span>
+                        </small>
+                        {session.cwd ? <small className="shareSessionPath">{session.cwd}</small> : null}
                       </span>
                     </label>
                   ))}

@@ -2765,7 +2765,7 @@ button.primary {
 }
 
 .shareSessionChoices {
-  max-height: 220px;
+  max-height: 260px;
   overflow: auto;
 }
 
@@ -2805,9 +2805,26 @@ button.primary {
 }
 
 .shareSessionChoice small {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 8px;
   color: var(--muted);
   font-size: 12px;
   line-height: 1.25;
+}
+
+.shareSessionChoice small span {
+  min-width: 0;
+}
+
+.shareSessionChoice small span:first-child {
+  color: var(--text);
+  font-weight: 650;
+}
+
+.shareSessionChoice .shareSessionPath {
+  display: block;
+  color: var(--muted);
 }
 
 .shareManager {
