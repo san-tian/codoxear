@@ -2767,7 +2767,7 @@ button.primary {
 
 .shareSessionChoice {
   display: flex;
-  align-items: flex-start;
+  align-items: center;
   gap: 10px;
   padding: 10px 12px;
   border: 1px solid var(--border);
@@ -2777,13 +2777,16 @@ button.primary {
 
 .shareSessionChoice input {
   flex: 0 0 auto;
-  margin-top: 2px;
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  accent-color: var(--accent);
 }
 
 .shareSessionChoice span {
   min-width: 0;
   display: grid;
-  gap: 3px;
+  gap: 2px;
 }
 
 .shareSessionChoice strong,
@@ -2792,8 +2795,15 @@ button.primary {
   overflow-wrap: anywhere;
 }
 
+.shareSessionChoice strong {
+  font-size: 14px;
+  line-height: 1.25;
+}
+
 .shareSessionChoice small {
   color: var(--muted);
+  font-size: 12px;
+  line-height: 1.25;
 }
 
 .error-inline {
