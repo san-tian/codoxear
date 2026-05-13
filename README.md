@@ -130,6 +130,12 @@ tailscale serve status
 - Web-owned tmux sessions: start a new Codex or Pi session from the Codoxear UI with `Create in tmux` enabled to run it inside a stable tmux session derived from the session workspace/cwd for shell-side observability. Sessions in the same workspace share one tmux session and use separate tmux windows.
 - When a tmux-backed session is selected, the top bar shows a tmux button that copies the exact `tmux attach-session ...` command for reconnecting to that session from a terminal.
 - The Nova preview shell also exposes a `Copy tmux attach` button for tmux-backed sessions, using the same `tmux attach-session ...` command shape.
+- Nova shows a compact `NEW` badge beside `Codoxear Nova` when the local checkout does not contain the configured remote HEAD. By default it checks `origin`'s default branch (`origin/HEAD`), then `upstream`'s default branch, then `main`. Override this in `.env` only when you want a different update source:
+
+```sh
+CODOXEAR_UPDATE_REMOTE=origin
+CODOXEAR_UPDATE_REF=san-tian-dev
+```
 
 ## Session ownership
 

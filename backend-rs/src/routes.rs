@@ -2353,78 +2353,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn version_status_route_reports_remote_update() {
+    async fn version_status_route_uses_configured_remote_ref() {
         let _guard = env_lock().lock().unwrap();
-        let repo = temp_dir("version-status-repo");
-        assert!(std::process::Command::new("git")
-            .current_dir(&repo)
-            .args(["init", "-q", "-b", "main"])
-            .status()
-            .unwrap()
-            .success());
-        assert!(std::process::Command::new("git")
-            .current_dir(&repo)
-            .args(["config", "user.email", "codoxear@example.test"])
-            .status()
-            .unwrap()
-            .success());
-        assert!(std::process::Command::new("git")
-            .current_dir(&repo)
-            .args(["config", "user.name", "Codoxear Test"])
-            .status()
-            .unwrap()
-            .success());
-        fs::write(repo.join("README.md"), "local\n").unwrap();
-        assert!(std::process::Command::new("git")
-            .current_dir(&repo)
-            .args(["add", "README.md"])
-            .status()
-            .unwrap()
-            .success());
-        assert!(std::process::Command::new("git")
-            .current_dir(&repo)
-            .args(["commit", "-q", "-m", "local"])
-            .status()
-            .unwrap()
-            .success());
-        let remote = temp_dir("version-status-remote");
-        assert!(std::process::Command::new("git")
-            .current_dir(&remote)
-            .args(["init", "-q", "-b", "main"])
-            .status()
-            .unwrap()
-            .success());
-        assert!(std::process::Command::new("git")
-            .current_dir(&remote)
-            .args(["config", "user.email", "codoxear@example.test"])
-            .status()
-            .unwrap()
-            .success());
-        assert!(std::process::Command::new("git")
-            .current_dir(&remote)
-            .args(["config", "user.name", "Codoxear Test"])
-            .status()
-            .unwrap()
-            .success());
-        fs::write(remote.join("README.md"), "remote\n").unwrap();
-        assert!(std::process::Command::new("git")
-            .current_dir(&remote)
-            .args(["add", "README.md"])
-            .status()
-            .unwrap()
-            .success());
-        assert!(std::process::Command::new("git")
-            .current_dir(&remote)
-            .args(["commit", "-q", "-m", "remote"])
-            .status()
-            .unwrap()
-            .success());
-        assert!(std::process::Command::new("git")
-            .current_dir(&repo)
-            .args(["remote", "add", "upstream", remote.to_str().unwrap()])
-            .status()
-            .unwrap()
-            .success());
+        let repo = make_git_repo("version-status-repo", "main", "local");
+        let remote = make_git_repo("version-status-remote", "main", "remote");
+        git_ok(
+            &repo,
+            &["remote", "add", "upstream", remote.to_str().unwrap()],
+        );
         let _repo_root = EnvGuard::set("CODOXEAR_REPO_ROOT", repo.display().to_string());
         let _remote = EnvGuard::set("CODOXEAR_UPDATE_REMOTE", "upstream");
         let _remote_ref = EnvGuard::set("CODOXEAR_UPDATE_REF", "main");
@@ -2450,6 +2386,56 @@ mod tests {
         assert_eq!(payload["update_available"], true);
         assert_eq!(payload["remote"], "upstream");
         assert_eq!(payload["remote_ref"], "main");
+    }
+
+    #[tokio::test]
+    async fn version_status_route_defaults_to_origin_head() {
+        let _guard = env_lock().lock().unwrap();
+        let repo = make_git_repo("version-status-origin-repo", "main", "local");
+        let origin = make_git_repo("version-status-origin-remote", "release", "origin");
+        let upstream = make_git_repo("version-status-upstream-remote", "main", "upstream");
+        git_ok(
+            &repo,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        );
+        git_ok(
+            &repo,
+            &["remote", "add", "upstream", upstream.to_str().unwrap()],
+        );
+        git_ok(&repo, &["fetch", "origin", "release"]);
+        git_ok(
+            &repo,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/release",
+            ],
+        );
+        let _repo_root = EnvGuard::set("CODOXEAR_REPO_ROOT", repo.display().to_string());
+        let _remote = EnvGuard::remove("CODOXEAR_UPDATE_REMOTE");
+        let _remote_ref = EnvGuard::remove("CODOXEAR_UPDATE_REF");
+        let app = router(
+            build_state_from_config(RuntimeConfig {
+                app_dir: temp_app_dir("version-status-origin-default"),
+            })
+            .unwrap(),
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/version_status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["ok"], true);
+        assert_eq!(payload["update_available"], true);
+        assert_eq!(payload["remote"], "origin");
+        assert_eq!(payload["remote_ref"], "release");
     }
 
     #[tokio::test]
@@ -3195,6 +3181,31 @@ mod tests {
         path
     }
 
+    fn git_ok(repo: &Path, args: &[&str]) {
+        assert!(
+            std::process::Command::new("git")
+                .current_dir(repo)
+                .args(args)
+                .status()
+                .unwrap()
+                .success(),
+            "git {:?} failed in {}",
+            args,
+            repo.display()
+        );
+    }
+
+    fn make_git_repo(name: &str, branch: &str, text: &str) -> PathBuf {
+        let repo = temp_dir(name);
+        git_ok(&repo, &["init", "-q", "-b", branch]);
+        git_ok(&repo, &["config", "user.email", "codoxear@example.test"]);
+        git_ok(&repo, &["config", "user.name", "Codoxear Test"]);
+        fs::write(repo.join("README.md"), format!("{text}\n")).unwrap();
+        git_ok(&repo, &["add", "README.md"]);
+        git_ok(&repo, &["commit", "-q", "-m", text]);
+        repo
+    }
+
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
@@ -3209,6 +3220,12 @@ mod tests {
         fn set(key: &'static str, value: impl AsRef<str>) -> Self {
             let previous = env::var(key).ok();
             env::set_var(key, value.as_ref());
+            Self { key, previous }
+        }
+
+        fn remove(key: &'static str) -> Self {
+            let previous = env::var(key).ok();
+            env::remove_var(key);
             Self { key, previous }
         }
     }

@@ -4538,10 +4538,10 @@ fn resolve_update_remote_ref(repo: &Path) -> Result<(String, String), String> {
         .filter(|value| !value.is_empty())
         .collect::<Vec<_>>();
     let remote = configured_remote.unwrap_or_else(|| {
-        if remotes.iter().any(|value| *value == "upstream") {
-            "upstream".to_string()
-        } else if remotes.iter().any(|value| *value == "origin") {
+        if remotes.iter().any(|value| *value == "origin") {
             "origin".to_string()
+        } else if remotes.iter().any(|value| *value == "upstream") {
+            "upstream".to_string()
         } else {
             remotes.first().copied().unwrap_or("origin").to_string()
         }
