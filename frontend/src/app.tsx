@@ -3902,6 +3902,7 @@ export function App() {
               </button>
             ) : null}
             <form
+              className={composerSessionBusy ? "isBusy" : undefined}
               onSubmit={(event) => {
                 event.preventDefault();
                 void handleSend();

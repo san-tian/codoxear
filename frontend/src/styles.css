@@ -2874,18 +2874,23 @@ button.primary {
   }
 
   .composer form {
+    flex-wrap: nowrap;
+    align-items: center;
+  }
+
+  .composer form.isBusy {
     flex-wrap: wrap;
     border-radius: 18px;
     align-items: stretch;
     padding: 8px;
   }
 
-  .inputWrap {
+  .composer form.isBusy .inputWrap {
     flex: 1 1 100%;
     min-width: 100%;
   }
 
-  .composerMode {
+  .composer form.isBusy .composerMode {
     order: 3;
     width: 100%;
     justify-content: space-between;
@@ -2961,17 +2966,27 @@ button.primary {
   }
 
   .composer {
-    padding: 10px 12px calc(12px + env(safe-area-inset-bottom));
+    padding: 6px 10px calc(6px + env(safe-area-inset-bottom));
   }
 
   .composer form {
+    gap: 5px;
+    padding: 5px 6px;
+  }
+
+  .composer form.isBusy {
     gap: 6px;
+    padding: 8px;
     border-radius: 16px;
   }
 
   .inputWrap textarea,
   .ph {
-    padding-inline: 10px;
+    padding: 8px 9px;
+  }
+
+  .inputWrap textarea {
+    min-height: 36px;
   }
 
   .modalBackdrop {
