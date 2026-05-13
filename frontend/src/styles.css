@@ -3308,7 +3308,11 @@ button.primary {
 
   .queuePreview {
     width: 100%;
+    max-height: min(128px, 24dvh);
     margin-bottom: 10px;
+    overflow: auto;
+    overscroll-behavior: contain;
+    -webkit-overflow-scrolling: touch;
   }
 
   .queuePreviewItem span:last-child,
@@ -3316,6 +3320,13 @@ button.primary {
   .queuePreviewEmpty {
     white-space: normal;
     overflow-wrap: anywhere;
+  }
+
+  .queuePreviewItem span:last-child {
+    display: -webkit-box;
+    overflow: hidden;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
   }
 
   .modalBackdrop {
@@ -3363,6 +3374,7 @@ button.primary {
   }
 
   .queuePreview {
+    max-height: min(104px, 22dvh);
     padding: 8px 9px;
   }
 
