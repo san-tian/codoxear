@@ -3,7 +3,9 @@ use crate::models::{
     ApiFileSearchMatch, ApiFileSearchResponse, ApiGitDiffResponse, ApiGitFileVersionsResponse,
     ApiHarnessResponse, ApiMessagesHistoryResponse, ApiMessagesLiveResponse,
     ApiMessagesTailResponse, ApiNewSessionDefaults, ApiQueueItem, ApiQueueResponse,
-    ApiSessionSummary, ApiSessionsResponse, SessionDetail, SessionSummary,
+    ApiSessionSummary, ApiSessionsResponse, ApiShareFilesResponse, ApiShareLoginResponse,
+    ApiShareMessageResponse, ApiShareMessageSession, ApiShareSessionRef, ApiShareSet,
+    SessionDetail, SessionSummary,
 };
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
@@ -107,6 +109,7 @@ const ASK_USER_TOOL_NAMES: &[&str] = &["ask_user", "AskUserQuestion"];
 const EXTENSION_DISPLAY_KEY: &str = "codoxear_display";
 const EXTENSION_DISPLAY_TOOL_NAMES: &[&str] = &["codoxear_display", "codoxear.display"];
 const GOAL_TOOL_NAMES: &[&str] = &["create_goal", "get_goal", "update_goal"];
+const SHARE_FILE_NAME: &str = "session_shares.json";
 const FILE_LIST_IGNORED_DIRS: &[&str] = &[
     ".git",
     ".hg",
@@ -2927,6 +2930,23 @@ pub fn load_file_blob(
         }
         _ => Err("file is not previewable inline".to_string()),
     }
+}
+
+pub fn load_file_download_bytes(
+    config: &RuntimeConfig,
+    session_id: &str,
+    raw_path: &str,
+) -> Result<(Vec<u8>, String), String> {
+    let session = find_session(config, session_id)?;
+    let resolved = resolve_session_path(&session.cwd, raw_path)?;
+    let raw = fs::read(&resolved).map_err(map_io_error)?;
+    let (_kind, content_type) = detect_file_kind(&resolved, &raw);
+    Ok((
+        raw,
+        content_type
+            .unwrap_or("application/octet-stream")
+            .to_string(),
+    ))
 }
 
 fn session_from_meta(
@@ -6615,6 +6635,299 @@ fn read_optional_value(path: &Path) -> Result<Option<Value>, String> {
             .map_err(|err| format!("parse {}: {err}", path.display())),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(err) => Err(format!("read {}: {err}", path.display())),
+    }
+}
+
+fn share_file_path(config: &RuntimeConfig) -> PathBuf {
+    config.app_dir.join(SHARE_FILE_NAME)
+}
+
+fn share_password_hash(share_id: &str, password: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(share_id.as_bytes());
+    hasher.update(b":");
+    hasher.update(password.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+fn generate_share_id() -> String {
+    let mut bytes = [0_u8; 16];
+    if let Ok(mut file) = fs::File::open("/dev/urandom") {
+        let _ = file.read_exact(&mut bytes);
+    } else {
+        bytes[..8].copy_from_slice(&epoch_now().to_le_bytes());
+    }
+    URL_SAFE_NO_PAD.encode(bytes)
+}
+
+fn generate_share_password() -> String {
+    let mut bytes = [0_u8; 24];
+    if let Ok(mut file) = fs::File::open("/dev/urandom") {
+        let _ = file.read_exact(&mut bytes);
+    } else {
+        bytes[..8].copy_from_slice(&epoch_now().to_le_bytes());
+    }
+    URL_SAFE_NO_PAD.encode(bytes)
+}
+
+fn read_share_store(config: &RuntimeConfig) -> Result<HashMap<String, ApiShareSet>, String> {
+    let path = share_file_path(config);
+    let Some(Value::Object(object)) = read_optional_value(&path)? else {
+        return Ok(HashMap::new());
+    };
+    let mut shares = HashMap::new();
+    for (share_id, value) in object {
+        let Ok(mut share) = serde_json::from_value::<ApiShareSet>(Value::Object(
+            value.as_object().cloned().unwrap_or_default(),
+        )) else {
+            continue;
+        };
+        if share.share_id.trim().is_empty() {
+            share.share_id = share_id.clone();
+        }
+        shares.insert(share_id, share);
+    }
+    Ok(shares)
+}
+
+fn write_share_store(
+    config: &RuntimeConfig,
+    shares: &HashMap<String, ApiShareSet>,
+) -> Result<(), String> {
+    let path = share_file_path(config);
+    write_json_value(&path, &json!(shares))
+}
+
+fn share_session_refs_from_sessions(
+    config: &RuntimeConfig,
+    session_ids: &[String],
+    nicknames: &HashMap<String, String>,
+) -> Result<Vec<ApiShareSessionRef>, String> {
+    let mut refs = Vec::new();
+    for session_id in session_ids {
+        let session = find_session(config, session_id)?;
+        refs.push(ApiShareSessionRef {
+            session_id: session_id.clone(),
+            nickname: nicknames
+                .get(session_id)
+                .cloned()
+                .unwrap_or_else(|| session.alias.clone()),
+            added_ts: epoch_now(),
+        });
+    }
+    Ok(refs)
+}
+
+fn share_set_from_record(
+    config: &RuntimeConfig,
+    record: &ApiShareSet,
+) -> Result<ApiShareSet, String> {
+    let nickname_map = record
+        .sessions
+        .iter()
+        .map(|session| (session.session_id.clone(), session.nickname.clone()))
+        .collect::<HashMap<_, _>>();
+    let sessions = share_session_refs_from_sessions(config, &record.session_ids, &nickname_map)?;
+    Ok(ApiShareSet {
+        share_id: record.share_id.clone(),
+        label: record.label.clone(),
+        password_hash: record.password_hash.clone(),
+        password_hint: record.password_hint.clone(),
+        expires_at: record.expires_at,
+        created_at: record.created_at,
+        updated_at: record.updated_at,
+        allow_interrupt: record.allow_interrupt,
+        allow_files: record.allow_files,
+        allow_attachment_downloads: record.allow_attachment_downloads,
+        session_ids: record.session_ids.clone(),
+        sessions,
+    })
+}
+
+fn share_session_title(session_id: &str, session: &ApiSessionSummary) -> String {
+    if !session.alias.trim().is_empty() {
+        session.alias.clone()
+    } else if let Some(name) = Path::new(&session.cwd)
+        .file_name()
+        .and_then(|value| value.to_str())
+    {
+        name.to_string()
+    } else {
+        session_id.to_string()
+    }
+}
+
+fn share_message_session(
+    config: &RuntimeConfig,
+    session_id: &str,
+) -> Result<ApiShareMessageSession, String> {
+    let session = find_session(config, session_id)?;
+    Ok(ApiShareMessageSession {
+        session_id: session_id.to_string(),
+        title: share_session_title(session_id, &session),
+        alias: if session.alias.trim().is_empty() {
+            share_session_title(session_id, &session)
+        } else {
+            session.alias
+        },
+    })
+}
+
+pub fn create_share_set(
+    config: &RuntimeConfig,
+    label: &str,
+    session_ids: &[String],
+    nicknames: &HashMap<String, String>,
+    expires_at: f64,
+    allow_interrupt: bool,
+    allow_files: bool,
+    allow_attachment_downloads: bool,
+) -> Result<(ApiShareSet, String), String> {
+    let cleaned_sessions = session_ids
+        .iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    if cleaned_sessions.is_empty() {
+        return Err("at least one session required".to_string());
+    }
+    let created_at = epoch_now();
+    let share_id = generate_share_id();
+    let password = generate_share_password();
+    let sessions = share_session_refs_from_sessions(config, &cleaned_sessions, nicknames)?;
+    let share = ApiShareSet {
+        share_id: share_id.clone(),
+        label: sanitize_share_label(label),
+        password_hash: share_password_hash(&share_id, &password),
+        password_hint: password.chars().take(4).collect(),
+        expires_at,
+        created_at,
+        updated_at: created_at,
+        allow_interrupt,
+        allow_files,
+        allow_attachment_downloads,
+        session_ids: cleaned_sessions,
+        sessions,
+    };
+    let mut shares = read_share_store(config)?;
+    shares.insert(share_id.clone(), share.clone());
+    write_share_store(config, &shares)?;
+    Ok((share, password))
+}
+
+pub fn update_share_sessions(
+    config: &RuntimeConfig,
+    share_id: &str,
+    label: &str,
+    session_ids: &[String],
+    nicknames: &HashMap<String, String>,
+) -> Result<ApiShareSet, String> {
+    let mut shares = read_share_store(config)?;
+    let Some(mut share) = shares.get(share_id).cloned() else {
+        return Err("unknown share".to_string());
+    };
+    share.label = sanitize_share_label(label);
+    share.session_ids = session_ids
+        .iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect();
+    share.sessions = share_session_refs_from_sessions(config, &share.session_ids, nicknames)?;
+    share.updated_at = epoch_now();
+    shares.insert(share_id.to_string(), share.clone());
+    write_share_store(config, &shares)?;
+    Ok(share)
+}
+
+pub fn load_share_set(config: &RuntimeConfig, share_id: &str) -> Result<ApiShareSet, String> {
+    let shares = read_share_store(config)?;
+    let Some(share) = shares.get(share_id) else {
+        return Err("unknown share".to_string());
+    };
+    share_set_from_record(config, share)
+}
+
+pub fn login_share_set(
+    config: &RuntimeConfig,
+    share_id: &str,
+    password: &str,
+) -> Result<ApiShareLoginResponse, String> {
+    let share = load_share_set(config, share_id)?;
+    if share.password_hash != share_password_hash(&share.share_id, password) {
+        return Err("invalid password".to_string());
+    }
+    Ok(ApiShareLoginResponse {
+        ok: true,
+        share_id: share.share_id,
+        share_label: share.label,
+        expires_at: share.expires_at,
+        allow_interrupt: share.allow_interrupt,
+        allow_files: share.allow_files,
+        allow_attachment_downloads: share.allow_attachment_downloads,
+        sessions: share.sessions,
+    })
+}
+
+pub fn share_message_transcript(
+    config: &RuntimeConfig,
+    share_id: &str,
+    session_id: &str,
+    limit: usize,
+) -> Result<ApiShareMessageResponse, String> {
+    let share = load_share_set(config, share_id)?;
+    if !share.session_ids.iter().any(|value| value == session_id) {
+        return Err("session not in share".to_string());
+    }
+    let session = share_message_session(config, session_id)?;
+    let tail = load_messages_tail(config, session_id, limit)?;
+    let transcript = tail.events.clone();
+    Ok(ApiShareMessageResponse {
+        ok: true,
+        share_id: share.share_id,
+        share_label: share.label,
+        session,
+        transcript,
+        tail: serde_json::to_value(tail).map_err(|err| err.to_string())?,
+    })
+}
+
+pub fn share_file_entries(
+    config: &RuntimeConfig,
+    share_id: &str,
+    session_id: &str,
+) -> Result<ApiShareFilesResponse, String> {
+    let share = load_share_set(config, share_id)?;
+    if !share.session_ids.iter().any(|value| value == session_id) {
+        return Err("session not in share".to_string());
+    }
+    let session = find_session(config, session_id)?;
+    let mut files = Vec::new();
+    for path in session.files {
+        if path.trim().is_empty() {
+            continue;
+        }
+        files.push(json!({
+            "path": path,
+            "rel": path,
+            "kind": "file",
+            "download_url": format!("/share/{share_id}/sessions/{session_id}/file/blob?path={}", url_encode(&path)),
+        }));
+    }
+    Ok(ApiShareFilesResponse {
+        ok: true,
+        share_id: share.share_id,
+        share_label: share.label,
+        session_id: session_id.to_string(),
+        files,
+    })
+}
+
+fn sanitize_share_label(raw: &str) -> String {
+    let label = raw.trim().replace(|ch: char| ch.is_control(), "");
+    if label.is_empty() {
+        "Shared sessions".to_string()
+    } else {
+        label.chars().take(120).collect()
     }
 }
 

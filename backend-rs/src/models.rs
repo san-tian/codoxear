@@ -221,6 +221,78 @@ pub struct ApiQueueItem {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
+pub struct ApiShareSessionRef {
+    pub session_id: String,
+    pub nickname: String,
+    pub added_ts: f64,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct ApiShareSet {
+    pub share_id: String,
+    pub label: String,
+    pub password_hash: String,
+    pub password_hint: String,
+    pub expires_at: f64,
+    pub created_at: f64,
+    pub updated_at: f64,
+    pub allow_interrupt: bool,
+    pub allow_files: bool,
+    pub allow_attachment_downloads: bool,
+    pub session_ids: Vec<String>,
+    pub sessions: Vec<ApiShareSessionRef>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct ApiShareLoginResponse {
+    pub ok: bool,
+    pub share_id: String,
+    pub share_label: String,
+    pub expires_at: f64,
+    pub allow_interrupt: bool,
+    pub allow_files: bool,
+    pub allow_attachment_downloads: bool,
+    pub sessions: Vec<ApiShareSessionRef>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct ApiShareCreateResponse {
+    pub ok: bool,
+    pub share_id: String,
+    pub share_url: String,
+    pub share_password: String,
+    pub share_label: String,
+    pub expires_at: f64,
+    pub sessions: Vec<ApiShareSessionRef>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct ApiShareMessageSession {
+    pub session_id: String,
+    pub title: String,
+    pub alias: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct ApiShareMessageResponse {
+    pub ok: bool,
+    pub share_id: String,
+    pub share_label: String,
+    pub session: ApiShareMessageSession,
+    pub transcript: Vec<serde_json::Value>,
+    pub tail: serde_json::Value,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct ApiShareFilesResponse {
+    pub ok: bool,
+    pub share_id: String,
+    pub share_label: String,
+    pub session_id: String,
+    pub files: Vec<serde_json::Value>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ApiQueueResponse {
     pub ok: bool,
     pub items: Vec<ApiQueueItem>,

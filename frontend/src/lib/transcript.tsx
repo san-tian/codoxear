@@ -542,10 +542,17 @@ function parseMessageBodySegments(body: string): MessageBodySegment[] {
   return segments;
 }
 
-function AttachmentBlock(props: { segment: Extract<MessageBodySegment, { kind: "attachment" }> }) {
+function AttachmentBlock(props: { segment: Extract<MessageBodySegment, { kind: "attachment" }>; href?: string }) {
   const { segment } = props;
   return (
-    <div className="attachment-card" title={segment.path}>
+    <a
+      className={`attachment-card${props.href ? "" : " is-disabled"}`}
+      title={segment.path}
+      href={props.href || undefined}
+      target={props.href ? "_blank" : undefined}
+      rel={props.href ? "noreferrer" : undefined}
+      aria-disabled={!props.href}
+    >
       <div className="attachment-filemark" aria-hidden="true">
         <span>{segment.extension}</span>
       </div>
@@ -556,11 +563,11 @@ function AttachmentBlock(props: { segment: Extract<MessageBodySegment, { kind: "
         </div>
         <div className="attachment-path">{segment.path}</div>
       </div>
-    </div>
+    </a>
   );
 }
 
-function RichMessageBody(props: { body: string; className?: string }) {
+function RichMessageBody(props: { body: string; className?: string; attachmentHref?: (path: string) => string | undefined }) {
   const segments = parseMessageBodySegments(props.body);
   if (!segments.length) return null;
   if (segments.length === 1 && segments[0].kind === "text") {
@@ -570,7 +577,7 @@ function RichMessageBody(props: { body: string; className?: string }) {
     <div className="message-body rich-message-body">
       {segments.map((segment, index) =>
         segment.kind === "attachment" ? (
-          <AttachmentBlock segment={segment} key={`attachment-${segment.index}-${index}`} />
+          <AttachmentBlock segment={segment} href={props.attachmentHref?.(segment.path)} key={`attachment-${segment.index}-${index}`} />
         ) : (
           <MarkdownBlock text={segment.text} className={props.className || "message-body markdown-body"} key={`text-${index}`} />
         ),
@@ -579,7 +586,7 @@ function RichMessageBody(props: { body: string; className?: string }) {
   );
 }
 
-function ExtensionProgress(props: { event: UiTranscriptEvent }) {
+function ExtensionProgress(props: { event: UiTranscriptEvent; attachmentHref?: (path: string) => string | undefined }) {
   const { event } = props;
   const total = event.progressTotal;
   const current = event.progressCurrent;
@@ -617,7 +624,7 @@ function ExtensionProgress(props: { event: UiTranscriptEvent }) {
           ))}
         </ol>
       ) : null}
-      {event.body ? <RichMessageBody body={event.body} className="message-body markdown-body extension-body" /> : null}
+      {event.body ? <RichMessageBody body={event.body} className="message-body markdown-body extension-body" attachmentHref={props.attachmentHref} /> : null}
     </div>
   );
 }
@@ -632,7 +639,7 @@ function GoalMetric(props: { label: string; value: string }) {
   );
 }
 
-function GoalPanel(props: { event: UiTranscriptEvent }) {
+function GoalPanel(props: { event: UiTranscriptEvent; attachmentHref?: (path: string) => string | undefined }) {
   const { event } = props;
   const objective = String(event.goalObjective || event.summary || "").trim();
   const used = formatCompactNumber(event.goalTokensUsed);
@@ -653,12 +660,12 @@ function GoalPanel(props: { event: UiTranscriptEvent }) {
         <GoalMetric label="Elapsed" value={elapsed} />
       </div>
       {event.goalCompletionReport ? <div className="goal-report">{event.goalCompletionReport}</div> : null}
-      {event.body ? <RichMessageBody body={event.body} className="message-body markdown-body extension-body" /> : null}
+      {event.body ? <RichMessageBody body={event.body} className="message-body markdown-body extension-body" attachmentHref={props.attachmentHref} /> : null}
     </div>
   );
 }
 
-function ToolEventDetails(props: { event: UiTranscriptEvent }) {
+function ToolEventDetails(props: { event: UiTranscriptEvent; attachmentHref?: (path: string) => string | undefined }) {
   const { event } = props;
   const toolCallBody = String(event.toolCallBody || "").trim();
   const toolResultBody = String(event.toolResultBody || "").trim();
@@ -667,17 +674,17 @@ function ToolEventDetails(props: { event: UiTranscriptEvent }) {
       <div className="tool-pair">
         <section className="tool-part">
           <div className="tool-part-label">Call</div>
-          <RichMessageBody body={toolCallBody} className="message-body markdown-body" />
+          <RichMessageBody body={toolCallBody} className="message-body markdown-body" attachmentHref={props.attachmentHref} />
         </section>
         <section className="tool-part">
           <div className="tool-part-label">Result</div>
-          <RichMessageBody body={toolResultBody} className="message-body markdown-body" />
+          <RichMessageBody body={toolResultBody} className="message-body markdown-body" attachmentHref={props.attachmentHref} />
         </section>
       </div>
     );
   }
   const body = toolResultBody || toolCallBody || String(event.body || "").trim();
-  return body ? <RichMessageBody body={body} className="message-body markdown-body" /> : null;
+  return body ? <RichMessageBody body={body} className="message-body markdown-body" attachmentHref={props.attachmentHref} /> : null;
 }
 
 function answerTextForAskUser(event: UiTranscriptEvent, values: string[], freeform: string, bridgeAnswers: Record<string, string | string[]>) {
@@ -846,6 +853,7 @@ export function TranscriptEventRow(props: {
   collapsed: boolean;
   onToggle: (event: UiTranscriptEvent) => void;
   onAskUserRespond?: (event: UiTranscriptEvent, text: string) => Promise<void>;
+  attachmentHref?: (path: string) => string | undefined;
 }) {
   const { event, events, index, collapsed, onToggle, onAskUserRespond } = props;
   const collapsible = isCollapsibleEvent(event.kind);
@@ -890,11 +898,11 @@ export function TranscriptEventRow(props: {
                 <span className="message-fold is-open" aria-label="Hide details" title="Hide details" />
               </div>
             ) : null}
-            {event.kind === "extension" && event.extensionKind === "goal" ? <GoalPanel event={event} /> : null}
-            {event.kind === "extension" && event.extensionKind !== "goal" ? <ExtensionProgress event={event} /> : null}
+            {event.kind === "extension" && event.extensionKind === "goal" ? <GoalPanel event={event} attachmentHref={props.attachmentHref} /> : null}
+            {event.kind === "extension" && event.extensionKind !== "goal" ? <ExtensionProgress event={event} attachmentHref={props.attachmentHref} /> : null}
             {event.kind === "ask_user" ? <AskUserPrompt event={event} onRespond={onAskUserRespond} /> : null}
-            {event.kind === "tool" ? <ToolEventDetails event={event} /> : null}
-            {event.kind !== "extension" && event.kind !== "ask_user" && event.kind !== "tool" && event.body ? <RichMessageBody body={event.body} className="message-body markdown-body" /> : null}
+            {event.kind === "tool" ? <ToolEventDetails event={event} attachmentHref={props.attachmentHref} /> : null}
+            {event.kind !== "extension" && event.kind !== "ask_user" && event.kind !== "tool" && event.body ? <RichMessageBody body={event.body} className="message-body markdown-body" attachmentHref={props.attachmentHref} /> : null}
             {collapsible && event.meta ? <div className="message-meta">{event.meta}</div> : null}
             {showMessageFooter ? (
               <div className="message-footer">

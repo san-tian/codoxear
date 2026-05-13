@@ -449,3 +449,68 @@ export type DownloadOnlyFileView = {
 };
 
 export type FileReadResponse = TextFileView | ImageFileView | PdfFileView | DownloadOnlyFileView;
+
+export type ShareSessionRef = {
+  session_id: string;
+  nickname: string;
+  added_ts: number;
+};
+
+export type ShareSet = {
+  share_id: string;
+  label: string;
+  password_hash: string;
+  password_hint: string;
+  expires_at: number;
+  created_at: number;
+  updated_at: number;
+  allow_interrupt: boolean;
+  allow_files: boolean;
+  allow_attachment_downloads: boolean;
+  session_ids: string[];
+  sessions: ShareSessionRef[];
+};
+
+export type ShareLoginResponse = {
+  ok: true;
+  share_id: string;
+  share_label: string;
+  expires_at: number;
+  allow_interrupt: boolean;
+  allow_files: boolean;
+  allow_attachment_downloads: boolean;
+  sessions: ShareSessionRef[];
+};
+
+export type ShareCreateResponse = {
+  ok: true;
+  share_id: string;
+  share_url: string;
+  share_password: string;
+  share_label: string;
+  expires_at: number;
+  sessions: ShareSessionRef[];
+};
+
+export type ShareMessageSession = {
+  session_id: string;
+  title: string;
+  alias: string;
+};
+
+export type ShareMessageResponse = {
+  ok: true;
+  share_id: string;
+  share_label: string;
+  session: ShareMessageSession;
+  transcript: RawChatEvent[];
+  tail: TailResponse;
+};
+
+export type ShareFilesResponse = {
+  ok: true;
+  share_id: string;
+  share_label: string;
+  session_id: string;
+  files: Array<Record<string, unknown>>;
+};

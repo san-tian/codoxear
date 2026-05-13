@@ -23,6 +23,9 @@ import type {
   QueueResponse,
   QueueItem,
   ResumeCandidate,
+  ShareFilesResponse,
+  ShareLoginResponse,
+  ShareSet,
   SessionSummary,
   UiTranscriptEvent,
   VoiceSettingsResponse,
@@ -60,6 +63,8 @@ const MOBILE_SIDEBAR_BREAKPOINT_PX = 860;
 const IMPORTANT_PRIORITY_OFFSET = 0.85;
 const PENDING_PRIORITY_OFFSET = -0.85;
 const SHELVE_FOR_NOW_SECONDS = 24 * 60 * 60;
+const SHARE_INIT_LIMIT = 120;
+const SHARE_OLDER_LIMIT = 60;
 
 type BusySubmitMode = "queue" | "interrupt";
 type ThemeMode = "dark" | "light";
@@ -94,6 +99,11 @@ type SessionViewSnapshot = {
   busy: boolean;
   queueLen: number;
   tokenSummary: TokenSummary | null;
+};
+
+type ShareTarget = {
+  shareId: string;
+  sessionId: string;
 };
 
 const EMPTY_VOICE_SETTINGS: VoiceSettingsResponse = {
@@ -362,6 +372,17 @@ function sessionIdFromHash() {
   const params = new URLSearchParams(raw);
   const sessionId = params.get("session");
   return sessionId && sessionId.trim() ? sessionId.trim() : "";
+}
+
+function shareTargetFromPath(pathname = window.location.pathname): ShareTarget | null {
+  const parts = pathname.split("/").filter(Boolean);
+  if (parts[0] !== "share" || parts.length < 2) return null;
+  const shareId = parts[1]?.trim() || "";
+  if (!shareId) return null;
+  if (parts[2] === "sessions" && parts[3]?.trim()) {
+    return { shareId, sessionId: parts[3].trim() };
+  }
+  return { shareId, sessionId: "" };
 }
 
 function writeSessionHash(sessionId: string) {
@@ -996,7 +1017,198 @@ function LoginScreen(props: {
   );
 }
 
+function ShareLoginScreen(props: {
+  label: string;
+  password: string;
+  errorText: string;
+  onPasswordChange: (value: string) => void;
+  onSubmit: () => void | Promise<void>;
+}) {
+  return (
+    <div className="loginWrap">
+      <form
+        className="login"
+        onSubmit={(event) => {
+          event.preventDefault();
+          void props.onSubmit();
+        }}
+      >
+        <div className="title">{props.label || "Shared sessions"}</div>
+        <div className="muted">Enter the temporary share password.</div>
+        <input
+          type="password"
+          value={props.password}
+          onInput={(event) => props.onPasswordChange((event.currentTarget as HTMLInputElement).value)}
+          placeholder="Share password"
+          autoComplete="current-password"
+        />
+        <button className="primary" type="submit">
+          Open share
+        </button>
+      </form>
+      {props.errorText ? <div className="error-toast">{props.errorText}</div> : null}
+    </div>
+  );
+}
+
+function ShareWorkspace(props: {
+  share: ShareSet;
+  sessionId: string;
+  transcript: UiTranscriptEvent[];
+  files: ShareFilesResponse | null;
+  selectedFilePath: string;
+  selectedFile: FileReadResponse | null;
+  loading: boolean;
+  loadingOlder: boolean;
+  hasOlder: boolean;
+  busy: boolean;
+  queueLen: number;
+  errorText: string;
+  sendText: string;
+  canSend: boolean;
+  onSessionChange: (sessionId: string) => void;
+  onSendTextChange: (value: string) => void;
+  onSend: () => void | Promise<void>;
+  onInterrupt: () => void | Promise<void>;
+  onLoadOlder: () => void | Promise<void>;
+  onSelectFile: (path: string) => void;
+}) {
+  const session = props.share.sessions.find((item) => item.session_id === props.sessionId) || props.share.sessions[0] || null;
+  return (
+    <div className="app shareApp">
+      <aside className="sidebar shareSidebar">
+        <header>
+          <div className="title">
+            <span className="sidebarLogoDot" />
+            Shared sessions
+          </div>
+        </header>
+        <div className="sessions shareSessions">
+          {props.share.sessions.map((item) => (
+            <button
+              key={item.session_id}
+              className={`workspaceSelect shareSession${item.session_id === props.sessionId ? " active" : ""}`}
+              type="button"
+              onClick={() => props.onSessionChange(item.session_id)}
+            >
+              <div className="workspaceHeader">
+                <div className="workspaceTitleRow">
+                  <div className="workspaceTitle">{item.nickname || item.session_id}</div>
+                </div>
+                <div className="workspaceMeta">{item.session_id}</div>
+              </div>
+            </button>
+          ))}
+        </div>
+      </aside>
+      <div className="main shareMain">
+        <div className="topbar">
+          <div className="pill">
+            <div className="titleWrap">
+              <div className="titleRow">
+                <div>{session?.nickname || session?.session_id || props.share.label}</div>
+                <div className="topMeta">
+                  <span className="status-chip">{props.share.label}</span>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div className="actions topActions">
+            <button className="icon-btn" type="button" title="Interrupt" disabled={!props.share.allow_interrupt || !props.sessionId || props.loading} onClick={() => void props.onInterrupt()}>
+              {icon("stop")}
+            </button>
+          </div>
+        </div>
+        <div className="workspaceBody">
+          <div className="workspaceMain">
+            <div className="chatWrap">
+              <div className="chat">
+                <div className="chatInner">
+                  {props.hasOlder ? (
+                    <button className="olderBtn" type="button" disabled={props.loadingOlder} onClick={() => void props.onLoadOlder()}>
+                      {props.loadingOlder ? "Loading older messages…" : "Load older messages"}
+                    </button>
+                  ) : null}
+                  {props.transcript.map((event, index) => (
+                    <TranscriptEventRow
+                      key={event.id}
+                      event={event}
+                      events={props.transcript}
+                      index={index}
+                      collapsed={false}
+                      onToggle={() => {}}
+                      attachmentHref={(path) =>
+                        `/share/${encodeURIComponent(props.share.share_id)}/sessions/${encodeURIComponent(props.sessionId)}/file/download?path=${encodeURIComponent(path)}`
+                      }
+                    />
+                  ))}
+                  {!props.transcript.length ? <div className="emptyState">No transcript yet for this shared session.</div> : null}
+                </div>
+              </div>
+            </div>
+          </div>
+          <aside className="detailRail">
+            {props.share.allow_files ? (
+            <section className="detailSection fileSection">
+              <div className="detailSectionHeader">Files</div>
+              <div className="fileList">
+                {(props.files?.files || []).map((entry) => {
+                  const path = String(entry.path || entry.rel || "");
+                  if (!path) return null;
+                  return (
+                    <button key={path} className={`fileEntry${props.selectedFilePath === path ? " active" : ""}`} type="button" onClick={() => props.onSelectFile(path)}>
+                      <div className="fileEntryPath">{path}</div>
+                      <div className="fileEntryMeta">{String(entry.kind || "file")}</div>
+                    </button>
+                  );
+                })}
+              </div>
+              {props.selectedFile ? (
+                <div className="filePreview">
+                  <div className="filePreviewHeader">{props.selectedFile.rel}</div>
+                  {"text" === props.selectedFile.kind ? <pre className="filePreviewText">{props.selectedFile.text}</pre> : null}
+                  {"image" === props.selectedFile.kind ? (
+                    <div className="filePreviewMedia">
+                      <img src={props.selectedFile.image_url} alt={props.selectedFile.rel} />
+                    </div>
+                  ) : null}
+                  {"pdf" === props.selectedFile.kind ? (
+                    <a className="filePreviewLink" href={props.selectedFile.pdf_url} target="_blank" rel="noreferrer">
+                      Open PDF
+                    </a>
+                  ) : null}
+                  {"download_only" === props.selectedFile.kind ? <div className="muted">{props.selectedFile.reason || "Binary file"}</div> : null}
+                </div>
+              ) : null}
+            </section>
+            ) : null}
+          </aside>
+        </div>
+        <div className="composer">
+          <form
+            onSubmit={(event) => {
+              event.preventDefault();
+              void props.onSend();
+            }}
+          >
+            <div className="inputWrap">
+              <textarea value={props.sendText} onInput={(event) => props.onSendTextChange((event.currentTarget as HTMLTextAreaElement).value)} aria-label="Reply in shared session" />
+              {!props.sendText ? <div className="ph">Reply in shared session</div> : null}
+            </div>
+            <button className="icon-btn primary" type="submit" title={props.loading ? "Sending…" : "Send"} disabled={!props.canSend || props.loading}>
+              {icon("send")}
+            </button>
+          </form>
+        </div>
+        {props.errorText ? <div className="toast muted">{props.errorText}</div> : null}
+      </div>
+    </div>
+  );
+}
+
 export function App() {
+  const shareTarget = shareTargetFromPath();
+  const shareMode = Boolean(shareTarget);
   const [authState, setAuthState] = useState<"loading" | "login" | "ready">("loading");
   const [loadingText, setLoadingText] = useState("Loading workspace…");
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
@@ -1023,6 +1235,25 @@ export function App() {
   const [busySubmitMode, setBusySubmitMode] = useState<BusySubmitMode>(() => readBusySubmitMode());
   const [toastText, setToastText] = useState("");
   const [loginPassword, setLoginPassword] = useState("");
+  const [shareAuthState, setShareAuthState] = useState<"loading" | "login" | "ready">(shareMode ? "loading" : "ready");
+  const [shareLabel, setShareLabel] = useState("Shared sessions");
+  const [sharePassword, setSharePassword] = useState("");
+  const [sharePasswordError, setSharePasswordError] = useState("");
+  const [shareSet, setShareSet] = useState<ShareSet | null>(null);
+  const [shareSessionId, setShareSessionId] = useState(shareTarget?.sessionId || "");
+  const [shareTranscript, setShareTranscript] = useState<UiTranscriptEvent[]>([]);
+  const [shareHistoryCursor, setShareHistoryCursor] = useState<string | null>(null);
+  const [shareLiveCursor, setShareLiveCursor] = useState<string | null>(null);
+  const [shareHasOlder, setShareHasOlder] = useState(false);
+  const [shareLoadingOlder, setShareLoadingOlder] = useState(false);
+  const [shareBusy, setShareBusy] = useState(false);
+  const [shareQueueLen, setShareQueueLen] = useState(0);
+  const [shareErrorText, setShareErrorText] = useState("");
+  const [shareLoading, setShareLoading] = useState(false);
+  const [shareSendText, setShareSendText] = useState("");
+  const [shareFiles, setShareFiles] = useState<ShareFilesResponse | null>(null);
+  const [shareSelectedFilePath, setShareSelectedFilePath] = useState("");
+  const [shareSelectedFile, setShareSelectedFile] = useState<FileReadResponse | null>(null);
   const [showTools, setShowTools] = useState(() => readLocalStorage(SHOW_TOOL_CALLS_KEY) !== "0");
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [mobileViewport, setMobileViewport] = useState(() => isMobileViewportWidth());
@@ -1131,6 +1362,210 @@ export function App() {
     () => sessions.find((session) => session.session_id === selectedSessionId) || null,
     [sessions, selectedSessionId],
   );
+
+  async function loadShareSession(nextSessionId = shareSessionId) {
+    if (!shareTarget || !nextSessionId) return;
+    setShareLoading(true);
+    setShareErrorText("");
+    try {
+      const tail = await api.fetchShareTail(shareTarget.shareId, nextSessionId, SHARE_INIT_LIMIT);
+      const normalized = coalesceAdjacentAssistantEvents(normalizeEvents(tail.events || []));
+      setShareTranscript(normalized);
+      setShareLiveCursor(tail.live_cursor || null);
+      setShareHistoryCursor(tail.history_cursor || null);
+      setShareHasOlder(Boolean(tail.has_older));
+      setShareBusy(Boolean(tail.busy));
+      setShareQueueLen(Number(tail.queue_len || 0));
+      const files = await api.fetchShareFiles(shareTarget.shareId, nextSessionId);
+      setShareFiles(files);
+      setShareSelectedFilePath("");
+      setShareSelectedFile(null);
+    } catch (error) {
+      const status = typeof error === "object" && error && "status" in error ? Number((error as { status?: number }).status) : 0;
+      if (status === 401) {
+        setShareAuthState("login");
+      } else {
+        setShareErrorText(error instanceof Error ? error.message : "Unable to load shared session");
+      }
+    } finally {
+      setShareLoading(false);
+    }
+  }
+
+  async function handleShareLogin() {
+    if (!shareTarget) return;
+    const password = sharePassword.trim();
+    if (!password) {
+      setSharePasswordError("Password required");
+      return;
+    }
+    setSharePasswordError("");
+    try {
+      const response: ShareLoginResponse = await api.loginShareLink(shareTarget.shareId, password);
+      applyShareInfo(response);
+      const nextSessionId = shareTarget.sessionId || response.sessions[0]?.session_id || "";
+      setShareSessionId(nextSessionId);
+      setShareAuthState("ready");
+      setSharePassword("");
+      if (nextSessionId) await loadShareSession(nextSessionId);
+    } catch (error) {
+      setSharePasswordError(error instanceof Error ? error.message : "Unable to open share");
+    }
+  }
+
+  function applyShareInfo(response: ShareLoginResponse) {
+    setShareSet({
+      share_id: response.share_id,
+      label: response.share_label,
+      password_hash: "",
+      password_hint: "",
+      expires_at: response.expires_at,
+      created_at: 0,
+      updated_at: 0,
+      allow_interrupt: Boolean(response.allow_interrupt),
+      allow_files: Boolean(response.allow_files),
+      allow_attachment_downloads: Boolean(response.allow_attachment_downloads),
+      session_ids: response.sessions.map((item) => item.session_id),
+      sessions: response.sessions,
+    });
+    setShareLabel(response.share_label);
+  }
+
+  async function loadShareOlder() {
+    if (!shareTarget || !shareSessionId || !shareHistoryCursor || shareLoadingOlder) return;
+    setShareLoadingOlder(true);
+    try {
+      const history = await api.fetchShareHistory(shareTarget.shareId, shareSessionId, shareHistoryCursor, SHARE_OLDER_LIMIT);
+      setShareTranscript((current) =>
+        coalesceAdjacentAssistantEvents(mergeTranscriptEvents(normalizeEvents(history.events || []), current)),
+      );
+      setShareHistoryCursor(history.history_cursor || null);
+      setShareHasOlder(Boolean(history.has_older));
+    } catch (error) {
+      setShareErrorText(error instanceof Error ? error.message : "Unable to load older messages");
+    } finally {
+      setShareLoadingOlder(false);
+    }
+  }
+
+  async function selectShareFile(path: string) {
+    if (!shareTarget || !shareSessionId || !path) return;
+    setShareSelectedFilePath(path);
+    setShareErrorText("");
+    try {
+      const file = await api.readShareFile(shareTarget.shareId, shareSessionId, path);
+      setShareSelectedFile(file);
+    } catch (error) {
+      setShareErrorText(error instanceof Error ? error.message : "Unable to open file");
+    }
+  }
+
+  async function handleShareSend() {
+    if (!shareTarget || !shareSessionId) return;
+    const text = shareSendText.trim();
+    if (!text) return;
+    setShareLoading(true);
+    setShareErrorText("");
+    const localEvent = {
+      role: "user" as const,
+      text,
+      ts: Date.now() / 1000,
+      localId: `share-local-${Date.now()}`,
+    };
+    setShareTranscript((current) => current.concat(normalizeEvents([localEvent])));
+    setShareSendText("");
+    try {
+      await api.sendShareMessage(shareTarget.shareId, shareSessionId, text);
+      await loadShareSession(shareSessionId);
+    } catch (error) {
+      setShareErrorText(error instanceof Error ? error.message : "Unable to send message");
+    } finally {
+      setShareLoading(false);
+    }
+  }
+
+  async function handleShareInterrupt() {
+    if (!shareTarget || !shareSessionId || !shareSet?.allow_interrupt) return;
+    setShareLoading(true);
+    setShareErrorText("");
+    try {
+      await api.interruptShareSession(shareTarget.shareId, shareSessionId);
+      await loadShareSession(shareSessionId);
+    } catch (error) {
+      setShareErrorText(error instanceof Error ? error.message : "Unable to interrupt session");
+    } finally {
+      setShareLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    if (!shareMode || !shareTarget) return;
+    let cancelled = false;
+    const init = async () => {
+      setShareAuthState("loading");
+      try {
+        const info = await api.fetchShareInfo(shareTarget.shareId);
+        if (cancelled) return;
+        applyShareInfo(info);
+        const sessionId = shareTarget.sessionId || info.sessions[0]?.session_id || shareSessionId;
+        if (!sessionId) {
+          setShareAuthState("login");
+          return;
+        }
+        const tail = await api.fetchShareTail(shareTarget.shareId, sessionId, SHARE_INIT_LIMIT);
+        if (cancelled) return;
+        setShareSessionId(sessionId);
+        setShareTranscript(coalesceAdjacentAssistantEvents(normalizeEvents(tail.events || [])));
+        setShareLiveCursor(tail.live_cursor || null);
+        setShareHistoryCursor(tail.history_cursor || null);
+        setShareHasOlder(Boolean(tail.has_older));
+        setShareBusy(Boolean(tail.busy));
+        setShareQueueLen(Number(tail.queue_len || 0));
+        setShareAuthState("ready");
+        try {
+          const files = await api.fetchShareFiles(shareTarget.shareId, sessionId);
+          if (!cancelled) setShareFiles(files);
+        } catch {
+          if (!cancelled) setShareFiles(null);
+        }
+      } catch (error) {
+        if (cancelled) return;
+        setShareAuthState("login");
+        if (error instanceof Error && !String(error.message).includes("401")) {
+          setSharePasswordError(error.message);
+        }
+      }
+    };
+    void init();
+    return () => {
+      cancelled = true;
+    };
+  }, [shareMode, shareTarget?.shareId]);
+
+  useEffect(() => {
+    if (!shareMode || shareAuthState !== "ready" || !shareTarget || !shareSessionId || !shareLiveCursor) return;
+    let cancelled = false;
+    const timer = window.setInterval(async () => {
+      try {
+        const live = await api.fetchShareLive(shareTarget.shareId, shareSessionId, shareLiveCursor);
+        if (cancelled) return;
+        if (live.events?.length) {
+          setShareTranscript((current) =>
+            coalesceAdjacentAssistantEvents(mergeTranscriptEvents(current, normalizeEvents(live.events || []))),
+          );
+        }
+        setShareLiveCursor(live.live_cursor || shareLiveCursor);
+        setShareBusy(Boolean(live.busy));
+        setShareQueueLen(Number(live.queue_len || 0));
+      } catch (error) {
+        if (!cancelled) setShareErrorText(error instanceof Error ? error.message : "Unable to refresh share");
+      }
+    }, shareBusy ? POLL_BUSY_MS : POLL_IDLE_MS);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [shareMode, shareAuthState, shareTarget?.shareId, shareSessionId, shareLiveCursor, shareBusy]);
   const contextMenuSession = useMemo(
     () => sessions.find((session) => session.session_id === sessionContextMenu?.sessionId) || null,
     [sessionContextMenu, sessions],
@@ -2930,6 +3365,49 @@ export function App() {
       if (notificationPollTimerRef.current !== null) window.clearInterval(notificationPollTimerRef.current);
     };
   }, []);
+
+  if (shareMode) {
+    if (shareAuthState === "loading") return <LoadingScreen text="Loading shared sessions…" />;
+    if (shareAuthState === "login" || !shareSet) {
+      return (
+        <ShareLoginScreen
+          label={shareLabel}
+          password={sharePassword}
+          errorText={sharePasswordError}
+          onPasswordChange={setSharePassword}
+          onSubmit={handleShareLogin}
+        />
+      );
+    }
+    return (
+      <ShareWorkspace
+        share={shareSet}
+        sessionId={shareSessionId}
+        transcript={shareTranscript}
+        files={shareFiles}
+        selectedFilePath={shareSelectedFilePath}
+        selectedFile={shareSelectedFile}
+        loading={shareLoading}
+        loadingOlder={shareLoadingOlder}
+        hasOlder={shareHasOlder}
+        busy={shareBusy}
+        queueLen={shareQueueLen}
+        errorText={shareErrorText}
+        sendText={shareSendText}
+        canSend={Boolean(shareSessionId && shareSendText.trim())}
+        onSessionChange={(sessionId) => {
+          setShareSessionId(sessionId);
+          void loadShareSession(sessionId);
+          history.replaceState(null, "", `/share/${shareSet.share_id}/sessions/${sessionId}/`);
+        }}
+        onSendTextChange={setShareSendText}
+        onSend={handleShareSend}
+        onInterrupt={handleShareInterrupt}
+        onLoadOlder={loadShareOlder}
+        onSelectFile={(path) => void selectShareFile(path)}
+      />
+    );
+  }
 
   if (authState === "loading") return <LoadingScreen text={loadingText} />;
   if (authState === "login") {

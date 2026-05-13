@@ -14,6 +14,11 @@ import type {
   QueueResponse,
   RestartServiceResponse,
   ResumeCandidatesResponse,
+  ShareCreateResponse,
+  ShareFilesResponse,
+  ShareLoginResponse,
+  ShareMessageResponse,
+  ShareSet,
   SessionsResponse,
   TailResponse,
   VoiceSettingsResponse,
@@ -250,5 +255,74 @@ export const api = {
     return readJson<{ ok: true; items: Array<Record<string, unknown>> }>(
       `/api/notifications/feed?since=${encodeURIComponent(String(since))}`,
     );
+  },
+  createShareLink(payload: {
+    label?: string;
+    session_ids: string[];
+    nicknames?: Record<string, string>;
+    expires_in_hours?: number;
+    allow_interrupt?: boolean;
+    allow_files?: boolean;
+    allow_attachment_downloads?: boolean;
+  }): Promise<ShareCreateResponse> {
+    return readJson<ShareCreateResponse>("/api/v1/share-links", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+  },
+  fetchShareLink(shareId: string): Promise<ShareSet> {
+    return readJson<ShareSet>(`/api/v1/share-links/${encodeURIComponent(shareId)}`);
+  },
+  updateShareLink(
+    shareId: string,
+    payload: { label?: string; session_ids: string[]; nicknames?: Record<string, string> },
+  ): Promise<ShareSet> {
+    return readJson<ShareSet>(`/api/v1/share-links/${encodeURIComponent(shareId)}`, {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+  },
+  loginShareLink(shareId: string, password: string): Promise<ShareLoginResponse> {
+    return readJson<ShareLoginResponse>(`/api/v1/share-links/${encodeURIComponent(shareId)}/login`, {
+      method: "POST",
+      body: JSON.stringify({ password }),
+    });
+  },
+  fetchShareInfo(shareId: string): Promise<ShareLoginResponse> {
+    return readJson<ShareLoginResponse>(`/share/${encodeURIComponent(shareId)}/info`);
+  },
+  fetchShareTail(shareId: string, sessionId: string, limit = 120): Promise<TailResponse> {
+    return readJson<TailResponse>(
+      `/share/${encodeURIComponent(shareId)}/sessions/${encodeURIComponent(sessionId)}/messages/tail?limit=${limit}`,
+    );
+  },
+  fetchShareHistory(shareId: string, sessionId: string, cursor: string, limit = 60): Promise<HistoryResponse> {
+    return readJson<HistoryResponse>(
+      `/share/${encodeURIComponent(shareId)}/sessions/${encodeURIComponent(sessionId)}/messages/history?cursor=${encodeURIComponent(cursor)}&limit=${limit}`,
+    );
+  },
+  fetchShareLive(shareId: string, sessionId: string, cursor: string): Promise<LiveResponse> {
+    return readJson<LiveResponse>(
+      `/share/${encodeURIComponent(shareId)}/sessions/${encodeURIComponent(sessionId)}/messages/live?cursor=${encodeURIComponent(cursor)}`,
+    );
+  },
+  sendShareMessage(shareId: string, sessionId: string, text: string): Promise<{ ok?: true }> {
+    return readJson<{ ok?: true }>(`/share/${encodeURIComponent(shareId)}/sessions/${encodeURIComponent(sessionId)}/send`, {
+      method: "POST",
+      body: JSON.stringify({ text }),
+    });
+  },
+  interruptShareSession(shareId: string, sessionId: string): Promise<{ ok: true }> {
+    return readJson<{ ok: true }>(`/share/${encodeURIComponent(shareId)}/sessions/${encodeURIComponent(sessionId)}/interrupt`, {
+      method: "POST",
+    });
+  },
+  readShareFile(shareId: string, sessionId: string, path: string): Promise<FileReadResponse> {
+    return readJson<FileReadResponse>(
+      `/share/${encodeURIComponent(shareId)}/sessions/${encodeURIComponent(sessionId)}/file/read?path=${encodeURIComponent(path)}`,
+    );
+  },
+  fetchShareFiles(shareId: string, sessionId: string): Promise<ShareFilesResponse> {
+    return readJson<ShareFilesResponse>(`/share/${encodeURIComponent(shareId)}/sessions/${encodeURIComponent(sessionId)}/files`);
   },
 };

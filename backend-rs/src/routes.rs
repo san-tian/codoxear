@@ -1,25 +1,26 @@
 use crate::app_state::{epoch_now, AppState};
 use crate::models::{
     ApiChangedFilesResponse, ApiDiagnosticsResponse, ApiFileSearchResponse, ApiGitDiffResponse,
-    ApiGitFileVersionsResponse, ApiHarnessResponse, ApiQueueResponse, EventKind, LiveEvent,
-    SendMessagePayload, TranscriptEvent,
+    ApiGitFileVersionsResponse, ApiHarnessResponse, ApiQueueResponse, ApiShareCreateResponse,
+    ApiShareFilesResponse, ApiShareSet, EventKind, LiveEvent, SendMessagePayload, TranscriptEvent,
 };
 use crate::runtime::{
-    create_session, create_session_request_from_payload, default_file_search_limit,
-    delete_queue_item, delete_session, edit_session, enqueue_session_message,
-    inject_session_attachment, interrupt_session, load_audio_playlist_bytes,
-    load_audio_segment_bytes, load_changed_files_response, load_codex_config_response,
-    load_cwd_suggestions_response, load_diagnostics_response, load_file_blob,
-    load_file_read_response, load_file_search_response, load_git_diff_response,
-    load_git_file_versions_response, load_harness_response, load_legacy_static_file,
-    load_messages_history, load_messages_live, load_messages_tail, load_notification_feed_response,
-    load_notification_message_response, load_notification_subscriptions_response,
-    load_nova_shell_file, load_queue_response, load_resume_candidates_response,
-    load_sessions_response, load_voice_settings_response, move_queue_item, normalize_backend,
+    create_session, create_session_request_from_payload, create_share_set,
+    default_file_search_limit, delete_queue_item, delete_session, edit_session,
+    enqueue_session_message, inject_session_attachment, interrupt_session,
+    load_audio_playlist_bytes, load_audio_segment_bytes, load_changed_files_response,
+    load_codex_config_response, load_cwd_suggestions_response, load_diagnostics_response,
+    load_file_blob, load_file_download_bytes, load_file_read_response, load_file_search_response,
+    load_git_diff_response, load_git_file_versions_response, load_harness_response,
+    load_legacy_static_file, load_messages_history, load_messages_live, load_messages_tail,
+    load_notification_feed_response, load_notification_message_response,
+    load_notification_subscriptions_response, load_nova_shell_file, load_queue_response,
+    load_resume_candidates_response, load_sessions_response, load_share_set,
+    load_voice_settings_response, login_share_set, move_queue_item, normalize_backend,
     rename_session, resolve_dir_target, save_codex_config_response, save_file_write_response,
     save_voice_settings_response, schedule_local_service_restart_response, send_session_message,
-    set_harness_config, toggle_notification_subscription_response,
-    update_audio_listener_heartbeat_response, update_queue_item,
+    set_harness_config, share_file_entries, toggle_notification_subscription_response,
+    update_audio_listener_heartbeat_response, update_queue_item, update_share_sessions,
     upsert_notification_subscription_response, FileWriteError,
 };
 use axum::body::Body;
@@ -37,6 +38,7 @@ use hmac::{Hmac, Mac};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::Sha256;
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::env;
 use std::fs;
@@ -56,6 +58,54 @@ pub fn router(state: AppState) -> Router {
         .route("/nova-preview/", get(nova_preview_index))
         .route("/nova-preview/assets/*path", get(nova_preview_asset))
         .route("/nova-preview/*path", get(nova_preview_spa))
+        .route("/share/:share_id", get(share_page))
+        .route("/share/:share_id/", get(share_page))
+        .route("/share/:share_id/info", get(share_info))
+        .route("/share/:share_id/sessions/:session_id", get(share_page))
+        .route("/share/:share_id/sessions/:session_id/", get(share_page))
+        .route(
+            "/share/:share_id/sessions/:session_id/messages/tail",
+            get(share_messages_tail),
+        )
+        .route(
+            "/share/:share_id/sessions/:session_id/messages/history",
+            get(share_messages_history),
+        )
+        .route(
+            "/share/:share_id/sessions/:session_id/messages/live",
+            get(share_messages_live),
+        )
+        .route(
+            "/share/:share_id/sessions/:session_id/file/read",
+            get(share_file_read),
+        )
+        .route(
+            "/share/:share_id/sessions/:session_id/file/blob",
+            get(share_file_blob),
+        )
+        .route(
+            "/share/:share_id/sessions/:session_id/file/download",
+            get(share_file_download),
+        )
+        .route(
+            "/share/:share_id/sessions/:session_id/files",
+            get(share_files),
+        )
+        .route(
+            "/share/:share_id/sessions/:session_id/send",
+            post(share_session_send),
+        )
+        .route(
+            "/share/:share_id/sessions/:session_id/interrupt",
+            post(share_session_interrupt),
+        )
+        .route("/share/:share_id/login", post(share_login))
+        .route("/api/v1/share-links", post(share_create))
+        .route(
+            "/api/v1/share-links/:share_id",
+            get(share_get).post(share_update),
+        )
+        .route("/api/v1/share-links/:share_id/login", post(share_login))
         .route("/service-worker.js", get(service_worker))
         .route("/manifest.webmanifest", get(legacy_manifest))
         .route("/favicon.ico", get(legacy_favicon))
@@ -1026,6 +1076,455 @@ async fn file_blob(
     Ok(response)
 }
 
+async fn share_messages_tail(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((share_id, session_id)): Path<(String, String)>,
+    Query(query): Query<LimitQuery>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    match share_request_is_authorized(&headers, &state.config.app_dir, &share_id) {
+        Ok(true) => {}
+        Ok(false) => return Err((StatusCode::UNAUTHORIZED, "unauthorized".to_string())),
+        Err(message) => return Err((StatusCode::INTERNAL_SERVER_ERROR, message)),
+    }
+    let share = load_share_set(&state.config, &share_id)
+        .map_err(|message| (StatusCode::NOT_FOUND, message))?;
+    if !share.session_ids.iter().any(|value| value == &session_id) {
+        return Err((StatusCode::NOT_FOUND, "session not in share".to_string()));
+    }
+    let response = load_messages_tail(&state.config, &session_id, query.limit.unwrap_or(120))
+        .map_err(route_error)?;
+    let value = serde_json::to_value(response)
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    Ok(Json(value))
+}
+
+async fn share_info(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(share_id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    match share_request_is_authorized(&headers, &state.config.app_dir, &share_id) {
+        Ok(true) => {}
+        Ok(false) => return Err((StatusCode::UNAUTHORIZED, "unauthorized".to_string())),
+        Err(message) => return Err((StatusCode::INTERNAL_SERVER_ERROR, message)),
+    }
+    let share = load_share_set(&state.config, &share_id)
+        .map_err(|message| (StatusCode::NOT_FOUND, message))?;
+    Ok(Json(json!({
+        "ok": true,
+        "share_id": share.share_id,
+        "share_label": share.label,
+        "expires_at": share.expires_at,
+        "allow_interrupt": share.allow_interrupt,
+        "allow_files": share.allow_files,
+        "allow_attachment_downloads": share.allow_attachment_downloads,
+        "sessions": share.sessions,
+    })))
+}
+
+async fn share_messages_history(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((share_id, session_id)): Path<(String, String)>,
+    Query(query): Query<HistoryQuery>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    match share_request_is_authorized(&headers, &state.config.app_dir, &share_id) {
+        Ok(true) => {}
+        Ok(false) => return Err((StatusCode::UNAUTHORIZED, "unauthorized".to_string())),
+        Err(message) => return Err((StatusCode::INTERNAL_SERVER_ERROR, message)),
+    }
+    let share = load_share_set(&state.config, &share_id)
+        .map_err(|message| (StatusCode::NOT_FOUND, message))?;
+    if !share.session_ids.iter().any(|value| value == &session_id) {
+        return Err((StatusCode::NOT_FOUND, "session not in share".to_string()));
+    }
+    let response = load_messages_history(
+        &state.config,
+        &session_id,
+        &query.cursor,
+        query.limit.unwrap_or(60),
+    )
+    .map_err(route_error)?;
+    let value = serde_json::to_value(response)
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    Ok(Json(value))
+}
+
+async fn share_messages_live(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((share_id, session_id)): Path<(String, String)>,
+    Query(query): Query<LiveQuery>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    match share_request_is_authorized(&headers, &state.config.app_dir, &share_id) {
+        Ok(true) => {}
+        Ok(false) => return Err((StatusCode::UNAUTHORIZED, "unauthorized".to_string())),
+        Err(message) => return Err((StatusCode::INTERNAL_SERVER_ERROR, message)),
+    }
+    let share = load_share_set(&state.config, &share_id)
+        .map_err(|message| (StatusCode::NOT_FOUND, message))?;
+    if !share.session_ids.iter().any(|value| value == &session_id) {
+        return Err((StatusCode::NOT_FOUND, "session not in share".to_string()));
+    }
+    let response =
+        load_messages_live(&state.config, &session_id, &query.cursor).map_err(route_error)?;
+    Ok(Json(serde_json::to_value(response).map_err(|err| {
+        (StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
+    })?))
+}
+
+async fn share_file_read(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((share_id, session_id)): Path<(String, String)>,
+    Query(query): Query<FilePathQuery>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    match share_request_is_authorized(&headers, &state.config.app_dir, &share_id) {
+        Ok(true) => {}
+        Ok(false) => return Err((StatusCode::UNAUTHORIZED, "unauthorized".to_string())),
+        Err(message) => return Err((StatusCode::INTERNAL_SERVER_ERROR, message)),
+    }
+    let share = load_share_set(&state.config, &share_id)
+        .map_err(|message| (StatusCode::NOT_FOUND, message))?;
+    if !share.session_ids.iter().any(|value| value == &session_id) {
+        return Err((StatusCode::NOT_FOUND, "session not in share".to_string()));
+    }
+    if !share.allow_files {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "files disabled for share".to_string(),
+        ));
+    }
+    let response =
+        load_file_read_response(&state.config, &session_id, &query.path).map_err(route_error)?;
+    let value = serde_json::to_value(response)
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    Ok(Json(value))
+}
+
+async fn share_file_blob(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((share_id, session_id)): Path<(String, String)>,
+    Query(query): Query<FilePathQuery>,
+) -> Result<Response, (StatusCode, String)> {
+    match share_request_is_authorized(&headers, &state.config.app_dir, &share_id) {
+        Ok(true) => {}
+        Ok(false) => return Err((StatusCode::UNAUTHORIZED, "unauthorized".to_string())),
+        Err(message) => return Err((StatusCode::INTERNAL_SERVER_ERROR, message)),
+    }
+    let share = load_share_set(&state.config, &share_id)
+        .map_err(|message| (StatusCode::NOT_FOUND, message))?;
+    if !share.session_ids.iter().any(|value| value == &session_id) {
+        return Err((StatusCode::NOT_FOUND, "session not in share".to_string()));
+    }
+    if !share.allow_files {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "files disabled for share".to_string(),
+        ));
+    }
+    let (raw, content_type) =
+        load_file_blob(&state.config, &session_id, &query.path).map_err(route_error)?;
+    let mut response = Response::new(Body::from(raw.clone()));
+    *response.status_mut() = StatusCode::OK;
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_str(&content_type)
+            .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?,
+    );
+    headers.insert(
+        header::CONTENT_LENGTH,
+        HeaderValue::from_str(&raw.len().to_string())
+            .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?,
+    );
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
+    headers.insert(header::EXPIRES, HeaderValue::from_static("0"));
+    Ok(response)
+}
+
+async fn share_file_download(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((share_id, session_id)): Path<(String, String)>,
+    Query(query): Query<FilePathQuery>,
+) -> Result<Response, (StatusCode, String)> {
+    match share_request_is_authorized(&headers, &state.config.app_dir, &share_id) {
+        Ok(true) => {}
+        Ok(false) => return Err((StatusCode::UNAUTHORIZED, "unauthorized".to_string())),
+        Err(message) => return Err((StatusCode::INTERNAL_SERVER_ERROR, message)),
+    }
+    let share = load_share_set(&state.config, &share_id)
+        .map_err(|message| (StatusCode::NOT_FOUND, message))?;
+    if !share.session_ids.iter().any(|value| value == &session_id) {
+        return Err((StatusCode::NOT_FOUND, "session not in share".to_string()));
+    }
+    if !share.allow_files || !share.allow_attachment_downloads {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "downloads disabled for share".to_string(),
+        ));
+    }
+    let (raw, content_type) =
+        load_file_download_bytes(&state.config, &session_id, &query.path).map_err(route_error)?;
+    let mut response = Response::new(Body::from(raw.clone()));
+    *response.status_mut() = StatusCode::OK;
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_str(&content_type)
+            .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?,
+    );
+    headers.insert(
+        header::CONTENT_LENGTH,
+        HeaderValue::from_str(&raw.len().to_string())
+            .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?,
+    );
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
+    headers.insert(header::EXPIRES, HeaderValue::from_static("0"));
+    Ok(response)
+}
+
+async fn share_files(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((share_id, session_id)): Path<(String, String)>,
+) -> Result<Json<ApiShareFilesResponse>, (StatusCode, String)> {
+    match share_request_is_authorized(&headers, &state.config.app_dir, &share_id) {
+        Ok(true) => {}
+        Ok(false) => return Err((StatusCode::UNAUTHORIZED, "unauthorized".to_string())),
+        Err(message) => return Err((StatusCode::INTERNAL_SERVER_ERROR, message)),
+    }
+    let share = load_share_set(&state.config, &share_id)
+        .map_err(|message| (StatusCode::NOT_FOUND, message))?;
+    if !share.session_ids.iter().any(|value| value == &session_id) {
+        return Err((StatusCode::NOT_FOUND, "session not in share".to_string()));
+    }
+    if !share.allow_files {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "files disabled for share".to_string(),
+        ));
+    }
+    let response =
+        share_file_entries(&state.config, &share_id, &session_id).map_err(route_error)?;
+    Ok(Json(response))
+}
+
+async fn share_session_send(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((share_id, session_id)): Path<(String, String)>,
+    Json(payload): Json<TextPayload>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    match share_request_is_authorized(&headers, &state.config.app_dir, &share_id) {
+        Ok(true) => {}
+        Ok(false) => return Err((StatusCode::UNAUTHORIZED, "unauthorized".to_string())),
+        Err(message) => return Err((StatusCode::INTERNAL_SERVER_ERROR, message)),
+    }
+    let share = load_share_set(&state.config, &share_id)
+        .map_err(|message| (StatusCode::NOT_FOUND, message))?;
+    if !share.session_ids.iter().any(|value| value == &session_id) {
+        return Err((StatusCode::NOT_FOUND, "session not in share".to_string()));
+    }
+    let response =
+        send_session_message(&state.config, &session_id, &payload.text).map_err(route_error)?;
+    Ok(Json(response))
+}
+
+async fn share_session_interrupt(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((share_id, session_id)): Path<(String, String)>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    match share_request_is_authorized(&headers, &state.config.app_dir, &share_id) {
+        Ok(true) => {}
+        Ok(false) => return Err((StatusCode::UNAUTHORIZED, "unauthorized".to_string())),
+        Err(message) => return Err((StatusCode::INTERNAL_SERVER_ERROR, message)),
+    }
+    let share = load_share_set(&state.config, &share_id)
+        .map_err(|message| (StatusCode::NOT_FOUND, message))?;
+    if !share.session_ids.iter().any(|value| value == &session_id) {
+        return Err((StatusCode::NOT_FOUND, "session not in share".to_string()));
+    }
+    if !share.allow_interrupt {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "interrupt disabled for share".to_string(),
+        ));
+    }
+    let response = interrupt_session(&state.config, &session_id).map_err(route_error)?;
+    Ok(Json(response))
+}
+
+async fn share_page() -> Result<Response, (StatusCode, String)> {
+    static_file_response(load_nova_shell_file("index.html"), true)
+}
+
+async fn share_create(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<Value>,
+) -> Result<Json<ApiShareCreateResponse>, (StatusCode, String)> {
+    match request_is_authenticated(&headers, &state.config.app_dir) {
+        Ok(true) => {}
+        Ok(false) => return Err((StatusCode::UNAUTHORIZED, "unauthorized".to_string())),
+        Err(message) => return Err((StatusCode::INTERNAL_SERVER_ERROR, message)),
+    }
+    let object = payload.as_object().ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            "invalid json body (expected object)".to_string(),
+        )
+    })?;
+    let label = object
+        .get("label")
+        .and_then(Value::as_str)
+        .unwrap_or("Shared sessions");
+    let expires_in_hours = object
+        .get("expires_in_hours")
+        .and_then(Value::as_f64)
+        .unwrap_or(24.0);
+    let expires_at = epoch_now() + (expires_in_hours.max(0.25) * 3600.0);
+    let allow_interrupt = object
+        .get("allow_interrupt")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let allow_files = object
+        .get("allow_files")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let allow_attachment_downloads = object
+        .get("allow_attachment_downloads")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let sessions = object
+        .get("session_ids")
+        .and_then(Value::as_array)
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, "session_ids required".to_string()))?;
+    let session_ids = sessions
+        .iter()
+        .filter_map(|value| value.as_str().map(|text| text.trim().to_string()))
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    let mut nicknames = HashMap::new();
+    if let Some(Value::Object(items)) = object.get("nicknames") {
+        for (key, value) in items {
+            if let Some(text) = value.as_str() {
+                nicknames.insert(key.clone(), text.to_string());
+            }
+        }
+    }
+    let (share, password) = create_share_set(
+        &state.config,
+        label,
+        &session_ids,
+        &nicknames,
+        expires_at,
+        allow_interrupt,
+        allow_files,
+        allow_attachment_downloads,
+    )
+    .map_err(|message| (StatusCode::BAD_REQUEST, message))?;
+    let share_url = format!("/share/{}/", share.share_id);
+    Ok(Json(ApiShareCreateResponse {
+        ok: true,
+        share_id: share.share_id,
+        share_url,
+        share_password: password,
+        share_label: share.label,
+        expires_at: share.expires_at,
+        sessions: share.sessions,
+    }))
+}
+
+async fn share_get(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(share_id): Path<String>,
+) -> Result<Json<ApiShareSet>, (StatusCode, String)> {
+    match request_is_authenticated(&headers, &state.config.app_dir) {
+        Ok(true) => {}
+        Ok(false) => return Err((StatusCode::UNAUTHORIZED, "unauthorized".to_string())),
+        Err(message) => return Err((StatusCode::INTERNAL_SERVER_ERROR, message)),
+    }
+    load_share_set(&state.config, &share_id)
+        .map(Json)
+        .map_err(|message| (StatusCode::NOT_FOUND, message))
+}
+
+async fn share_update(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(share_id): Path<String>,
+    Json(payload): Json<Value>,
+) -> Result<Json<ApiShareSet>, (StatusCode, String)> {
+    match request_is_authenticated(&headers, &state.config.app_dir) {
+        Ok(true) => {}
+        Ok(false) => return Err((StatusCode::UNAUTHORIZED, "unauthorized".to_string())),
+        Err(message) => return Err((StatusCode::INTERNAL_SERVER_ERROR, message)),
+    }
+    let object = payload.as_object().ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            "invalid json body (expected object)".to_string(),
+        )
+    })?;
+    let label = object
+        .get("label")
+        .and_then(Value::as_str)
+        .unwrap_or("Shared sessions");
+    let sessions = object
+        .get("session_ids")
+        .and_then(Value::as_array)
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, "session_ids required".to_string()))?;
+    let session_ids = sessions
+        .iter()
+        .filter_map(|value| value.as_str().map(|text| text.trim().to_string()))
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    let mut nicknames = HashMap::new();
+    if let Some(Value::Object(items)) = object.get("nicknames") {
+        for (key, value) in items {
+            if let Some(text) = value.as_str() {
+                nicknames.insert(key.clone(), text.to_string());
+            }
+        }
+    }
+    update_share_sessions(&state.config, &share_id, label, &session_ids, &nicknames)
+        .map(Json)
+        .map_err(|message| (StatusCode::BAD_REQUEST, message))
+}
+
+async fn share_login(
+    State(state): State<AppState>,
+    Path(share_id): Path<String>,
+    Json(payload): Json<Value>,
+) -> Result<Response, (StatusCode, String)> {
+    let password = payload
+        .get("password")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, "password required".to_string()))?;
+    let response = login_share_set(&state.config, &share_id, password)
+        .map_err(|message| (StatusCode::UNAUTHORIZED, message))?;
+    let cookie = share_cookie_header(
+        &state.config.app_dir,
+        &response.share_id,
+        response.expires_at,
+    )
+    .map_err(|message| (StatusCode::INTERNAL_SERVER_ERROR, message))?;
+    let payload = serde_json::to_value(response)
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    json_response_with_cookie(payload, &cookie)
+        .map_err(|message| (StatusCode::INTERNAL_SERVER_ERROR, message))
+}
+
 async fn git_diff(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
@@ -1239,6 +1738,86 @@ fn json_response_with_cookie(payload: Value, set_cookie: &str) -> Result<Respons
         HeaderValue::from_str(set_cookie).map_err(|err| err.to_string())?,
     );
     Ok(response)
+}
+
+fn share_cookie_name() -> &'static str {
+    "codoxear_share"
+}
+
+fn share_cookie_header(
+    app_dir: &std::path::Path,
+    share_id: &str,
+    expires_at: f64,
+) -> Result<String, String> {
+    let raw = serde_json::to_vec(&json!({ "share_id": share_id, "exp": expires_at as i64 }))
+        .map_err(|err| err.to_string())?;
+    let secret = load_or_create_hmac_secret(app_dir)?;
+    let mut mac = Hmac::<Sha256>::new_from_slice(&secret).map_err(|err| err.to_string())?;
+    mac.update(&raw);
+    let sig = mac.finalize().into_bytes();
+    let token = format!(
+        "{}.{}",
+        URL_SAFE_NO_PAD.encode(raw),
+        URL_SAFE_NO_PAD.encode(sig)
+    );
+    let prefix = format!("/share/{share_id}/");
+    Ok(format!(
+        "{}={}; Path={prefix}; HttpOnly; SameSite=Strict; Max-Age={}",
+        share_cookie_name(),
+        token,
+        (expires_at - epoch_now()).max(0.0).round() as i64
+    ))
+}
+
+fn share_request_share_id(
+    headers: &HeaderMap,
+    app_dir: &std::path::Path,
+) -> Result<Option<String>, String> {
+    let Some(cookie_header) = headers
+        .get(header::COOKIE)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return Ok(None);
+    };
+    let Some(token) = cookie_value(cookie_header, share_cookie_name()) else {
+        return Ok(None);
+    };
+    let Some((payload_b64, sig_b64)) = token.split_once('.') else {
+        return Ok(None);
+    };
+    let Ok(raw_payload) = URL_SAFE_NO_PAD.decode(payload_b64.as_bytes()) else {
+        return Ok(None);
+    };
+    let Ok(signature) = URL_SAFE_NO_PAD.decode(sig_b64.as_bytes()) else {
+        return Ok(None);
+    };
+    let secret = load_or_create_hmac_secret(app_dir)?;
+    let mut mac = Hmac::<Sha256>::new_from_slice(&secret).map_err(|err| err.to_string())?;
+    mac.update(&raw_payload);
+    if mac.verify_slice(&signature).is_err() {
+        return Ok(None);
+    }
+    let Ok(payload) = serde_json::from_slice::<Value>(&raw_payload) else {
+        return Ok(None);
+    };
+    let Some(exp) = payload.get("exp").and_then(Value::as_i64) else {
+        return Ok(None);
+    };
+    if exp <= epoch_now() as i64 {
+        return Ok(None);
+    }
+    Ok(payload
+        .get("share_id")
+        .and_then(Value::as_str)
+        .map(|text| text.to_string()))
+}
+
+fn share_request_is_authorized(
+    headers: &HeaderMap,
+    app_dir: &std::path::Path,
+    share_id: &str,
+) -> Result<bool, String> {
+    Ok(share_request_share_id(headers, app_dir)?.as_deref() == Some(share_id))
 }
 
 fn json_response(status: StatusCode, payload: Value) -> Response {
