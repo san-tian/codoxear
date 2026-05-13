@@ -1382,6 +1382,8 @@ export function App() {
   const appRef = useRef<HTMLDivElement | null>(null);
   const sidebarRef = useRef<HTMLElement | null>(null);
   const newSessionCwdInputRef = useRef<HTMLInputElement | null>(null);
+  const activeFilePathRef = useRef("");
+  const filesLoadedSessionRef = useRef("");
   const chatScrollRef = useRef<HTMLDivElement | null>(null);
   const stickToBottomRef = useRef(true);
   const lastAutoScrollKeyRef = useRef("");
@@ -2364,10 +2366,11 @@ export function App() {
     }
   }
 
-  async function loadFiles(sessionId = selectedSessionRef.current) {
+  async function loadFiles(sessionId = selectedSessionRef.current, options: { showLoading?: boolean } = {}) {
     if (!sessionId) return;
     const session = sessions.find((item) => item.session_id === sessionId) || null;
-    setFilesLoading(true);
+    const showLoading = Boolean(options.showLoading || filesLoadedSessionRef.current !== sessionId);
+    if (showLoading) setFilesLoading(true);
     setFileOpenError("");
     let changedFiles: ChangedFilesResponse | null = null;
     try {
@@ -2375,23 +2378,24 @@ export function App() {
     } catch {
       changedFiles = null;
     }
-    const entries = buildFileEntries(session, changedFiles);
-    setFileEntries(entries);
-    setFilesLoading(false);
-    if (entries.length && !entries.some((entry) => entry.request_path === activeFilePath)) {
-      void openFile(entries[0].request_path);
+    if (selectedSessionRef.current !== sessionId) {
+      if (showLoading) setFilesLoading(false);
+      return;
     }
-    if (!entries.length) {
-      setActiveFile(null);
-      setActiveFilePath("");
+    const entries = buildFileEntries(session, changedFiles);
+    filesLoadedSessionRef.current = sessionId;
+    setFileEntries(entries);
+    if (showLoading) setFilesLoading(false);
+    if (entries.length && !activeFilePathRef.current) {
+      void openFile(entries[0].request_path);
     }
   }
 
   async function openFile(path: string) {
     if (!selectedSessionRef.current || !path) return;
     const sessionId = selectedSessionRef.current;
+    activeFilePathRef.current = path;
     setActiveFilePath(path);
-    setActiveFile(null);
     setFileOpenError("");
     setFileOpenLoading(true);
     try {
@@ -2401,6 +2405,8 @@ export function App() {
       setErrorText("");
     } catch (error) {
       const message = error instanceof Error ? error.message : "Unable to open file";
+      if (selectedSessionRef.current !== sessionId) return;
+      setActiveFile(null);
       setFileOpenError(message);
       setErrorText(message);
     } finally {
@@ -3390,6 +3396,8 @@ export function App() {
     setFileSearchEntries([]);
     setFileOpenLoading(false);
     setFileOpenError("");
+    activeFilePathRef.current = "";
+    filesLoadedSessionRef.current = "";
     setActiveFile(null);
     setActiveFilePath("");
     setCollapsedEvents({});
@@ -3444,7 +3452,7 @@ export function App() {
 
   useEffect(() => {
     if (!showFilesPanel || !selectedSessionId) return;
-    void loadFiles(selectedSessionId);
+    void loadFiles(selectedSessionId, { showLoading: filesLoadedSessionRef.current !== selectedSessionId });
   }, [showFilesPanel, selectedSessionId, sessions]);
 
   useEffect(() => {
