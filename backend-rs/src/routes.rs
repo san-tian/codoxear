@@ -3387,6 +3387,13 @@ mod tests {
         assert_eq!(listed_payload["shares"].as_array().unwrap().len(), 1);
         assert_eq!(listed_payload["shares"][0]["share_id"], share_id);
         assert_eq!(listed_payload["shares"][0]["label"], "Managed share");
+        assert_eq!(listed_payload["shares"][0]["sessions"][0]["cwd"], "/repo");
+        assert_eq!(
+            listed_payload["shares"][0]["sessions"][0]["agent_backend"],
+            "codex"
+        );
+        assert_eq!(listed_payload["shares"][0]["sessions"][0]["queue_len"], 0);
+        assert_eq!(listed_payload["shares"][0]["sessions"][0]["busy"], false);
 
         let deleted = app
             .clone()

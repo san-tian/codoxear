@@ -6828,6 +6828,12 @@ fn share_session_refs_from_sessions(
                 .cloned()
                 .unwrap_or_else(|| session.alias.clone()),
             added_ts: epoch_now(),
+            cwd: session.cwd,
+            workspace_cwd: session.workspace_cwd,
+            agent_backend: session.agent_backend,
+            busy: session.busy,
+            queue_len: session.queue_len,
+            updated_ts: session.updated_ts,
         });
     }
     Ok(refs)

@@ -1137,10 +1137,18 @@ function ShareWorkspace(props: {
   onSelectFile: (path: string) => void;
   onOpenMentionedFile: (path: string) => void | Promise<void>;
   onCopyText: (event: UiTranscriptEvent) => void | Promise<void>;
+  isEventCollapsed: (event: UiTranscriptEvent) => boolean;
+  onToggleEvent: (event: UiTranscriptEvent) => void;
 }) {
   const session = props.share.sessions.find((item) => item.session_id === props.sessionId) || props.share.sessions[0] || null;
   const shareFiles = props.share.allow_files ? props.files?.files || [] : [];
   const showFileRail = props.share.allow_files && (shareFiles.length > 0 || Boolean(props.selectedFile));
+  const shareWorking = Boolean(props.busy || session?.busy);
+  const shareQueueLen = Number(props.queueLen || session?.queue_len || 0);
+  const shareWaiting = Boolean(!shareWorking && shareQueueLen > 0);
+  const shareStatus = shareWorking ? "working" : shareQueueLen ? `queue ${shareQueueLen}` : "idle";
+  const shareStatusClass = shareWorking ? "status-chip working" : shareWaiting ? "status-chip waiting" : "status-chip";
+  const shareWorkingIndicatorLabel = shareWorking ? "Working" : shareWaiting ? "Waiting" : "";
   return (
     <div className="app shareApp">
       <aside className="sidebar shareSidebar">
@@ -1162,7 +1170,10 @@ function ShareWorkspace(props: {
                 <div className="workspaceTitleRow">
                   <div className="workspaceTitle">{item.nickname || item.session_id}</div>
                 </div>
-                <div className="workspaceMeta">{item.session_id}</div>
+                <div className="workspacePath">{item.cwd || item.workspace_cwd || item.session_id}</div>
+                <div className="workspaceMeta">
+                  {String(item.agent_backend || "codex").toUpperCase()} · {item.busy ? "working" : item.queue_len ? `queue ${item.queue_len}` : "idle"} · {relativeAge(item.updated_ts || item.added_ts)}
+                </div>
               </div>
             </button>
           ))}
@@ -1176,6 +1187,8 @@ function ShareWorkspace(props: {
                 <div>{session?.nickname || session?.session_id || props.share.label}</div>
                 <div className="topMeta">
                   <span className="status-chip">{props.share.label}</span>
+                  {session?.cwd ? <span className="status-chip" title={session.cwd}>{baseName(session.workspace_cwd || session.cwd)}</span> : null}
+                  <span className={shareStatusClass}>{shareStatus}</span>
                 </div>
               </div>
             </div>
@@ -1202,8 +1215,8 @@ function ShareWorkspace(props: {
                       event={event}
                       events={props.transcript}
                       index={index}
-                      collapsed={false}
-                      onToggle={() => {}}
+                      collapsed={props.isEventCollapsed(event)}
+                      onToggle={props.onToggleEvent}
                       onCopyText={props.onCopyText}
                       onOpenPath={props.onOpenMentionedFile}
                       attachmentHref={(path) =>
@@ -1211,7 +1224,8 @@ function ShareWorkspace(props: {
                       }
                     />
                   ))}
-                  {!props.transcript.length ? <div className="emptyState">No transcript yet for this shared session.</div> : null}
+                  {shareWorkingIndicatorLabel ? <WorkingIndicator label={shareWorkingIndicatorLabel} tone={shareWaiting ? "waiting" : "working"} /> : null}
+                  {!props.transcript.length && !shareWorkingIndicatorLabel ? <div className="emptyState">No transcript yet for this shared session.</div> : null}
                 </div>
               </div>
             </div>
@@ -1455,6 +1469,20 @@ export function App() {
     : "";
   const selectedShareSessionCount = shareCreateSessions.filter((session) => session.checked).length;
 
+  function updateShareSessionRuntime(sessionId: string, busyValue: boolean, queueLength: number) {
+    setShareSet((current) => {
+      if (!current) return current;
+      return {
+        ...current,
+        sessions: current.sessions.map((session) =>
+          session.session_id === sessionId
+            ? { ...session, busy: busyValue, queue_len: queueLength, updated_ts: Math.max(session.updated_ts || 0, Date.now() / 1000) }
+            : session,
+        ),
+      };
+    });
+  }
+
   async function loadShareSession(nextSessionId = shareSessionId) {
     if (!shareTarget || !nextSessionId) return;
     setShareLoading(true);
@@ -1468,6 +1496,7 @@ export function App() {
       setShareHasOlder(Boolean(tail.has_older));
       setShareBusy(Boolean(tail.busy));
       setShareQueueLen(Number(tail.queue_len || 0));
+      updateShareSessionRuntime(nextSessionId, Boolean(tail.busy), Number(tail.queue_len || 0));
       const files = await api.fetchShareFiles(shareTarget.shareId, nextSessionId);
       setShareFiles(files);
       setShareSelectedFilePath("");
@@ -1613,6 +1642,7 @@ export function App() {
         setShareHasOlder(Boolean(tail.has_older));
         setShareBusy(Boolean(tail.busy));
         setShareQueueLen(Number(tail.queue_len || 0));
+        updateShareSessionRuntime(sessionId, Boolean(tail.busy), Number(tail.queue_len || 0));
         setShareAuthState("ready");
         try {
           const files = await api.fetchShareFiles(shareTarget.shareId, sessionId);
@@ -1649,6 +1679,7 @@ export function App() {
         setShareLiveCursor(live.live_cursor || shareLiveCursor);
         setShareBusy(Boolean(live.busy));
         setShareQueueLen(Number(live.queue_len || 0));
+        updateShareSessionRuntime(shareSessionId, Boolean(live.busy), Number(live.queue_len || 0));
       } catch (error) {
         if (!cancelled) setShareErrorText(error instanceof Error ? error.message : "Unable to refresh share");
       }
@@ -3735,6 +3766,8 @@ export function App() {
         onSelectFile={(path) => void selectShareFile(path)}
         onOpenMentionedFile={(path) => void selectShareFile(path.trim())}
         onCopyText={copyTranscriptEvent}
+        isEventCollapsed={transcriptEventCollapsed}
+        onToggleEvent={toggleTranscriptEvent}
       />
     );
   }

@@ -465,6 +465,12 @@ export type ShareSessionRef = {
   session_id: string;
   nickname: string;
   added_ts: number;
+  cwd: string;
+  workspace_cwd?: string | null;
+  agent_backend: string;
+  busy: boolean;
+  queue_len: number;
+  updated_ts: number;
 };
 
 export type ShareSet = {

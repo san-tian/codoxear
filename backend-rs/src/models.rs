@@ -225,6 +225,18 @@ pub struct ApiShareSessionRef {
     pub session_id: String,
     pub nickname: String,
     pub added_ts: f64,
+    #[serde(default)]
+    pub cwd: String,
+    #[serde(default)]
+    pub workspace_cwd: Option<String>,
+    #[serde(default)]
+    pub agent_backend: String,
+    #[serde(default)]
+    pub busy: bool,
+    #[serde(default)]
+    pub queue_len: usize,
+    #[serde(default)]
+    pub updated_ts: f64,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
