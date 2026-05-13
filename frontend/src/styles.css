@@ -1064,15 +1064,44 @@ button.primary {
 
 .detailRail {
   width: var(--rail-w);
-  max-width: 40vw;
+  max-width: min(720px, calc(100vw - 320px));
   min-width: 320px;
-  border-left: 1px solid var(--border);
   background: var(--panel);
   overflow: auto;
 }
 
 .workspaceBody:has(.detailRail) {
-  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-columns: minmax(0, 1fr) var(--detail-resizer-w, 10px) auto;
+}
+
+.detailRailResizer {
+  position: relative;
+  width: var(--detail-resizer-w, 10px);
+  min-width: var(--detail-resizer-w, 10px);
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  border-left: 1px solid var(--border);
+  background: transparent;
+  cursor: col-resize;
+  touch-action: none;
+}
+
+.detailRailResizer::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: calc(50% - 1px);
+  width: 2px;
+  background: transparent;
+  transition: background 140ms ease, box-shadow 140ms ease;
+}
+
+.detailRailResizer:hover::before,
+.app.detailRailResizing .detailRailResizer::before {
+  background: rgba(159, 193, 255, 0.45);
+  box-shadow: 0 0 0 3px rgba(159, 193, 255, 0.12);
 }
 
 .workspaceBody.hasFloatingProgress .workspaceMain {
@@ -2990,11 +3019,14 @@ button.primary {
     grid-template-rows: minmax(0, 1fr) minmax(160px, 38vh);
   }
 
+  .detailRailResizer {
+    display: none;
+  }
+
   .detailRail {
     width: auto;
     max-width: none;
     min-width: 0;
-    border-left: 0;
     border-top: 1px solid var(--border);
   }
 }

@@ -52,6 +52,7 @@ const NEW_SESSION_PREFERENCES_KEY = "codoxear.nova.newSessionPreferences";
 const SIDEBAR_WORKSPACE_ORDER_KEY = "codoxear.nova.sidebar.workspaceOrder";
 const SIDEBAR_SESSION_ORDER_KEY = "codoxear.nova.sidebar.sessionOrder";
 const SIDEBAR_WIDTH_KEY = "codoxear.nova.sidebar.width";
+const DETAIL_RAIL_WIDTH_KEY = "codoxear.nova.detailRail.width";
 const CHAT_BOTTOM_FOLLOW_THRESHOLD_PX = 96;
 const CHAT_HISTORY_TOP_THRESHOLD_PX = 16;
 const CHAT_HISTORY_JUMP_OFFSET_PX = 24;
@@ -61,6 +62,9 @@ const SIDEBAR_MAX_WIDTH_PX = 520;
 const SIDEBAR_RESIZER_WIDTH_PX = 10;
 const MAIN_MIN_WIDTH_PX = 320;
 const DETAIL_RAIL_WIDTH_PX = 360;
+const DETAIL_RAIL_MIN_WIDTH_PX = 320;
+const DETAIL_RAIL_MAX_WIDTH_PX = 720;
+const DETAIL_RAIL_RESIZER_WIDTH_PX = 10;
 const DETAIL_RAIL_STACK_BREAKPOINT_PX = 1080;
 const MOBILE_SIDEBAR_BREAKPOINT_PX = 860;
 const IMPORTANT_PRIORITY_OFFSET = 0.85;
@@ -172,11 +176,27 @@ function clampSidebarWidth(width: number, viewportWidth = window.innerWidth) {
   return Math.max(SIDEBAR_MIN_WIDTH_PX, Math.min(width, maxWidth));
 }
 
+function clampDetailRailWidth(width: number, viewportWidth = window.innerWidth) {
+  if (viewportWidth <= DETAIL_RAIL_STACK_BREAKPOINT_PX) return Math.max(DETAIL_RAIL_MIN_WIDTH_PX, Math.min(width, DETAIL_RAIL_MAX_WIDTH_PX));
+  const maxWidth = Math.max(
+    DETAIL_RAIL_MIN_WIDTH_PX,
+    Math.min(DETAIL_RAIL_MAX_WIDTH_PX, viewportWidth - MAIN_MIN_WIDTH_PX - DETAIL_RAIL_RESIZER_WIDTH_PX),
+  );
+  return Math.max(DETAIL_RAIL_MIN_WIDTH_PX, Math.min(width, maxWidth));
+}
+
 function readStoredSidebarWidth() {
   const raw = readLocalStorage(SIDEBAR_WIDTH_KEY);
   if (!raw) return null;
   const width = Number(raw);
   return Number.isFinite(width) ? clampSidebarWidth(width) : null;
+}
+
+function readStoredDetailRailWidth() {
+  const raw = readLocalStorage(DETAIL_RAIL_WIDTH_KEY);
+  if (!raw) return DETAIL_RAIL_WIDTH_PX;
+  const width = Number(raw);
+  return Number.isFinite(width) ? clampDetailRailWidth(width) : DETAIL_RAIL_WIDTH_PX;
 }
 
 function readStoredStringList(key: string) {
@@ -1308,6 +1328,8 @@ export function App() {
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
   const [sidebarWidth, setSidebarWidth] = useState<number | null>(() => readStoredSidebarWidth());
   const [sidebarResizing, setSidebarResizing] = useState(false);
+  const [detailRailWidth, setDetailRailWidth] = useState(() => readStoredDetailRailWidth());
+  const [detailRailResizing, setDetailRailResizing] = useState(false);
   const [workspaceOrder, setWorkspaceOrder] = useState<string[]>(() => readStoredStringList(SIDEBAR_WORKSPACE_ORDER_KEY));
   const [sessionOrderByWorkspace, setSessionOrderByWorkspace] = useState<SidebarSessionOrder>(() => readStoredSessionOrder());
   const [draggingWorkspaceKey, setDraggingWorkspaceKey] = useState("");
@@ -1419,6 +1441,8 @@ export function App() {
   const newSessionCwdRequestRef = useRef(0);
   const sidebarResizeStartXRef = useRef(0);
   const sidebarResizeStartWidthRef = useRef(0);
+  const detailRailResizeStartXRef = useRef(0);
+  const detailRailResizeStartWidthRef = useRef(DETAIL_RAIL_WIDTH_PX);
 
   const selectedSession = useMemo(
     () => sessions.find((session) => session.session_id === selectedSessionId) || null,
@@ -1777,8 +1801,12 @@ export function App() {
   const workingIndicatorTone = queuedWaitingStatus ? "waiting" : "working";
   const composerText = selectedSessionId ? sessionDrafts[selectedSessionId] || "" : "";
   const appStyle = useMemo(
-    () => (sidebarWidth == null ? undefined : ({ "--sidebar-w": `${sidebarWidth}px` } as JSX.CSSProperties)),
-    [sidebarWidth],
+    () =>
+      ({
+        ...(sidebarWidth == null ? {} : { "--sidebar-w": `${sidebarWidth}px` }),
+        "--rail-w": `${detailRailWidth}px`,
+      }) as JSX.CSSProperties,
+    [detailRailWidth, sidebarWidth],
   );
   const sidebarToggleTitle = mobileViewport
     ? mobileSidebarOpen
@@ -1791,7 +1819,11 @@ export function App() {
   const mobileSidebarToggleLabel = mobileSidebarOpen ? "Close" : "Sessions";
 
   function sidebarRailWidth(viewportWidth = window.innerWidth) {
-    return showFilesPanel || showDetailsPanel ? (viewportWidth > DETAIL_RAIL_STACK_BREAKPOINT_PX ? DETAIL_RAIL_WIDTH_PX : 0) : 0;
+    return showFilesPanel || showDetailsPanel
+      ? viewportWidth > DETAIL_RAIL_STACK_BREAKPOINT_PX
+        ? detailRailWidth + DETAIL_RAIL_RESIZER_WIDTH_PX
+        : 0
+      : 0;
   }
 
   function currentSidebarLayoutWidth(viewportWidth = window.innerWidth) {
@@ -1890,6 +1922,14 @@ export function App() {
       currentSidebarLayoutWidth(),
     );
     setSidebarResizing(true);
+  }
+
+  function handleDetailRailResizeStart(event: SidebarPointerEvent) {
+    event.preventDefault();
+    if (mobileViewport || window.innerWidth <= DETAIL_RAIL_STACK_BREAKPOINT_PX) return;
+    detailRailResizeStartXRef.current = event.clientX;
+    detailRailResizeStartWidthRef.current = clampDetailRailWidth(detailRailWidth);
+    setDetailRailResizing(true);
   }
 
   function handleWorkspaceDragStart(event: SidebarDragEvent, workspaceKey: string) {
@@ -3430,6 +3470,10 @@ export function App() {
   }, [sidebarWidth]);
 
   useEffect(() => {
+    writeLocalStorage(DETAIL_RAIL_WIDTH_KEY, String(Math.round(detailRailWidth)));
+  }, [detailRailWidth]);
+
+  useEffect(() => {
     writeLocalStorage(DESKTOP_NOTIFICATIONS_KEY, desktopNotificationsEnabled ? "1" : null);
   }, [desktopNotificationsEnabled]);
 
@@ -3462,6 +3506,35 @@ export function App() {
     window.addEventListener("resize", onResize);
     return () => window.removeEventListener("resize", onResize);
   }, [showDetailsPanel, showFilesPanel, sidebarWidth]);
+
+  useEffect(() => {
+    if (!detailRailResizing) return;
+    const onPointerMove = (event: PointerEvent) => {
+      const delta = detailRailResizeStartXRef.current - event.clientX;
+      setDetailRailWidth(clampDetailRailWidth(detailRailResizeStartWidthRef.current + delta));
+    };
+    const onPointerUp = () => setDetailRailResizing(false);
+    const { style } = document.body;
+    const prevCursor = style.cursor;
+    const prevUserSelect = style.userSelect;
+    style.cursor = "col-resize";
+    style.userSelect = "none";
+    window.addEventListener("pointermove", onPointerMove);
+    window.addEventListener("pointerup", onPointerUp);
+    return () => {
+      window.removeEventListener("pointermove", onPointerMove);
+      window.removeEventListener("pointerup", onPointerUp);
+      style.cursor = prevCursor;
+      style.userSelect = prevUserSelect;
+    };
+  }, [detailRailResizing]);
+
+  useEffect(() => {
+    const onResize = () => setDetailRailWidth((current) => clampDetailRailWidth(current));
+    onResize();
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
 
   useEffect(() => {
     if (!selectedSessionId || queueLen <= 0) {
@@ -3671,7 +3744,7 @@ export function App() {
     <>
       <div
         ref={appRef}
-        className={`app${showFilesPanel || showDetailsPanel ? " withRail" : ""}${sidebarCollapsed ? " sidebarCollapsed" : ""}${sidebarResizing ? " sidebarResizing" : ""}${mobileViewport ? " mobileLayout" : ""}${mobileSidebarOpen ? " mobileSidebarOpen" : ""}${compactSessionCards ? " compactSessionCards" : ""}`}
+        className={`app${showFilesPanel || showDetailsPanel ? " withRail" : ""}${sidebarCollapsed ? " sidebarCollapsed" : ""}${sidebarResizing ? " sidebarResizing" : ""}${detailRailResizing ? " detailRailResizing" : ""}${mobileViewport ? " mobileLayout" : ""}${mobileSidebarOpen ? " mobileSidebarOpen" : ""}${compactSessionCards ? " compactSessionCards" : ""}`}
         style={appStyle}
         onClick={() => setSessionContextMenu(null)}
       >
@@ -4045,6 +4118,16 @@ export function App() {
             </div>
 
             {showFilesPanel || showDetailsPanel ? (
+              <div
+                className="detailRailResizer"
+                role="separator"
+                aria-orientation="vertical"
+                aria-label="Resize detail panel"
+                onPointerDown={handleDetailRailResizeStart}
+              />
+            ) : null}
+
+            {showFilesPanel || showDetailsPanel ? (
               <aside className="detailRail">
                 {showDetailsPanel ? (
                   <section className="detailSection">
@@ -4099,7 +4182,7 @@ export function App() {
                         {fileSearchLoading ? "Searching…" : "Search"}
                       </button>
                       <button className="secondaryBtn" type="button" disabled={fileOpenLoading || !fileSearchQuery.trim()} onClick={() => void openFile(fileSearchQuery.trim())}>
-                        {fileOpenLoading ? "Opening..." : "Open"}
+                        {fileOpenLoading ? "Opening..." : "Open path"}
                       </button>
                     </form>
                     {filesLoading ? <div className="muted">Loading files…</div> : null}
@@ -4118,7 +4201,7 @@ export function App() {
                         </button>
                       ))}
                       {!filesLoading && !visibleFileEntries.length ? (
-                        <div className="muted">{fileSearchQuery.trim() ? "No matching files. Use Open to try this exact path." : "No tracked or changed files yet."}</div>
+                        <div className="muted">{fileSearchQuery.trim() ? "No matching files. Use Open path to try this exact path." : "No tracked or changed files yet."}</div>
                       ) : null}
                     </div>
                     {activeFile ? (
