@@ -131,7 +131,7 @@ export function ShareWorkspace(props: {
                 <div className="workspaceTitleRow">
                   <div className="workspaceTitle">{item.nickname || item.session_id}</div>
                 </div>
-                <div className="workspacePath">{item.cwd || item.workspace_cwd || item.session_id}</div>
+                <div className="workspacePath">{item.workspace_cwd || item.cwd || item.session_id}</div>
                 <div className="workspaceMeta">
                   {String(item.agent_backend || "codex").toUpperCase()} / {item.busy ? "working" : item.queue_len ? `queue ${item.queue_len}` : "idle"} / {relativeAge(item.updated_ts || item.added_ts)}
                 </div>
