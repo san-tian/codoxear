@@ -538,8 +538,8 @@ function sessionIsRunning(session: SessionSummary | null, awaitingReply = false,
 }
 
 function sessionStatusText(session: SessionSummary, awaitingReply = false, stopSuppressed = false) {
-  if (session.queue_len) return `queue ${session.queue_len}`;
   if (sessionIsStarting(session)) return "starting";
+  if (session.queue_len) return `queue ${session.queue_len}`;
   if (sessionIsRunning(session, awaitingReply, stopSuppressed)) return "working";
   return "idle";
 }
@@ -1555,10 +1555,11 @@ export function App() {
   const queuePreviewItems = useMemo(() => queueItems.slice(0, 3), [queueItems]);
   const selectedSessionInterrupting = Boolean(selectedSessionId && interruptingSessionId === selectedSessionId);
   const selectedSessionStoppingFeedback = Boolean(selectedSessionInterrupting && Date.now() < interruptingFeedbackUntil);
+  const selectedSessionStarting = sessionIsStarting(selectedSession);
   const effectiveAwaitingAssistantReply = selectedSessionInterrupting ? false : awaitingAssistantReply;
-  const selectedSessionBusy = Boolean(busy || selectedSession?.busy);
+  const selectedSessionBusy = Boolean(!selectedSessionStarting && (busy || selectedSession?.busy));
   const effectiveSelectedSessionBusy = selectedSessionInterrupting ? false : selectedSessionBusy;
-  const composerSessionBusy = Boolean(effectiveAwaitingAssistantReply || effectiveSelectedSessionBusy);
+  const composerSessionBusy = Boolean(selectedSessionStarting || effectiveAwaitingAssistantReply || effectiveSelectedSessionBusy);
   const displayedVoiceSettings = voiceSettings || EMPTY_VOICE_SETTINGS;
   const settingsInitialLoading = voiceSettingsLoading && !voiceSettings && !codexConfig;
   const queuedWaitingStatus = Boolean(
@@ -1573,12 +1574,21 @@ export function App() {
     if (!selectedSession) return "No session";
     if (closingSession) return "closing";
     if (selectedSessionStoppingFeedback) return "stopping";
+    if (selectedSessionStarting) return "starting";
     if (sending) return "sending";
     if (effectiveAwaitingAssistantReply || effectiveSelectedSessionBusy) return "working";
     if (queueLen) return `queue ${queueLen}`;
-    if (sessionIsStarting(selectedSession)) return "starting";
     return "idle";
-  }, [closingSession, effectiveAwaitingAssistantReply, effectiveSelectedSessionBusy, queueLen, selectedSession, selectedSessionStoppingFeedback, sending]);
+  }, [
+    closingSession,
+    effectiveAwaitingAssistantReply,
+    effectiveSelectedSessionBusy,
+    queueLen,
+    selectedSession,
+    selectedSessionStarting,
+    selectedSessionStoppingFeedback,
+    sending,
+  ]);
   const topSessionStatusClass =
     topSessionStatus === "stopping"
       ? "status-chip stopping"
