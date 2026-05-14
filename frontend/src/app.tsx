@@ -1203,6 +1203,7 @@ export function App() {
   const [queueItems, setQueueItems] = useState<QueueItem[]>([]);
   const [queueDrafts, setQueueDrafts] = useState<Record<string, string>>({});
   const [queueLoading, setQueueLoading] = useState(false);
+  const [queueInterruptSendingItemId, setQueueInterruptSendingItemId] = useState("");
   const [harnessOpen, setHarnessOpen] = useState(false);
   const [harnessLoading, setHarnessLoading] = useState(false);
   const [harnessSaving, setHarnessSaving] = useState(false);
@@ -2470,6 +2471,32 @@ export function App() {
       await refreshSessions();
     } catch (error) {
       setErrorText(error instanceof Error ? error.message : "Unable to move queue item");
+    }
+  }
+
+  async function interruptSendQueueItem(itemId: string) {
+    const sessionId = selectedSessionRef.current;
+    if (!sessionId || queueInterruptSendingItemId) return;
+    const text = String(queueDrafts[itemId] || "").trim();
+    if (!text) {
+      await deleteQueueItem(itemId);
+      return;
+    }
+    setQueueInterruptSendingItemId(itemId);
+    setErrorText("");
+    try {
+      await api.interrupt(sessionId);
+      await api.sendMessage(sessionId, text);
+      await api.deleteQueueItem(sessionId, itemId);
+      pushToast("Interrupted and sent queued message");
+      fastPollUntilRef.current = Date.now() + 5000;
+      schedulePoll(0);
+      await loadQueue(sessionId);
+      await refreshSessions();
+    } catch (error) {
+      setErrorText(error instanceof Error ? error.message : "Unable to interrupt and send queue item");
+    } finally {
+      setQueueInterruptSendingItemId("");
     }
   }
 
@@ -4733,21 +4760,36 @@ export function App() {
                     }
                   />
                   <div className="queueActions">
-                    <button className="icon-btn" type="button" disabled={index === 0 || item.sending} onClick={() => void moveQueueItem(item.id, index - 1)}>
+                    <button
+                      className="icon-btn"
+                      type="button"
+                      disabled={index === 0 || item.sending || Boolean(queueInterruptSendingItemId)}
+                      onClick={() => void moveQueueItem(item.id, index - 1)}
+                    >
                       {icon("up")}
                     </button>
                     <button
                       className="icon-btn"
                       type="button"
-                      disabled={index === queueItems.length - 1 || item.sending}
+                      disabled={index === queueItems.length - 1 || item.sending || Boolean(queueInterruptSendingItemId)}
                       onClick={() => void moveQueueItem(item.id, index + 1)}
                     >
                       {icon("down")}
                     </button>
-                    <button className="secondaryBtn" type="button" onClick={() => void saveQueueItem(item.id)}>
+                    <button
+                      className="secondaryBtn queueInterruptSendBtn"
+                      type="button"
+                      title="Interrupt current work and send this queued message"
+                      disabled={item.sending || Boolean(queueInterruptSendingItemId)}
+                      onClick={() => void interruptSendQueueItem(item.id)}
+                    >
+                      {icon("stop")}
+                      <span>{queueInterruptSendingItemId === item.id ? "Sending..." : "Send now"}</span>
+                    </button>
+                    <button className="secondaryBtn" type="button" disabled={Boolean(queueInterruptSendingItemId)} onClick={() => void saveQueueItem(item.id)}>
                       Save
                     </button>
-                    <button className="icon-btn danger" type="button" onClick={() => void deleteQueueItem(item.id)}>
+                    <button className="icon-btn danger" type="button" disabled={Boolean(queueInterruptSendingItemId)} onClick={() => void deleteQueueItem(item.id)}>
                       {icon("trash")}
                     </button>
                   </div>
