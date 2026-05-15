@@ -1,3 +1,7 @@
+# Agent install prompt
+
+帮我安装这个 https://github.com/san-tian/codoxear，我会通过公网 IP xxxx 访问，因此你需要监听 0.0.0.0，端口你可以自己选。密码设置成 xxxxxx。使用守护进程防止闪退。安装好之后告诉我如何登录。可以使用 Tailscale 发布到公网，问我是否需要。
+
 # Codoxear
 
 <p align="center">
