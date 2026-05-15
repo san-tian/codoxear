@@ -602,6 +602,15 @@ button:disabled {
   box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.14);
 }
 
+.workspaceUnreadMark {
+  width: 8px;
+  height: 8px;
+  flex: 0 0 auto;
+  border-radius: 999px;
+  background: #ef4444;
+  box-shadow: 0 0 0 2px rgba(239, 68, 68, 0.18), 0 0 10px rgba(239, 68, 68, 0.5);
+}
+
 .workspacePath,
 .workspaceMeta,
 .lastLine,

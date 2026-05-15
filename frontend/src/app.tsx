@@ -1092,6 +1092,7 @@ export function App() {
   const [errorText, setErrorText] = useState("");
   const [sessionDrafts, setSessionDrafts] = useState<Record<string, string>>(() => readStoredSessionDrafts());
   const [closedTurnTsBySession, setClosedTurnTsBySession] = useState<Record<string, number>>({});
+  const [unreadSessionIds, setUnreadSessionIds] = useState<Record<string, boolean>>({});
   const [busySubmitMode, setBusySubmitMode] = useState<BusySubmitMode>(() => readBusySubmitMode());
   const [toastText, setToastText] = useState("");
   const [loginPassword, setLoginPassword] = useState("");
@@ -1217,6 +1218,7 @@ export function App() {
   const historyCursorRef = useRef<string | null>(null);
   const selectedSessionRef = useRef("");
   const sessionViewCacheRef = useRef<Record<string, SessionViewSnapshot>>({});
+  const previousSessionBusyRef = useRef<Record<string, boolean>>({});
   const fastPollUntilRef = useRef(0);
   const openRequestRef = useRef(0);
   const notificationFeedSinceRef = useRef(0);
@@ -1827,11 +1829,24 @@ export function App() {
     }, 2200);
   }
 
+  function markSessionUnreadAtTurnBoundary(sessionId: string) {
+    if (!sessionId || selectedSessionRef.current === sessionId) return;
+    setUnreadSessionIds((current) => (current[sessionId] ? current : { ...current, [sessionId]: true }));
+  }
+
   function selectSession(sessionId: string) {
     const changed = selectedSessionRef.current !== sessionId;
     const previousSessionId = selectedSessionRef.current;
     if (changed) rememberActiveSessionSnapshot(previousSessionId);
     selectedSessionRef.current = sessionId;
+    if (sessionId) {
+      setUnreadSessionIds((current) => {
+        if (!current[sessionId]) return current;
+        const next = { ...current };
+        delete next[sessionId];
+        return next;
+      });
+    }
     if (changed) {
       const cached = sessionViewCacheRef.current[sessionId];
       stickToBottomRef.current = true;
@@ -1987,6 +2002,7 @@ export function App() {
       });
       if (data.turn_end || data.turn_aborted) {
         setClosedTurnTsBySession((current) => ({ ...current, [sessionId]: Date.now() / 1000 }));
+        markSessionUnreadAtTurnBoundary(sessionId);
       }
     }
     if (sessionId && (!data.busy || data.turn_aborted)) {
@@ -1998,6 +2014,15 @@ export function App() {
   async function refreshSessions({ preserveSelection = true }: { preserveSelection?: boolean } = {}) {
     const payload = await api.fetchSessions();
     const ordered = sortSessions(payload.sessions || []);
+    const previousBusyBySession = previousSessionBusyRef.current;
+    const hasPreviousBusySnapshot = Object.keys(previousBusyBySession).length > 0;
+    const nextBusyBySession = Object.fromEntries(ordered.map((session) => [session.session_id, Boolean(session.busy)]));
+    for (const session of ordered) {
+      if (hasPreviousBusySnapshot && previousBusyBySession[session.session_id] && !session.busy) {
+        markSessionUnreadAtTurnBoundary(session.session_id);
+      }
+    }
+    previousSessionBusyRef.current = nextBusyBySession;
     const orderedSessionIds = new Set(ordered.map((session) => session.session_id));
     Object.keys(sessionViewCacheRef.current).forEach((sessionId) => {
       if (!orderedSessionIds.has(sessionId)) delete sessionViewCacheRef.current[sessionId];
@@ -2023,6 +2048,8 @@ export function App() {
     if (!ordered.length) {
       selectSession("");
       sessionViewCacheRef.current = {};
+      previousSessionBusyRef.current = {};
+      setUnreadSessionIds({});
       setTranscript([]);
       return;
     }
@@ -2640,6 +2667,13 @@ export function App() {
     try {
       await api.deleteSession(sessionId);
       delete sessionViewCacheRef.current[sessionId];
+      delete previousSessionBusyRef.current[sessionId];
+      setUnreadSessionIds((current) => {
+        if (!current[sessionId]) return current;
+        const next = { ...current };
+        delete next[sessionId];
+        return next;
+      });
       setSessionDraft(sessionId, "");
       pushToast("Session closed");
       if (selectedSessionRef.current === sessionId) {
@@ -3705,6 +3739,7 @@ export function App() {
                         const pendingMarked = markerState === "pending";
                         const shelvedMarked = markerState === "snooze";
                         const hasDraft = Boolean((sessionDrafts[session.session_id] || "").trim());
+                        const hasUnread = Boolean(unreadSessionIds[session.session_id]);
                         const markerBusy = sessionMarkerBusyId === session.session_id;
                         const sessionAwaitingReply = session.session_id === selectedSessionAwaitingReplyId;
                         const sessionStopSuppressed = session.session_id === interruptingSessionId;
@@ -3743,6 +3778,7 @@ export function App() {
                             <div className="workspaceMarkers">
                               <div className="workspaceStateMarkers" role="group" aria-label="Session state markers">
                                 {hasDraft ? <span className="workspaceDraftMark" title="Draft saved" aria-label="Draft saved" /> : null}
+                                {hasUnread ? <span className="workspaceUnreadMark" title="Unread completed turn" aria-label="Unread completed turn" /> : null}
                                 <span
                                   className={`status-dot ${
                                     sessionIsQueuedWaiting(session)
