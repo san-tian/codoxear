@@ -552,11 +552,8 @@ function sessionMarkerState(session: SessionSummary | null): SessionMarkerState 
   return "normal";
 }
 
-function nextSessionMarkerState(state: SessionMarkerState): SessionMarkerState {
-  if (state === "normal") return "star";
-  if (state === "star") return "pending";
-  if (state === "pending") return "snooze";
-  return "normal";
+function nextSessionMarkerButtonState(state: SessionMarkerState): SessionMarkerState {
+  return state === "star" ? "normal" : "star";
 }
 
 function sessionMarkerLabel(state: SessionMarkerState) {
@@ -3734,7 +3731,7 @@ export function App() {
                     <div className="workspaceSessions">
                       {group.sessions.map((session) => {
                         const markerState = sessionMarkerState(session);
-                        const nextMarkerState = nextSessionMarkerState(markerState);
+                        const nextMarkerState = nextSessionMarkerButtonState(markerState);
                         const importantMarked = markerState === "star";
                         const pendingMarked = markerState === "pending";
                         const shelvedMarked = markerState === "snooze";
