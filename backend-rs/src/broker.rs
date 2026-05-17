@@ -541,7 +541,14 @@ fn handle_conn(runtime: BrokerRuntime, mut stream: UnixStream) {
             let response = runtime
                 .state
                 .lock()
-                .map(|state| json!({"busy": state.busy, "queue_len": 0, "token": state.token}))
+                .map(|state| {
+                    json!({
+                        "busy": state.busy,
+                        "queue_len": 0,
+                        "token": state.token,
+                        "tail": state.output_tail,
+                    })
+                })
                 .unwrap_or_else(|_| json!({"error": "no state"}));
             let _ = send_json_line(&mut stream, &response);
         }
@@ -1851,6 +1858,11 @@ mod tests {
         let state = socket_request(&sock_path, json!({"cmd":"state"}));
         assert_eq!(state.get("queue_len").and_then(Value::as_i64), Some(0));
         assert_eq!(state.get("busy").and_then(Value::as_bool), Some(false));
+        assert!(state
+            .get("tail")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .contains("READY"));
 
         let tail = wait_for_tail(&sock_path);
         assert!(tail.contains("READY"));

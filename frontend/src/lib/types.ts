@@ -14,6 +14,7 @@ export type SessionSummary = {
   queue_len: number;
   busy: boolean;
   token?: Record<string, unknown> | null;
+  terminal_prompt?: TerminalPrompt | null;
   harness_enabled: boolean;
   harness_cooldown_minutes: number;
   harness_remaining_injections: number;
@@ -37,6 +38,19 @@ export type SessionSummary = {
   blocked: boolean;
   snoozed: boolean;
   last_assistant_ts?: number | null;
+};
+
+export type TerminalPromptChoice = {
+  label: string;
+  value: string;
+  description: string;
+  key_seq: string;
+};
+
+export type TerminalPrompt = {
+  kind: string;
+  message: string;
+  choices: TerminalPromptChoice[];
 };
 
 export type SessionsResponse = {
@@ -269,6 +283,7 @@ export type TailResponse = {
   busy: boolean;
   queue_len: number;
   token?: Record<string, unknown> | null;
+  terminal_prompt?: TerminalPrompt | null;
 };
 
 export type HistoryResponse = {
@@ -280,6 +295,7 @@ export type HistoryResponse = {
   busy: boolean;
   queue_len: number;
   token?: Record<string, unknown> | null;
+  terminal_prompt?: TerminalPrompt | null;
 };
 
 export type LiveResponse = {
@@ -295,6 +311,7 @@ export type LiveResponse = {
   busy: boolean;
   queue_len: number;
   token?: Record<string, unknown> | null;
+  terminal_prompt?: TerminalPrompt | null;
 };
 
 export type DiagnosticsResponse = {
@@ -313,6 +330,7 @@ export type DiagnosticsResponse = {
   broker_busy: boolean;
   queue_len: number;
   token?: Record<string, unknown> | null;
+  terminal_prompt?: TerminalPrompt | null;
   model_provider: string | null;
   preferred_auth_method: string | null;
   provider_choice: string | null;

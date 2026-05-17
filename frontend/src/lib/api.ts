@@ -155,6 +155,12 @@ export const api = {
       method: "POST",
     });
   },
+  sendTerminalResponse(sessionId: string, kind: string, value: string): Promise<{ ok: true }> {
+    return readJson<{ ok: true }>(`/api/sessions/${encodeURIComponent(sessionId)}/terminal_response`, {
+      method: "POST",
+      body: JSON.stringify({ kind, value }),
+    });
+  },
   fetchDiagnostics(sessionId: string): Promise<DiagnosticsResponse> {
     return readJson<DiagnosticsResponse>(`/api/sessions/${encodeURIComponent(sessionId)}/diagnostics`);
   },

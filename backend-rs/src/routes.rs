@@ -20,8 +20,8 @@ use crate::runtime::{
     load_version_status_response, load_voice_settings_response, login_share_set, move_queue_item,
     normalize_backend, rename_session, resolve_dir_target, save_codex_config_response,
     save_file_write_response, save_voice_settings_response,
-    schedule_local_service_restart_response, send_session_message, set_harness_config,
-    share_file_entries, toggle_notification_subscription_response,
+    schedule_local_service_restart_response, send_session_message, send_terminal_response,
+    set_harness_config, share_file_entries, toggle_notification_subscription_response,
     update_audio_listener_heartbeat_response, update_queue_item, update_share_sessions,
     upsert_notification_subscription_response, FileWriteError,
 };
@@ -210,6 +210,10 @@ pub fn router(state: AppState) -> Router {
             "/api/v1/sessions/:session_id/interrupt",
             post(session_interrupt),
         )
+        .route(
+            "/api/v1/sessions/:session_id/terminal_response",
+            post(session_terminal_response),
+        )
         .route("/api/v1/messages/send", post(send_message))
         .route("/api/v1/events/stream", get(events))
         .nest("/api", public_api_router(state.clone()))
@@ -299,6 +303,10 @@ fn public_api_router(state: AppState) -> Router<AppState> {
         .route("/sessions/:session_id/messages/live", get(messages_live))
         .route("/sessions/:session_id/send", post(session_send))
         .route("/sessions/:session_id/interrupt", post(session_interrupt))
+        .route(
+            "/sessions/:session_id/terminal_response",
+            post(session_terminal_response),
+        )
         .route("/messages/send", post(send_message))
         .route("/events/stream", get(events))
         .route_layer(middleware::from_fn_with_state(
@@ -564,6 +572,12 @@ struct NotificationFeedQuery {
 #[derive(Deserialize)]
 struct TextPayload {
     text: String,
+}
+
+#[derive(Deserialize)]
+struct TerminalResponsePayload {
+    kind: String,
+    value: String,
 }
 
 #[derive(Deserialize)]
@@ -872,6 +886,27 @@ async fn session_interrupt(
     interrupt_session(&state.config, &session_id)
         .map(Json)
         .map_err(route_error)
+}
+
+async fn session_terminal_response(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    Json(payload): Json<TerminalResponsePayload>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if payload.kind.trim().is_empty() || payload.value.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "kind and value required".to_string(),
+        ));
+    }
+    send_terminal_response(
+        &state.config,
+        &session_id,
+        payload.kind.trim(),
+        payload.value.trim(),
+    )
+    .map(Json)
+    .map_err(route_error)
 }
 
 async fn session_rename(
@@ -4222,7 +4257,7 @@ mod tests {
         let sock_path = app_dir.join("socks").join("sid-action.sock");
         let listener = UnixListener::bind(&sock_path).unwrap();
         let listener_thread = thread::spawn(move || {
-            for _ in 0..5 {
+            for _ in 0..10 {
                 let (mut stream, _) = listener.accept().unwrap();
                 let mut line = String::new();
                 BufReader::new(stream.try_clone().unwrap())
@@ -4232,7 +4267,7 @@ mod tests {
                 match payload["cmd"].as_str().unwrap() {
                     "state" => {
                         stream
-                            .write_all(b"{\"busy\":false,\"queue_len\":0}\n")
+                            .write_all(b"{\"busy\":false,\"queue_len\":0,\"tail\":\"Replace goal? (y/n)\"}\n")
                             .unwrap();
                     }
                     "send" => {
@@ -4242,8 +4277,16 @@ mod tests {
                             .unwrap();
                     }
                     "keys" => {
-                        assert_eq!(payload["seq"], "\\x03");
+                        assert!(
+                            payload["seq"] == "\\x03" || payload["seq"] == "y\n",
+                            "unexpected key seq: {}",
+                            payload["seq"]
+                        );
+                        let is_terminal_goal_response = payload["seq"] == "y\n";
                         stream.write_all(b"{\"accepted\":true}\n").unwrap();
+                        if is_terminal_goal_response {
+                            return;
+                        }
                     }
                     other => panic!("unexpected broker command: {other}"),
                 }
@@ -4279,6 +4322,7 @@ mod tests {
         assert_eq!(send_payload["queue_len"], 0);
 
         let interrupt = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -4293,6 +4337,33 @@ mod tests {
         let interrupt_payload: Value = serde_json::from_slice(&interrupt_body).unwrap();
         assert_eq!(interrupt_payload["ok"], true);
         assert_eq!(interrupt_payload["broker"]["accepted"], true);
+
+        let terminal_response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/sessions/sid-action/terminal_response")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"kind":"replace_goal","value":"replace"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let terminal_status = terminal_response.status();
+        let terminal_body = to_bytes(terminal_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            terminal_status,
+            StatusCode::OK,
+            "{}",
+            String::from_utf8_lossy(&terminal_body)
+        );
+        let terminal_payload: Value = serde_json::from_slice(&terminal_body).unwrap();
+        assert_eq!(terminal_payload["ok"], true);
+        assert_eq!(terminal_payload["kind"], "replace_goal");
+        assert_eq!(terminal_payload["value"], "replace");
+        assert_eq!(terminal_payload["broker"]["accepted"], true);
 
         listener_thread.join().unwrap();
     }

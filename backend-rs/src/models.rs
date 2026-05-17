@@ -81,6 +81,7 @@ pub struct ApiSessionSummary {
     pub queue_len: usize,
     pub busy: bool,
     pub token: Option<serde_json::Value>,
+    pub terminal_prompt: Option<ApiTerminalPrompt>,
     pub harness_enabled: bool,
     pub harness_cooldown_minutes: f64,
     pub harness_remaining_injections: i64,
@@ -104,6 +105,21 @@ pub struct ApiSessionSummary {
     pub blocked: bool,
     pub snoozed: bool,
     pub last_assistant_ts: Option<f64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ApiTerminalPrompt {
+    pub kind: String,
+    pub message: String,
+    pub choices: Vec<ApiTerminalPromptChoice>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ApiTerminalPromptChoice {
+    pub label: String,
+    pub value: String,
+    pub description: String,
+    pub key_seq: String,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -148,6 +164,7 @@ pub struct ApiMessagesTailResponse {
     pub busy: bool,
     pub queue_len: usize,
     pub token: Option<serde_json::Value>,
+    pub terminal_prompt: Option<ApiTerminalPrompt>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -160,6 +177,7 @@ pub struct ApiMessagesHistoryResponse {
     pub busy: bool,
     pub queue_len: usize,
     pub token: Option<serde_json::Value>,
+    pub terminal_prompt: Option<ApiTerminalPrompt>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -176,6 +194,7 @@ pub struct ApiMessagesLiveResponse {
     pub busy: bool,
     pub queue_len: usize,
     pub token: Option<serde_json::Value>,
+    pub terminal_prompt: Option<ApiTerminalPrompt>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -195,6 +214,7 @@ pub struct ApiDiagnosticsResponse {
     pub broker_busy: bool,
     pub queue_len: usize,
     pub token: Option<serde_json::Value>,
+    pub terminal_prompt: Option<ApiTerminalPrompt>,
     pub model_provider: Option<String>,
     pub preferred_auth_method: Option<String>,
     pub provider_choice: Option<String>,

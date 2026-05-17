@@ -2499,6 +2499,58 @@ button.primary {
   font-size: 12px;
 }
 
+.terminalPromptPanel {
+  width: min(920px, calc(100% - 48px));
+  margin: 10px auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  border: 1px solid rgba(245, 158, 11, 0.28);
+  border-radius: 8px;
+  background: rgba(245, 158, 11, 0.1);
+}
+
+.terminalPromptText {
+  min-width: 0;
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1.35;
+}
+
+.terminalPromptActions {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.terminalPromptBtn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 32px;
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--panel);
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 750;
+}
+
+.terminalPromptBtn.primary {
+  border-color: rgba(37, 99, 235, 0.28);
+  background: #2563eb;
+  color: #fff;
+}
+
+.terminalPromptBtn svg {
+  width: 14px;
+  height: 14px;
+}
+
 .composer form {
   max-width: 920px;
   margin: 0 auto;
@@ -3338,6 +3390,21 @@ button.primary {
     -webkit-box-orient: vertical;
   }
 
+  .terminalPromptPanel {
+    width: 100%;
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .terminalPromptActions {
+    width: 100%;
+  }
+
+  .terminalPromptBtn {
+    flex: 1 1 0;
+    justify-content: center;
+  }
+
   .modalBackdrop {
     align-items: end;
     padding: 12px;
@@ -3748,6 +3815,11 @@ button.primary,
 .event-assistant .message-kind {
   color: #eef3fb;
   background: rgba(216, 222, 233, 0.07);
+}
+
+:root[data-theme="light"] .terminalPromptBtn {
+  background: var(--panel);
+  color: var(--text);
 }
 
 :root[data-theme="light"] .queueText,

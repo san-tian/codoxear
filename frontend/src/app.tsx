@@ -30,6 +30,7 @@ import type {
   ShareLoginResponse,
   ShareSet,
   SessionSummary,
+  TerminalPrompt,
   UiTranscriptEvent,
   VersionStatusResponse,
   VoiceSettingsResponse,
@@ -80,6 +81,7 @@ type BusySubmitMode = "queue" | "interrupt";
 type ThemeMode = "dark" | "light";
 type AgentBackend = "codex" | "pi";
 type TokenSummary = { label: string; title: string };
+type TerminalPromptState = TerminalPrompt & { sessionId: string };
 type ShareDraftSession = { session_id: string; label: string; workspace: string; cwd: string; checked: boolean };
 type ManagedShareSet = ShareSet & { share_password?: string };
 type NewSessionBackendPreferences = {
@@ -111,12 +113,17 @@ type SessionViewSnapshot = {
   busy: boolean;
   queueLen: number;
   tokenSummary: TokenSummary | null;
+  terminalPrompt: TerminalPromptState | null;
 };
 
 type ShareTarget = {
   shareId: string;
   sessionId: string;
 };
+
+function terminalPromptKey(sessionId: string, prompt: TerminalPrompt | TerminalPromptState) {
+  return `${sessionId}:${prompt.kind}:${prompt.message}`;
+}
 
 const EMPTY_VOICE_SETTINGS: VoiceSettingsResponse = {
   ok: true,
@@ -1081,6 +1088,8 @@ export function App() {
   const [sessionMarkerBusyId, setSessionMarkerBusyId] = useState("");
   const [queueLen, setQueueLen] = useState(0);
   const [tokenSummary, setTokenSummary] = useState<TokenSummary | null>(null);
+  const [terminalPrompt, setTerminalPrompt] = useState<TerminalPromptState | null>(null);
+  const [terminalPromptSending, setTerminalPromptSending] = useState(false);
   const [liveCursor, setLiveCursor] = useState<string | null>(null);
   const [historyCursor, setHistoryCursor] = useState<string | null>(null);
   const [hasOlder, setHasOlder] = useState(false);
@@ -1216,6 +1225,7 @@ export function App() {
   const selectedSessionRef = useRef("");
   const sessionViewCacheRef = useRef<Record<string, SessionViewSnapshot>>({});
   const previousSessionBusyRef = useRef<Record<string, boolean>>({});
+  const suppressedTerminalPromptKeysRef = useRef<Record<string, boolean>>({});
   const fastPollUntilRef = useRef(0);
   const openRequestRef = useRef(0);
   const notificationFeedSinceRef = useRef(0);
@@ -1699,6 +1709,7 @@ export function App() {
       busy: false,
       queueLen: 0,
       tokenSummary: null,
+      terminalPrompt: null,
     };
     sessionViewCacheRef.current[sessionId] = { ...current, ...patch };
   }
@@ -1713,6 +1724,7 @@ export function App() {
       busy,
       queueLen,
       tokenSummary,
+      terminalPrompt,
     });
   }
 
@@ -1859,6 +1871,7 @@ export function App() {
         setBusy(cached.busy);
         setQueueLen(cached.queueLen);
         setTokenSummary(cached.tokenSummary);
+        setTerminalPrompt(cached.terminalPrompt);
       } else {
         liveCursorRef.current = null;
         historyCursorRef.current = null;
@@ -1869,6 +1882,7 @@ export function App() {
         setBusy(false);
         setQueueLen(Number(sessions.find((session) => session.session_id === sessionId)?.queue_len || 0));
         setTokenSummary(null);
+        setTerminalPrompt(null);
       }
     }
     if (mobileViewport) closeMobileSidebar();
@@ -1967,6 +1981,7 @@ export function App() {
     turn_end?: boolean;
     turn_aborted?: boolean;
     token?: Record<string, unknown> | null;
+    terminal_prompt?: TerminalPrompt | null;
   }, sessionId = selectedSessionRef.current, transcriptEvents?: UiTranscriptEvent[]) {
     liveCursorRef.current = data.live_cursor ?? null;
     setLiveCursor(liveCursorRef.current);
@@ -1984,9 +1999,18 @@ export function App() {
     const nextBusy = Boolean(data.busy);
     const nextQueueLen = Number.isFinite(Number(data.queue_len)) ? Number(data.queue_len) : 0;
     const nextTokenSummary = renderTokenSummary(data.token);
+    const rawTerminalPrompt = data.terminal_prompt && sessionId ? { ...data.terminal_prompt, sessionId } : null;
+    const nextTerminalPrompt =
+      rawTerminalPrompt && !suppressedTerminalPromptKeysRef.current[terminalPromptKey(sessionId, rawTerminalPrompt)] ? rawTerminalPrompt : null;
+    if (!rawTerminalPrompt && sessionId) {
+      Object.keys(suppressedTerminalPromptKeysRef.current).forEach((key) => {
+        if (key.startsWith(`${sessionId}:`)) delete suppressedTerminalPromptKeysRef.current[key];
+      });
+    }
     setBusy(nextBusy);
     setQueueLen(nextQueueLen);
     setTokenSummary(nextTokenSummary);
+    setTerminalPrompt(nextTerminalPrompt);
     if (sessionId) {
       cacheSessionSnapshot(sessionId, {
         ...(transcriptEvents ? { transcript: transcriptEvents } : {}),
@@ -1996,6 +2020,7 @@ export function App() {
         busy: nextBusy,
         queueLen: nextQueueLen,
         tokenSummary: nextTokenSummary,
+        terminalPrompt: nextTerminalPrompt,
       });
       if (data.turn_end || data.turn_aborted) {
         setClosedTurnTsBySession((current) => ({ ...current, [sessionId]: Date.now() / 1000 }));
@@ -2157,13 +2182,18 @@ export function App() {
       const nextQueueLen = Number.isFinite(Number(data.queue_len)) ? Number(data.queue_len) : 0;
       setQueueLen(nextQueueLen);
       const nextTokenSummary = renderTokenSummary(data.token);
+      const rawTerminalPrompt = data.terminal_prompt ? { ...data.terminal_prompt, sessionId } : null;
+      const nextTerminalPrompt =
+        rawTerminalPrompt && !suppressedTerminalPromptKeysRef.current[terminalPromptKey(sessionId, rawTerminalPrompt)] ? rawTerminalPrompt : null;
       setTokenSummary(nextTokenSummary);
+      setTerminalPrompt(nextTerminalPrompt);
       cacheSessionSnapshot(sessionId, {
         historyCursor: historyCursorRef.current,
         hasOlder: Boolean(data.has_older),
         busy: Boolean(data.busy),
         queueLen: nextQueueLen,
         tokenSummary: nextTokenSummary,
+        terminalPrompt: nextTerminalPrompt,
       });
       if (jumpTargetId) {
         window.requestAnimationFrame(() => {
@@ -2647,6 +2677,27 @@ export function App() {
     fastPollUntilRef.current = Date.now() + 5000;
     schedulePoll(0);
     pushToast(event.askQuestion ? "Answer sent" : "Response sent");
+  }
+
+  async function handleTerminalPromptResponse(value: string) {
+    const prompt = terminalPrompt;
+    const sessionId = selectedSessionRef.current;
+    if (!prompt || !sessionId || prompt.sessionId !== sessionId || terminalPromptSending) return;
+    setTerminalPromptSending(true);
+    setErrorText("");
+    try {
+      await api.sendTerminalResponse(sessionId, prompt.kind, value);
+      suppressedTerminalPromptKeysRef.current[terminalPromptKey(sessionId, prompt)] = true;
+      setTerminalPrompt(null);
+      cacheSessionSnapshot(sessionId, { terminalPrompt: null });
+      fastPollUntilRef.current = Date.now() + 5000;
+      schedulePoll(0);
+      pushToast(value === "replace" ? "Goal replacement confirmed" : "Goal replacement declined");
+    } catch (error) {
+      setErrorText(error instanceof Error ? error.message : "Unable to answer terminal prompt");
+    } finally {
+      setTerminalPromptSending(false);
+    }
   }
 
   function handleComposerKeyDown(event: KeyboardEvent) {
@@ -3997,6 +4048,26 @@ export function App() {
                         />
                       );
                     })}
+                    {terminalPrompt && terminalPrompt.sessionId === selectedSessionId ? (
+                      <div className="terminalPromptPanel" role="group" aria-label="Terminal prompt">
+                        <div className="terminalPromptText">{terminalPrompt.message || "The terminal is waiting for confirmation."}</div>
+                        <div className="terminalPromptActions">
+                          {terminalPrompt.choices.map((choice) => (
+                            <button
+                              className={`terminalPromptBtn ${choice.value === "replace" ? "primary" : ""}`}
+                              type="button"
+                              key={choice.value}
+                              title={choice.description || choice.label}
+                              disabled={terminalPromptSending}
+                              onClick={() => void handleTerminalPromptResponse(choice.value)}
+                            >
+                              {choice.value === "replace" ? icon("star") : icon("close")}
+                              <span>{choice.label}</span>
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                    ) : null}
                     {workingIndicatorLabel ? <WorkingIndicator label={workingIndicatorLabel} tone={workingIndicatorTone} /> : null}
                     {!visibleTranscript.length && !workingIndicatorLabel ? <div className="emptyState">No transcript yet for this session.</div> : null}
                   </div>

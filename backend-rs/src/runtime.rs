@@ -5,7 +5,7 @@ use crate::models::{
     ApiMessagesTailResponse, ApiNewSessionDefaults, ApiQueueItem, ApiQueueResponse,
     ApiSessionSummary, ApiSessionsResponse, ApiShareFilesResponse, ApiShareLoginResponse,
     ApiShareMessageResponse, ApiShareMessageSession, ApiShareSessionRef, ApiShareSet,
-    SessionDetail, SessionSummary,
+    ApiTerminalPrompt, ApiTerminalPromptChoice, SessionDetail, SessionSummary,
 };
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
@@ -110,6 +110,7 @@ const ASK_USER_TOOL_NAMES: &[&str] = &["ask_user", "AskUserQuestion"];
 const EXTENSION_DISPLAY_KEY: &str = "codoxear_display";
 const EXTENSION_DISPLAY_TOOL_NAMES: &[&str] = &["codoxear_display", "codoxear.display"];
 const GOAL_TOOL_NAMES: &[&str] = &["create_goal", "get_goal", "update_goal"];
+const TERMINAL_PROMPT_REPLACE_GOAL: &str = "replace_goal";
 const SHARE_FILE_NAME: &str = "session_shares.json";
 const FILE_LIST_IGNORED_DIRS: &[&str] = &[
     ".git",
@@ -199,6 +200,7 @@ struct BrokerState {
     busy: bool,
     _queue_len: usize,
     token: Option<Value>,
+    terminal_prompt: Option<ApiTerminalPrompt>,
 }
 
 #[derive(Debug, Clone)]
@@ -1311,6 +1313,7 @@ pub fn load_messages_tail(
             busy: session.busy,
             queue_len: session.queue_len,
             token: session.token,
+            terminal_prompt: session.terminal_prompt,
         });
     };
     let records = read_positioned_records(Path::new(log_path))?;
@@ -1334,6 +1337,7 @@ pub fn load_messages_tail(
         busy: session.busy,
         queue_len: session.queue_len,
         token: session.token,
+        terminal_prompt: session.terminal_prompt,
     })
 }
 
@@ -1354,6 +1358,7 @@ pub fn load_messages_history(
             busy: session.busy,
             queue_len: session.queue_len,
             token: session.token,
+            terminal_prompt: session.terminal_prompt,
         });
     };
     let before = parse_cursor(before_cursor)?;
@@ -1374,6 +1379,7 @@ pub fn load_messages_history(
         busy: session.busy,
         queue_len: session.queue_len,
         token: session.token,
+        terminal_prompt: session.terminal_prompt,
     })
 }
 
@@ -1397,6 +1403,7 @@ pub fn load_messages_live(
             busy: session.busy,
             queue_len: session.queue_len,
             token: session.token,
+            terminal_prompt: session.terminal_prompt,
         });
     };
     let after = parse_cursor(after_cursor)?;
@@ -1420,6 +1427,7 @@ pub fn load_messages_live(
         busy: session.busy,
         queue_len: session.queue_len,
         token: session.token,
+        terminal_prompt: session.terminal_prompt,
     })
 }
 
@@ -1506,6 +1514,9 @@ pub fn load_diagnostics_response(
         broker_busy,
         queue_len: session.queue_len,
         token: broker_state.token.or(session.token),
+        terminal_prompt: broker_state
+            .terminal_prompt
+            .or(session.terminal_prompt.clone()),
         model_provider: session.model_provider.clone(),
         preferred_auth_method: session.preferred_auth_method.clone(),
         provider_choice: provider_choice_for_settings(
@@ -3115,6 +3126,9 @@ fn session_from_meta(
                 .filter(|path| path.exists())
                 .and_then(latest_token_update_from_log)
         });
+    let terminal_prompt = broker_state
+        .as_ref()
+        .and_then(|state| state.terminal_prompt.clone());
     let last_assistant_ts = log_path
         .as_deref()
         .map(Path::new)
@@ -3137,6 +3151,7 @@ fn session_from_meta(
         queue_len,
         busy,
         token,
+        terminal_prompt,
         harness_enabled: object_bool(harness_entry, "enabled").unwrap_or(false),
         harness_cooldown_minutes: object_number(harness_entry, "cooldown_minutes")
             .unwrap_or(HARNESS_DEFAULT_IDLE_MINUTES),
@@ -7950,6 +7965,117 @@ fn object_string(value: Option<&Value>, key: &str) -> Option<String> {
         .map(|text| text.to_string())
 }
 
+fn strip_ansi(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut idx = 0usize;
+    while idx < bytes.len() {
+        if bytes[idx] != 0x1b {
+            if let Some(ch) = text[idx..].chars().next() {
+                out.push(ch);
+                idx += ch.len_utf8();
+            } else {
+                break;
+            }
+            continue;
+        }
+        idx += 1;
+        if idx >= bytes.len() {
+            break;
+        }
+        match bytes[idx] {
+            b']' => {
+                idx += 1;
+                while idx < bytes.len() {
+                    if bytes[idx] == 0x07 {
+                        idx += 1;
+                        break;
+                    }
+                    if bytes[idx] == 0x1b && idx + 1 < bytes.len() && bytes[idx + 1] == b'\\' {
+                        idx += 2;
+                        break;
+                    }
+                    idx += 1;
+                }
+            }
+            b'[' => {
+                idx += 1;
+                while idx < bytes.len() {
+                    let byte = bytes[idx];
+                    idx += 1;
+                    if (0x40..=0x7e).contains(&byte) {
+                        break;
+                    }
+                }
+            }
+            _ => {
+                idx += 1;
+            }
+        }
+    }
+    out
+}
+
+fn clean_terminal_tail(text: &str) -> String {
+    strip_ansi(text)
+        .chars()
+        .map(|ch| {
+            if ch == '\r' || ch == '\n' || ch.is_control() {
+                ' '
+            } else {
+                ch
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn terminal_prompt_from_tail(tail: &str) -> Option<ApiTerminalPrompt> {
+    let cleaned = clean_terminal_tail(tail);
+    let recent = cleaned
+        .chars()
+        .rev()
+        .take(480)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>();
+    let lower = recent.to_ascii_lowercase();
+    let mentions_goal = lower.contains("goal");
+    let mentions_replace = lower.contains("replace") || lower.contains("overwrite");
+    let looks_like_confirmation = lower.contains("?")
+        || lower.contains("(y")
+        || lower.contains("[y")
+        || lower.contains("yes");
+    if !(mentions_goal && mentions_replace && looks_like_confirmation) {
+        return None;
+    }
+    Some(ApiTerminalPrompt {
+        kind: TERMINAL_PROMPT_REPLACE_GOAL.to_string(),
+        message: if recent.is_empty() {
+            "Replace the active goal?".to_string()
+        } else {
+            recent
+        },
+        choices: vec![
+            ApiTerminalPromptChoice {
+                label: "Replace".to_string(),
+                value: "replace".to_string(),
+                description: "Confirm the new /goal should replace the active goal.".to_string(),
+                key_seq: "y\n".to_string(),
+            },
+            ApiTerminalPromptChoice {
+                label: "Keep current".to_string(),
+                value: "keep".to_string(),
+                description: "Decline replacement and keep the active goal.".to_string(),
+                key_seq: "n\n".to_string(),
+            },
+        ],
+    })
+}
+
 fn epoch_now() -> f64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -8021,10 +8147,15 @@ fn read_broker_state(sock_path: &Path) -> Result<Option<BrokerState>, String> {
         Some(Value::Object(_)) => value.get("token").cloned(),
         _ => None,
     };
+    let terminal_prompt = value
+        .get("tail")
+        .and_then(Value::as_str)
+        .and_then(terminal_prompt_from_tail);
     Ok(Some(BrokerState {
         busy,
         _queue_len: queue_len,
         token,
+        terminal_prompt,
     }))
 }
 
@@ -8089,6 +8220,37 @@ pub fn interrupt_session(config: &RuntimeConfig, session_id: &str) -> Result<Val
         Duration::from_secs_f64(2.0),
     )?;
     Ok(json!({"ok": true, "broker": broker}))
+}
+
+pub fn send_terminal_response(
+    config: &RuntimeConfig,
+    session_id: &str,
+    kind: &str,
+    value: &str,
+) -> Result<Value, String> {
+    let session = find_session(config, session_id)?;
+    let prompt = session
+        .terminal_prompt
+        .clone()
+        .ok_or_else(|| "no terminal prompt is active for this session".to_string())?;
+    if prompt.kind != kind {
+        return Err(format!(
+            "active terminal prompt is {}, not {kind}",
+            prompt.kind
+        ));
+    }
+    let choice = prompt
+        .choices
+        .iter()
+        .find(|choice| choice.value == value)
+        .ok_or_else(|| format!("unsupported terminal prompt response: {value}"))?;
+    let broker = broker_request_for_session(
+        config,
+        &session,
+        &json!({"cmd": "keys", "seq": choice.key_seq}),
+        Duration::from_secs_f64(2.0),
+    )?;
+    Ok(json!({"ok": true, "kind": prompt.kind, "value": choice.value, "broker": broker}))
 }
 
 pub fn rename_session(
