@@ -1,6 +1,6 @@
 # Agent install prompt
 
-帮我安装这个 https://github.com/san-tian/codoxear，我会通过公网 IP xxxx 访问，因此你需要监听 0.0.0.0，端口你可以自己选。密码设置成 xxxxxx。使用守护进程防止闪退。安装好之后告诉我如何登录。可以使用 Tailscale 发布到公网，问我是否需要。
+帮我安装这个 https://github.com/san-tian/codoxear，我会通过公网 IP xxxx 访问，因此你需要监听 0.0.0.0，端口你可以自己选。密码设置成 xxxxxx。使用守护进程防止闪退。同时把仓库里的 `skills/codoxear-session` 安装到 `${CODEX_HOME:-$HOME/.codex}/skills/codoxear-session`，方便后续 agent 通过 Codoxear 创建、发送和管理会话。安装好之后告诉我如何登录。可以使用 Tailscale 发布到公网，问我是否需要。
 
 # Codoxear
 
@@ -54,7 +54,18 @@ Requires Rust, Node.js for frontend builds, and the Codex or Pi CLI you want to 
    - Default bind: `127.0.0.1`
    - Default port: `8743`
 
-3. Add separate wrappers for terminal-owned brokered sessions (zsh/bash function, not an alias):
+3. Install the bundled Codex skill so agents can operate Codoxear sessions:
+
+   ```sh
+   CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
+   mkdir -p "$CODEX_HOME/skills"
+   rm -rf "$CODEX_HOME/skills/codoxear-session"
+   cp -R skills/codoxear-session "$CODEX_HOME/skills/codoxear-session"
+   ```
+
+   The skill adds helpers for creating Codoxear-visible sessions, sending messages, renaming sessions, and updating Nova markers. Set `CODOXEAR_BASE_URL` if the service is not reachable at `http://127.0.0.1:8743`.
+
+4. Add separate wrappers for terminal-owned brokered sessions (zsh/bash function, not an alias):
 
    Never wrap or replace `codex()` or `pi()` themselves. Web-owned sessions launch the underlying CLI directly, so wrapping the original command to call the broker can recurse back into the broker and create an unbounded session-spawn loop.
 
@@ -72,11 +83,11 @@ Requires Rust, Node.js for frontend builds, and the Codex or Pi CLI you want to 
 
    Restart your shell or `source` your rc file.
 
-4. Use `codox` for terminal-owned Codex sessions and `piox` for terminal-owned Pi sessions when you want them registered with Codoxear. Leave plain `codex` and `pi` unwrapped.
+5. Use `codox` for terminal-owned Codex sessions and `piox` for terminal-owned Pi sessions when you want them registered with Codoxear. Leave plain `codex` and `pi` unwrapped.
 
-5. On your phone, open `http://<your-computer>:8743`, enter the password, and select the session.
+6. On your phone, open `http://<your-computer>:8743`, enter the password, and select the session.
 
-6. (Optional) Enable Harness mode for a session:
+7. (Optional) Enable Harness mode for a session:
 
    - Click the Harness icon in the top bar, toggle it on, tune cooldown minutes and injection count, and edit the optional extra request.
    - Harness runs in the server process (not the browser tab), so it continues even if you close the web page.
