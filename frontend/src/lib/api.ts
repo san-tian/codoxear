@@ -336,6 +336,12 @@ export const api = {
       method: "POST",
     });
   },
+  sendShareTerminalResponse(shareId: string, sessionId: string, kind: string, value: string): Promise<{ ok: true }> {
+    return readJson<{ ok: true }>(`/share/${encodeURIComponent(shareId)}/sessions/${encodeURIComponent(sessionId)}/terminal_response`, {
+      method: "POST",
+      body: JSON.stringify({ kind, value }),
+    });
+  },
   readShareFile(shareId: string, sessionId: string, path: string): Promise<FileReadResponse> {
     return readJson<FileReadResponse>(
       `/share/${encodeURIComponent(shareId)}/sessions/${encodeURIComponent(sessionId)}/file/read?path=${encodeURIComponent(path)}`,

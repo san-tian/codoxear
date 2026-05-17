@@ -101,6 +101,10 @@ pub fn router(state: AppState) -> Router {
             "/share/:share_id/sessions/:session_id/interrupt",
             post(share_session_interrupt),
         )
+        .route(
+            "/share/:share_id/sessions/:session_id/terminal_response",
+            post(share_session_terminal_response),
+        )
         .route("/share/:share_id/login", post(share_login))
         .route("/api/v1/share-links", get(share_list).post(share_create))
         .route(
@@ -1403,6 +1407,38 @@ async fn share_session_interrupt(
         ));
     }
     let response = interrupt_session(&state.config, &session_id).map_err(route_error)?;
+    Ok(Json(response))
+}
+
+async fn share_session_terminal_response(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((share_id, session_id)): Path<(String, String)>,
+    Json(payload): Json<TerminalResponsePayload>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    match share_request_is_authorized(&headers, &state.config.app_dir, &share_id) {
+        Ok(true) => {}
+        Ok(false) => return Err((StatusCode::UNAUTHORIZED, "unauthorized".to_string())),
+        Err(message) => return Err((StatusCode::INTERNAL_SERVER_ERROR, message)),
+    }
+    let share = load_share_set(&state.config, &share_id)
+        .map_err(|message| (StatusCode::NOT_FOUND, message))?;
+    if !share.session_ids.iter().any(|value| value == &session_id) {
+        return Err((StatusCode::NOT_FOUND, "session not in share".to_string()));
+    }
+    if payload.kind.trim().is_empty() || payload.value.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "kind and value required".to_string(),
+        ));
+    }
+    let response = send_terminal_response(
+        &state.config,
+        &session_id,
+        payload.kind.trim(),
+        payload.value.trim(),
+    )
+    .map_err(route_error)?;
     Ok(Json(response))
 }
 

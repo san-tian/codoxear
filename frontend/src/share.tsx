@@ -1,5 +1,5 @@
 import { TranscriptEventRow, WorkingIndicator } from "./lib/transcript";
-import type { FileReadResponse, ShareFilesResponse, ShareSet, UiTranscriptEvent } from "./lib/types";
+import type { FileReadResponse, ShareFilesResponse, ShareSet, TerminalPrompt, UiTranscriptEvent } from "./lib/types";
 
 function baseName(path: string) {
   const parts = String(path || "").split("/").filter(Boolean);
@@ -15,7 +15,7 @@ function relativeAge(ts: number) {
   return `${Math.max(1, Math.floor(delta / 86400))}d ago`;
 }
 
-function shareIcon(name: "send" | "stop") {
+function shareIcon(name: "send" | "stop" | "replace" | "keep") {
   const common = {
     width: 16,
     height: 16,
@@ -30,6 +30,21 @@ function shareIcon(name: "send" | "stop") {
     return (
       <svg {...common}>
         <rect x="4" y="4" width="8" height="8" rx="1.4" />
+      </svg>
+    );
+  }
+  if (name === "replace") {
+    return (
+      <svg {...common}>
+        <path d="m8 2.7 1.45 3 3.25.47-2.35 2.3.55 3.25L8 10.18 5.1 11.72l.55-3.25-2.35-2.3 3.25-.47L8 2.7Z" />
+      </svg>
+    );
+  }
+  if (name === "keep") {
+    return (
+      <svg {...common}>
+        <path d="M4.5 4.5 11.5 11.5" />
+        <path d="M11.5 4.5 4.5 11.5" />
       </svg>
     );
   }
@@ -87,6 +102,8 @@ export function ShareWorkspace(props: {
   hasOlder: boolean;
   busy: boolean;
   queueLen: number;
+  terminalPrompt: TerminalPrompt | null;
+  terminalPromptSending: boolean;
   errorText: string;
   sendText: string;
   canSend: boolean;
@@ -94,6 +111,7 @@ export function ShareWorkspace(props: {
   onSendTextChange: (value: string) => void;
   onSend: () => void | Promise<void>;
   onInterrupt: () => void | Promise<void>;
+  onTerminalPromptResponse: (value: string) => void | Promise<void>;
   onLoadOlder: () => void | Promise<void>;
   onSelectFile: (path: string) => void;
   onOpenMentionedFile: (path: string) => void | Promise<void>;
@@ -185,6 +203,26 @@ export function ShareWorkspace(props: {
                       }
                     />
                   ))}
+                  {props.terminalPrompt ? (
+                    <div className="terminalPromptPanel" role="group" aria-label="Terminal prompt">
+                      <div className="terminalPromptText">{props.terminalPrompt.message || "The terminal is waiting for confirmation."}</div>
+                      <div className="terminalPromptActions">
+                        {props.terminalPrompt.choices.map((choice) => (
+                          <button
+                            className={`terminalPromptBtn ${choice.value === "replace" ? "primary" : ""}`}
+                            type="button"
+                            key={choice.value}
+                            title={choice.description || choice.label}
+                            disabled={props.terminalPromptSending}
+                            onClick={() => void props.onTerminalPromptResponse(choice.value)}
+                          >
+                            {shareIcon(choice.value === "replace" ? "replace" : "keep")}
+                            <span>{choice.label}</span>
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  ) : null}
                   {shareWorkingIndicatorLabel ? <WorkingIndicator label={shareWorkingIndicatorLabel} tone={shareWaiting ? "waiting" : "working"} /> : null}
                   {!props.transcript.length && !shareWorkingIndicatorLabel ? <div className="emptyState">No transcript yet for this shared session.</div> : null}
                 </div>

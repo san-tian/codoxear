@@ -1115,6 +1115,8 @@ export function App() {
   const [shareLoadingOlder, setShareLoadingOlder] = useState(false);
   const [shareBusy, setShareBusy] = useState(false);
   const [shareQueueLen, setShareQueueLen] = useState(0);
+  const [shareTerminalPrompt, setShareTerminalPrompt] = useState<TerminalPromptState | null>(null);
+  const [shareTerminalPromptSending, setShareTerminalPromptSending] = useState(false);
   const [shareErrorText, setShareErrorText] = useState("");
   const [shareLoading, setShareLoading] = useState(false);
   const [shareSendText, setShareSendText] = useState("");
@@ -1269,20 +1271,46 @@ export function App() {
     });
   }
 
-  async function loadShareSession(nextSessionId = shareSessionId) {
+  function updateShareTerminalPrompt(sessionId: string, prompt?: TerminalPrompt | null) {
+    const rawPrompt = prompt && sessionId ? { ...prompt, sessionId } : null;
+    const nextPrompt =
+      rawPrompt && !suppressedTerminalPromptKeysRef.current[terminalPromptKey(sessionId, rawPrompt)] ? rawPrompt : null;
+    if (!rawPrompt && sessionId) {
+      Object.keys(suppressedTerminalPromptKeysRef.current).forEach((key) => {
+        if (key.startsWith(`${sessionId}:`)) delete suppressedTerminalPromptKeysRef.current[key];
+      });
+    }
+    setShareTerminalPrompt(nextPrompt);
+  }
+
+  function updateShareRuntimeFromResponse(
+    sessionId: string,
+    data: { busy: boolean; queue_len: number; terminal_prompt?: TerminalPrompt | null },
+  ) {
+    const nextBusy = Boolean(data.busy);
+    const nextQueueLen = Number(data.queue_len || 0);
+    setShareBusy(nextBusy);
+    setShareQueueLen(nextQueueLen);
+    updateShareSessionRuntime(sessionId, nextBusy, nextQueueLen);
+    updateShareTerminalPrompt(sessionId, data.terminal_prompt || null);
+  }
+
+  async function loadShareSession(nextSessionId = shareSessionId, preservedEvents: UiTranscriptEvent[] = []) {
     if (!shareTarget || !nextSessionId) return;
     setShareLoading(true);
     setShareErrorText("");
     try {
       const tail = await api.fetchShareTail(shareTarget.shareId, nextSessionId, SHARE_INIT_LIMIT);
       const normalized = coalesceAdjacentAssistantEvents(normalizeEvents(tail.events || []));
-      setShareTranscript(normalized);
+      const retainedEvents = preservedEvents.filter((event) => {
+        const body = String(event.body || "").trim();
+        return body && !normalized.some((item) => item.kind === event.kind && String(item.body || "").trim() === body);
+      });
+      setShareTranscript(retainedEvents.length ? retainedEvents.concat(normalized) : normalized);
       setShareLiveCursor(tail.live_cursor || null);
       setShareHistoryCursor(tail.history_cursor || null);
       setShareHasOlder(Boolean(tail.has_older));
-      setShareBusy(Boolean(tail.busy));
-      setShareQueueLen(Number(tail.queue_len || 0));
-      updateShareSessionRuntime(nextSessionId, Boolean(tail.busy), Number(tail.queue_len || 0));
+      updateShareRuntimeFromResponse(nextSessionId, tail);
       const files = await api.fetchShareFiles(shareTarget.shareId, nextSessionId);
       setShareFiles(files);
       setShareSelectedFilePath("");
@@ -1348,6 +1376,7 @@ export function App() {
       );
       setShareHistoryCursor(history.history_cursor || null);
       setShareHasOlder(Boolean(history.has_older));
+      updateShareRuntimeFromResponse(shareSessionId, history);
     } catch (error) {
       setShareErrorText(error instanceof Error ? error.message : "Unable to load older messages");
     } finally {
@@ -1379,11 +1408,12 @@ export function App() {
       ts: Date.now() / 1000,
       localId: `share-local-${Date.now()}`,
     };
-    setShareTranscript((current) => current.concat(normalizeEvents([localEvent])));
+    const localEvents = normalizeEvents([localEvent]);
+    setShareTranscript((current) => current.concat(localEvents));
     setShareSendText("");
     try {
       await api.sendShareMessage(shareTarget.shareId, shareSessionId, text);
-      await loadShareSession(shareSessionId);
+      await loadShareSession(shareSessionId, localEvents);
     } catch (error) {
       setShareErrorText(error instanceof Error ? error.message : "Unable to send message");
     } finally {
@@ -1402,6 +1432,24 @@ export function App() {
       setShareErrorText(error instanceof Error ? error.message : "Unable to interrupt session");
     } finally {
       setShareLoading(false);
+    }
+  }
+
+  async function handleShareTerminalPromptResponse(value: string) {
+    const prompt = shareTerminalPrompt;
+    if (!shareTarget || !shareSessionId || !prompt || prompt.sessionId !== shareSessionId || shareTerminalPromptSending) return;
+    setShareTerminalPromptSending(true);
+    setShareErrorText("");
+    try {
+      await api.sendShareTerminalResponse(shareTarget.shareId, shareSessionId, prompt.kind, value);
+      suppressedTerminalPromptKeysRef.current[terminalPromptKey(shareSessionId, prompt)] = true;
+      setShareTerminalPrompt(null);
+      pushToast(value === "replace" ? "Goal replacement confirmed" : "Goal replacement declined");
+      await loadShareSession(shareSessionId);
+    } catch (error) {
+      setShareErrorText(error instanceof Error ? error.message : "Unable to answer terminal prompt");
+    } finally {
+      setShareTerminalPromptSending(false);
     }
   }
 
@@ -1426,9 +1474,7 @@ export function App() {
         setShareLiveCursor(tail.live_cursor || null);
         setShareHistoryCursor(tail.history_cursor || null);
         setShareHasOlder(Boolean(tail.has_older));
-        setShareBusy(Boolean(tail.busy));
-        setShareQueueLen(Number(tail.queue_len || 0));
-        updateShareSessionRuntime(sessionId, Boolean(tail.busy), Number(tail.queue_len || 0));
+        updateShareRuntimeFromResponse(sessionId, tail);
         setShareAuthState("ready");
         try {
           const files = await api.fetchShareFiles(shareTarget.shareId, sessionId);
@@ -1463,9 +1509,7 @@ export function App() {
           );
         }
         setShareLiveCursor(live.live_cursor || shareLiveCursor);
-        setShareBusy(Boolean(live.busy));
-        setShareQueueLen(Number(live.queue_len || 0));
-        updateShareSessionRuntime(shareSessionId, Boolean(live.busy), Number(live.queue_len || 0));
+        updateShareRuntimeFromResponse(shareSessionId, live);
       } catch (error) {
         if (!cancelled) setShareErrorText(error instanceof Error ? error.message : "Unable to refresh share");
       }
@@ -3642,6 +3686,8 @@ export function App() {
         hasOlder={shareHasOlder}
         busy={shareBusy}
         queueLen={shareQueueLen}
+        terminalPrompt={shareTerminalPrompt?.sessionId === shareSessionId ? shareTerminalPrompt : null}
+        terminalPromptSending={shareTerminalPromptSending}
         errorText={shareErrorText}
         sendText={shareSendText}
         canSend={Boolean(shareSessionId && shareSendText.trim())}
@@ -3653,6 +3699,7 @@ export function App() {
         onSendTextChange={setShareSendText}
         onSend={handleShareSend}
         onInterrupt={handleShareInterrupt}
+        onTerminalPromptResponse={handleShareTerminalPromptResponse}
         onLoadOlder={loadShareOlder}
         onSelectFile={(path) => void selectShareFile(path)}
         onOpenMentionedFile={(path) => void selectShareFile(path.trim())}
