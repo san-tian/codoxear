@@ -549,8 +549,8 @@ function sessionIsRunning(session: SessionSummary | null, awaitingReply = false,
 
 function sessionStatusText(session: SessionSummary, awaitingReply = false, stopSuppressed = false) {
   if (sessionIsStarting(session)) return "starting";
-  if (session.queue_len) return `queue ${session.queue_len}`;
   if (sessionIsRunning(session, awaitingReply, stopSuppressed)) return "working";
+  if (session.queue_len) return `queue ${session.queue_len}`;
   return "idle";
 }
 
@@ -1564,9 +1564,10 @@ export function App() {
       const group = groups.get(key) || { key, cwd: key, sessions: [], queueLen: 0, busyCount: 0, updatedTs: 0 };
       const awaitingReply = session.session_id === selectedSessionAwaitingReplyId;
       const stopSuppressed = session.session_id === interruptingSessionId;
-      group.sessions.push(session);
-      group.queueLen += Number(session.queue_len || 0);
-      if (sessionIsRunning(session, awaitingReply, stopSuppressed)) group.busyCount += 1;
+      const runtimeSession = sessionWithRuntimeState(session);
+      group.sessions.push(runtimeSession);
+      group.queueLen += Number(runtimeSession.queue_len || 0);
+      if (sessionIsRunning(runtimeSession, awaitingReply, stopSuppressed)) group.busyCount += 1;
       group.updatedTs = Math.max(group.updatedTs, Number(session.updated_ts || session.start_ts || 0));
       groups.set(key, group);
     }
@@ -1777,6 +1778,16 @@ export function App() {
       terminalPrompt: null,
     };
     sessionViewCacheRef.current[sessionId] = { ...current, ...patch };
+  }
+
+  function sessionWithRuntimeState(session: SessionSummary) {
+    const cached = sessionViewCacheRef.current[session.session_id];
+    if (!cached) return session;
+    return {
+      ...session,
+      busy: cached.busy,
+      queue_len: cached.queueLen,
+    };
   }
 
   function rememberActiveSessionSnapshot(sessionId = selectedSessionRef.current) {
@@ -2091,6 +2102,9 @@ export function App() {
         setClosedTurnTsBySession((current) => ({ ...current, [sessionId]: Date.now() / 1000 }));
         markSessionUnreadAtTurnBoundary(sessionId);
       }
+      setSessions((current) =>
+        current.map((session) => (session.session_id === sessionId ? { ...session, busy: nextBusy, queue_len: nextQueueLen } : session)),
+      );
     }
     if (sessionId && (!data.busy || data.turn_aborted)) {
       setInterruptingSessionId((current) => (current === sessionId ? "" : current));
