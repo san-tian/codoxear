@@ -15,7 +15,7 @@ function relativeAge(ts: number) {
   return `${Math.max(1, Math.floor(delta / 86400))}d ago`;
 }
 
-function shareIcon(name: "send" | "stop" | "replace" | "keep") {
+function shareIcon(name: "send" | "stop" | "replace" | "keep" | "schedule") {
   const common = {
     width: 16,
     height: 16,
@@ -45,6 +45,17 @@ function shareIcon(name: "send" | "stop" | "replace" | "keep") {
       <svg {...common}>
         <path d="M4.5 4.5 11.5 11.5" />
         <path d="M11.5 4.5 4.5 11.5" />
+      </svg>
+    );
+  }
+  if (name === "schedule") {
+    return (
+      <svg {...common}>
+        <rect x="3" y="3.5" width="10" height="9.5" rx="1.4" />
+        <path d="M5.5 2.5v2" />
+        <path d="M10.5 2.5v2" />
+        <path d="M3 6.5h10" />
+        <path d="M8 8.4v2.3l1.6.8" />
       </svg>
     );
   }
@@ -118,6 +129,7 @@ export function ShareWorkspace(props: {
   onCopyText: (event: UiTranscriptEvent) => void | Promise<void>;
   isEventCollapsed: (event: UiTranscriptEvent) => boolean;
   onToggleEvent: (event: UiTranscriptEvent) => void;
+  onOpenSchedules: () => void;
 }) {
   const session = props.share.sessions.find((item) => item.session_id === props.sessionId) || props.share.sessions[0] || null;
   const shareFiles = props.share.allow_files ? props.files?.files || [] : [];
@@ -173,6 +185,9 @@ export function ShareWorkspace(props: {
             </div>
           </div>
           <div className="actions topActions">
+            <button className="icon-btn" type="button" title="Schedules" disabled={!props.sessionId || props.loading} onClick={props.onOpenSchedules}>
+              {shareIcon("schedule")}
+            </button>
             <button className="icon-btn" type="button" title="Interrupt" disabled={!props.share.allow_interrupt || !props.sessionId || props.loading} onClick={() => void props.onInterrupt()}>
               {shareIcon("stop")}
             </button>

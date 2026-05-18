@@ -25,6 +25,11 @@ use crate::runtime::{
     update_audio_listener_heartbeat_response, update_queue_item, update_share_sessions,
     upsert_notification_subscription_response, FileWriteError,
 };
+use crate::schedules::{
+    create_schedule_response, delete_schedule_response, list_schedules_response,
+    mark_schedule_run_done_response, run_schedule_now_response, set_schedule_enabled_response,
+    update_schedule_response,
+};
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, Request, StatusCode};
@@ -41,6 +46,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::Sha256;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::convert::Infallible;
 use std::env;
 use std::fs;
@@ -105,6 +111,30 @@ pub fn router(state: AppState) -> Router {
             "/share/:share_id/sessions/:session_id/terminal_response",
             post(share_session_terminal_response),
         )
+        .route(
+            "/share/:share_id/schedules",
+            get(share_schedules).post(share_schedule_create),
+        )
+        .route(
+            "/share/:share_id/schedules/:schedule_id",
+            post(share_schedule_update).delete(share_schedule_delete),
+        )
+        .route(
+            "/share/:share_id/schedules/:schedule_id/run_now",
+            post(share_schedule_run_now),
+        )
+        .route(
+            "/share/:share_id/schedules/:schedule_id/enable",
+            post(share_schedule_enable),
+        )
+        .route(
+            "/share/:share_id/schedules/:schedule_id/disable",
+            post(share_schedule_disable),
+        )
+        .route(
+            "/share/:share_id/schedules/:schedule_id/runs/:run_id/mark_done",
+            post(share_schedule_run_mark_done),
+        )
         .route("/share/:share_id/login", post(share_login))
         .route("/api/v1/share-links", get(share_list).post(share_create))
         .route(
@@ -151,6 +181,27 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/audio/live.m3u8", get(audio_playlist))
         .route("/api/v1/audio/listener", post(audio_listener))
         .route("/api/v1/audio/segments/*path", get(audio_segment))
+        .route("/api/v1/schedules", get(schedules).post(schedule_create))
+        .route(
+            "/api/v1/schedules/:schedule_id",
+            post(schedule_update).delete(schedule_delete),
+        )
+        .route(
+            "/api/v1/schedules/:schedule_id/run_now",
+            post(schedule_run_now),
+        )
+        .route(
+            "/api/v1/schedules/:schedule_id/enable",
+            post(schedule_enable),
+        )
+        .route(
+            "/api/v1/schedules/:schedule_id/disable",
+            post(schedule_disable),
+        )
+        .route(
+            "/api/v1/schedules/:schedule_id/runs/:run_id/mark_done",
+            post(schedule_run_mark_done),
+        )
         .route("/api/v1/sessions", get(sessions).post(session_create))
         .route("/api/v1/login", post(login))
         .route("/api/v1/logout", post(logout))
@@ -264,6 +315,18 @@ fn public_api_router(state: AppState) -> Router<AppState> {
         .route("/audio/live.m3u8", get(audio_playlist))
         .route("/audio/listener", post(audio_listener))
         .route("/audio/segments/*path", get(audio_segment))
+        .route("/schedules", get(schedules).post(schedule_create))
+        .route(
+            "/schedules/:schedule_id",
+            post(schedule_update).delete(schedule_delete),
+        )
+        .route("/schedules/:schedule_id/run_now", post(schedule_run_now))
+        .route("/schedules/:schedule_id/enable", post(schedule_enable))
+        .route("/schedules/:schedule_id/disable", post(schedule_disable))
+        .route(
+            "/schedules/:schedule_id/runs/:run_id/mark_done",
+            post(schedule_run_mark_done),
+        )
         .route("/sessions", get(sessions).post(session_create))
         .route("/sessions/:session_id/diagnostics", get(diagnostics))
         .route("/sessions/:session_id/queue", get(queue))
@@ -445,6 +508,84 @@ async fn sessions(
     load_sessions_response(&state.config)
         .map(Json)
         .map_err(|message| (StatusCode::INTERNAL_SERVER_ERROR, message))
+}
+
+async fn schedules(State(state): State<AppState>) -> Result<Json<Value>, (StatusCode, String)> {
+    list_schedules_response(&state.config, None)
+        .and_then(|response| serde_json::to_value(response).map_err(|err| err.to_string()))
+        .map(Json)
+        .map_err(schedule_route_error)
+}
+
+async fn schedule_create(
+    State(state): State<AppState>,
+    Json(payload): Json<Value>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    create_schedule_response(&state.config, &payload, None)
+        .and_then(|response| serde_json::to_value(response).map_err(|err| err.to_string()))
+        .map(Json)
+        .map_err(schedule_route_error)
+}
+
+async fn schedule_update(
+    State(state): State<AppState>,
+    Path(schedule_id): Path<String>,
+    Json(payload): Json<Value>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    update_schedule_response(&state.config, &schedule_id, &payload, None)
+        .and_then(|response| serde_json::to_value(response).map_err(|err| err.to_string()))
+        .map(Json)
+        .map_err(schedule_route_error)
+}
+
+async fn schedule_delete(
+    State(state): State<AppState>,
+    Path(schedule_id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    delete_schedule_response(&state.config, &schedule_id, None)
+        .and_then(|response| serde_json::to_value(response).map_err(|err| err.to_string()))
+        .map(Json)
+        .map_err(schedule_route_error)
+}
+
+async fn schedule_run_now(
+    State(state): State<AppState>,
+    Path(schedule_id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    run_schedule_now_response(&state.config, &schedule_id, None)
+        .and_then(|response| serde_json::to_value(response).map_err(|err| err.to_string()))
+        .map(Json)
+        .map_err(schedule_route_error)
+}
+
+async fn schedule_enable(
+    State(state): State<AppState>,
+    Path(schedule_id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    set_schedule_enabled_response(&state.config, &schedule_id, true, None)
+        .and_then(|response| serde_json::to_value(response).map_err(|err| err.to_string()))
+        .map(Json)
+        .map_err(schedule_route_error)
+}
+
+async fn schedule_disable(
+    State(state): State<AppState>,
+    Path(schedule_id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    set_schedule_enabled_response(&state.config, &schedule_id, false, None)
+        .and_then(|response| serde_json::to_value(response).map_err(|err| err.to_string()))
+        .map(Json)
+        .map_err(schedule_route_error)
+}
+
+async fn schedule_run_mark_done(
+    State(state): State<AppState>,
+    Path((schedule_id, run_id)): Path<(String, String)>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    mark_schedule_run_done_response(&state.config, &schedule_id, &run_id, None)
+        .and_then(|response| serde_json::to_value(response).map_err(|err| err.to_string()))
+        .map(Json)
+        .map_err(schedule_route_error)
 }
 
 async fn session_create(
@@ -1442,6 +1583,104 @@ async fn share_session_terminal_response(
     Ok(Json(response))
 }
 
+async fn share_schedules(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(share_id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let allowed = authorized_share_session_ids(&state, &headers, &share_id)?;
+    list_schedules_response(&state.config, Some(&allowed))
+        .and_then(|response| serde_json::to_value(response).map_err(|err| err.to_string()))
+        .map(Json)
+        .map_err(schedule_route_error)
+}
+
+async fn share_schedule_create(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(share_id): Path<String>,
+    Json(payload): Json<Value>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let allowed = authorized_share_session_ids(&state, &headers, &share_id)?;
+    create_schedule_response(&state.config, &payload, Some(&allowed))
+        .and_then(|response| serde_json::to_value(response).map_err(|err| err.to_string()))
+        .map(Json)
+        .map_err(schedule_route_error)
+}
+
+async fn share_schedule_update(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((share_id, schedule_id)): Path<(String, String)>,
+    Json(payload): Json<Value>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let allowed = authorized_share_session_ids(&state, &headers, &share_id)?;
+    update_schedule_response(&state.config, &schedule_id, &payload, Some(&allowed))
+        .and_then(|response| serde_json::to_value(response).map_err(|err| err.to_string()))
+        .map(Json)
+        .map_err(schedule_route_error)
+}
+
+async fn share_schedule_delete(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((share_id, schedule_id)): Path<(String, String)>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let allowed = authorized_share_session_ids(&state, &headers, &share_id)?;
+    delete_schedule_response(&state.config, &schedule_id, Some(&allowed))
+        .and_then(|response| serde_json::to_value(response).map_err(|err| err.to_string()))
+        .map(Json)
+        .map_err(schedule_route_error)
+}
+
+async fn share_schedule_run_now(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((share_id, schedule_id)): Path<(String, String)>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let allowed = authorized_share_session_ids(&state, &headers, &share_id)?;
+    run_schedule_now_response(&state.config, &schedule_id, Some(&allowed))
+        .and_then(|response| serde_json::to_value(response).map_err(|err| err.to_string()))
+        .map(Json)
+        .map_err(schedule_route_error)
+}
+
+async fn share_schedule_enable(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((share_id, schedule_id)): Path<(String, String)>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let allowed = authorized_share_session_ids(&state, &headers, &share_id)?;
+    set_schedule_enabled_response(&state.config, &schedule_id, true, Some(&allowed))
+        .and_then(|response| serde_json::to_value(response).map_err(|err| err.to_string()))
+        .map(Json)
+        .map_err(schedule_route_error)
+}
+
+async fn share_schedule_disable(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((share_id, schedule_id)): Path<(String, String)>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let allowed = authorized_share_session_ids(&state, &headers, &share_id)?;
+    set_schedule_enabled_response(&state.config, &schedule_id, false, Some(&allowed))
+        .and_then(|response| serde_json::to_value(response).map_err(|err| err.to_string()))
+        .map(Json)
+        .map_err(schedule_route_error)
+}
+
+async fn share_schedule_run_mark_done(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((share_id, schedule_id, run_id)): Path<(String, String, String)>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let allowed = authorized_share_session_ids(&state, &headers, &share_id)?;
+    mark_schedule_run_done_response(&state.config, &schedule_id, &run_id, Some(&allowed))
+        .and_then(|response| serde_json::to_value(response).map_err(|err| err.to_string()))
+        .map(Json)
+        .map_err(schedule_route_error)
+}
+
 async fn share_page() -> Result<Response, (StatusCode, String)> {
     static_file_response(load_nova_shell_file("index.html"), true)
 }
@@ -1806,6 +2045,38 @@ fn queue_action_error(message: String) -> (StatusCode, String) {
     (StatusCode::BAD_GATEWAY, message)
 }
 
+fn schedule_route_error(message: String) -> (StatusCode, String) {
+    if message == "schedule not found" || message == "run not found" {
+        return (StatusCode::NOT_FOUND, message);
+    }
+    if message == "session not in share"
+        || message == "share schedules can only target existing shared sessions"
+    {
+        return (StatusCode::FORBIDDEN, message);
+    }
+    if message.starts_with("unknown session:") || message == "target_missing" {
+        return (StatusCode::NOT_FOUND, message);
+    }
+    if message == "invalid json body (expected object)"
+        || message == "schedule_id already exists"
+        || message == "name required"
+        || message == "message_template required"
+        || message == "busy_policy must be enqueue"
+        || message == "target.session_id required"
+        || message == "target.session_template must be an object"
+        || message == "next_run_at required"
+        || message == "rule.interval_seconds must be at least 60"
+        || message == "rule.interval_seconds must be finite"
+        || message == "unsupported rule kind"
+        || message == "timeout_minutes must be a positive number or null"
+        || message.starts_with("invalid target:")
+        || message.starts_with("invalid rule:")
+    {
+        return (StatusCode::BAD_REQUEST, message);
+    }
+    (StatusCode::BAD_GATEWAY, message)
+}
+
 fn create_session_error_response(
     error: crate::runtime::CreateSessionError,
 ) -> (StatusCode, Json<serde_json::Value>) {
@@ -1927,6 +2198,21 @@ fn share_request_is_authorized(
     share_id: &str,
 ) -> Result<bool, String> {
     Ok(share_request_share_id(headers, app_dir)?.as_deref() == Some(share_id))
+}
+
+fn authorized_share_session_ids(
+    state: &AppState,
+    headers: &HeaderMap,
+    share_id: &str,
+) -> Result<HashSet<String>, (StatusCode, String)> {
+    match share_request_is_authorized(headers, &state.config.app_dir, share_id) {
+        Ok(true) => {}
+        Ok(false) => return Err((StatusCode::UNAUTHORIZED, "unauthorized".to_string())),
+        Err(message) => return Err((StatusCode::INTERNAL_SERVER_ERROR, message)),
+    }
+    let share = load_share_set(&state.config, share_id)
+        .map_err(|message| (StatusCode::NOT_FOUND, message))?;
+    Ok(share.session_ids.into_iter().collect::<HashSet<_>>())
 }
 
 fn json_response(status: StatusCode, payload: Value) -> Response {

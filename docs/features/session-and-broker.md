@@ -32,6 +32,7 @@ Session and broker code connects browser actions to live Codex/Pi CLI processes.
 - Rollout log discovery first matches by requested cwd, then accepts a unique open main-session log from the Codex process tree when shell startup changed the cwd recorded by Codex.
 - Terminal-owned sessions can be discovered and attached without forcing ownership transfer.
 - Queue and harness behavior support idle-triggered injection while avoiding direct sends into busy sessions.
+- Scheduled existing-session runs use the same persisted queue path as manual enqueue. A run remains `queued` while its queue item is present, switches to `running` after the item leaves the queue, and completes only when transcript polling observes an assistant final response or turn boundary after the recorded cursor.
 - In the local daemon, the delayed queue drain runs in a Rust worker, using the persisted `session_queues.json`, broker `state`, and idle-from-log gate plus the same grace window before injection.
 - In the local daemon, the harness sweep runs in a Rust worker, using the persisted `harness.json`, broker `state`/queue guards, per-thread dedupe scope, and assistant-tail cooldown rule before injecting the unattended prompt.
 - In the local daemon, the voice scan and delivery workers run in Rust, using socket sidecar discovery and the same rollout/Pi delivery-message classification rules, then consuming atomic `voice_inbox/*.json` handoff files internally for summary/TTS, Web Push, and HLS audio output.

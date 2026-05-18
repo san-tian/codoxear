@@ -43,7 +43,7 @@
 |-------|------------------------------|
 | `docs/features/server-and-api.md` | api, routes, auth, session endpoint, queue, harness, diagnostics, file read, inject_file, nova route |
 | `docs/features/session-and-broker.md` | broker, sessiond, pty, socket, send, enqueue, interrupt, tmux, resume, ownership, Codex, Pi |
-| `docs/features/ui.md` | static/app.js, static/app.css, legacy UI, /nova, browser, button, composer, mobile, tmux attach |
+| `docs/features/ui.md` | static/app.js, static/app.css, legacy UI, /nova, browser, button, composer, mobile, tmux attach, schedules |
 | `docs/features/replatforming.md` | replatforming, frontend, pretext, preact, vite, rust, axum, sse, transcript, backend-rs, nova-preview |
 | `docs/features/voice-push.md` | voice_push, TTS, notification, web push, VAPID, service-worker, narration, mobile push, audio stream |
 | `docs/features/rollout-log-parsing.md` | rollout_log, JSONL, messages, transcript, idle, token usage, tool call, ask_user, pi_log |
@@ -59,4 +59,5 @@
 - `docs/features/voice-push.md` — Voice/TTS, notification feed, service worker, VAPID subscription, and mobile push behavior.
 - `docs/features/rollout-log-parsing.md` — Rollout/Pi log parsing, chat event normalization, idle, and token extraction.
 - `docs/designs/extension-display-protocol.md` — `codoxear_display` v1 protocol for plugin-authored transcript progress/status display.
+- `docs/designs/schedules.md` — Daemon-owned scheduled agent runs, target modes, lifecycle, API, UI, and skill integration plan.
 - `docs/designs/voice-push-implementation-plan.md` — Original voice announcements and mobile push implementation plan.

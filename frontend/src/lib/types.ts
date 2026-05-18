@@ -62,6 +62,63 @@ export type SessionsResponse = {
   tmux_session_name: string | null;
 };
 
+export type ScheduleTarget =
+  | { mode: "existing_session"; session_id: string }
+  | { mode: "new_session_each_run"; session_template: Record<string, unknown> }
+  | { mode: "create_once_reuse"; session_template: Record<string, unknown>; created_session_id?: string | null };
+
+export type ScheduleRule = {
+  kind: "once" | "daily" | "weekly" | "monthly" | "interval";
+  next_run_at?: number | null;
+  interval_seconds?: number | null;
+  timezone?: string | null;
+  time?: string | null;
+  weekdays?: number[];
+  day_of_month?: number | null;
+};
+
+export type Schedule = {
+  schedule_id: string;
+  name: string;
+  enabled: boolean;
+  status: string;
+  target: ScheduleTarget;
+  rule: ScheduleRule;
+  message_template: string;
+  alias_template?: string | null;
+  busy_policy: "enqueue";
+  timeout_minutes: number | null;
+  created_at: number;
+  updated_at: number;
+  next_run_at?: number | null;
+  last_run_at?: number | null;
+  run_count: number;
+};
+
+export type ScheduleRun = {
+  run_id: string;
+  schedule_id: string;
+  status: string;
+  trigger: string;
+  scheduled_for: number;
+  created_at: number;
+  started_at?: number | null;
+  finished_at?: number | null;
+  target_session_id?: string | null;
+  created_session_id?: string | null;
+  queue_item_id?: string | null;
+  rendered_message: string;
+  rendered_alias?: string | null;
+  error?: string | null;
+  assistant_preview?: string | null;
+};
+
+export type SchedulesResponse = {
+  ok: true;
+  schedules: Schedule[];
+  runs: ScheduleRun[];
+};
+
 export type MeResponse = {
   ok: true;
   server_pid: number;

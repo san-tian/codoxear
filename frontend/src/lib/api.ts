@@ -14,6 +14,7 @@ import type {
   QueueResponse,
   RestartServiceResponse,
   ResumeCandidatesResponse,
+  SchedulesResponse,
   ShareCreateResponse,
   ShareFilesResponse,
   ShareListResponse,
@@ -72,6 +73,41 @@ export const api = {
   },
   fetchSessions(): Promise<SessionsResponse> {
     return readJson<SessionsResponse>("/api/sessions");
+  },
+  fetchSchedules(): Promise<SchedulesResponse> {
+    return readJson<SchedulesResponse>("/api/schedules");
+  },
+  createSchedule(payload: Record<string, unknown>): Promise<SchedulesResponse> {
+    return readJson<SchedulesResponse>("/api/schedules", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+  },
+  updateSchedule(scheduleId: string, payload: Record<string, unknown>): Promise<SchedulesResponse> {
+    return readJson<SchedulesResponse>(`/api/schedules/${encodeURIComponent(scheduleId)}`, {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+  },
+  deleteSchedule(scheduleId: string): Promise<SchedulesResponse> {
+    return readJson<SchedulesResponse>(`/api/schedules/${encodeURIComponent(scheduleId)}`, {
+      method: "DELETE",
+    });
+  },
+  runScheduleNow(scheduleId: string): Promise<SchedulesResponse> {
+    return readJson<SchedulesResponse>(`/api/schedules/${encodeURIComponent(scheduleId)}/run_now`, {
+      method: "POST",
+    });
+  },
+  setScheduleEnabled(scheduleId: string, enabled: boolean): Promise<SchedulesResponse> {
+    return readJson<SchedulesResponse>(`/api/schedules/${encodeURIComponent(scheduleId)}/${enabled ? "enable" : "disable"}`, {
+      method: "POST",
+    });
+  },
+  markScheduleRunDone(scheduleId: string, runId: string): Promise<SchedulesResponse> {
+    return readJson<SchedulesResponse>(`/api/schedules/${encodeURIComponent(scheduleId)}/runs/${encodeURIComponent(runId)}/mark_done`, {
+      method: "POST",
+    });
   },
   fetchResumeCandidates(cwd: string, agentBackend: string): Promise<ResumeCandidatesResponse> {
     return readJson<ResumeCandidatesResponse>(
@@ -309,6 +345,41 @@ export const api = {
   },
   fetchShareInfo(shareId: string): Promise<ShareLoginResponse> {
     return readJson<ShareLoginResponse>(`/share/${encodeURIComponent(shareId)}/info`);
+  },
+  fetchShareSchedules(shareId: string): Promise<SchedulesResponse> {
+    return readJson<SchedulesResponse>(`/share/${encodeURIComponent(shareId)}/schedules`);
+  },
+  createShareSchedule(shareId: string, payload: Record<string, unknown>): Promise<SchedulesResponse> {
+    return readJson<SchedulesResponse>(`/share/${encodeURIComponent(shareId)}/schedules`, {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+  },
+  updateShareSchedule(shareId: string, scheduleId: string, payload: Record<string, unknown>): Promise<SchedulesResponse> {
+    return readJson<SchedulesResponse>(`/share/${encodeURIComponent(shareId)}/schedules/${encodeURIComponent(scheduleId)}`, {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+  },
+  deleteShareSchedule(shareId: string, scheduleId: string): Promise<SchedulesResponse> {
+    return readJson<SchedulesResponse>(`/share/${encodeURIComponent(shareId)}/schedules/${encodeURIComponent(scheduleId)}`, {
+      method: "DELETE",
+    });
+  },
+  runShareScheduleNow(shareId: string, scheduleId: string): Promise<SchedulesResponse> {
+    return readJson<SchedulesResponse>(`/share/${encodeURIComponent(shareId)}/schedules/${encodeURIComponent(scheduleId)}/run_now`, {
+      method: "POST",
+    });
+  },
+  setShareScheduleEnabled(shareId: string, scheduleId: string, enabled: boolean): Promise<SchedulesResponse> {
+    return readJson<SchedulesResponse>(`/share/${encodeURIComponent(shareId)}/schedules/${encodeURIComponent(scheduleId)}/${enabled ? "enable" : "disable"}`, {
+      method: "POST",
+    });
+  },
+  markShareScheduleRunDone(shareId: string, scheduleId: string, runId: string): Promise<SchedulesResponse> {
+    return readJson<SchedulesResponse>(`/share/${encodeURIComponent(shareId)}/schedules/${encodeURIComponent(scheduleId)}/runs/${encodeURIComponent(runId)}/mark_done`, {
+      method: "POST",
+    });
   },
   fetchShareTail(shareId: string, sessionId: string, limit = 120): Promise<TailResponse> {
     return readJson<TailResponse>(

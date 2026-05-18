@@ -18,6 +18,7 @@ Codoxear is a local web handoff layer for live Codex/Pi CLI agent sessions. The 
 ## Design Docs
 
 - `designs/extension-display-protocol.md` — `codoxear_display` v1 protocol for plugin-authored transcript progress/status display.
+- `designs/schedules.md` — Daemon-owned scheduled agent runs, target modes, lifecycle, API, UI, and skill integration plan.
 - `designs/voice-push-implementation-plan.md` — Original voice announcements and mobile push implementation plan.
 
 ## Private Memory Boundary

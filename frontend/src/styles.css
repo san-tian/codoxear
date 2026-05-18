@@ -2701,6 +2701,10 @@ button.primary {
   width: min(560px, calc(100vw - 28px));
 }
 
+.scheduleModal {
+  width: min(1040px, calc(100vw - 28px));
+}
+
 .modalHeader {
   display: flex;
   align-items: center;
@@ -2714,6 +2718,89 @@ button.primary {
 .formGrid {
   display: grid;
   gap: 12px;
+}
+
+.scheduleToolbar,
+.scheduleActions,
+.scheduleItemHeader,
+.scheduleRun {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.scheduleToolbar,
+.scheduleItemHeader {
+  justify-content: space-between;
+}
+
+.scheduleLayout {
+  display: grid;
+  grid-template-columns: minmax(0, 1.2fr) minmax(300px, 0.8fr);
+  gap: 14px;
+  align-items: start;
+}
+
+.scheduleList,
+.scheduleEditor,
+.scheduleRuns {
+  display: grid;
+  gap: 10px;
+}
+
+.scheduleItem,
+.scheduleEditor {
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--panel-muted);
+}
+
+.scheduleName {
+  font-weight: 650;
+}
+
+.scheduleMeta,
+.scheduleRun,
+.scheduleMessage {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.scheduleMessage {
+  max-height: 72px;
+  overflow: auto;
+  white-space: pre-wrap;
+}
+
+.scheduleRuns {
+  padding-top: 2px;
+}
+
+.scheduleRun {
+  justify-content: space-between;
+  padding: 6px 0;
+  border-top: 1px solid var(--border);
+}
+
+.scheduleRun span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.scheduleActions {
+  justify-content: flex-end;
+  flex-wrap: wrap;
+}
+
+.scheduleTabs.backendTabs {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.scheduleEditor .scheduleTabs.backendTabs {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
 }
 
 .backendTabs,
@@ -3420,6 +3507,10 @@ button.primary {
   .modalActions,
   .queueActions {
     flex-wrap: wrap;
+  }
+
+  .scheduleLayout {
+    grid-template-columns: 1fr;
   }
 
   .modalActions > *,

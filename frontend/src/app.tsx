@@ -25,6 +25,8 @@ import type {
   QueueResponse,
   QueueItem,
   ResumeCandidate,
+  Schedule,
+  ScheduleRun,
   ShareCreateResponse,
   ShareFilesResponse,
   ShareLoginResponse,
@@ -36,6 +38,7 @@ import type {
   VoiceSettingsResponse,
 } from "./lib/types";
 import { ShareLoginScreen, ShareWorkspace } from "./share";
+import { ScheduleModal, applySchedulesResponse, buildSchedulePayload, defaultScheduleDraft, type ScheduleDraft } from "./schedules";
 
 const INIT_PAGE_LIMIT = 120;
 const OLDER_PAGE_LIMIT = 60;
@@ -839,6 +842,16 @@ function icon(name: string) {
           <path d="m6.5 8.9 3.2 1.8" />
         </svg>
       );
+    case "schedule":
+      return (
+        <svg {...common}>
+          <rect x="3" y="3.5" width="10" height="9.5" rx="1.4" />
+          <path d="M5.5 2.5v2" />
+          <path d="M10.5 2.5v2" />
+          <path d="M3 6.5h10" />
+          <path d="M8 8.4v2.3l1.6.8" />
+        </svg>
+      );
     case "edit":
       return (
         <svg {...common}>
@@ -1161,6 +1174,14 @@ export function App() {
   const [newSessionWorktree, setNewSessionWorktree] = useState(false);
   const [newSessionWorktreeBranch, setNewSessionWorktreeBranch] = useState("");
   const [newSessionError, setNewSessionError] = useState("");
+  const [schedulesOpen, setSchedulesOpen] = useState(false);
+  const [schedulesScope, setSchedulesScope] = useState<"session" | "all">("session");
+  const [schedules, setSchedules] = useState<Schedule[]>([]);
+  const [scheduleRuns, setScheduleRuns] = useState<ScheduleRun[]>([]);
+  const [scheduleDraft, setScheduleDraft] = useState<ScheduleDraft>(() => defaultScheduleDraft());
+  const [schedulesLoading, setSchedulesLoading] = useState(false);
+  const [schedulesSaving, setSchedulesSaving] = useState(false);
+  const [schedulesError, setSchedulesError] = useState("");
   const [renameOpen, setRenameOpen] = useState(false);
   const [renameSessionId, setRenameSessionId] = useState("");
   const [renameName, setRenameName] = useState("");
@@ -3148,6 +3169,100 @@ export function App() {
     }
   }
 
+  async function loadSchedules() {
+    setSchedulesLoading(true);
+    setSchedulesError("");
+    try {
+      const response = shareMode && shareTarget ? await api.fetchShareSchedules(shareTarget.shareId) : await api.fetchSchedules();
+      applySchedulesResponse(response, setSchedules, setScheduleRuns);
+    } catch (error) {
+      setSchedulesError(error instanceof Error ? error.message : "Unable to load schedules");
+    } finally {
+      setSchedulesLoading(false);
+    }
+  }
+
+  function openSchedulesDialog() {
+    const sessionId = shareMode ? shareSessionId : selectedSessionId;
+    const session = shareMode ? null : selectedSession;
+    setScheduleDraft(defaultScheduleDraft(sessionId, session?.cwd || recentCwds[0] || ""));
+    setSchedulesScope("session");
+    setSchedulesOpen(true);
+    void loadSchedules();
+  }
+
+  async function handleCreateSchedule() {
+    setSchedulesSaving(true);
+    setSchedulesError("");
+    try {
+      const payload = buildSchedulePayload(scheduleDraft, newSessionDefaults, shareMode);
+      const response =
+        shareMode && shareTarget
+          ? await api.createShareSchedule(shareTarget.shareId, payload)
+          : await api.createSchedule(payload);
+      applySchedulesResponse(response, setSchedules, setScheduleRuns);
+      setScheduleDraft(defaultScheduleDraft(shareMode ? shareSessionId : selectedSessionId, selectedSession?.cwd || recentCwds[0] || ""));
+      pushToast("Schedule created");
+    } catch (error) {
+      setSchedulesError(error instanceof Error ? error.message : "Unable to create schedule");
+    } finally {
+      setSchedulesSaving(false);
+    }
+  }
+
+  async function handleRunScheduleNow(scheduleId: string) {
+    setSchedulesError("");
+    try {
+      const response =
+        shareMode && shareTarget
+          ? await api.runShareScheduleNow(shareTarget.shareId, scheduleId)
+          : await api.runScheduleNow(scheduleId);
+      applySchedulesResponse(response, setSchedules, setScheduleRuns);
+      pushToast("Schedule run queued");
+    } catch (error) {
+      setSchedulesError(error instanceof Error ? error.message : "Unable to run schedule");
+    }
+  }
+
+  async function handleToggleSchedule(scheduleId: string, enabled: boolean) {
+    setSchedulesError("");
+    try {
+      const response =
+        shareMode && shareTarget
+          ? await api.setShareScheduleEnabled(shareTarget.shareId, scheduleId, enabled)
+          : await api.setScheduleEnabled(scheduleId, enabled);
+      applySchedulesResponse(response, setSchedules, setScheduleRuns);
+    } catch (error) {
+      setSchedulesError(error instanceof Error ? error.message : "Unable to update schedule");
+    }
+  }
+
+  async function handleDeleteSchedule(scheduleId: string) {
+    setSchedulesError("");
+    try {
+      const response =
+        shareMode && shareTarget
+          ? await api.deleteShareSchedule(shareTarget.shareId, scheduleId)
+          : await api.deleteSchedule(scheduleId);
+      applySchedulesResponse(response, setSchedules, setScheduleRuns);
+    } catch (error) {
+      setSchedulesError(error instanceof Error ? error.message : "Unable to delete schedule");
+    }
+  }
+
+  async function handleMarkScheduleDone(scheduleId: string, runId: string) {
+    setSchedulesError("");
+    try {
+      const response =
+        shareMode && shareTarget
+          ? await api.markShareScheduleRunDone(shareTarget.shareId, scheduleId, runId)
+          : await api.markScheduleRunDone(scheduleId, runId);
+      applySchedulesResponse(response, setSchedules, setScheduleRuns);
+    } catch (error) {
+      setSchedulesError(error instanceof Error ? error.message : "Unable to mark run done");
+    }
+  }
+
   async function loadVoiceAndNotifications() {
     setVoiceSettingsLoading(true);
     setSettingsLoadError("");
@@ -3674,39 +3789,65 @@ export function App() {
       );
     }
     return (
-      <ShareWorkspace
-        share={shareSet}
-        sessionId={shareSessionId}
-        transcript={shareTranscript}
-        files={shareFiles}
-        selectedFilePath={shareSelectedFilePath}
-        selectedFile={shareSelectedFile}
-        loading={shareLoading}
-        loadingOlder={shareLoadingOlder}
-        hasOlder={shareHasOlder}
-        busy={shareBusy}
-        queueLen={shareQueueLen}
-        terminalPrompt={shareTerminalPrompt?.sessionId === shareSessionId ? shareTerminalPrompt : null}
-        terminalPromptSending={shareTerminalPromptSending}
-        errorText={shareErrorText}
-        sendText={shareSendText}
-        canSend={Boolean(shareSessionId && shareSendText.trim())}
-        onSessionChange={(sessionId) => {
-          setShareSessionId(sessionId);
-          void loadShareSession(sessionId);
-          history.replaceState(null, "", `/share/${shareSet.share_id}/sessions/${sessionId}/`);
-        }}
-        onSendTextChange={setShareSendText}
-        onSend={handleShareSend}
-        onInterrupt={handleShareInterrupt}
-        onTerminalPromptResponse={handleShareTerminalPromptResponse}
-        onLoadOlder={loadShareOlder}
-        onSelectFile={(path) => void selectShareFile(path)}
-        onOpenMentionedFile={(path) => void selectShareFile(path.trim())}
-        onCopyText={copyTranscriptEvent}
-        isEventCollapsed={transcriptEventCollapsed}
-        onToggleEvent={toggleTranscriptEvent}
-      />
+      <>
+        <ShareWorkspace
+          share={shareSet}
+          sessionId={shareSessionId}
+          transcript={shareTranscript}
+          files={shareFiles}
+          selectedFilePath={shareSelectedFilePath}
+          selectedFile={shareSelectedFile}
+          loading={shareLoading}
+          loadingOlder={shareLoadingOlder}
+          hasOlder={shareHasOlder}
+          busy={shareBusy}
+          queueLen={shareQueueLen}
+          terminalPrompt={shareTerminalPrompt?.sessionId === shareSessionId ? shareTerminalPrompt : null}
+          terminalPromptSending={shareTerminalPromptSending}
+          errorText={shareErrorText}
+          sendText={shareSendText}
+          canSend={Boolean(shareSessionId && shareSendText.trim())}
+          onSessionChange={(sessionId) => {
+            setShareSessionId(sessionId);
+            void loadShareSession(sessionId);
+            history.replaceState(null, "", `/share/${shareSet.share_id}/sessions/${sessionId}/`);
+          }}
+          onSendTextChange={setShareSendText}
+          onSend={handleShareSend}
+          onInterrupt={handleShareInterrupt}
+          onTerminalPromptResponse={handleShareTerminalPromptResponse}
+          onLoadOlder={loadShareOlder}
+          onSelectFile={(path) => void selectShareFile(path)}
+          onOpenMentionedFile={(path) => void selectShareFile(path.trim())}
+          onCopyText={copyTranscriptEvent}
+          isEventCollapsed={transcriptEventCollapsed}
+          onToggleEvent={toggleTranscriptEvent}
+          onOpenSchedules={openSchedulesDialog}
+        />
+        <ScheduleModal
+          open={schedulesOpen}
+          owner={false}
+          share={shareSet}
+          selectedSessionId={shareSessionId}
+          sessions={[]}
+          defaults={newSessionDefaults}
+          scope={schedulesScope}
+          loading={schedulesLoading}
+          saving={schedulesSaving}
+          errorText={schedulesError}
+          schedules={schedules}
+          runs={scheduleRuns}
+          draft={scheduleDraft}
+          onClose={() => setSchedulesOpen(false)}
+          onScopeChange={setSchedulesScope}
+          onDraftChange={setScheduleDraft}
+          onCreate={handleCreateSchedule}
+          onRunNow={handleRunScheduleNow}
+          onToggle={handleToggleSchedule}
+          onDelete={handleDeleteSchedule}
+          onMarkDone={handleMarkScheduleDone}
+        />
+      </>
     );
   }
 
@@ -4013,6 +4154,16 @@ export function App() {
               >
                 {icon("share")}
                 {mobileViewport ? <span>Share</span> : null}
+              </button>
+              <button
+                className={mobileViewport ? "actionBtn mobileActionBtn" : "icon-btn"}
+                type="button"
+                title={selectedSession ? "Schedules" : "No session selected"}
+                disabled={!selectedSession}
+                onClick={openSchedulesDialog}
+              >
+                {icon("schedule")}
+                {mobileViewport ? <span>Schedules</span> : null}
               </button>
               <button
                 className={mobileViewport ? `actionBtn mobileActionBtn${tmuxCommand ? " active" : ""}` : `icon-btn${tmuxCommand ? " active" : ""}`}
@@ -4886,6 +5037,29 @@ export function App() {
           </div>
         </div>
       ) : null}
+
+      <ScheduleModal
+        open={schedulesOpen}
+        owner
+        selectedSessionId={selectedSessionId}
+        sessions={sessions}
+        defaults={newSessionDefaults}
+        scope={schedulesScope}
+        loading={schedulesLoading}
+        saving={schedulesSaving}
+        errorText={schedulesError}
+        schedules={schedules}
+        runs={scheduleRuns}
+        draft={scheduleDraft}
+        onClose={() => setSchedulesOpen(false)}
+        onScopeChange={setSchedulesScope}
+        onDraftChange={setScheduleDraft}
+        onCreate={handleCreateSchedule}
+        onRunNow={handleRunScheduleNow}
+        onToggle={handleToggleSchedule}
+        onDelete={handleDeleteSchedule}
+        onMarkDone={handleMarkScheduleDone}
+      />
 
       {queueOpen ? (
         <div className="modalBackdrop" onClick={() => setQueueOpen(false)}>
