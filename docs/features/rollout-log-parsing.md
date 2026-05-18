@@ -19,6 +19,7 @@ Rollout log parsing converts Codex/Pi CLI logs into normalized chat events, toke
 ## Current Behavior
 
 - Rust rollout parsing is the source of truth for historical transcript display and part of the busy/idle picture.
+- Codex `event_msg` lifecycle records feed idle detection: `task_started` marks the session busy, while `task_complete`, `turn_complete`, and `turn_aborted` mark the current turn idle/closed.
 - Token usage and final response state feed notification/voice behavior. The parsed token payload is also what Nova uses for the top-bar context chip: `tokens_in_context` comes from the latest log-derived token update, Codex logs provide `model_context_window` directly, and Pi logs currently derive the context-window size from local `models.json` metadata for the active provider/model.
 - The Rust broker reuses the Rust rollout/Pi token parser while tailing its discovered log, so broker socket `state` can update `token` live instead of waiting for a separate transcript/status route to rescan the log.
 - Tool-call and ask-user normalization supports visibility toggles in both legacy and preview UI work.

@@ -5335,6 +5335,7 @@ fn extract_chat_events(objs: &[Value]) -> ExtractedChatBatch {
                     continue;
                 };
                 match payload.get("type").and_then(Value::as_str) {
+                    Some("task_started") => turn_start = true,
                     Some("user_message") => {
                         if let Some(message) = payload.get("message").and_then(Value::as_str) {
                             turn_start = true;
@@ -9017,6 +9018,10 @@ pub(crate) fn compute_idle_from_log(path: &Path) -> Option<bool> {
                     continue;
                 };
                 match payload.get("type").and_then(Value::as_str) {
+                    Some("task_started") => {
+                        saw_terminal_signal = true;
+                        idle = false;
+                    }
                     Some("user_message")
                         if payload.get("message").and_then(Value::as_str).is_some() =>
                     {
@@ -10229,6 +10234,39 @@ mod tests {
         assert_eq!(session.files, vec!["README.md".to_string()]);
         assert_eq!(session.model_provider.as_deref(), Some("crs"));
         assert_eq!(session.tmux_session.as_deref(), Some("codoxear"));
+    }
+
+    #[test]
+    fn load_sessions_marks_open_task_started_turn_as_busy_after_abort() {
+        let app_dir = temp_app_dir("task-started-busy");
+        let log_path = app_dir.join("rollout-task-started.jsonl");
+        fs::write(
+            &log_path,
+            [
+                r#"{"type":"event_msg","timestamp":"2026-05-18T14:59:38.204Z","payload":{"type":"turn_aborted","turn_id":"turn-a"}}"#,
+                r#"{"type":"event_msg","timestamp":"2026-05-18T14:59:39.407Z","payload":{"type":"task_started","turn_id":"turn-b"}}"#,
+            ]
+            .join("\n")
+                + "\n",
+        )
+        .unwrap();
+        fs::write(app_dir.join("socks").join("sid-task.sock"), "").unwrap();
+        fs::write(
+            app_dir.join("socks").join("sid-task.json"),
+            format!(
+                r#"{{"session_id":"thread-task","codex_pid":{},"broker_pid":{},"agent_backend":"codex","owner":"web","cwd":"{}","log_path":"{}","start_ts":1.0}}"#,
+                std::process::id(),
+                std::process::id(),
+                app_dir.display(),
+                log_path.display(),
+            ),
+        )
+        .unwrap();
+
+        let response = load_sessions_response(&RuntimeConfig { app_dir }).unwrap();
+
+        assert_eq!(response.sessions.len(), 1);
+        assert!(response.sessions[0].busy);
     }
 
     #[test]
