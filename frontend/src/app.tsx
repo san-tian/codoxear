@@ -1944,6 +1944,12 @@ export function App() {
     setUnreadSessionIds((current) => (current[sessionId] ? current : { ...current, [sessionId]: true }));
   }
 
+  function markSessionTurnClosed(sessionId: string) {
+    if (!sessionId) return;
+    setClosedTurnTsBySession((current) => ({ ...current, [sessionId]: Date.now() / 1000 }));
+    markSessionUnreadAtTurnBoundary(sessionId);
+  }
+
   function selectSession(sessionId: string) {
     const changed = selectedSessionRef.current !== sessionId;
     const previousSessionId = selectedSessionRef.current;
@@ -2124,8 +2130,7 @@ export function App() {
         terminalPrompt: nextTerminalPrompt,
       });
       if (data.turn_end || data.turn_aborted) {
-        setClosedTurnTsBySession((current) => ({ ...current, [sessionId]: Date.now() / 1000 }));
-        markSessionUnreadAtTurnBoundary(sessionId);
+        markSessionTurnClosed(sessionId);
       }
       setSessions((current) =>
         current.map((session) => (session.session_id === sessionId ? { ...session, busy: nextBusy, queue_len: nextQueueLen } : session)),
@@ -2145,7 +2150,13 @@ export function App() {
     const nextBusyBySession = Object.fromEntries(ordered.map((session) => [session.session_id, Boolean(session.busy)]));
     for (const session of ordered) {
       if (hasPreviousBusySnapshot && previousBusyBySession[session.session_id] && !session.busy) {
-        markSessionUnreadAtTurnBoundary(session.session_id);
+        markSessionTurnClosed(session.session_id);
+        if (sessionViewCacheRef.current[session.session_id]) {
+          cacheSessionSnapshot(session.session_id, {
+            busy: false,
+            queueLen: Number.isFinite(Number(session.queue_len)) ? Number(session.queue_len) : 0,
+          });
+        }
       }
     }
     previousSessionBusyRef.current = nextBusyBySession;
