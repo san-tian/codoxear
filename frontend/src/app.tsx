@@ -726,13 +726,12 @@ function FloatingProgress(props: { event: UiTranscriptEvent; collapsed: boolean;
             </div>
           ) : null}
           <ol className="floatingProgressItems">
-            {items.slice(0, 4).map((item, index) => (
+            {items.map((item, index) => (
               <li className={`floatingProgressItem${todoStatusClass(item.status)}`} key={`${item.label || "item"}-${index}`}>
                 <span className="floatingProgressMark" />
                 <span className="floatingProgressItemLabel">{item.label || "Untitled item"}</span>
               </li>
             ))}
-            {items.length > 4 ? <li className="floatingProgressMore">+{items.length - 4} more</li> : null}
           </ol>
         </>
       ) : null}

@@ -2434,11 +2434,6 @@ button.primary {
   background: #16a34a;
 }
 
-.floatingProgressMore {
-  color: var(--muted);
-  font-size: 12px;
-}
-
 .queuePreview {
   width: min(920px, 100%);
   display: grid;
