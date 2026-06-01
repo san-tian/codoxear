@@ -79,6 +79,7 @@ const PENDING_PRIORITY_OFFSET = -0.85;
 const SHELVE_FOR_NOW_SECONDS = 24 * 60 * 60;
 const SHARE_INIT_LIMIT = 120;
 const SHARE_OLDER_LIMIT = 60;
+const HISTORY_USER_BOUNDARY_MAX_PAGES = 8;
 
 type BusySubmitMode = "queue" | "interrupt";
 type ThemeMode = "dark" | "light";
@@ -675,6 +676,10 @@ function olderHistoryJumpTarget(events: UiTranscriptEvent[]) {
   return events[events.length - 1]?.id || "";
 }
 
+function historyBatchReachedUserBoundary(events: UiTranscriptEvent[]) {
+  return events.some((event) => event.kind === "user");
+}
+
 function todoStatusLabel(status: string | undefined) {
   const value = String(status || "").replace(/_/g, " ").trim();
   return value || "pending";
@@ -1245,6 +1250,7 @@ export function App() {
   const liveCursorRef = useRef<string | null>(null);
   const historyCursorRef = useRef<string | null>(null);
   const selectedSessionRef = useRef("");
+  const shareSessionRef = useRef(shareTarget?.sessionId || "");
   const sessionViewCacheRef = useRef<Record<string, SessionViewSnapshot>>({});
   const previousSessionBusyRef = useRef<Record<string, boolean>>({});
   const suppressedTerminalPromptKeysRef = useRef<Record<string, boolean>>({});
@@ -1388,15 +1394,35 @@ export function App() {
 
   async function loadShareOlder() {
     if (!shareTarget || !shareSessionId || !shareHistoryCursor || shareLoadingOlder) return;
+    const shareId = shareTarget.shareId;
+    const sessionId = shareSessionId;
     setShareLoadingOlder(true);
     try {
-      const history = await api.fetchShareHistory(shareTarget.shareId, shareSessionId, shareHistoryCursor, SHARE_OLDER_LIMIT);
+      let cursor: string | null = shareHistoryCursor;
+      let history: Awaited<ReturnType<typeof api.fetchShareHistory>> | null = null;
+      const olderPages: UiTranscriptEvent[][] = [];
+
+      for (let page = 0; cursor && page < HISTORY_USER_BOUNDARY_MAX_PAGES; page += 1) {
+        const nextHistory = await api.fetchShareHistory(shareId, sessionId, cursor, SHARE_OLDER_LIMIT);
+        if (shareSessionRef.current !== sessionId) return;
+        history = nextHistory;
+        const older = normalizeEvents(nextHistory.events || []);
+        olderPages.unshift(older);
+
+        const nextCursor = nextHistory.history_cursor || null;
+        if (historyBatchReachedUserBoundary(older) || !nextHistory.has_older || !nextCursor || nextCursor === cursor) break;
+        cursor = nextCursor;
+      }
+
+      if (!history) return;
+      if (shareSessionRef.current !== sessionId) return;
+      const older = olderPages.flat();
       setShareTranscript((current) =>
-        coalesceAdjacentAssistantEvents(mergeTranscriptEvents(normalizeEvents(history.events || []), current)),
+        coalesceAdjacentAssistantEvents(mergeTranscriptEvents(older, current)),
       );
       setShareHistoryCursor(history.history_cursor || null);
       setShareHasOlder(Boolean(history.has_older));
-      updateShareRuntimeFromResponse(shareSessionId, history);
+      updateShareRuntimeFromResponse(sessionId, history);
     } catch (error) {
       setShareErrorText(error instanceof Error ? error.message : "Unable to load older messages");
     } finally {
@@ -2244,9 +2270,25 @@ export function App() {
     const sessionId = selectedSessionId;
     setLoadingOlder(true);
     try {
-      const data = await api.fetchHistory(sessionId, historyCursorRef.current, OLDER_PAGE_LIMIT);
+      let cursor: string | null = historyCursorRef.current;
+      let data: Awaited<ReturnType<typeof api.fetchHistory>> | null = null;
+      const olderPages: UiTranscriptEvent[][] = [];
+
+      for (let page = 0; cursor && page < HISTORY_USER_BOUNDARY_MAX_PAGES; page += 1) {
+        const nextData = await api.fetchHistory(sessionId, cursor, OLDER_PAGE_LIMIT);
+        if (selectedSessionRef.current !== sessionId) return;
+        data = nextData;
+        const older = normalizeEvents(nextData.events || []);
+        olderPages.unshift(older);
+
+        const nextCursor = nextData.history_cursor ?? null;
+        if (historyBatchReachedUserBoundary(older) || !nextData.has_older || !nextCursor || nextCursor === cursor) break;
+        cursor = nextCursor;
+      }
+
       if (selectedSessionRef.current !== sessionId) return;
-      const older = normalizeEvents(data.events || []);
+      if (!data) return;
+      const older = olderPages.flat();
       const jumpTargetId = olderHistoryJumpTarget(older);
       setTranscript((current) => {
         const merged = mergeTranscriptEvents(older, current);
@@ -3516,6 +3558,10 @@ export function App() {
     writeLocalStorage(SELECTED_SESSION_KEY, selectedSessionId);
     writeSessionHash(selectedSessionId);
   }, [selectedSessionId]);
+
+  useEffect(() => {
+    shareSessionRef.current = shareSessionId;
+  }, [shareSessionId]);
 
   useEffect(() => {
     writeLocalStorage(SHOW_TOOL_CALLS_KEY, showTools ? "1" : "0");
