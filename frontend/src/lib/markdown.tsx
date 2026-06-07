@@ -3,6 +3,43 @@ type MarkdownBlockProps = {
   className?: string;
 };
 
+function copyTextViaSelection(text: string) {
+  if (typeof document.execCommand !== "function") {
+    throw new Error("Selection copy unavailable");
+  }
+  const value = String(text ?? "");
+  const active = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+  const textarea = document.createElement("textarea");
+  textarea.value = value;
+  textarea.setAttribute("readonly", "");
+  textarea.setAttribute("aria-hidden", "true");
+  textarea.style.position = "fixed";
+  textarea.style.top = "0";
+  textarea.style.left = "0";
+  textarea.style.width = "1px";
+  textarea.style.height = "1px";
+  textarea.style.padding = "0";
+  textarea.style.border = "0";
+  textarea.style.opacity = "0";
+  textarea.style.pointerEvents = "none";
+  document.body.appendChild(textarea);
+  textarea.focus({ preventScroll: true });
+  textarea.select();
+  textarea.setSelectionRange(0, value.length);
+  const ok = document.execCommand("copy");
+  textarea.remove();
+  active?.focus({ preventScroll: true });
+  if (!ok) throw new Error("Selection copy failed");
+}
+
+async function copyToClipboard(text: string) {
+  if (window.isSecureContext && navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
+    await navigator.clipboard.writeText(String(text ?? ""));
+    return;
+  }
+  copyTextViaSelection(text);
+}
+
 function escapeHtml(value: unknown) {
   return String(value ?? "")
     .replaceAll("&", "&amp;")
@@ -278,7 +315,8 @@ export function markdownToHtml(text: string) {
       if (chunk.type === "code") {
         const lang = String(chunk.lang || "").trim();
         const langAttr = lang ? ` data-lang="${escapeHtml(lang)}"` : "";
-        return `<pre><code${langAttr}>${escapeHtml(chunk.value)}</code></pre>`;
+        const label = lang ? escapeHtml(lang) : "code";
+        return `<div class="md-code-block"><div class="md-code-bar"><span class="md-code-lang">${label}</span><button class="md-code-copy-btn" type="button" data-md-code-copy title="Copy code" aria-label="Copy code">Copy</button></div><pre><code${langAttr}>${escapeHtml(chunk.value)}</code></pre></div>`;
       }
       return renderMarkdownBlocks(chunk.value);
     })
@@ -286,5 +324,33 @@ export function markdownToHtml(text: string) {
 }
 
 export function MarkdownBlock({ text, className }: MarkdownBlockProps) {
-  return <div className={className} dangerouslySetInnerHTML={{ __html: markdownToHtml(text) }} />;
+  async function onClick(event: MouseEvent) {
+    const target = event.target instanceof Element ? event.target : null;
+    const button = target?.closest("[data-md-code-copy]");
+    if (!(button instanceof HTMLButtonElement)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const code = button.closest(".md-code-block")?.querySelector("code");
+    const value = code?.textContent || "";
+    if (!value) return;
+    const previousText = button.textContent || "Copy";
+    try {
+      await copyToClipboard(value);
+      button.textContent = "Copied";
+      button.classList.add("is-copied");
+      window.setTimeout(() => {
+        button.textContent = previousText;
+        button.classList.remove("is-copied");
+      }, 1200);
+    } catch {
+      button.textContent = "Failed";
+      button.classList.add("is-failed");
+      window.setTimeout(() => {
+        button.textContent = previousText;
+        button.classList.remove("is-failed");
+      }, 1400);
+    }
+  }
+
+  return <div className={className} onClick={onClick} dangerouslySetInnerHTML={{ __html: markdownToHtml(text) }} />;
 }
