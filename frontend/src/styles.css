@@ -593,6 +593,10 @@ button:disabled {
   overflow-wrap: anywhere;
 }
 
+.shareSession .workspaceTitleRow {
+  gap: 8px;
+}
+
 .workspaceDraftMark {
   width: 7px;
   height: 7px;
@@ -3043,6 +3047,23 @@ button.primary {
   overflow: auto;
 }
 
+.shareEditNotice {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid rgba(37, 99, 235, 0.26);
+  border-radius: 10px;
+  background: var(--accent-soft);
+  color: var(--text);
+  font-size: 13px;
+}
+
+.shareEditNotice span {
+  min-width: 0;
+}
+
 .shareSessionChoice {
   display: flex;
   align-items: center;
@@ -3203,6 +3224,13 @@ button.primary {
   height: 34px;
   padding-inline: 10px;
   text-decoration: none;
+}
+
+.shareManagerActions .shareManagerEditBtn {
+  border-color: rgba(37, 99, 235, 0.42);
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-weight: 750;
 }
 
 .shareManagerActions .icon-btn {

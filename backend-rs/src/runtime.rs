@@ -225,6 +225,7 @@ pub enum CreateSessionError {
         message: String,
         field: Option<String>,
     },
+    BadGateway(String),
     Internal(String),
 }
 
@@ -247,9 +248,14 @@ impl CreateSessionError {
         Self::Internal(message.into())
     }
 
+    pub fn bad_gateway(message: impl Into<String>) -> Self {
+        Self::BadGateway(message.into())
+    }
+
     pub fn message(&self) -> &str {
         match self {
             Self::BadRequest { message, .. } => message,
+            Self::BadGateway(message) => message,
             Self::Internal(message) => message,
         }
     }
@@ -257,12 +263,17 @@ impl CreateSessionError {
     pub fn field(&self) -> Option<&str> {
         match self {
             Self::BadRequest { field, .. } => field.as_deref(),
+            Self::BadGateway(_) => None,
             Self::Internal(_) => None,
         }
     }
 
     pub fn is_bad_request(&self) -> bool {
         matches!(self, Self::BadRequest { .. })
+    }
+
+    pub fn is_bad_gateway(&self) -> bool {
+        matches!(self, Self::BadGateway(_))
     }
 }
 
@@ -1310,6 +1321,9 @@ pub fn load_messages_tail(
             history_cursor: None,
             events: vec![],
             has_older: false,
+            turn_start: false,
+            turn_end: false,
+            turn_aborted: false,
             busy: session.busy,
             queue_len: session.queue_len,
             token: session.token,
@@ -1317,6 +1331,7 @@ pub fn load_messages_tail(
         });
     };
     let records = read_positioned_records(Path::new(log_path))?;
+    let (turn_start, turn_end, turn_aborted) = latest_turn_flags(&records);
     let chat_records = chat_records(records);
     let take = limit.max(1).min(chat_records.len());
     let split = chat_records.len().saturating_sub(take);
@@ -1334,6 +1349,9 @@ pub fn load_messages_tail(
         history_cursor,
         events,
         has_older: split > 0,
+        turn_start,
+        turn_end,
+        turn_aborted,
         busy: session.busy,
         queue_len: session.queue_len,
         token: session.token,
@@ -5342,6 +5360,25 @@ fn extract_chat_events(objs: &[Value]) -> ExtractedChatBatch {
                             events.push(json_text_event("user", message, event_ts(obj), None));
                         }
                     }
+                    Some("agent_message") => {
+                        if let Some(message) = payload.get("message").and_then(Value::as_str) {
+                            let is_final = payload.get("phase").and_then(Value::as_str)
+                                == Some("final_answer");
+                            if is_final {
+                                turn_end = true;
+                            }
+                            events.push(json_text_event(
+                                "assistant",
+                                message,
+                                event_ts(obj),
+                                if is_final {
+                                    Some("final_response")
+                                } else {
+                                    Some("narration")
+                                },
+                            ));
+                        }
+                    }
                     Some("agent_reasoning") => total_thinking += 1,
                     Some("turn_aborted") => turn_aborted = true,
                     Some("task_complete") | Some("turn_complete") => turn_end = true,
@@ -5377,6 +5414,7 @@ fn extract_chat_events(objs: &[Value]) -> ExtractedChatBatch {
                                 == Some("final_answer")
                                 || payload.get("end_turn").and_then(Value::as_bool) == Some(true)
                             {
+                                turn_end = true;
                                 Some("final_response")
                             } else {
                                 Some("narration")
@@ -6832,17 +6870,15 @@ fn write_share_store(
 fn share_session_refs_from_sessions(
     config: &RuntimeConfig,
     session_ids: &[String],
-    nicknames: &HashMap<String, String>,
+    _nicknames: &HashMap<String, String>,
 ) -> Result<Vec<ApiShareSessionRef>, String> {
     let mut refs = Vec::new();
     for session_id in session_ids {
         let session = find_session(config, session_id)?;
+        let nickname = share_session_title(session_id, &session);
         refs.push(ApiShareSessionRef {
             session_id: session_id.clone(),
-            nickname: nicknames
-                .get(session_id)
-                .cloned()
-                .unwrap_or_else(|| session.alias.clone()),
+            nickname,
             added_ts: epoch_now(),
             cwd: session.cwd,
             workspace_cwd: session.workspace_cwd,
@@ -6855,16 +6891,40 @@ fn share_session_refs_from_sessions(
     Ok(refs)
 }
 
+fn share_session_refs_from_record(
+    config: &RuntimeConfig,
+    session_ids: &[String],
+) -> Vec<ApiShareSessionRef> {
+    let mut refs = Vec::new();
+    for session_id in session_ids {
+        let Ok(session) = find_session(config, session_id) else {
+            continue;
+        };
+        let nickname = share_session_title(session_id, &session);
+        refs.push(ApiShareSessionRef {
+            session_id: session_id.clone(),
+            nickname,
+            added_ts: epoch_now(),
+            cwd: session.cwd,
+            workspace_cwd: session.workspace_cwd,
+            agent_backend: session.agent_backend,
+            busy: session.busy,
+            queue_len: session.queue_len,
+            updated_ts: session.updated_ts,
+        });
+    }
+    refs
+}
+
 fn share_set_from_record(
     config: &RuntimeConfig,
     record: &ApiShareSet,
 ) -> Result<ApiShareSet, String> {
-    let nickname_map = record
-        .sessions
+    let sessions = share_session_refs_from_record(config, &record.session_ids);
+    let session_ids = sessions
         .iter()
-        .map(|session| (session.session_id.clone(), session.nickname.clone()))
-        .collect::<HashMap<_, _>>();
-    let sessions = share_session_refs_from_sessions(config, &record.session_ids, &nickname_map)?;
+        .map(|session| session.session_id.clone())
+        .collect::<Vec<_>>();
     Ok(ApiShareSet {
         share_id: record.share_id.clone(),
         label: record.label.clone(),
@@ -6876,7 +6936,7 @@ fn share_set_from_record(
         allow_interrupt: record.allow_interrupt,
         allow_files: record.allow_files,
         allow_attachment_downloads: record.allow_attachment_downloads,
-        session_ids: record.session_ids.clone(),
+        session_ids,
         sessions,
     })
 }
@@ -8590,7 +8650,7 @@ pub fn create_session(
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
-            .map_err(|err| CreateSessionError::internal(format!("tmux launch failed: {err}")))?;
+            .map_err(|err| CreateSessionError::bad_gateway(format!("tmux launch failed: {err}")))?;
         let tmux_args = if has_session.success() {
             vec![
                 "new-window".to_string(),
@@ -8624,7 +8684,7 @@ pub fn create_session(
         let tmux_output = tmux_proc
             .args(tmux_args.iter().map(String::as_str))
             .output()
-            .map_err(|err| CreateSessionError::internal(format!("tmux launch failed: {err}")))?;
+            .map_err(|err| CreateSessionError::bad_gateway(format!("tmux launch failed: {err}")))?;
         if !tmux_output.status.success() {
             let detail = String::from_utf8_lossy(&tmux_output.stderr)
                 .trim()
@@ -8642,7 +8702,7 @@ pub fn create_session(
                     tmux_output.status.code().unwrap_or_default()
                 )
             };
-            return Err(CreateSessionError::internal(format!(
+            return Err(CreateSessionError::bad_gateway(format!(
                 "tmux launch failed: {message}"
             )));
         }
@@ -8657,9 +8717,9 @@ pub fn create_session(
         .map_err(|message| {
             let pane_tail = tmux_capture_pane_tail(&pane_id, 80);
             if pane_tail.is_empty() {
-                CreateSessionError::internal(message)
+                CreateSessionError::bad_gateway(message)
             } else {
-                CreateSessionError::internal(format!(
+                CreateSessionError::bad_gateway(format!(
                     "{message}\nLast tmux pane output:\n{pane_tail}"
                 ))
             }
@@ -8668,7 +8728,7 @@ pub fn create_session(
             .get("broker_pid")
             .and_then(Value::as_i64)
             .ok_or_else(|| {
-                CreateSessionError::internal("tmux launch metadata is missing broker_pid")
+                CreateSessionError::bad_gateway("tmux launch metadata is missing broker_pid")
             })?;
         return Ok(json!({
             "ok": true,
@@ -8689,9 +8749,9 @@ pub fn create_session(
     apply_spawn_env(&mut child, &env_overrides);
     let mut child = child
         .spawn()
-        .map_err(|err| CreateSessionError::internal(format!("spawn failed: {err}")))?;
+        .map_err(|err| CreateSessionError::bad_gateway(format!("spawn failed: {err}")))?;
     wait_or_raise(&mut child, "broker", Duration::from_secs_f64(1.5))
-        .map_err(CreateSessionError::internal)?;
+        .map_err(CreateSessionError::bad_gateway)?;
     let broker_pid = i64::from(child.id());
     let stderr = child.stderr.take();
     std::thread::spawn(move || {
@@ -8985,6 +9045,95 @@ fn latest_token_update_from_log(path: &Path) -> Option<Value> {
     None
 }
 
+#[derive(Clone, Copy)]
+enum TurnSignal {
+    Start,
+    End,
+    Abort,
+}
+
+fn latest_turn_flags(records: &[PositionedRecord]) -> (bool, bool, bool) {
+    let mut latest = None;
+    for record in records {
+        if let Some(signal) = turn_signal_from_obj(&record.obj) {
+            latest = Some(signal);
+        }
+    }
+    match latest {
+        Some(TurnSignal::Start) => (true, false, false),
+        Some(TurnSignal::End) => (false, true, false),
+        Some(TurnSignal::Abort) => (false, false, true),
+        None => (false, false, false),
+    }
+}
+
+fn turn_signal_from_obj(obj: &Value) -> Option<TurnSignal> {
+    match obj.get("type").and_then(Value::as_str) {
+        Some("message") => {
+            if pi_user_text_value(obj).is_some() || pi_message_keeps_turn_busy(obj) {
+                Some(TurnSignal::Start)
+            } else if pi_assistant_is_final_turn_end(obj) {
+                Some(TurnSignal::End)
+            } else if pi_assistant_text_value(obj).is_some() {
+                Some(TurnSignal::Start)
+            } else {
+                None
+            }
+        }
+        Some("event_msg") => {
+            let payload = obj.get("payload").and_then(Value::as_object)?;
+            match payload.get("type").and_then(Value::as_str) {
+                Some("task_started") | Some("user_message") | Some("agent_reasoning") => {
+                    Some(TurnSignal::Start)
+                }
+                Some("agent_message") => {
+                    if payload.get("phase").and_then(Value::as_str) == Some("final_answer") {
+                        Some(TurnSignal::End)
+                    } else if payload
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .map(|text| !text.trim().is_empty())
+                        .unwrap_or(false)
+                    {
+                        Some(TurnSignal::Start)
+                    } else {
+                        None
+                    }
+                }
+                Some("turn_aborted") | Some("thread_rolled_back") => Some(TurnSignal::Abort),
+                Some("task_complete") | Some("turn_complete") => Some(TurnSignal::End),
+                _ => None,
+            }
+        }
+        Some("response_item") => {
+            let payload = obj.get("payload").and_then(Value::as_object)?;
+            if response_item_has_assistant_output(obj) {
+                if payload.get("end_turn").and_then(Value::as_bool) == Some(true)
+                    || payload.get("phase").and_then(Value::as_str) == Some("final_answer")
+                {
+                    Some(TurnSignal::End)
+                } else {
+                    Some(TurnSignal::Start)
+                }
+            } else if matches!(
+                payload.get("type").and_then(Value::as_str),
+                Some("reasoning")
+                    | Some("function_call")
+                    | Some("function_call_output")
+                    | Some("custom_tool_call")
+                    | Some("custom_tool_call_output")
+                    | Some("web_search_call")
+                    | Some("local_shell_call")
+            ) {
+                Some(TurnSignal::Start)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
 pub(crate) fn compute_idle_from_log(path: &Path) -> Option<bool> {
     let size = file_len(path).ok()?;
     let records = read_positioned_records(path).ok()?;
@@ -9036,7 +9185,7 @@ pub(crate) fn compute_idle_from_log(path: &Path) -> Option<bool> {
                             .unwrap_or(false) =>
                     {
                         saw_terminal_signal = true;
-                        idle = false;
+                        idle = payload.get("phase").and_then(Value::as_str) == Some("final_answer");
                     }
                     Some("agent_reasoning") => {
                         saw_terminal_signal = true;
@@ -9059,7 +9208,8 @@ pub(crate) fn compute_idle_from_log(path: &Path) -> Option<bool> {
                 let payload_type = payload.get("type").and_then(Value::as_str);
                 if response_item_has_assistant_output(obj) {
                     saw_terminal_signal = true;
-                    idle = payload.get("end_turn").and_then(Value::as_bool) == Some(true);
+                    idle = payload.get("end_turn").and_then(Value::as_bool) == Some(true)
+                        || payload.get("phase").and_then(Value::as_str) == Some("final_answer");
                     continue;
                 }
                 if matches!(
@@ -10270,6 +10420,40 @@ mod tests {
     }
 
     #[test]
+    fn load_sessions_treats_final_agent_message_as_idle_without_task_complete() {
+        let app_dir = temp_app_dir("final-agent-message-idle");
+        let log_path = app_dir.join("rollout-final-agent-message.jsonl");
+        fs::write(
+            &log_path,
+            [
+                r#"{"type":"event_msg","timestamp":"2026-05-18T14:59:38.204Z","payload":{"type":"task_started","turn_id":"turn-a"}}"#,
+                r#"{"type":"event_msg","timestamp":"2026-05-18T14:59:39.204Z","payload":{"type":"user_message","message":"hello"}}"#,
+                r#"{"type":"event_msg","timestamp":"2026-05-18T14:59:40.204Z","payload":{"type":"agent_message","message":"done","phase":"final_answer"}}"#,
+            ]
+            .join("\n")
+                + "\n",
+        )
+        .unwrap();
+        fs::write(app_dir.join("socks").join("sid-final.sock"), "").unwrap();
+        fs::write(
+            app_dir.join("socks").join("sid-final.json"),
+            format!(
+                r#"{{"session_id":"thread-final","codex_pid":{},"broker_pid":{},"agent_backend":"codex","owner":"web","cwd":"{}","log_path":"{}","start_ts":1.0}}"#,
+                std::process::id(),
+                std::process::id(),
+                app_dir.display(),
+                log_path.display(),
+            ),
+        )
+        .unwrap();
+
+        let response = load_sessions_response(&RuntimeConfig { app_dir }).unwrap();
+
+        assert_eq!(response.sessions.len(), 1);
+        assert!(!response.sessions[0].busy);
+    }
+
+    #[test]
     fn load_sessions_skips_hidden_sessions() {
         let app_dir = temp_app_dir("hidden");
         fs::write(app_dir.join("socks").join("sid-hidden.sock"), "").unwrap();
@@ -11164,6 +11348,7 @@ name = "CRS"
         assert_eq!(tail.events[0]["text"], "working");
         assert_eq!(tail.events[1]["message_class"], "final_response");
         assert!(tail.has_older);
+        assert!(tail.turn_end);
 
         let history = load_messages_history(
             &config,
@@ -11178,6 +11363,76 @@ name = "CRS"
         let live = load_messages_live(&config, "sid-msg", "0").unwrap();
         assert_eq!(live.events.len(), 3);
         assert_eq!(live.live_cursor, tail.live_cursor);
+        assert!(live.turn_end);
+    }
+
+    #[test]
+    fn message_tail_marks_task_complete_as_turn_end_without_assistant_text() {
+        let app_dir = temp_app_dir("messages-task-complete-tail");
+        let log_path = app_dir.join("rollout-task-complete.jsonl");
+        fs::write(
+            &log_path,
+            [
+                r#"{"type":"event_msg","payload":{"type":"task_started"},"ts":1.0}"#,
+                r#"{"type":"event_msg","payload":{"type":"user_message","message":"hello"},"ts":2.0}"#,
+                r#"{"type":"event_msg","payload":{"type":"task_complete"},"ts":3.0}"#,
+            ]
+            .join("\n")
+                + "\n",
+        )
+        .unwrap();
+        fs::write(app_dir.join("socks").join("sid-complete-tail.sock"), "").unwrap();
+        fs::write(
+            app_dir.join("socks").join("sid-complete-tail.json"),
+            format!(
+                r#"{{"session_id":"thread-complete-tail","codex_pid":1,"broker_pid":2,"cwd":"/work","log_path":"{}","start_ts":1.0}}"#,
+                log_path.display()
+            ),
+        )
+        .unwrap();
+        let config = RuntimeConfig { app_dir };
+
+        let tail = load_messages_tail(&config, "sid-complete-tail", 10).unwrap();
+
+        assert_eq!(tail.events.len(), 1);
+        assert_eq!(tail.events[0]["role"], "user");
+        assert!(tail.turn_end);
+        assert!(!tail.turn_start);
+        assert!(!tail.turn_aborted);
+    }
+
+    #[test]
+    fn live_messages_mark_event_msg_final_agent_message_as_turn_end() {
+        let app_dir = temp_app_dir("messages-event-msg-final");
+        let log_path = app_dir.join("rollout-final.jsonl");
+        fs::write(
+            &log_path,
+            [
+                r#"{"type":"event_msg","payload":{"type":"user_message","message":"hello"},"ts":1.0}"#,
+                r#"{"type":"event_msg","payload":{"type":"agent_message","message":"done","phase":"final_answer"},"ts":2.0}"#,
+            ]
+            .join("\n")
+                + "\n",
+        )
+        .unwrap();
+        fs::write(app_dir.join("socks").join("sid-final-live.sock"), "").unwrap();
+        fs::write(
+            app_dir.join("socks").join("sid-final-live.json"),
+            format!(
+                r#"{{"session_id":"thread-final-live","codex_pid":1,"broker_pid":2,"cwd":"/work","log_path":"{}","start_ts":1.0}}"#,
+                log_path.display()
+            ),
+        )
+        .unwrap();
+        let config = RuntimeConfig { app_dir };
+
+        let live = load_messages_live(&config, "sid-final-live", "0").unwrap();
+
+        assert_eq!(live.events.len(), 2);
+        assert_eq!(live.events[1]["role"], "assistant");
+        assert_eq!(live.events[1]["text"], "done");
+        assert_eq!(live.events[1]["message_class"], "final_response");
+        assert!(live.turn_end);
     }
 
     #[test]

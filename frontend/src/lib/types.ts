@@ -337,6 +337,9 @@ export type TailResponse = {
   history_cursor: string | null;
   events: RawChatEvent[];
   has_older?: boolean;
+  turn_start?: boolean;
+  turn_end?: boolean;
+  turn_aborted?: boolean;
   busy: boolean;
   queue_len: number;
   token?: Record<string, unknown> | null;

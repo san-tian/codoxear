@@ -104,6 +104,26 @@ pub fn router(state: AppState) -> Router {
             post(share_session_send),
         )
         .route(
+            "/share/:share_id/sessions/:session_id/enqueue",
+            post(share_session_enqueue),
+        )
+        .route(
+            "/share/:share_id/sessions/:session_id/queue",
+            get(share_session_queue),
+        )
+        .route(
+            "/share/:share_id/sessions/:session_id/queue/delete",
+            post(share_queue_delete),
+        )
+        .route(
+            "/share/:share_id/sessions/:session_id/queue/update",
+            post(share_queue_update),
+        )
+        .route(
+            "/share/:share_id/sessions/:session_id/queue/move",
+            post(share_queue_move),
+        )
+        .route(
             "/share/:share_id/sessions/:session_id/interrupt",
             post(share_session_interrupt),
         )
@@ -1526,6 +1546,143 @@ async fn share_session_send(
     Ok(Json(response))
 }
 
+async fn share_session_queue(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((share_id, session_id)): Path<(String, String)>,
+) -> Result<Json<ApiQueueResponse>, (StatusCode, String)> {
+    match share_request_is_authorized(&headers, &state.config.app_dir, &share_id) {
+        Ok(true) => {}
+        Ok(false) => return Err((StatusCode::UNAUTHORIZED, "unauthorized".to_string())),
+        Err(message) => return Err((StatusCode::INTERNAL_SERVER_ERROR, message)),
+    }
+    let share = load_share_set(&state.config, &share_id)
+        .map_err(|message| (StatusCode::NOT_FOUND, message))?;
+    if !share.session_ids.iter().any(|value| value == &session_id) {
+        return Err((StatusCode::NOT_FOUND, "session not in share".to_string()));
+    }
+    load_queue_response(&state.config, &session_id)
+        .map(Json)
+        .map_err(route_error)
+}
+
+async fn share_session_enqueue(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((share_id, session_id)): Path<(String, String)>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    match share_request_is_authorized(&headers, &state.config.app_dir, &share_id) {
+        Ok(true) => {}
+        Ok(false) => return Err((StatusCode::UNAUTHORIZED, "unauthorized".to_string())),
+        Err(message) => return Err((StatusCode::INTERNAL_SERVER_ERROR, message)),
+    }
+    let share = load_share_set(&state.config, &share_id)
+        .map_err(|message| (StatusCode::NOT_FOUND, message))?;
+    if !share.session_ids.iter().any(|value| value == &session_id) {
+        return Err((StatusCode::NOT_FOUND, "session not in share".to_string()));
+    }
+    let Some(text) = payload.get("text").and_then(serde_json::Value::as_str) else {
+        return Err((StatusCode::BAD_REQUEST, "text required".to_string()));
+    };
+    if text.trim().is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "text required".to_string()));
+    }
+    enqueue_session_message(&state.config, &session_id, text)
+        .map(Json)
+        .map_err(queue_action_error)
+}
+
+async fn share_queue_delete(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((share_id, session_id)): Path<(String, String)>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    match share_request_is_authorized(&headers, &state.config.app_dir, &share_id) {
+        Ok(true) => {}
+        Ok(false) => return Err((StatusCode::UNAUTHORIZED, "unauthorized".to_string())),
+        Err(message) => return Err((StatusCode::INTERNAL_SERVER_ERROR, message)),
+    }
+    let share = load_share_set(&state.config, &share_id)
+        .map_err(|message| (StatusCode::NOT_FOUND, message))?;
+    if !share.session_ids.iter().any(|value| value == &session_id) {
+        return Err((StatusCode::NOT_FOUND, "session not in share".to_string()));
+    }
+    let Some(item_id) = payload.get("id").and_then(serde_json::Value::as_str) else {
+        return Err((StatusCode::BAD_REQUEST, "id required".to_string()));
+    };
+    if item_id.trim().is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "id required".to_string()));
+    }
+    delete_queue_item(&state.config, &session_id, item_id)
+        .map(Json)
+        .map_err(queue_action_error)
+}
+
+async fn share_queue_update(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((share_id, session_id)): Path<(String, String)>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    match share_request_is_authorized(&headers, &state.config.app_dir, &share_id) {
+        Ok(true) => {}
+        Ok(false) => return Err((StatusCode::UNAUTHORIZED, "unauthorized".to_string())),
+        Err(message) => return Err((StatusCode::INTERNAL_SERVER_ERROR, message)),
+    }
+    let share = load_share_set(&state.config, &share_id)
+        .map_err(|message| (StatusCode::NOT_FOUND, message))?;
+    if !share.session_ids.iter().any(|value| value == &session_id) {
+        return Err((StatusCode::NOT_FOUND, "session not in share".to_string()));
+    }
+    let Some(item_id) = payload.get("id").and_then(serde_json::Value::as_str) else {
+        return Err((StatusCode::BAD_REQUEST, "id required".to_string()));
+    };
+    if item_id.trim().is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "id required".to_string()));
+    }
+    let Some(text) = payload.get("text").and_then(serde_json::Value::as_str) else {
+        return Err((StatusCode::BAD_REQUEST, "text required".to_string()));
+    };
+    if text.trim().is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "text required".to_string()));
+    }
+    update_queue_item(&state.config, &session_id, item_id, text)
+        .map(Json)
+        .map_err(queue_action_error)
+}
+
+async fn share_queue_move(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((share_id, session_id)): Path<(String, String)>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    match share_request_is_authorized(&headers, &state.config.app_dir, &share_id) {
+        Ok(true) => {}
+        Ok(false) => return Err((StatusCode::UNAUTHORIZED, "unauthorized".to_string())),
+        Err(message) => return Err((StatusCode::INTERNAL_SERVER_ERROR, message)),
+    }
+    let share = load_share_set(&state.config, &share_id)
+        .map_err(|message| (StatusCode::NOT_FOUND, message))?;
+    if !share.session_ids.iter().any(|value| value == &session_id) {
+        return Err((StatusCode::NOT_FOUND, "session not in share".to_string()));
+    }
+    let Some(item_id) = payload.get("id").and_then(serde_json::Value::as_str) else {
+        return Err((StatusCode::BAD_REQUEST, "id required".to_string()));
+    };
+    if item_id.trim().is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "id required".to_string()));
+    }
+    let Some(to_index) = payload.get("to_index").and_then(serde_json::Value::as_i64) else {
+        return Err((StatusCode::BAD_REQUEST, "to_index required".to_string()));
+    };
+    move_queue_item(&state.config, &session_id, item_id, to_index)
+        .map(Json)
+        .map_err(queue_action_error)
+}
+
 async fn share_session_interrupt(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2082,6 +2239,8 @@ fn create_session_error_response(
 ) -> (StatusCode, Json<serde_json::Value>) {
     let status = if error.is_bad_request() {
         StatusCode::BAD_REQUEST
+    } else if error.is_bad_gateway() {
+        StatusCode::BAD_GATEWAY
     } else {
         StatusCode::INTERNAL_SERVER_ERROR
     };
@@ -3787,6 +3946,179 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn share_link_session_names_follow_owner_renames() {
+        let _guard = env_lock().lock().unwrap();
+        let app_dir = temp_app_dir("share-links-rename");
+        fs::write(app_dir.join("socks").join("sid-share-rename.sock"), "").unwrap();
+        fs::write(
+            app_dir.join("socks").join("sid-share-rename.json"),
+            r#"{"session_id":"thread-share-rename","codex_pid":1,"broker_pid":2,"agent_backend":"codex","cwd":"/repo","start_ts":11.0}"#,
+        )
+        .unwrap();
+        let _password = EnvGuard::set("CODEX_WEB_PASSWORD", "topsecret");
+        let app = router(build_state_from_config(RuntimeConfig { app_dir }).unwrap());
+        let owner_cookie = login_cookie(&app).await;
+
+        let created = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/share-links")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, &owner_cookie)
+                    .body(Body::from(
+                        r#"{"label":"Rename share","session_ids":["sid-share-rename"],"expires_in_hours":24}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::OK);
+        let created_body = to_bytes(created.into_body(), usize::MAX).await.unwrap();
+        let created_payload: Value = serde_json::from_slice(&created_body).unwrap();
+        let share_id = created_payload["share_id"].as_str().unwrap();
+        let share_password = created_payload["share_password"].as_str().unwrap();
+        assert_eq!(created_payload["sessions"][0]["nickname"], "repo");
+
+        let renamed = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/sessions/sid-share-rename/rename")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, &owner_cookie)
+                    .body(Body::from(r#"{"name":"GPU lease renamed"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(renamed.status(), StatusCode::OK);
+
+        let login = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/share/{share_id}/login"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(format!(r#"{{"password":"{share_password}"}}"#)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(login.status(), StatusCode::OK);
+        let login_body = to_bytes(login.into_body(), usize::MAX).await.unwrap();
+        let login_payload: Value = serde_json::from_slice(&login_body).unwrap();
+        assert_eq!(
+            login_payload["sessions"][0]["nickname"],
+            "GPU lease renamed"
+        );
+    }
+
+    #[tokio::test]
+    async fn share_owner_can_delete_expired_share_with_stale_sessions() {
+        let _guard = env_lock().lock().unwrap();
+        let app_dir = temp_app_dir("share-links-expired-delete");
+        let _password = EnvGuard::set("CODEX_WEB_PASSWORD", "topsecret");
+        let share_id = "expired-share";
+        fs::write(
+            app_dir.join("session_shares.json"),
+            format!(
+                r#"{{
+  "{share_id}": {{
+    "share_id": "{share_id}",
+    "label": "Expired share",
+    "password_hash": "hash",
+    "password_hint": "hint",
+    "expires_at": 1.0,
+    "created_at": 1.0,
+    "updated_at": 1.0,
+    "allow_interrupt": true,
+    "allow_files": true,
+    "allow_attachment_downloads": true,
+    "session_ids": ["missing-session"],
+    "sessions": [
+      {{
+        "session_id": "missing-session",
+        "nickname": "missing",
+        "added_ts": 1.0,
+        "cwd": "/gone",
+        "workspace_cwd": null,
+        "agent_backend": "codex",
+        "busy": false,
+        "queue_len": 0,
+        "updated_ts": 1.0
+      }}
+    ]
+  }}
+}}"#
+            ),
+        )
+        .unwrap();
+        let app = router(build_state_from_config(RuntimeConfig { app_dir }).unwrap());
+        let cookie = login_cookie(&app).await;
+
+        let listed = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/share-links")
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(listed.status(), StatusCode::OK);
+        let listed_body = to_bytes(listed.into_body(), usize::MAX).await.unwrap();
+        let listed_payload: Value = serde_json::from_slice(&listed_body).unwrap();
+        assert_eq!(listed_payload["shares"].as_array().unwrap().len(), 1);
+        assert_eq!(listed_payload["shares"][0]["share_id"], share_id);
+        assert_eq!(
+            listed_payload["shares"][0]["sessions"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+
+        let deleted = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/v1/share-links/{share_id}"))
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(deleted.status(), StatusCode::OK);
+
+        let listed_after = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/share-links")
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let listed_after_body = to_bytes(listed_after.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let listed_after_payload: Value = serde_json::from_slice(&listed_after_body).unwrap();
+        assert!(listed_after_payload["shares"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
     async fn session_create_route_spawns_web_broker() {
         let _guard = env_lock().lock().unwrap();
         let app_dir = temp_app_dir("create-session");
@@ -3964,6 +4296,73 @@ mod tests {
             payload["error"],
             "resume session not found for cwd: missing"
         );
+    }
+
+    #[tokio::test]
+    async fn session_create_route_reports_resume_spawn_failure_as_bad_gateway() {
+        let _guard = env_lock().lock().unwrap();
+        let app_dir = temp_app_dir("create-resume-spawn-failure");
+        let codex_home = temp_dir("resume-spawn-failure-home");
+        let workspace = temp_dir("resume-spawn-failure-workspace");
+        let repo_root = temp_dir("resume-spawn-failure-root");
+        let sessions_dir = codex_home
+            .join("sessions")
+            .join("2026")
+            .join("05")
+            .join("31");
+        fs::create_dir_all(&sessions_dir).unwrap();
+        fs::write(
+            sessions_dir.join(
+                "rollout-2026-05-31T01-00-00-resume-fails-resume-fails-resumefail.jsonl",
+            ),
+            format!(
+                r#"{{"type":"session_meta","payload":{{"id":"resume-fails","cwd":"{}","timestamp":"2026-05-31T01:00:00Z","source":"cli"}}}}
+"#,
+                workspace.display()
+            ),
+        )
+        .unwrap();
+        let broker_path = repo_root.join("fake-broker-fails.sh");
+        write_executable(
+            &broker_path,
+            "#!/usr/bin/env bash\nprintf 'codex resume crashed before socket metadata\\n' >&2\nexit 42\n",
+        );
+        let _codex_home = EnvGuard::set("CODEX_HOME", codex_home.display().to_string());
+        let _repo_root = EnvGuard::set("CODOXEAR_REPO_ROOT", repo_root.display().to_string());
+        let _broker = EnvGuard::set(
+            "CODOXEAR_RUST_BROKER_BIN",
+            broker_path.display().to_string(),
+        );
+        let app = router(build_state_from_config(RuntimeConfig { app_dir }).unwrap());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/sessions")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(format!(
+                        r#"{{"cwd":"{}","resume_session_id":"resume-fails"}}"#,
+                        workspace.display()
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(
+            status,
+            StatusCode::BAD_GATEWAY,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        assert!(payload["error"]
+            .as_str()
+            .unwrap()
+            .contains("codex resume crashed before socket metadata"));
     }
 
     #[tokio::test]
@@ -5351,6 +5750,149 @@ mod tests {
         assert_eq!(items[0]["text"], "queued two");
 
         listener_thread.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn share_queue_routes_mutate_shared_session_queue() {
+        let app_dir = temp_app_dir("share-queue-actions");
+        fs::write(app_dir.join("socks").join("sid-share-queue.sock"), "").unwrap();
+        fs::write(
+            app_dir.join("socks").join("sid-share-queue.json"),
+            r#"{"session_id":"thread-share-queue","codex_pid":1,"broker_pid":2,"agent_backend":"codex","cwd":"/repo","start_ts":11.0}"#,
+        )
+        .unwrap();
+        fs::write(
+            app_dir.join("session_queues.json"),
+            r#"{"sid-share-queue":[{"id":"q-one","text":"owner queued","created_ts":11.0}]}"#,
+        )
+        .unwrap();
+        let _password = EnvGuard::set("CODEX_WEB_PASSWORD", "topsecret");
+        let app = router(build_state_from_config(RuntimeConfig { app_dir }).unwrap());
+        let owner_cookie = login_cookie(&app).await;
+
+        let created = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/share-links")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, &owner_cookie)
+                    .body(Body::from(
+                        r#"{"label":"Queue share","session_ids":["sid-share-queue"],"expires_in_hours":24}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::OK);
+        let created_body = to_bytes(created.into_body(), usize::MAX).await.unwrap();
+        let created_payload: Value = serde_json::from_slice(&created_body).unwrap();
+        let share_id = created_payload["share_id"].as_str().unwrap();
+        let share_password = created_payload["share_password"].as_str().unwrap();
+
+        let login = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/share/{share_id}/login"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(format!(r#"{{"password":"{share_password}"}}"#)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(login.status(), StatusCode::OK);
+        let share_cookie = login
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        let listed = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/share/{share_id}/sessions/sid-share-queue/queue"))
+                    .header(header::COOKIE, &share_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(listed.status(), StatusCode::OK);
+        let listed_body = to_bytes(listed.into_body(), usize::MAX).await.unwrap();
+        let listed_payload: Value = serde_json::from_slice(&listed_body).unwrap();
+        assert_eq!(listed_payload["items"][0]["text"], "owner queued");
+
+        let updated = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/share/{share_id}/sessions/sid-share-queue/queue/update"
+                    ))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, &share_cookie)
+                    .body(Body::from(r#"{"id":"q-one","text":"share edited"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated.status(), StatusCode::OK);
+
+        let enqueued = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/share/{share_id}/sessions/sid-share-queue/enqueue"
+                    ))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, &share_cookie)
+                    .body(Body::from(r#"{"text":"share queued"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(enqueued.status(), StatusCode::OK);
+        let enqueued_body = to_bytes(enqueued.into_body(), usize::MAX).await.unwrap();
+        let enqueued_payload: Value = serde_json::from_slice(&enqueued_body).unwrap();
+        assert_eq!(enqueued_payload["queue_len"], 2);
+
+        let owner_queue = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/sessions/sid-share-queue/queue")
+                    .header(header::COOKIE, &owner_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(owner_queue.status(), StatusCode::OK);
+        let owner_queue_body = to_bytes(owner_queue.into_body(), usize::MAX).await.unwrap();
+        let owner_queue_payload: Value = serde_json::from_slice(&owner_queue_body).unwrap();
+        assert_eq!(owner_queue_payload["items"][0]["text"], "share edited");
+        assert_eq!(owner_queue_payload["items"][1]["text"], "share queued");
+
+        let unauthorized = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/share/{share_id}/sessions/missing/queue"))
+                    .header(header::COOKIE, &share_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

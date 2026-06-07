@@ -1,5 +1,5 @@
 import { TranscriptEventRow, WorkingIndicator } from "./lib/transcript";
-import type { FileReadResponse, ShareFilesResponse, ShareSet, TerminalPrompt, UiTranscriptEvent } from "./lib/types";
+import type { FileReadResponse, QueueItem, ShareFilesResponse, ShareSet, TerminalPrompt, UiTranscriptEvent } from "./lib/types";
 
 function baseName(path: string) {
   const parts = String(path || "").split("/").filter(Boolean);
@@ -15,7 +15,7 @@ function relativeAge(ts: number) {
   return `${Math.max(1, Math.floor(delta / 86400))}d ago`;
 }
 
-function shareIcon(name: "send" | "stop" | "replace" | "keep" | "schedule") {
+function shareIcon(name: "send" | "stop" | "replace" | "keep" | "schedule" | "tools" | "queue" | "up" | "down" | "trash") {
   const common = {
     width: 16,
     height: 16,
@@ -56,6 +56,46 @@ function shareIcon(name: "send" | "stop" | "replace" | "keep" | "schedule") {
         <path d="M10.5 2.5v2" />
         <path d="M3 6.5h10" />
         <path d="M8 8.4v2.3l1.6.8" />
+      </svg>
+    );
+  }
+  if (name === "tools") {
+    return (
+      <svg {...common}>
+        <path d="M10.7 2.8a3.1 3.1 0 0 0 2.5 3.7L6.1 13.6a1.5 1.5 0 0 1-2.1-2.1l7.1-7.1A3.1 3.1 0 0 0 10.7 2.8Z" />
+        <path d="M4.4 11.6 5.9 13.1" />
+      </svg>
+    );
+  }
+  if (name === "queue") {
+    return (
+      <svg {...common}>
+        <path d="M4 4.5h8" />
+        <path d="M4 8h8" />
+        <path d="M4 11.5h5" />
+      </svg>
+    );
+  }
+  if (name === "up") {
+    return (
+      <svg {...common}>
+        <path d="m4.5 9.5 3.5-3.5 3.5 3.5" />
+      </svg>
+    );
+  }
+  if (name === "down") {
+    return (
+      <svg {...common}>
+        <path d="m4.5 6.5 3.5 3.5 3.5-3.5" />
+      </svg>
+    );
+  }
+  if (name === "trash") {
+    return (
+      <svg {...common}>
+        <path d="M3.8 4.8h8.4" />
+        <path d="M6.3 4.8v-1h3.4v1" />
+        <path d="m5.2 4.8.5 7h4.6l.5-7" />
       </svg>
     );
   }
@@ -108,11 +148,16 @@ export function ShareWorkspace(props: {
   files: ShareFilesResponse | null;
   selectedFilePath: string;
   selectedFile: FileReadResponse | null;
+  showTools: boolean;
   loading: boolean;
   loadingOlder: boolean;
   hasOlder: boolean;
   busy: boolean;
   queueLen: number;
+  queueItems: QueueItem[];
+  queueDrafts: Record<string, string>;
+  queueLoading: boolean;
+  queueOpen: boolean;
   terminalPrompt: TerminalPrompt | null;
   terminalPromptSending: boolean;
   errorText: string;
@@ -121,6 +166,7 @@ export function ShareWorkspace(props: {
   onSessionChange: (sessionId: string) => void;
   onSendTextChange: (value: string) => void;
   onSend: () => void | Promise<void>;
+  onEnqueue: () => void | Promise<void>;
   onInterrupt: () => void | Promise<void>;
   onTerminalPromptResponse: (value: string) => void | Promise<void>;
   onLoadOlder: () => void | Promise<void>;
@@ -129,6 +175,13 @@ export function ShareWorkspace(props: {
   onCopyText: (event: UiTranscriptEvent) => void | Promise<void>;
   isEventCollapsed: (event: UiTranscriptEvent) => boolean;
   onToggleEvent: (event: UiTranscriptEvent) => void;
+  onToggleTools: () => void;
+  onOpenQueue: () => void;
+  onCloseQueue: () => void;
+  onQueueDraftChange: (itemId: string, value: string) => void;
+  onSaveQueueItem: (itemId: string) => void | Promise<void>;
+  onDeleteQueueItem: (itemId: string) => void | Promise<void>;
+  onMoveQueueItem: (itemId: string, toIndex: number) => void | Promise<void>;
   onOpenSchedules: () => void;
 }) {
   const session = props.share.sessions.find((item) => item.session_id === props.sessionId) || props.share.sessions[0] || null;
@@ -140,6 +193,7 @@ export function ShareWorkspace(props: {
   const shareStatus = shareWorking ? "working" : shareQueueLen ? `queue ${shareQueueLen}` : "idle";
   const shareStatusClass = shareWorking ? "status-chip working" : shareWaiting ? "status-chip waiting" : "status-chip";
   const shareWorkingIndicatorLabel = shareWorking ? "Working" : shareWaiting ? "Waiting" : "";
+  const queuePreviewItems = props.queueItems.slice(0, 3);
   return (
     <div className="app shareApp">
       <aside className="sidebar shareSidebar">
@@ -150,24 +204,34 @@ export function ShareWorkspace(props: {
           </div>
         </header>
         <div className="sessions shareSessions">
-          {props.share.sessions.map((item) => (
-            <button
-              key={item.session_id}
-              className={`workspaceSelect shareSession${item.session_id === props.sessionId ? " active" : ""}`}
-              type="button"
-              onClick={() => props.onSessionChange(item.session_id)}
-            >
-              <div className="workspaceHeader">
-                <div className="workspaceTitleRow">
-                  <div className="workspaceTitle">{item.nickname || item.session_id}</div>
+          {props.share.sessions.map((item) => {
+            const isCurrentSession = item.session_id === props.sessionId;
+            const itemBusy = isCurrentSession ? Boolean(props.busy || item.busy) : Boolean(item.busy);
+            const itemQueueLen = isCurrentSession
+              ? Math.max(Number(props.queueLen || 0), Number(item.queue_len || 0))
+              : Number(item.queue_len || 0);
+            const itemStatus = itemBusy ? "working" : itemQueueLen ? `queue ${itemQueueLen}` : "idle";
+            const itemDotClass = itemBusy ? "running" : itemQueueLen ? "waiting" : "idle";
+            return (
+              <button
+                key={item.session_id}
+                className={`workspaceSelect shareSession${isCurrentSession ? " active" : ""}`}
+                type="button"
+                onClick={() => props.onSessionChange(item.session_id)}
+              >
+                <div className="workspaceHeader">
+                  <div className="workspaceTitleRow">
+                    <div className="workspaceTitle">{item.nickname || item.session_id}</div>
+                    <span className={`status-dot ${itemDotClass}`} title={itemStatus} aria-label={itemStatus} />
+                  </div>
+                  <div className="workspacePath">{item.workspace_cwd || item.cwd || item.session_id}</div>
+                  <div className="workspaceMeta">
+                    {String(item.agent_backend || "codex").toUpperCase()} / {itemStatus} / {relativeAge(item.updated_ts || item.added_ts)}
+                  </div>
                 </div>
-                <div className="workspacePath">{item.workspace_cwd || item.cwd || item.session_id}</div>
-                <div className="workspaceMeta">
-                  {String(item.agent_backend || "codex").toUpperCase()} / {item.busy ? "working" : item.queue_len ? `queue ${item.queue_len}` : "idle"} / {relativeAge(item.updated_ts || item.added_ts)}
-                </div>
-              </div>
-            </button>
-          ))}
+              </button>
+            );
+          })}
         </div>
       </aside>
       <div className="main shareMain">
@@ -185,6 +249,18 @@ export function ShareWorkspace(props: {
             </div>
           </div>
           <div className="actions topActions">
+            <button className="icon-btn" type="button" title="Queued messages" disabled={!props.sessionId} onClick={props.onOpenQueue}>
+              {shareIcon("queue")}
+            </button>
+            <button
+              className={`icon-btn${props.showTools ? " active" : ""}`}
+              type="button"
+              title={props.showTools ? "Hide tools and narration" : "Show tools and narration"}
+              aria-pressed={props.showTools}
+              onClick={props.onToggleTools}
+            >
+              {shareIcon("tools")}
+            </button>
             <button className="icon-btn" type="button" title="Schedules" disabled={!props.sessionId || props.loading} onClick={props.onOpenSchedules}>
               {shareIcon("schedule")}
             </button>
@@ -282,6 +358,24 @@ export function ShareWorkspace(props: {
           ) : null}
         </div>
         <div className="composer">
+          {shareQueueLen > 0 ? (
+            <button className="queuePreview" type="button" onClick={props.onOpenQueue}>
+              <span className="queuePreviewHeader">
+                <span>Queued messages</span>
+                <span>{props.queueLoading ? "loading" : `${shareQueueLen}`}</span>
+              </span>
+              <span className="queuePreviewList">
+                {queuePreviewItems.map((item, index) => (
+                  <span className="queuePreviewItem" key={item.id}>
+                    <span>{index + 1}</span>
+                    <span>{item.text}</span>
+                  </span>
+                ))}
+                {!queuePreviewItems.length ? <span className="queuePreviewEmpty">Loading queued messages...</span> : null}
+                {shareQueueLen > queuePreviewItems.length ? <span className="queuePreviewMore">+{shareQueueLen - queuePreviewItems.length} more</span> : null}
+              </span>
+            </button>
+          ) : null}
           <form
             onSubmit={(event) => {
               event.preventDefault();
@@ -292,6 +386,9 @@ export function ShareWorkspace(props: {
               <textarea value={props.sendText} onInput={(event) => props.onSendTextChange((event.currentTarget as HTMLTextAreaElement).value)} aria-label="Reply in shared session" />
               {!props.sendText ? <div className="ph">Reply in shared session</div> : null}
             </div>
+            <button className="icon-btn" type="button" title="Queue message" disabled={!props.canSend || props.loading} onClick={() => void props.onEnqueue()}>
+              {shareIcon("queue")}
+            </button>
             <button className="icon-btn primary" type="submit" title={props.loading ? "Sending..." : "Send"} disabled={!props.canSend || props.loading}>
               {shareIcon("send")}
             </button>
@@ -299,6 +396,45 @@ export function ShareWorkspace(props: {
         </div>
         {props.errorText ? <div className="toast muted">{props.errorText}</div> : null}
       </div>
+      {props.queueOpen ? (
+        <div className="modalBackdrop" onClick={props.onCloseQueue}>
+          <div className="modalCard" onClick={(event) => event.stopPropagation()}>
+            <div className="modalHeader">
+              <div>Queued messages</div>
+              <button className="icon-btn" type="button" onClick={props.onCloseQueue}>
+                {shareIcon("keep")}
+              </button>
+            </div>
+            {props.queueLoading ? <div className="muted">Loading queue...</div> : null}
+            <div className="queueList">
+              {props.queueItems.map((item, index) => (
+                <div className="queueItem" key={item.id}>
+                  <textarea
+                    className="queueText"
+                    value={props.queueDrafts[item.id] ?? item.text}
+                    onInput={(event) => props.onQueueDraftChange(item.id, (event.currentTarget as HTMLTextAreaElement).value)}
+                  />
+                  <div className="queueActions">
+                    <button className="icon-btn" type="button" disabled={index === 0 || item.sending} onClick={() => void props.onMoveQueueItem(item.id, index - 1)}>
+                      {shareIcon("up")}
+                    </button>
+                    <button className="icon-btn" type="button" disabled={index === props.queueItems.length - 1 || item.sending} onClick={() => void props.onMoveQueueItem(item.id, index + 1)}>
+                      {shareIcon("down")}
+                    </button>
+                    <button className="secondaryBtn" type="button" onClick={() => void props.onSaveQueueItem(item.id)}>
+                      Save
+                    </button>
+                    <button className="icon-btn danger" type="button" onClick={() => void props.onDeleteQueueItem(item.id)}>
+                      {shareIcon("trash")}
+                    </button>
+                  </div>
+                </div>
+              ))}
+              {!props.queueLoading && !props.queueItems.length ? <div className="muted">No queued messages.</div> : null}
+            </div>
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }

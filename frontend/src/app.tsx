@@ -119,6 +119,18 @@ type SessionViewSnapshot = {
   tokenSummary: TokenSummary | null;
   terminalPrompt: TerminalPromptState | null;
 };
+type ShareViewSnapshot = {
+  transcript: UiTranscriptEvent[];
+  liveCursor: string | null;
+  historyCursor: string | null;
+  hasOlder: boolean;
+  busy: boolean;
+  queueLen: number;
+  terminalPrompt: TerminalPromptState | null;
+  files: ShareFilesResponse | null;
+  selectedFilePath: string;
+  selectedFile: FileReadResponse | null;
+};
 
 type ShareTarget = {
   shareId: string;
@@ -1132,6 +1144,10 @@ export function App() {
   const [shareLoadingOlder, setShareLoadingOlder] = useState(false);
   const [shareBusy, setShareBusy] = useState(false);
   const [shareQueueLen, setShareQueueLen] = useState(0);
+  const [shareQueueOpen, setShareQueueOpen] = useState(false);
+  const [shareQueueItems, setShareQueueItems] = useState<QueueItem[]>([]);
+  const [shareQueueDrafts, setShareQueueDrafts] = useState<Record<string, string>>({});
+  const [shareQueueLoading, setShareQueueLoading] = useState(false);
   const [shareTerminalPrompt, setShareTerminalPrompt] = useState<TerminalPromptState | null>(null);
   const [shareTerminalPromptSending, setShareTerminalPromptSending] = useState(false);
   const [shareErrorText, setShareErrorText] = useState("");
@@ -1200,6 +1216,7 @@ export function App() {
   const [shareCreateResult, setShareCreateResult] = useState<ShareCreateResponse | null>(null);
   const [managedShares, setManagedShares] = useState<ManagedShareSet[]>([]);
   const [managedSharesLoading, setManagedSharesLoading] = useState(false);
+  const [editingShareId, setEditingShareId] = useState("");
   const [deletingShareId, setDeletingShareId] = useState("");
   const [sessionContextMenu, setSessionContextMenu] = useState<{ sessionId: string; x: number; y: number } | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -1251,7 +1268,10 @@ export function App() {
   const historyCursorRef = useRef<string | null>(null);
   const selectedSessionRef = useRef("");
   const shareSessionRef = useRef(shareTarget?.sessionId || "");
+  const shareOpenRequestRef = useRef(0);
+  const shareQueueLoadedSessionRef = useRef("");
   const sessionViewCacheRef = useRef<Record<string, SessionViewSnapshot>>({});
+  const shareViewCacheRef = useRef<Record<string, ShareViewSnapshot>>({});
   const previousSessionBusyRef = useRef<Record<string, boolean>>({});
   const suppressedTerminalPromptKeysRef = useRef<Record<string, boolean>>({});
   const fastPollUntilRef = useRef(0);
@@ -1286,15 +1306,163 @@ export function App() {
   function updateShareSessionRuntime(sessionId: string, busyValue: boolean, queueLength: number) {
     setShareSet((current) => {
       if (!current) return current;
+      const existing = current.sessions.find((session) => session.session_id === sessionId);
+      if (existing && Boolean(existing.busy) === busyValue && Number(existing.queue_len || 0) === queueLength) return current;
+      const now = Date.now() / 1000;
       return {
         ...current,
         sessions: current.sessions.map((session) =>
           session.session_id === sessionId
-            ? { ...session, busy: busyValue, queue_len: queueLength, updated_ts: Math.max(session.updated_ts || 0, Date.now() / 1000) }
+            ? { ...session, busy: busyValue, queue_len: queueLength, updated_ts: Math.max(session.updated_ts || 0, now) }
             : session,
         ),
       };
     });
+  }
+
+  function cacheShareSnapshot(sessionId: string, patch: Partial<ShareViewSnapshot>) {
+    if (!sessionId) return;
+    const current = shareViewCacheRef.current[sessionId] || {
+      transcript: [],
+      liveCursor: null,
+      historyCursor: null,
+      hasOlder: false,
+      busy: false,
+      queueLen: 0,
+      terminalPrompt: null,
+      files: null,
+      selectedFilePath: "",
+      selectedFile: null,
+    };
+    shareViewCacheRef.current[sessionId] = { ...current, ...patch };
+  }
+
+  function rememberActiveShareSnapshot(sessionId = shareSessionRef.current) {
+    if (!sessionId) return;
+    cacheShareSnapshot(sessionId, {
+      transcript: shareTranscript,
+      liveCursor: shareLiveCursor,
+      historyCursor: shareHistoryCursor,
+      hasOlder: shareHasOlder,
+      busy: shareBusy,
+      queueLen: shareQueueLen,
+      terminalPrompt: shareTerminalPrompt,
+      files: shareFiles,
+      selectedFilePath: shareSelectedFilePath,
+      selectedFile: shareSelectedFile,
+    });
+  }
+
+  function restoreShareSnapshot(sessionId: string) {
+    const cached = shareViewCacheRef.current[sessionId];
+    if (!cached) return false;
+    setShareTranscript(cached.transcript);
+    setShareLiveCursor(cached.liveCursor);
+    setShareHistoryCursor(cached.historyCursor);
+    setShareHasOlder(cached.hasOlder);
+    setShareBusy(cached.busy);
+    setShareQueueLen(cached.queueLen);
+    setShareTerminalPrompt(cached.terminalPrompt);
+    setShareFiles(cached.files);
+    setShareSelectedFilePath(cached.selectedFilePath);
+    setShareSelectedFile(cached.selectedFile);
+    return true;
+  }
+
+  async function loadShareFilesForSession(sessionId: string) {
+    if (!shareTarget || !sessionId) return;
+    try {
+      const files = await api.fetchShareFiles(shareTarget.shareId, sessionId);
+      if (shareSessionRef.current !== sessionId) return;
+      setShareFiles(files);
+      cacheShareSnapshot(sessionId, { files });
+    } catch {
+      if (shareSessionRef.current === sessionId) setShareFiles(null);
+      cacheShareSnapshot(sessionId, { files: null });
+    }
+  }
+
+  async function loadShareQueue(sessionId = shareSessionRef.current) {
+    if (!shareTarget || !sessionId) return;
+    setShareQueueLoading(true);
+    try {
+      const response = await api.fetchShareQueue(shareTarget.shareId, sessionId);
+      if (shareSessionRef.current !== sessionId) return;
+      const items = normalizeQueueItems(response);
+      setShareQueueItems(items);
+      setShareQueueLen(items.length);
+      shareQueueLoadedSessionRef.current = sessionId;
+      setShareQueueDrafts(Object.fromEntries(items.map((item) => [item.id, item.text])));
+      updateShareSessionRuntime(sessionId, shareBusy, items.length);
+      cacheShareSnapshot(sessionId, { queueLen: items.length });
+    } catch (error) {
+      setShareErrorText(error instanceof Error ? error.message : "Unable to load queue");
+    } finally {
+      setShareQueueLoading(false);
+    }
+  }
+
+  function openShareQueueModal() {
+    if (!shareSessionRef.current) return;
+    setShareQueueOpen(true);
+    void loadShareQueue(shareSessionRef.current);
+  }
+
+  async function enqueueShareDraft() {
+    if (!shareTarget || !shareSessionId) return;
+    const text = shareSendText.trim();
+    if (!text) return;
+    setShareLoading(true);
+    setShareErrorText("");
+    try {
+      const response = await api.enqueueShareMessage(shareTarget.shareId, shareSessionId, text);
+      setShareSendText("");
+      const nextQueueLen = Number(response.queue_len || shareQueueLen + 1);
+      setShareQueueLen(nextQueueLen);
+      updateShareSessionRuntime(shareSessionId, shareBusy, nextQueueLen);
+      cacheShareSnapshot(shareSessionId, { queueLen: nextQueueLen });
+      setShareQueueOpen(true);
+      await loadShareQueue(shareSessionId);
+    } catch (error) {
+      setShareErrorText(error instanceof Error ? error.message : "Unable to queue message");
+    } finally {
+      setShareLoading(false);
+    }
+  }
+
+  async function saveShareQueueItem(itemId: string) {
+    if (!shareTarget || !shareSessionId) return;
+    const nextText = String(shareQueueDrafts[itemId] || "").trim();
+    if (!nextText) {
+      await deleteShareQueueItem(itemId);
+      return;
+    }
+    try {
+      await api.updateShareQueueItem(shareTarget.shareId, shareSessionId, itemId, nextText);
+      await loadShareQueue(shareSessionId);
+    } catch (error) {
+      setShareErrorText(error instanceof Error ? error.message : "Unable to update queue item");
+    }
+  }
+
+  async function deleteShareQueueItem(itemId: string) {
+    if (!shareTarget || !shareSessionId) return;
+    try {
+      await api.deleteShareQueueItem(shareTarget.shareId, shareSessionId, itemId);
+      await loadShareQueue(shareSessionId);
+    } catch (error) {
+      setShareErrorText(error instanceof Error ? error.message : "Unable to delete queue item");
+    }
+  }
+
+  async function moveShareQueueItem(itemId: string, toIndex: number) {
+    if (!shareTarget || !shareSessionId) return;
+    try {
+      await api.moveShareQueueItem(shareTarget.shareId, shareSessionId, itemId, toIndex);
+      await loadShareQueue(shareSessionId);
+    } catch (error) {
+      setShareErrorText(error instanceof Error ? error.message : "Unable to move queue item");
+    }
   }
 
   function updateShareTerminalPrompt(sessionId: string, prompt?: TerminalPrompt | null) {
@@ -1319,14 +1487,22 @@ export function App() {
     setShareQueueLen(nextQueueLen);
     updateShareSessionRuntime(sessionId, nextBusy, nextQueueLen);
     updateShareTerminalPrompt(sessionId, data.terminal_prompt || null);
+    const rawPrompt = data.terminal_prompt && sessionId ? { ...data.terminal_prompt, sessionId } : null;
+    const nextPrompt =
+      rawPrompt && !suppressedTerminalPromptKeysRef.current[terminalPromptKey(sessionId, rawPrompt)] ? rawPrompt : null;
+    cacheShareSnapshot(sessionId, { busy: nextBusy, queueLen: nextQueueLen, terminalPrompt: nextPrompt });
+    if (shareQueueOpen || shareQueueLoadedSessionRef.current === sessionId) void loadShareQueue(sessionId);
   }
 
   async function loadShareSession(nextSessionId = shareSessionId, preservedEvents: UiTranscriptEvent[] = []) {
     if (!shareTarget || !nextSessionId) return;
+    const requestId = shareOpenRequestRef.current + 1;
+    shareOpenRequestRef.current = requestId;
     setShareLoading(true);
     setShareErrorText("");
     try {
       const tail = await api.fetchShareTail(shareTarget.shareId, nextSessionId, SHARE_INIT_LIMIT);
+      if (requestId !== shareOpenRequestRef.current || shareSessionRef.current !== nextSessionId) return;
       const normalized = coalesceAdjacentAssistantEvents(normalizeEvents(tail.events || []));
       const retainedEvents = preservedEvents.filter((event) => {
         const body = String(event.body || "").trim();
@@ -1337,10 +1513,17 @@ export function App() {
       setShareHistoryCursor(tail.history_cursor || null);
       setShareHasOlder(Boolean(tail.has_older));
       updateShareRuntimeFromResponse(nextSessionId, tail);
-      const files = await api.fetchShareFiles(shareTarget.shareId, nextSessionId);
-      setShareFiles(files);
       setShareSelectedFilePath("");
       setShareSelectedFile(null);
+      cacheShareSnapshot(nextSessionId, {
+        transcript: retainedEvents.length ? retainedEvents.concat(normalized) : normalized,
+        liveCursor: tail.live_cursor || null,
+        historyCursor: tail.history_cursor || null,
+        hasOlder: Boolean(tail.has_older),
+        selectedFilePath: "",
+        selectedFile: null,
+      });
+      void loadShareFilesForSession(nextSessionId);
     } catch (error) {
       const status = typeof error === "object" && error && "status" in error ? Number((error as { status?: number }).status) : 0;
       if (status === 401) {
@@ -1349,7 +1532,7 @@ export function App() {
         setShareErrorText(error instanceof Error ? error.message : "Unable to load shared session");
       }
     } finally {
-      setShareLoading(false);
+      if (requestId === shareOpenRequestRef.current && shareSessionRef.current === nextSessionId) setShareLoading(false);
     }
   }
 
@@ -1366,15 +1549,20 @@ export function App() {
       applyShareInfo(response);
       const nextSessionId = shareTarget.sessionId || response.sessions[0]?.session_id || "";
       setShareSessionId(nextSessionId);
+      shareSessionRef.current = nextSessionId;
       setShareAuthState("ready");
       setSharePassword("");
-      if (nextSessionId) await loadShareSession(nextSessionId);
+      if (nextSessionId) {
+        await loadShareSession(nextSessionId);
+        void loadShareQueue(nextSessionId);
+      }
     } catch (error) {
       setSharePasswordError(error instanceof Error ? error.message : "Unable to open share");
     }
   }
 
   function applyShareInfo(response: ShareLoginResponse) {
+    const nextSessionIds = new Set(response.sessions.map((item) => item.session_id));
     setShareSet({
       share_id: response.share_id,
       label: response.share_label,
@@ -1390,6 +1578,15 @@ export function App() {
       sessions: response.sessions,
     });
     setShareLabel(response.share_label);
+    if (shareSessionRef.current && !nextSessionIds.has(shareSessionRef.current)) {
+      const nextSessionId = response.sessions[0]?.session_id || "";
+      setShareSessionId(nextSessionId);
+      shareSessionRef.current = nextSessionId;
+      if (nextSessionId) {
+        void loadShareSession(nextSessionId);
+        void loadShareQueue(nextSessionId);
+      }
+    }
   }
 
   async function loadShareOlder() {
@@ -1460,6 +1657,7 @@ export function App() {
     try {
       await api.sendShareMessage(shareTarget.shareId, shareSessionId, text);
       await loadShareSession(shareSessionId, localEvents);
+      void loadShareQueue(shareSessionId);
     } catch (error) {
       setShareErrorText(error instanceof Error ? error.message : "Unable to send message");
     } finally {
@@ -1474,6 +1672,7 @@ export function App() {
     try {
       await api.interruptShareSession(shareTarget.shareId, shareSessionId);
       await loadShareSession(shareSessionId);
+      void loadShareQueue(shareSessionId);
     } catch (error) {
       setShareErrorText(error instanceof Error ? error.message : "Unable to interrupt session");
     } finally {
@@ -1492,6 +1691,7 @@ export function App() {
       setShareTerminalPrompt(null);
       pushToast(value === "replace" ? "Goal replacement confirmed" : "Goal replacement declined");
       await loadShareSession(shareSessionId);
+      void loadShareQueue(shareSessionId);
     } catch (error) {
       setShareErrorText(error instanceof Error ? error.message : "Unable to answer terminal prompt");
     } finally {
@@ -1508,7 +1708,8 @@ export function App() {
         const info = await api.fetchShareInfo(shareTarget.shareId);
         if (cancelled) return;
         applyShareInfo(info);
-        const sessionId = shareTarget.sessionId || info.sessions[0]?.session_id || shareSessionId;
+        const targetSessionId = info.sessions.some((session) => session.session_id === shareTarget.sessionId) ? shareTarget.sessionId : "";
+        const sessionId = targetSessionId || info.sessions[0]?.session_id || shareSessionId;
         if (!sessionId) {
           setShareAuthState("login");
           return;
@@ -1516,18 +1717,21 @@ export function App() {
         const tail = await api.fetchShareTail(shareTarget.shareId, sessionId, SHARE_INIT_LIMIT);
         if (cancelled) return;
         setShareSessionId(sessionId);
+        shareSessionRef.current = sessionId;
         setShareTranscript(coalesceAdjacentAssistantEvents(normalizeEvents(tail.events || [])));
         setShareLiveCursor(tail.live_cursor || null);
         setShareHistoryCursor(tail.history_cursor || null);
         setShareHasOlder(Boolean(tail.has_older));
         updateShareRuntimeFromResponse(sessionId, tail);
         setShareAuthState("ready");
-        try {
-          const files = await api.fetchShareFiles(shareTarget.shareId, sessionId);
-          if (!cancelled) setShareFiles(files);
-        } catch {
-          if (!cancelled) setShareFiles(null);
-        }
+        cacheShareSnapshot(sessionId, {
+          transcript: coalesceAdjacentAssistantEvents(normalizeEvents(tail.events || [])),
+          liveCursor: tail.live_cursor || null,
+          historyCursor: tail.history_cursor || null,
+          hasOlder: Boolean(tail.has_older),
+        });
+        void loadShareFilesForSession(sessionId);
+        void loadShareQueue(sessionId);
       } catch (error) {
         if (cancelled) return;
         setShareAuthState("login");
@@ -1565,6 +1769,23 @@ export function App() {
       window.clearInterval(timer);
     };
   }, [shareMode, shareAuthState, shareTarget?.shareId, shareSessionId, shareLiveCursor, shareBusy]);
+
+  useEffect(() => {
+    if (!shareMode || shareAuthState !== "ready" || !shareTarget) return;
+    let cancelled = false;
+    const timer = window.setInterval(async () => {
+      try {
+        const info = await api.fetchShareInfo(shareTarget.shareId);
+        if (!cancelled) applyShareInfo(info);
+      } catch (error) {
+        if (!cancelled) setShareErrorText(error instanceof Error ? error.message : "Unable to refresh share sessions");
+      }
+    }, SESSION_REFRESH_MS);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [shareMode, shareAuthState, shareTarget?.shareId]);
   const contextMenuSession = useMemo(
     () => sessions.find((session) => session.session_id === sessionContextMenu?.sessionId) || null,
     [sessionContextMenu, sessions],
@@ -1639,6 +1860,15 @@ export function App() {
           : transcript.filter(transcriptEventVisibleWithToolsHidden),
       ),
     [showTools, transcript],
+  );
+  const visibleShareTranscript = useMemo(
+    () =>
+      coalesceAdjacentAssistantEvents(
+        showTools
+          ? shareTranscript
+          : shareTranscript.filter(transcriptEventVisibleWithToolsHidden),
+      ),
+    [shareTranscript, showTools],
   );
   const floatingProgressEvent = useMemo(() => {
     for (let index = visibleTranscript.length - 1; index >= 0; index -= 1) {
@@ -2415,6 +2645,8 @@ export function App() {
       await api.deleteShareLink(shareId);
       setManagedShares((current) => current.filter((share) => share.share_id !== shareId));
       if (shareCreateResult?.share_id === shareId) setShareCreateResult(null);
+      if (editingShareId === shareId) setEditingShareId("");
+      void refreshManagedShares();
       pushToast("Share closed");
     } catch (error) {
       setShareCreateError(error instanceof Error ? error.message : "Unable to close share");
@@ -2423,25 +2655,38 @@ export function App() {
     }
   }
 
-  function openShareCreateDialog() {
-    if (!selectedSession) return;
-    const candidates = sortSessions(sessions).map((session) => {
+  function shareDraftSessionsForSelected(checkedSessionIds: Set<string>) {
+    return sortSessions(sessions).map((session) => {
       const workspaceCwd = workspaceKeyForSession(session);
       return {
         session_id: session.session_id,
         label: sessionDisplayName(session),
         workspace: workspaceTitle(workspaceCwd),
         cwd: workspaceCwd === "__unknown_workspace__" ? "" : workspaceCwd,
-        checked: session.session_id === selectedSession.session_id,
+        checked: checkedSessionIds.has(session.session_id),
       };
     });
-    setShareCreateSessions(candidates);
+  }
+
+  function openShareCreateDialog() {
+    if (!selectedSession) return;
+    setEditingShareId("");
+    setShareCreateSessions(shareDraftSessionsForSelected(new Set([selectedSession.session_id])));
     setShareCreateLabel(sessionDisplayName(selectedSession));
     setShareCreateExpiresHours(24);
     setShareCreateError("");
     setShareCreateResult(null);
     setShareCreateOpen(true);
     void refreshManagedShares();
+  }
+
+  function editManagedShare(share: ManagedShareSet) {
+    setEditingShareId(share.share_id);
+    setShareCreateSessions(shareDraftSessionsForSelected(new Set(share.session_ids || [])));
+    setShareCreateLabel(share.label || "Shared sessions");
+    setShareCreateExpiresHours(Math.max(1, Math.ceil((share.expires_at - Date.now() / 1000) / 3600)));
+    setShareCreateError("");
+    setShareCreateResult(null);
   }
 
   function toggleShareDraftSession(sessionId: string) {
@@ -2456,11 +2701,26 @@ export function App() {
       setShareCreateError("Select at least one session");
       return;
     }
-    const expiresInHours = Math.max(1, Math.min(24 * 30, Math.round(Number(shareCreateExpiresHours) || 24)));
     setShareCreateBusy(true);
     setShareCreateError("");
     try {
       const nicknames = Object.fromEntries(selected.map((session) => [session.session_id, session.label]));
+      if (editingShareId) {
+        const updated = await api.updateShareLink(editingShareId, {
+          label: shareCreateLabel.trim() || selected[0]?.label || "Shared sessions",
+          session_ids: selected.map((session) => session.session_id),
+          nicknames,
+        });
+        setManagedShares((current) =>
+          current.map((share) =>
+            share.share_id === updated.share_id ? { ...updated, share_password: share.share_password } : share,
+          ),
+        );
+        setEditingShareId("");
+        pushToast("Share sessions updated");
+        return;
+      }
+      const expiresInHours = Math.max(1, Math.min(24 * 30, Math.round(Number(shareCreateExpiresHours) || 24)));
       const response = await api.createShareLink({
         label: shareCreateLabel.trim() || selected[0]?.label || "Shared sessions",
         session_ids: selected.map((session) => session.session_id),
@@ -2492,7 +2752,7 @@ export function App() {
       });
       pushToast("Share link created");
     } catch (error) {
-      setShareCreateError(error instanceof Error ? error.message : "Unable to create share link");
+      setShareCreateError(error instanceof Error ? error.message : editingShareId ? "Unable to update share" : "Unable to create share link");
     } finally {
       setShareCreateBusy(false);
     }
@@ -3863,27 +4123,51 @@ export function App() {
         <ShareWorkspace
           share={shareSet}
           sessionId={shareSessionId}
-          transcript={shareTranscript}
+          transcript={visibleShareTranscript}
           files={shareFiles}
           selectedFilePath={shareSelectedFilePath}
           selectedFile={shareSelectedFile}
+          showTools={showTools}
           loading={shareLoading}
           loadingOlder={shareLoadingOlder}
           hasOlder={shareHasOlder}
           busy={shareBusy}
           queueLen={shareQueueLen}
+          queueItems={shareQueueItems}
+          queueDrafts={shareQueueDrafts}
+          queueLoading={shareQueueLoading}
+          queueOpen={shareQueueOpen}
           terminalPrompt={shareTerminalPrompt?.sessionId === shareSessionId ? shareTerminalPrompt : null}
           terminalPromptSending={shareTerminalPromptSending}
           errorText={shareErrorText}
           sendText={shareSendText}
           canSend={Boolean(shareSessionId && shareSendText.trim())}
           onSessionChange={(sessionId) => {
+            rememberActiveShareSnapshot();
             setShareSessionId(sessionId);
+            shareSessionRef.current = sessionId;
+            if (!restoreShareSnapshot(sessionId)) {
+              setShareTranscript([]);
+              setShareLiveCursor(null);
+              setShareHistoryCursor(null);
+              setShareHasOlder(false);
+              setShareBusy(false);
+              setShareQueueLen(Number(shareSet.sessions.find((item) => item.session_id === sessionId)?.queue_len || 0));
+              setShareTerminalPrompt(null);
+              setShareFiles(null);
+              setShareSelectedFilePath("");
+              setShareSelectedFile(null);
+            }
+            setShareQueueItems([]);
+            setShareQueueDrafts({});
+            shareQueueLoadedSessionRef.current = "";
             void loadShareSession(sessionId);
+            void loadShareQueue(sessionId);
             history.replaceState(null, "", `/share/${shareSet.share_id}/sessions/${sessionId}/`);
           }}
           onSendTextChange={setShareSendText}
           onSend={handleShareSend}
+          onEnqueue={enqueueShareDraft}
           onInterrupt={handleShareInterrupt}
           onTerminalPromptResponse={handleShareTerminalPromptResponse}
           onLoadOlder={loadShareOlder}
@@ -3892,6 +4176,18 @@ export function App() {
           onCopyText={copyTranscriptEvent}
           isEventCollapsed={transcriptEventCollapsed}
           onToggleEvent={toggleTranscriptEvent}
+          onToggleTools={() => setShowTools((current) => !current)}
+          onOpenQueue={openShareQueueModal}
+          onCloseQueue={() => setShareQueueOpen(false)}
+          onQueueDraftChange={(itemId, value) =>
+            setShareQueueDrafts((current) => ({
+              ...current,
+              [itemId]: value,
+            }))
+          }
+          onSaveQueueItem={saveShareQueueItem}
+          onDeleteQueueItem={deleteShareQueueItem}
+          onMoveQueueItem={moveShareQueueItem}
           onOpenSchedules={openSchedulesDialog}
         />
         <ScheduleModal
@@ -4869,16 +5165,25 @@ export function App() {
                   placeholder={selectedSession ? sessionDisplayName(selectedSession) : "Shared sessions"}
                 />
               </label>
-              <label className="field">
-                <span>Expires in hours</span>
-                <input
-                  type="number"
-                  min="1"
-                  max="720"
-                  value={String(shareCreateExpiresHours)}
-                  onInput={(event) => setShareCreateExpiresHours(Number((event.currentTarget as HTMLInputElement).value) || 24)}
-                />
-              </label>
+              {editingShareId ? (
+                <div className="shareEditNotice">
+                  <span>Editing an existing share keeps its URL and password.</span>
+                  <button className="secondaryBtn" type="button" onClick={() => setEditingShareId("")}>
+                    Cancel edit
+                  </button>
+                </div>
+              ) : (
+                <label className="field">
+                  <span>Expires in hours</span>
+                  <input
+                    type="number"
+                    min="1"
+                    max="720"
+                    value={String(shareCreateExpiresHours)}
+                    onInput={(event) => setShareCreateExpiresHours(Number((event.currentTarget as HTMLInputElement).value) || 24)}
+                  />
+                </label>
+              )}
               <div className="field">
                 <span>Sessions</span>
                 <div className="shareSessionChoices">
@@ -4937,6 +5242,14 @@ export function App() {
                         </div>
                       </div>
                       <div className="shareManagerActions">
+                        <button
+                          className="secondaryBtn shareManagerEditBtn"
+                          type="button"
+                          title="Edit included sessions without changing this share URL or password"
+                          onClick={() => editManagedShare(share)}
+                        >
+                          编辑会话
+                        </button>
                         <a className="secondaryBtn" href={shareSetUrl(share)} target="_blank" rel="noreferrer">
                           Open
                         </a>
@@ -4944,13 +5257,13 @@ export function App() {
                           Copy
                         </button>
                         <button
-                          className="icon-btn danger"
+                          className="secondaryBtn danger"
                           type="button"
-                          title="Close share"
+                          title="Delete share"
                           disabled={deletingShareId === share.share_id}
                           onClick={() => void deleteManagedShare(share.share_id)}
                         >
-                          {icon("trash")}
+                          {deletingShareId === share.share_id ? "Deleting..." : "删除"}
                         </button>
                       </div>
                     </article>
@@ -4964,7 +5277,15 @@ export function App() {
                   Close
                 </button>
                 <button className="primary" type="submit" disabled={shareCreateBusy || !selectedShareSessionCount}>
-                  {shareCreateBusy ? "Creating..." : shareCreateResult ? "Create another" : "Create share"}
+                  {shareCreateBusy
+                    ? editingShareId
+                      ? "Saving..."
+                      : "Creating..."
+                    : editingShareId
+                      ? "Save sessions"
+                      : shareCreateResult
+                        ? "Create another"
+                        : "Create share"}
                 </button>
               </div>
             </form>

@@ -3,8 +3,10 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RUST_PID_FILE="$ROOT_DIR/.tmp/codoxear-rust.pid"
+SUPERVISOR_PID_FILE="$ROOT_DIR/.tmp/codoxear-supervisor.pid"
 LEGACY_WEB_PID_FILE="$ROOT_DIR/.tmp/codoxear-web.pid"
 RUST_LOG_FILE="$ROOT_DIR/.tmp/codoxear-rust.log"
+SUPERVISOR_LOG_FILE="$ROOT_DIR/.tmp/codoxear-supervisor.log"
 NOVA_BIN="$ROOT_DIR/backend-rs/target/release/codoxear-backend-rs"
 BROKER_BIN="$ROOT_DIR/backend-rs/target/release/codoxear-broker-rs"
 
@@ -52,22 +54,16 @@ running_pid() {
   return 1
 }
 
-start_server() {
-  require_runtime
-  mkdir -p "$ROOT_DIR/.tmp"
-  local rust_pid legacy_pid
-  if rust_pid="$(running_pid "$RUST_PID_FILE")" || legacy_pid="$(running_pid "$LEGACY_WEB_PID_FILE")"; then
-    echo "error: Codoxear already running" >&2
-    exit 1
-  fi
-
+export_runtime_env() {
   cd "$ROOT_DIR"
   set -a
   # shellcheck disable=SC1091
   source "$ROOT_DIR/.env"
   set +a
+}
 
-  setsid env \
+run_rust_server() {
+  exec env \
     CODOXEAR_BIND_HOST=127.0.0.1 \
     CODOXEAR_BIND_PORT=8743 \
     CODOXEAR_ENABLE_HARNESS_SWEEP=1 \
@@ -77,10 +73,56 @@ start_server() {
     CODOXEAR_ENABLE_VOICE_WORKER=1 \
     CODOXEAR_REPO_ROOT="$ROOT_DIR" \
     CODOXEAR_RUST_BROKER_BIN="$BROKER_BIN" \
-    "$NOVA_BIN" >>"$RUST_LOG_FILE" 2>&1 < /dev/null &
-  rust_pid=$!
-  echo "$rust_pid" > "$RUST_PID_FILE"
+    "$NOVA_BIN"
+}
+
+supervise_server() {
+  trap 'if [[ -n "${child_pid:-}" ]]; then kill "$child_pid" 2>/dev/null || true; wait "$child_pid" 2>/dev/null || true; fi; rm -f "$RUST_PID_FILE" "$SUPERVISOR_PID_FILE"; exit 0' TERM INT
+
+  while true; do
+    (
+      export_runtime_env
+      run_rust_server
+    ) >>"$RUST_LOG_FILE" 2>&1 &
+    child_pid=$!
+    echo "$child_pid" > "$RUST_PID_FILE"
+    echo "$(date -Is) started rust pid $child_pid" >>"$SUPERVISOR_LOG_FILE"
+    set +e
+    wait "$child_pid"
+    status=$?
+    set -e
+    rm -f "$RUST_PID_FILE"
+    echo "$(date -Is) rust pid $child_pid exited status $status; restarting in 2s" >>"$SUPERVISOR_LOG_FILE"
+    sleep 2
+  done
+}
+
+start_server() {
+  require_runtime
+  mkdir -p "$ROOT_DIR/.tmp"
+  local rust_pid supervisor_pid legacy_pid
+  if supervisor_pid="$(running_pid "$SUPERVISOR_PID_FILE")" || rust_pid="$(running_pid "$RUST_PID_FILE")" || legacy_pid="$(running_pid "$LEGACY_WEB_PID_FILE")"; then
+    echo "error: Codoxear already running" >&2
+    exit 1
+  fi
+
+  setsid "$0" supervise >>"$SUPERVISOR_LOG_FILE" 2>&1 < /dev/null &
+  supervisor_pid=$!
+  echo "$supervisor_pid" > "$SUPERVISOR_PID_FILE"
   sleep 2
+  if ! kill -0 "$supervisor_pid" 2>/dev/null; then
+    rm -f "$SUPERVISOR_PID_FILE"
+    echo "error: Codoxear supervisor failed to start; check logs in $ROOT_DIR/.tmp" >&2
+    exit 1
+  fi
+  local rust_pid=""
+  rust_pid="$(running_pid "$RUST_PID_FILE" 2>/dev/null || true)"
+  if [[ -z "$rust_pid" ]]; then
+    rm -f "$SUPERVISOR_PID_FILE"
+    kill "$supervisor_pid" 2>/dev/null || true
+    echo "error: Codoxear failed to start; check logs in $ROOT_DIR/.tmp" >&2
+    exit 1
+  fi
   if ! kill -0 "$rust_pid" 2>/dev/null; then
     rm -f "$RUST_PID_FILE"
     echo "error: Codoxear failed to start; check logs in $ROOT_DIR/.tmp" >&2
@@ -88,17 +130,19 @@ start_server() {
   fi
 
   echo "started Codoxear Nova"
+  echo "supervisor pid: $supervisor_pid"
   echo "public rust pid: $rust_pid"
   echo "rust log: $RUST_LOG_FILE"
+  echo "supervisor log: $SUPERVISOR_LOG_FILE"
 }
 
 stop_server() {
   local failed=0
-  if ! running_pid "$RUST_PID_FILE" >/dev/null && ! running_pid "$LEGACY_WEB_PID_FILE" >/dev/null; then
+  if ! running_pid "$SUPERVISOR_PID_FILE" >/dev/null && ! running_pid "$RUST_PID_FILE" >/dev/null && ! running_pid "$LEGACY_WEB_PID_FILE" >/dev/null; then
     echo "error: Codoxear is not running" >&2
     exit 1
   fi
-  for pid_file in "$RUST_PID_FILE" "$LEGACY_WEB_PID_FILE"; do
+  for pid_file in "$SUPERVISOR_PID_FILE" "$RUST_PID_FILE" "$LEGACY_WEB_PID_FILE"; do
     local pid=""
     if pid="$(running_pid "$pid_file" 2>/dev/null)"; then
       kill "$pid"
@@ -123,11 +167,17 @@ stop_server() {
 }
 
 status_server() {
-  local rust_pid
-  if rust_pid="$(running_pid "$RUST_PID_FILE")"; then
+  local rust_pid supervisor_pid
+  if supervisor_pid="$(running_pid "$SUPERVISOR_PID_FILE")" || rust_pid="$(running_pid "$RUST_PID_FILE")"; then
     echo "running"
-    echo "public rust pid: $rust_pid"
+    if [[ -n "${supervisor_pid:-}" ]]; then
+      echo "supervisor pid: $supervisor_pid"
+    fi
+    if rust_pid="$(running_pid "$RUST_PID_FILE" 2>/dev/null)"; then
+      echo "public rust pid: $rust_pid"
+    fi
     echo "rust log: $RUST_LOG_FILE"
+    echo "supervisor log: $SUPERVISOR_LOG_FILE"
     exit 0
   fi
   echo "stopped"
@@ -142,10 +192,15 @@ case "${1:-}" in
     stop_server
     ;;
   restart)
-    if running_pid "$RUST_PID_FILE" >/dev/null || running_pid "$LEGACY_WEB_PID_FILE" >/dev/null; then
+    if running_pid "$SUPERVISOR_PID_FILE" >/dev/null || running_pid "$RUST_PID_FILE" >/dev/null || running_pid "$LEGACY_WEB_PID_FILE" >/dev/null; then
       stop_server
     fi
     start_server
+    ;;
+  supervise)
+    require_runtime
+    mkdir -p "$ROOT_DIR/.tmp"
+    supervise_server
     ;;
   status)
     status_server

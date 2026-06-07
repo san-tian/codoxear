@@ -396,6 +396,36 @@ export const api = {
       `/share/${encodeURIComponent(shareId)}/sessions/${encodeURIComponent(sessionId)}/messages/live?cursor=${encodeURIComponent(cursor)}`,
     );
   },
+  enqueueShareMessage(shareId: string, sessionId: string, text: string): Promise<{ ok?: true; queued?: boolean; queue_len?: number }> {
+    return readJson<{ ok?: true; queued?: boolean; queue_len?: number }>(
+      `/share/${encodeURIComponent(shareId)}/sessions/${encodeURIComponent(sessionId)}/enqueue`,
+      {
+        method: "POST",
+        body: JSON.stringify({ text }),
+      },
+    );
+  },
+  fetchShareQueue(shareId: string, sessionId: string): Promise<QueueResponse> {
+    return readJson<QueueResponse>(`/share/${encodeURIComponent(shareId)}/sessions/${encodeURIComponent(sessionId)}/queue`);
+  },
+  updateShareQueueItem(shareId: string, sessionId: string, itemId: string, text: string): Promise<{ ok?: true }> {
+    return readJson<{ ok?: true }>(`/share/${encodeURIComponent(shareId)}/sessions/${encodeURIComponent(sessionId)}/queue/update`, {
+      method: "POST",
+      body: JSON.stringify({ id: itemId, text }),
+    });
+  },
+  deleteShareQueueItem(shareId: string, sessionId: string, itemId: string): Promise<{ ok?: true }> {
+    return readJson<{ ok?: true }>(`/share/${encodeURIComponent(shareId)}/sessions/${encodeURIComponent(sessionId)}/queue/delete`, {
+      method: "POST",
+      body: JSON.stringify({ id: itemId }),
+    });
+  },
+  moveShareQueueItem(shareId: string, sessionId: string, itemId: string, toIndex: number): Promise<{ ok?: true }> {
+    return readJson<{ ok?: true }>(`/share/${encodeURIComponent(shareId)}/sessions/${encodeURIComponent(sessionId)}/queue/move`, {
+      method: "POST",
+      body: JSON.stringify({ id: itemId, to_index: toIndex }),
+    });
+  },
   sendShareMessage(shareId: string, sessionId: string, text: string): Promise<{ ok?: true }> {
     return readJson<{ ok?: true }>(`/share/${encodeURIComponent(shareId)}/sessions/${encodeURIComponent(sessionId)}/send`, {
       method: "POST",
